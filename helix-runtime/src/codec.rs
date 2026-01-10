@@ -1,0 +1,454 @@
+//! Message codec for Raft protocol over TCP.
+//!
+//! This module provides binary serialization for Raft messages using a
+//! simple length-prefixed format suitable for TCP streaming.
+//!
+//! # Wire Format
+//!
+//! Each message is framed as:
+//! - 4 bytes: message length (u32 little-endian, not including header)
+//! - 1 byte: message type tag
+//! - N bytes: message-specific payload
+//!
+//! # Message Types
+//!
+//! - 0: RequestVote
+//! - 1: RequestVoteResponse
+//! - 2: AppendEntries
+//! - 3: AppendEntriesResponse
+
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use helix_core::{LogIndex, NodeId, TermId};
+use helix_raft::{
+    AppendEntriesRequest, AppendEntriesResponse, LogEntry, Message, RequestVoteRequest,
+    RequestVoteResponse,
+};
+use thiserror::Error;
+
+/// Maximum message size (16 MB).
+const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
+
+/// Message type tags.
+const TAG_REQUEST_VOTE: u8 = 0;
+const TAG_REQUEST_VOTE_RESPONSE: u8 = 1;
+const TAG_APPEND_ENTRIES: u8 = 2;
+const TAG_APPEND_ENTRIES_RESPONSE: u8 = 3;
+
+/// Codec errors.
+#[derive(Debug, Error)]
+pub enum CodecError {
+    /// Message exceeds maximum allowed size.
+    #[error("message too large: {size} bytes (max {max})")]
+    MessageTooLarge {
+        /// Actual size.
+        size: u32,
+        /// Maximum allowed.
+        max: u32,
+    },
+
+    /// Unknown message type tag.
+    #[error("unknown message type: {tag}")]
+    UnknownMessageType {
+        /// The unknown tag value.
+        tag: u8,
+    },
+
+    /// Insufficient data to decode message.
+    #[error("insufficient data: need {need} bytes, have {have}")]
+    InsufficientData {
+        /// Bytes needed.
+        need: usize,
+        /// Bytes available.
+        have: usize,
+    },
+
+    /// I/O error.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Result type for codec operations.
+pub type CodecResult<T> = Result<T, CodecError>;
+
+/// Encodes a Raft message to bytes.
+///
+/// # Errors
+/// Returns an error if the message is too large.
+pub fn encode_message(message: &Message) -> CodecResult<Bytes> {
+    let mut buf = BytesMut::with_capacity(256);
+
+    // Reserve space for length prefix (filled in at the end).
+    buf.put_u32_le(0);
+
+    match message {
+        Message::RequestVote(req) => {
+            buf.put_u8(TAG_REQUEST_VOTE);
+            encode_request_vote(&mut buf, req);
+        }
+        Message::RequestVoteResponse(resp) => {
+            buf.put_u8(TAG_REQUEST_VOTE_RESPONSE);
+            encode_request_vote_response(&mut buf, resp);
+        }
+        Message::AppendEntries(req) => {
+            buf.put_u8(TAG_APPEND_ENTRIES);
+            encode_append_entries(&mut buf, req);
+        }
+        Message::AppendEntriesResponse(resp) => {
+            buf.put_u8(TAG_APPEND_ENTRIES_RESPONSE);
+            encode_append_entries_response(&mut buf, resp);
+        }
+    }
+
+    // Fill in length (excluding the 4-byte header).
+    let len = (buf.len() - 4) as u32;
+    if len > MAX_MESSAGE_SIZE {
+        return Err(CodecError::MessageTooLarge {
+            size: len,
+            max: MAX_MESSAGE_SIZE,
+        });
+    }
+
+    // Write length at the beginning.
+    buf[0..4].copy_from_slice(&len.to_le_bytes());
+
+    Ok(buf.freeze())
+}
+
+/// Decodes a Raft message from bytes.
+///
+/// Expects the full framed message including length prefix.
+///
+/// # Errors
+/// Returns an error if the data is malformed or incomplete.
+pub fn decode_message(data: &[u8]) -> CodecResult<(Message, usize)> {
+    if data.len() < 4 {
+        return Err(CodecError::InsufficientData {
+            need: 4,
+            have: data.len(),
+        });
+    }
+
+    let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+
+    if len > MAX_MESSAGE_SIZE as usize {
+        return Err(CodecError::MessageTooLarge {
+            size: len as u32,
+            max: MAX_MESSAGE_SIZE,
+        });
+    }
+
+    let total_len = 4 + len;
+    if data.len() < total_len {
+        return Err(CodecError::InsufficientData {
+            need: total_len,
+            have: data.len(),
+        });
+    }
+
+    let payload = &data[4..total_len];
+    if payload.is_empty() {
+        return Err(CodecError::InsufficientData {
+            need: 1,
+            have: 0,
+        });
+    }
+
+    let tag = payload[0];
+    let body = &payload[1..];
+    let mut buf = body;
+
+    let message = match tag {
+        TAG_REQUEST_VOTE => Message::RequestVote(decode_request_vote(&mut buf)?),
+        TAG_REQUEST_VOTE_RESPONSE => {
+            Message::RequestVoteResponse(decode_request_vote_response(&mut buf)?)
+        }
+        TAG_APPEND_ENTRIES => Message::AppendEntries(decode_append_entries(&mut buf)?),
+        TAG_APPEND_ENTRIES_RESPONSE => {
+            Message::AppendEntriesResponse(decode_append_entries_response(&mut buf)?)
+        }
+        _ => return Err(CodecError::UnknownMessageType { tag }),
+    };
+
+    Ok((message, total_len))
+}
+
+/// Encodes a `RequestVoteRequest`.
+fn encode_request_vote(buf: &mut BytesMut, req: &RequestVoteRequest) {
+    buf.put_u64_le(req.term.get());
+    buf.put_u64_le(req.candidate_id.get());
+    buf.put_u64_le(req.to.get());
+    buf.put_u64_le(req.last_log_index.get());
+    buf.put_u64_le(req.last_log_term.get());
+}
+
+/// Decodes a `RequestVoteRequest`.
+fn decode_request_vote(buf: &mut &[u8]) -> CodecResult<RequestVoteRequest> {
+    ensure_remaining(buf, 40)?;
+
+    let term = TermId::new(buf.get_u64_le());
+    let candidate_id = NodeId::new(buf.get_u64_le());
+    let to = NodeId::new(buf.get_u64_le());
+    let last_log_index = LogIndex::new(buf.get_u64_le());
+    let last_log_term = TermId::new(buf.get_u64_le());
+
+    Ok(RequestVoteRequest::new(
+        term,
+        candidate_id,
+        to,
+        last_log_index,
+        last_log_term,
+    ))
+}
+
+/// Encodes a `RequestVoteResponse`.
+fn encode_request_vote_response(buf: &mut BytesMut, resp: &RequestVoteResponse) {
+    buf.put_u64_le(resp.term.get());
+    buf.put_u64_le(resp.from.get());
+    buf.put_u64_le(resp.to.get());
+    buf.put_u8(u8::from(resp.vote_granted));
+}
+
+/// Decodes a `RequestVoteResponse`.
+fn decode_request_vote_response(buf: &mut &[u8]) -> CodecResult<RequestVoteResponse> {
+    ensure_remaining(buf, 25)?;
+
+    let term = TermId::new(buf.get_u64_le());
+    let from = NodeId::new(buf.get_u64_le());
+    let to = NodeId::new(buf.get_u64_le());
+    let vote_granted = buf.get_u8() != 0;
+
+    Ok(RequestVoteResponse::new(term, from, to, vote_granted))
+}
+
+/// Encodes an `AppendEntriesRequest`.
+fn encode_append_entries(buf: &mut BytesMut, req: &AppendEntriesRequest) {
+    buf.put_u64_le(req.term.get());
+    buf.put_u64_le(req.leader_id.get());
+    buf.put_u64_le(req.to.get());
+    buf.put_u64_le(req.prev_log_index.get());
+    buf.put_u64_le(req.prev_log_term.get());
+    buf.put_u64_le(req.leader_commit.get());
+
+    // Encode entries count and entries.
+    buf.put_u32_le(req.entries.len() as u32);
+    for entry in &req.entries {
+        encode_log_entry(buf, entry);
+    }
+}
+
+/// Decodes an `AppendEntriesRequest`.
+fn decode_append_entries(buf: &mut &[u8]) -> CodecResult<AppendEntriesRequest> {
+    ensure_remaining(buf, 52)?;
+
+    let term = TermId::new(buf.get_u64_le());
+    let leader_id = NodeId::new(buf.get_u64_le());
+    let to = NodeId::new(buf.get_u64_le());
+    let prev_log_index = LogIndex::new(buf.get_u64_le());
+    let prev_log_term = TermId::new(buf.get_u64_le());
+    let leader_commit = LogIndex::new(buf.get_u64_le());
+
+    let entry_count = buf.get_u32_le() as usize;
+    let mut entries = Vec::with_capacity(entry_count);
+
+    for _ in 0..entry_count {
+        entries.push(decode_log_entry(buf)?);
+    }
+
+    Ok(AppendEntriesRequest::new(
+        term,
+        leader_id,
+        to,
+        prev_log_index,
+        prev_log_term,
+        entries,
+        leader_commit,
+    ))
+}
+
+/// Encodes an `AppendEntriesResponse`.
+fn encode_append_entries_response(buf: &mut BytesMut, resp: &AppendEntriesResponse) {
+    buf.put_u64_le(resp.term.get());
+    buf.put_u64_le(resp.from.get());
+    buf.put_u64_le(resp.to.get());
+    buf.put_u8(u8::from(resp.success));
+    buf.put_u64_le(resp.match_index.get());
+}
+
+/// Decodes an `AppendEntriesResponse`.
+fn decode_append_entries_response(buf: &mut &[u8]) -> CodecResult<AppendEntriesResponse> {
+    ensure_remaining(buf, 33)?;
+
+    let term = TermId::new(buf.get_u64_le());
+    let from = NodeId::new(buf.get_u64_le());
+    let to = NodeId::new(buf.get_u64_le());
+    let success = buf.get_u8() != 0;
+    let match_index = LogIndex::new(buf.get_u64_le());
+
+    Ok(AppendEntriesResponse::new(
+        term,
+        from,
+        to,
+        success,
+        match_index,
+    ))
+}
+
+/// Encodes a log entry.
+fn encode_log_entry(buf: &mut BytesMut, entry: &LogEntry) {
+    buf.put_u64_le(entry.term.get());
+    buf.put_u64_le(entry.index.get());
+    buf.put_u32_le(entry.data.len() as u32);
+    buf.put_slice(&entry.data);
+}
+
+/// Decodes a log entry.
+fn decode_log_entry(buf: &mut &[u8]) -> CodecResult<LogEntry> {
+    ensure_remaining(buf, 20)?;
+
+    let term = TermId::new(buf.get_u64_le());
+    let index = LogIndex::new(buf.get_u64_le());
+    let data_len = buf.get_u32_le() as usize;
+
+    ensure_remaining(buf, data_len)?;
+    let data = Bytes::copy_from_slice(&buf[..data_len]);
+    buf.advance(data_len);
+
+    Ok(LogEntry::new(term, index, data))
+}
+
+/// Ensures the buffer has at least `need` bytes remaining.
+fn ensure_remaining(buf: &[u8], need: usize) -> CodecResult<()> {
+    if buf.len() < need {
+        return Err(CodecError::InsufficientData {
+            need,
+            have: buf.len(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_request_vote() -> Message {
+        Message::RequestVote(RequestVoteRequest::new(
+            TermId::new(5),
+            NodeId::new(1),
+            NodeId::new(2),
+            LogIndex::new(10),
+            TermId::new(4),
+        ))
+    }
+
+    fn make_request_vote_response() -> Message {
+        Message::RequestVoteResponse(RequestVoteResponse::new(
+            TermId::new(5),
+            NodeId::new(2),
+            NodeId::new(1),
+            true,
+        ))
+    }
+
+    fn make_append_entries_heartbeat() -> Message {
+        Message::AppendEntries(AppendEntriesRequest::heartbeat(
+            TermId::new(5),
+            NodeId::new(1),
+            NodeId::new(2),
+            LogIndex::new(10),
+            TermId::new(4),
+            LogIndex::new(8),
+        ))
+    }
+
+    fn make_append_entries_with_data() -> Message {
+        let entries = vec![
+            LogEntry::new(TermId::new(5), LogIndex::new(11), Bytes::from("hello")),
+            LogEntry::new(TermId::new(5), LogIndex::new(12), Bytes::from("world")),
+        ];
+        Message::AppendEntries(AppendEntriesRequest::new(
+            TermId::new(5),
+            NodeId::new(1),
+            NodeId::new(2),
+            LogIndex::new(10),
+            TermId::new(4),
+            entries,
+            LogIndex::new(8),
+        ))
+    }
+
+    fn make_append_entries_response() -> Message {
+        Message::AppendEntriesResponse(AppendEntriesResponse::new(
+            TermId::new(5),
+            NodeId::new(2),
+            NodeId::new(1),
+            true,
+            LogIndex::new(12),
+        ))
+    }
+
+    #[test]
+    fn test_encode_decode_request_vote() {
+        let original = make_request_vote();
+        let encoded = encode_message(&original).unwrap();
+        let (decoded, consumed) = decode_message(&encoded).unwrap();
+
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_encode_decode_request_vote_response() {
+        let original = make_request_vote_response();
+        let encoded = encode_message(&original).unwrap();
+        let (decoded, consumed) = decode_message(&encoded).unwrap();
+
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_encode_decode_append_entries_heartbeat() {
+        let original = make_append_entries_heartbeat();
+        let encoded = encode_message(&original).unwrap();
+        let (decoded, consumed) = decode_message(&encoded).unwrap();
+
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_encode_decode_append_entries_with_data() {
+        let original = make_append_entries_with_data();
+        let encoded = encode_message(&original).unwrap();
+        let (decoded, consumed) = decode_message(&encoded).unwrap();
+
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_encode_decode_append_entries_response() {
+        let original = make_append_entries_response();
+        let encoded = encode_message(&original).unwrap();
+        let (decoded, consumed) = decode_message(&encoded).unwrap();
+
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_insufficient_data() {
+        // Only 2 bytes when we need at least 4.
+        let result = decode_message(&[0, 1]);
+        assert!(matches!(result, Err(CodecError::InsufficientData { .. })));
+    }
+
+    #[test]
+    fn test_unknown_message_type() {
+        // Valid length but unknown tag.
+        let data = [1, 0, 0, 0, 255]; // length=1, tag=255
+        let result = decode_message(&data);
+        assert!(matches!(result, Err(CodecError::UnknownMessageType { tag: 255 })));
+    }
+}

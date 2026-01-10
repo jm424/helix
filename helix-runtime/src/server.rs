@@ -20,6 +20,7 @@ use tokio::time::{interval, Instant};
 use tracing::{debug, info, warn};
 
 use crate::config::{ServerConfig, TimingConfig};
+use crate::transport::TransportHandle;
 
 /// Commands that can be sent to the Raft server.
 #[derive(Debug)]
@@ -198,18 +199,41 @@ impl RaftServer {
     /// Runs the server, returning a handle for interaction.
     ///
     /// This spawns background tasks for timer management.
+    /// This version runs without network transport (for testing).
     pub fn run(self) -> (ServerHandle, impl std::future::Future<Output = ()>) {
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let handle = ServerHandle { commands: cmd_tx };
 
         let server = Arc::new(Mutex::new(self));
-        let future = Self::run_loop(server, cmd_rx);
+        let future = Self::run_loop(server, cmd_rx, None, None);
+
+        (handle, future)
+    }
+
+    /// Runs the server with network transport.
+    ///
+    /// This version uses TCP transport for peer communication.
+    pub fn run_with_transport(
+        self,
+        transport: TransportHandle,
+        incoming: mpsc::Receiver<helix_raft::Message>,
+    ) -> (ServerHandle, impl std::future::Future<Output = ()>) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        let handle = ServerHandle { commands: cmd_tx };
+
+        let server = Arc::new(Mutex::new(self));
+        let future = Self::run_loop(server, cmd_rx, Some(transport), Some(incoming));
 
         (handle, future)
     }
 
     /// Main server loop.
-    async fn run_loop(server: Arc<Mutex<Self>>, mut commands: mpsc::Receiver<ServerCommand>) {
+    async fn run_loop(
+        server: Arc<Mutex<Self>>,
+        mut commands: mpsc::Receiver<ServerCommand>,
+        transport: Option<TransportHandle>,
+        mut incoming: Option<mpsc::Receiver<helix_raft::Message>>,
+    ) {
         // Get initial timing config.
         let timing = {
             let s = server.lock().await;
@@ -245,7 +269,23 @@ impl RaftServer {
                     // Drain outgoing messages.
                     let messages = std::mem::take(&mut s.outgoing);
                     drop(s);
-                    Self::send_messages(messages).await;
+                    Self::send_messages(messages, transport.as_ref()).await;
+                }
+
+                // Handle incoming transport messages.
+                Some(message) = async {
+                    match incoming.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let mut s = server.lock().await;
+                    s.handle_peer_message(message).await;
+
+                    // Drain outgoing messages.
+                    let messages = std::mem::take(&mut s.outgoing);
+                    drop(s);
+                    Self::send_messages(messages, transport.as_ref()).await;
                 }
 
                 // Election timeout.
@@ -263,7 +303,7 @@ impl RaftServer {
                     // Drain outgoing messages.
                     let messages = std::mem::take(&mut s.outgoing);
                     drop(s);
-                    Self::send_messages(messages).await;
+                    Self::send_messages(messages, transport.as_ref()).await;
                 }
 
                 // Heartbeat timeout (leader only).
@@ -277,7 +317,7 @@ impl RaftServer {
                         // Drain outgoing messages.
                         let messages = std::mem::take(&mut s.outgoing);
                         drop(s);
-                        Self::send_messages(messages).await;
+                        Self::send_messages(messages, transport.as_ref()).await;
                     }
                 }
             }
@@ -416,16 +456,28 @@ impl RaftServer {
 
     /// Sends outgoing messages to peers.
     ///
-    /// In a real implementation, this would use TCP connections.
-    /// For now, it's a placeholder.
-    async fn send_messages(messages: Vec<OutgoingMessage>) {
+    /// If transport is provided, messages are sent over TCP.
+    /// Otherwise, messages are logged but not sent (useful for testing).
+    async fn send_messages(messages: Vec<OutgoingMessage>, transport: Option<&TransportHandle>) {
         for msg in messages {
-            debug!(
-                to = msg.to.get(),
-                msg_type = ?std::mem::discriminant(&msg.message),
-                "Would send message to peer"
-            );
-            // TODO: Implement actual network transport.
+            match transport {
+                Some(t) => {
+                    if let Err(e) = t.send(msg.to, msg.message).await {
+                        warn!(
+                            to = msg.to.get(),
+                            error = %e,
+                            "Failed to send message to peer"
+                        );
+                    }
+                }
+                None => {
+                    debug!(
+                        to = msg.to.get(),
+                        msg_type = ?std::mem::discriminant(&msg.message),
+                        "Would send message to peer (no transport)"
+                    );
+                }
+            }
         }
     }
 

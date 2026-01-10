@@ -35,8 +35,15 @@
 #![warn(clippy::pedantic)]
 #![warn(clippy::nursery)]
 
+mod codec;
 mod config;
 mod server;
+mod transport;
 
+pub use codec::{decode_message, encode_message, CodecError, CodecResult};
 pub use config::{ConfigError, PeerConfig, ServerConfig, TimingConfig};
 pub use server::{OutgoingMessage, RaftServer, ServerCommand, ServerError, ServerEvent, ServerHandle};
+pub use transport::{
+    PeerInfo, Transport, TransportBuilder, TransportConfig, TransportError, TransportHandle,
+    TransportResult,
+};
