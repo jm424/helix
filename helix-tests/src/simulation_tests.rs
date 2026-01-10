@@ -73,8 +73,11 @@ fn create_simulation(config: &SimulationTestConfig) -> (DiscreteSimulationEngine
         .collect();
 
     // Register actors with the engine.
+    // Use longer election timeouts for simulation to reduce event storms
+    // during partitions. This doesn't affect correctness, just test speed.
     for (&node_id, &actor_id) in node_ids.iter().zip(actor_ids.iter()) {
-        let raft_config = RaftConfig::new(node_id, node_ids.clone());
+        let raft_config = RaftConfig::new(node_id, node_ids.clone())
+            .with_election_timeout(500_000, 1_500_000); // 500ms-1.5s for faster simulation
         let actor = RaftActor::new(actor_id, raft_config, node_to_actor.clone());
         engine.register_actor(Box::new(actor));
     }
@@ -717,8 +720,11 @@ fn create_simulation_with_network_state(
         .map(|(&n, &a)| (n, a))
         .collect();
 
+    // Use longer election timeouts for simulation to reduce event storms
+    // during partitions. This doesn't affect correctness, just test speed.
     for (&node_id, &actor_id) in node_ids.iter().zip(actor_ids.iter()) {
-        let raft_config = RaftConfig::new(node_id, node_ids.clone());
+        let raft_config = RaftConfig::new(node_id, node_ids.clone())
+            .with_election_timeout(500_000, 1_500_000); // 500ms-1.5s for faster simulation
         let mut actor = RaftActor::new(actor_id, raft_config, node_to_actor.clone());
         actor.set_network_state(Arc::clone(&network_state));
         engine.register_actor(Box::new(actor));

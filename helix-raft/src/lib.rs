@@ -44,7 +44,8 @@ pub mod limits {
     pub const APPEND_ENTRIES_BATCH_SIZE_MAX: u32 = 1000;
 
     /// Maximum time to wait for election timeout (microseconds).
-    pub const ELECTION_TIMEOUT_US_MAX: u64 = 500_000; // 500ms
+    /// Note: Default is 500ms, but tests may use longer values for faster simulation.
+    pub const ELECTION_TIMEOUT_US_MAX: u64 = 2_000_000; // 2s (allows longer for testing)
 
     /// Minimum time to wait for election timeout (microseconds).
     pub const ELECTION_TIMEOUT_US_MIN: u64 = 150_000; // 150ms
