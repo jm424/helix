@@ -11,7 +11,60 @@ Helix is a Kafka replacement built with Deterministic Simulation Testing (DST) u
 - `helix-raft` - Raft consensus implementation (TLA+ verified)
 - `helix-partition` - Kafka-style partitions, producer, consumer, replication
 - `helix-runtime` - Production runtime with async timers
+- `helix-server` - gRPC API server
 - `helix-tests` - Deterministic simulation tests using Bloodhound
+
+## Implementation Plan
+
+**IMPORTANT**: All development must follow the implementation plan at `/Users/jai.menon/expt/helix-implementation-plan.md`.
+
+### Before Starting Any Work
+
+1. **Read the implementation plan** to understand the current phase
+2. **Check `IMPLEMENTATION_STATUS.md`** for what's done vs remaining
+3. **Complete current phase before moving to next** - don't skip ahead
+4. **Testing milestones are mandatory** - don't mark a phase complete without them
+
+### Phase Order (DO NOT SKIP)
+
+```
+Phase 0: Foundations (TLA+ specs, core types, Bloodhound integration)
+    ↓
+Phase 1: Core Consensus (WAL, Raft state machine, 10K hours simulation)
+    ↓
+Phase 2: Multi-Raft & Sharding (scale to thousands of groups)
+    ↓
+Phase 3: Storage Features (tiering, progress tracking)
+    ↓
+Phase 4: API & Flow Control (gRPC, Kafka proxy)
+    ↓
+Phase 5: Production Readiness (observability, load testing)
+```
+
+### Testing Requirements Per Phase
+
+Each phase has specific testing milestones that MUST be completed:
+
+**Phase 1 Critical Milestone**:
+> "Bloodhound: 10,000 hours with random faults, zero safety violations"
+
+This means running extensive simulation tests with:
+- Network partitions
+- Node crashes
+- Message delays
+- Disk faults
+
+And verifying these properties ALWAYS hold:
+- `SingleLeaderPerTerm` - At most one leader per term
+- `LogMatching` - Same index/term means identical logs
+- `LeaderCompleteness` - Committed entries in all future leaders
+
+### What NOT to Do
+
+- Do NOT build gRPC API before Multi-Raft is complete
+- Do NOT skip Bloodhound simulation testing
+- Do NOT create new crates not in the plan without discussion
+- Do NOT mark phases complete without testing milestones
 
 ## TigerStyle for Rust
 
