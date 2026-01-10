@@ -19,10 +19,14 @@
 
 mod error;
 mod limits;
+mod record;
 mod types;
 
 pub use error::{Error, Result};
 pub use limits::Limits;
+pub use record::{
+    Compression, Header, Offset, Record, RecordBatch, RecordError, Timestamp,
+};
 pub use types::{
     BatchId, ConsumerGroupId, ConsumerId, GroupId, LeaseId, LogIndex, NodeId, PartitionId,
     ReplicaId, TermId, TopicId,

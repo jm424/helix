@@ -18,6 +18,16 @@ pub struct Limits {
     /// Maximum number of messages in a batch.
     pub max_messages_per_batch: u32,
 
+    // Record limits (Kafka-style).
+    /// Maximum size of a record value in bytes.
+    pub record_value_size_bytes_max: u32,
+    /// Maximum size of a record key in bytes.
+    pub record_key_size_bytes_max: u32,
+    /// Maximum number of headers per record.
+    pub record_headers_count_max: u32,
+    /// Maximum number of records per batch.
+    pub batch_records_count_max: u32,
+
     // Network limits.
     /// Maximum number of in-flight requests per connection.
     pub max_in_flight_requests: u32,
@@ -74,6 +84,12 @@ impl Limits {
             max_message_bytes: 1024 * 1024,
             max_batch_bytes: 16 * 1024 * 1024,
             max_messages_per_batch: 10_000,
+
+            // Record limits: 1MB value, 256KB key, 64 headers, 10k records/batch.
+            record_value_size_bytes_max: 1024 * 1024,
+            record_key_size_bytes_max: 256 * 1024,
+            record_headers_count_max: 64,
+            batch_records_count_max: 10_000,
 
             // Network: 256 in-flight, 64MB buffers.
             max_in_flight_requests: 256,

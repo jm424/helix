@@ -11,8 +11,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-# No external dependencies - this crate is pure Rust types.
-# Clock, Network, Storage, Rng come from Bloodhound.
+bytes = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
