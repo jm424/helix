@@ -20,6 +20,7 @@ mod client;
 mod config;
 mod log;
 mod message;
+pub mod multi;
 mod state;
 mod storage;
 mod wal_storage;
@@ -43,16 +44,22 @@ pub mod limits {
     /// Maximum number of entries in a single `AppendEntries` request.
     pub const APPEND_ENTRIES_BATCH_SIZE_MAX: u32 = 1000;
 
-    /// Maximum time to wait for election timeout (microseconds).
-    /// Note: Default is 500ms, but tests may use longer values for faster simulation.
-    pub const ELECTION_TIMEOUT_US_MAX: u64 = 2_000_000; // 2s (allows longer for testing)
-
-    /// Minimum time to wait for election timeout (microseconds).
-    pub const ELECTION_TIMEOUT_US_MIN: u64 = 150_000; // 150ms
-
-    /// Heartbeat interval (microseconds).
-    pub const HEARTBEAT_INTERVAL_US: u64 = 50_000; // 50ms
-
     /// Maximum number of nodes in a cluster.
     pub const CLUSTER_SIZE_MAX: usize = 7;
+
+    /// Default election tick (number of ticks before election timeout).
+    ///
+    /// The actual timeout will be randomized in \[`election_tick`, 2 * `election_tick`).
+    /// With a 100ms tick interval, this gives 1-2 second election timeout.
+    pub const ELECTION_TICK_DEFAULT: u32 = 10;
+
+    /// Default heartbeat tick (number of ticks between heartbeats).
+    /// With a 100ms tick interval, this gives 100ms heartbeat.
+    pub const HEARTBEAT_TICK_DEFAULT: u32 = 1;
+
+    /// Minimum election tick (must be > heartbeat tick).
+    pub const ELECTION_TICK_MIN: u32 = 2;
+
+    /// Maximum election tick.
+    pub const ELECTION_TICK_MAX: u32 = 100;
 }

@@ -90,37 +90,36 @@ impl PeerConfig {
 }
 
 /// Timing configuration for Raft.
+///
+/// Timing is tick-based:
+/// - The runtime calls `tick()` at regular intervals (`tick_interval`)
+/// - The Raft library internally tracks elapsed ticks
+/// - Elections and heartbeats fire based on tick counts (configured in `RaftConfig`)
 #[derive(Debug, Clone)]
 pub struct TimingConfig {
-    /// Minimum election timeout.
-    pub election_timeout_min: Duration,
-    /// Maximum election timeout.
-    pub election_timeout_max: Duration,
-    /// Heartbeat interval.
-    pub heartbeat_interval: Duration,
-    /// Request timeout.
+    /// Interval at which to call `tick()` on the Raft state machine.
+    /// This drives both election timeouts and heartbeats.
+    /// Recommended: 100ms (gives ~1-2s election timeout with default tick settings).
+    pub tick_interval: Duration,
+    /// Request timeout for client operations.
     pub request_timeout: Duration,
 }
 
 impl Default for TimingConfig {
     fn default() -> Self {
         Self {
-            election_timeout_min: Duration::from_millis(150),
-            election_timeout_max: Duration::from_millis(300),
-            heartbeat_interval: Duration::from_millis(50),
+            tick_interval: Duration::from_millis(100),
             request_timeout: Duration::from_secs(5),
         }
     }
 }
 
 impl TimingConfig {
-    /// Creates timing config suitable for testing (faster timeouts).
+    /// Creates timing config suitable for testing (faster ticks).
     #[must_use]
     pub const fn fast_for_testing() -> Self {
         Self {
-            election_timeout_min: Duration::from_millis(50),
-            election_timeout_max: Duration::from_millis(100),
-            heartbeat_interval: Duration::from_millis(20),
+            tick_interval: Duration::from_millis(20),
             request_timeout: Duration::from_secs(1),
         }
     }
@@ -130,35 +129,14 @@ impl TimingConfig {
     /// # Errors
     /// Returns an error if the configuration is invalid.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        // Election timeout max must be >= min
-        if self.election_timeout_max < self.election_timeout_min {
+        // Tick interval must be > 0.
+        if self.tick_interval.is_zero() {
             return Err(ConfigError::InvalidTiming {
-                message: "election_timeout_max must be >= election_timeout_min".to_string(),
-            });
-        }
-
-        // Election timeout must be > heartbeat interval (2x recommended)
-        if self.election_timeout_min <= self.heartbeat_interval {
-            return Err(ConfigError::InvalidTiming {
-                message: "election_timeout_min must be > heartbeat_interval".to_string(),
+                message: "tick_interval must be > 0".to_string(),
             });
         }
 
         Ok(())
-    }
-
-    /// Generates a random election timeout within the configured range.
-    #[must_use]
-    pub fn random_election_timeout(&self) -> Duration {
-        use rand::Rng;
-
-        // Safe cast: election timeouts in milliseconds always fit in u64.
-        #[allow(clippy::cast_possible_truncation)]
-        let min_ms = self.election_timeout_min.as_millis() as u64;
-        #[allow(clippy::cast_possible_truncation)]
-        let max_ms = self.election_timeout_max.as_millis() as u64;
-        let ms = rand::thread_rng().gen_range(min_ms..=max_ms);
-        Duration::from_millis(ms)
     }
 }
 
@@ -205,10 +183,9 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_election_timeout_range() {
+    fn test_invalid_zero_tick_interval() {
         let timing = TimingConfig {
-            election_timeout_min: Duration::from_millis(200),
-            election_timeout_max: Duration::from_millis(100),
+            tick_interval: Duration::ZERO,
             ..Default::default()
         };
         assert!(timing.validate().is_err());

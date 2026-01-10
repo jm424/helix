@@ -1,6 +1,16 @@
 //! Raft state machine implementation.
 //!
-//! This implements the core Raft consensus algorithm as specified in the TLA+ spec.
+//! This implements the core Raft consensus algorithm with tick-based timing.
+//! The application calls `tick()` at regular intervals, and the library
+//! internally tracks elapsed ticks to determine when to trigger elections
+//! and heartbeats.
+//!
+//! # Design
+//!
+//! - **Tick-based timing**: No external timers needed - just call `tick()` periodically
+//! - **Randomized election timeout**: Prevents split votes and thundering herd
+//! - **Deterministic**: All randomness from seeded PRNG for simulation testing
+//! - **Pre-vote extension**: Prevents disruption from partitioned nodes
 
 use std::collections::{HashMap, HashSet};
 
@@ -34,10 +44,6 @@ pub enum RaftState {
 pub enum RaftOutput {
     /// Send a message to another node.
     SendMessage(Message),
-    /// Reset the election timer with a new random timeout.
-    ResetElectionTimer,
-    /// Reset the heartbeat timer.
-    ResetHeartbeatTimer,
     /// A log entry has been committed and can be applied.
     CommitEntry {
         /// The log index of the committed entry.
@@ -51,11 +57,62 @@ pub enum RaftOutput {
     SteppedDown,
 }
 
+/// Simple linear congruential generator for deterministic randomization.
+///
+/// Uses the same constants as glibc for reasonable distribution.
+#[derive(Debug, Clone)]
+struct SimpleRng {
+    state: u64,
+}
+
+impl SimpleRng {
+    /// Creates a new RNG with the given seed.
+    const fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    /// Generates the next random u32.
+    fn next_u32(&mut self) -> u32 {
+        // LCG constants from Numerical Recipes.
+        self.state = self.state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        (self.state >> 32) as u32
+    }
+
+    /// Generates a random u32 in the range [min, max).
+    fn range(&mut self, min: u32, max: u32) -> u32 {
+        debug_assert!(min < max, "range requires min < max");
+        let range = max - min;
+        min + (self.next_u32() % range)
+    }
+}
+
 /// A Raft consensus node.
 ///
-/// This is a pure state machine - it takes inputs and produces outputs
-/// but does not perform I/O itself. This design enables deterministic
-/// simulation testing.
+/// This is a pure state machine with tick-based timing. Call `tick()` at
+/// regular intervals (e.g., every 100ms) and the node will internally
+/// track when to trigger elections and heartbeats.
+///
+/// # Example
+///
+/// ```ignore
+/// let config = RaftConfig::new(node_id, peers);
+/// let mut node = RaftNode::new(config);
+///
+/// // In your event loop:
+/// loop {
+///     // Process any incoming messages.
+///     for msg in incoming_messages {
+///         let outputs = node.handle_message(msg);
+///         process_outputs(outputs);
+///     }
+///
+///     // Tick at regular intervals (e.g., every 100ms).
+///     let outputs = node.tick();
+///     process_outputs(outputs);
+///
+///     sleep(Duration::from_millis(100));
+/// }
+/// ```
 #[derive(Debug)]
 pub struct RaftNode {
     /// Configuration.
@@ -97,6 +154,23 @@ pub struct RaftNode {
     // Leadership transfer state.
     /// Target node for leadership transfer (if in progress).
     transfer_target: Option<NodeId>,
+
+    // Tick-based timing state.
+    /// Ticks since last election timeout reset.
+    /// Incremented on each tick for followers/candidates.
+    election_elapsed: u32,
+
+    /// Ticks since last heartbeat sent.
+    /// Incremented on each tick for leaders.
+    heartbeat_elapsed: u32,
+
+    /// Randomized election timeout (in ticks).
+    ///
+    /// Chosen randomly in \[`election_tick`, 2 * `election_tick`) on each reset.
+    randomized_election_timeout: u32,
+
+    /// Random number generator for election timeout randomization.
+    rng: SimpleRng,
 }
 
 impl RaftNode {
@@ -113,6 +187,10 @@ impl RaftNode {
             match_index.insert(*peer, LogIndex::new(0));
         }
 
+        let mut rng = SimpleRng::new(config.random_seed);
+        let election_tick = config.election_tick;
+        let randomized_timeout = rng.range(election_tick, election_tick * 2);
+
         Self {
             config,
             current_term: TermId::new(0),
@@ -127,6 +205,10 @@ impl RaftNode {
             votes_received: HashSet::new(),
             leader_id: None,
             transfer_target: None,
+            election_elapsed: 0,
+            heartbeat_elapsed: 0,
+            randomized_election_timeout: randomized_timeout,
+            rng,
         }
     }
 
@@ -178,18 +260,98 @@ impl RaftNode {
         &self.log
     }
 
-    /// Handles an election timeout.
+    /// Returns the current election elapsed ticks.
+    #[must_use]
+    pub const fn election_elapsed(&self) -> u32 {
+        self.election_elapsed
+    }
+
+    /// Returns the current randomized election timeout.
+    #[must_use]
+    pub const fn randomized_election_timeout(&self) -> u32 {
+        self.randomized_election_timeout
+    }
+
+    /// Advances the internal logical clock by one tick.
     ///
-    /// This should be called when the election timer fires.
-    /// Returns the actions to take.
+    /// This is the main driver for Raft timing. Call this at regular intervals
+    /// (e.g., every 100ms). The node internally tracks elapsed ticks and
+    /// triggers elections/heartbeats when appropriate.
     ///
-    /// With pre-vote enabled, this starts a pre-election phase first.
-    /// Only if pre-votes succeed does the node increment its term and
-    /// become a candidate. This prevents disruption from partitioned nodes.
-    pub fn handle_election_timeout(&mut self) -> Vec<RaftOutput> {
+    /// # Returns
+    ///
+    /// Actions to take (messages to send, entries committed, etc.).
+    pub fn tick(&mut self) -> Vec<RaftOutput> {
+        match self.state {
+            RaftState::Leader => self.tick_leader(),
+            RaftState::Follower | RaftState::PreCandidate | RaftState::Candidate => {
+                self.tick_election()
+            }
+        }
+    }
+
+    /// Tick processing for leaders.
+    ///
+    /// Sends heartbeats when `heartbeat_elapsed` >= `heartbeat_tick`.
+    fn tick_leader(&mut self) -> Vec<RaftOutput> {
+        self.heartbeat_elapsed += 1;
+
+        if self.heartbeat_elapsed >= self.config.heartbeat_tick {
+            self.heartbeat_elapsed = 0;
+            self.send_heartbeats()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Tick processing for non-leaders.
+    ///
+    /// Starts election when `election_elapsed` >= `randomized_timeout`.
+    fn tick_election(&mut self) -> Vec<RaftOutput> {
+        self.election_elapsed += 1;
+
+        if self.election_elapsed >= self.randomized_election_timeout {
+            self.election_elapsed = 0;
+            self.reset_randomized_election_timeout();
+            self.start_pre_election()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Resets the election timeout with a new random value.
+    fn reset_randomized_election_timeout(&mut self) {
+        let election_tick = self.config.election_tick;
+        self.randomized_election_timeout = self.rng.range(election_tick, election_tick * 2);
+    }
+
+    /// Resets the election elapsed counter.
+    ///
+    /// Called when receiving valid messages from the leader.
+    fn reset_election_elapsed(&mut self) {
+        self.election_elapsed = 0;
+    }
+
+    /// Sends heartbeats to all followers (leader only).
+    fn send_heartbeats(&self) -> Vec<RaftOutput> {
+        debug_assert!(self.state == RaftState::Leader);
+        debug_assert!(self.leader_id == Some(self.config.node_id));
+
+        let mut outputs = Vec::new();
+        for peer in self.config.peers() {
+            outputs.extend(self.send_append_entries(peer));
+        }
+        outputs
+    }
+
+    /// Starts a pre-election (pre-vote phase).
+    ///
+    /// With pre-vote enabled, we first gather pre-votes before incrementing
+    /// term. This prevents disruption from partitioned nodes.
+    fn start_pre_election(&mut self) -> Vec<RaftOutput> {
         let mut outputs = Vec::new();
 
-        // Only followers, pre-candidates, and candidates start elections.
+        // Leaders don't start elections.
         if self.state == RaftState::Leader {
             return outputs;
         }
@@ -200,9 +362,6 @@ impl RaftNode {
         self.pre_votes_received.clear();
         self.pre_votes_received.insert(self.config.node_id); // Vote for self.
         self.leader_id = None;
-
-        // Reset election timer.
-        outputs.push(RaftOutput::ResetElectionTimer);
 
         // The term we would use if we win the pre-vote.
         let proposed_term = TermId::new(self.current_term.get() + 1);
@@ -230,36 +389,6 @@ impl RaftNode {
                 || self.state == RaftState::Candidate
                 || self.state == RaftState::Leader
         );
-
-        outputs
-    }
-
-    /// Handles a heartbeat timeout (leader only).
-    ///
-    /// This should be called when the heartbeat timer fires.
-    /// Returns the actions to take.
-    pub fn handle_heartbeat_timeout(&mut self) -> Vec<RaftOutput> {
-        let mut outputs = Vec::new();
-
-        if self.state != RaftState::Leader {
-            // Precondition: only leaders send heartbeats.
-            debug_assert!(outputs.is_empty());
-            return outputs;
-        }
-
-        // Invariant: leader always knows it is the leader.
-        debug_assert!(self.leader_id == Some(self.config.node_id));
-
-        // Send heartbeats to all peers.
-        let peer_count = self.config.peers().len();
-        for peer in self.config.peers() {
-            outputs.extend(self.send_append_entries(peer));
-        }
-
-        outputs.push(RaftOutput::ResetHeartbeatTimer);
-
-        // Postcondition: sent messages to all peers plus timer reset.
-        debug_assert!(outputs.len() >= peer_count);
 
         outputs
     }
@@ -333,12 +462,22 @@ impl RaftNode {
 
     /// Steps down to follower and updates term.
     fn step_down(&mut self, new_term: TermId) {
+        let was_leader = self.state == RaftState::Leader;
+
         self.current_term = new_term;
         self.state = RaftState::Follower;
         self.voted_for = None;
         self.pre_votes_received.clear();
         self.votes_received.clear();
         self.transfer_target = None;
+
+        // Reset election timeout when stepping down.
+        self.reset_election_elapsed();
+        self.reset_randomized_election_timeout();
+
+        // Note: we don't emit SteppedDown here because step_down is called
+        // before processing the message. The output will be handled elsewhere.
+        let _ = was_leader; // Suppress unused warning.
     }
 
     /// Handles a pre-vote request.
@@ -437,7 +576,8 @@ impl RaftNode {
 
         if vote_granted {
             self.voted_for = Some(req.candidate_id);
-            outputs.push(RaftOutput::ResetElectionTimer);
+            // Reset election timeout when granting vote.
+            self.reset_election_elapsed();
         }
 
         let response = RequestVoteResponse::new(
@@ -501,6 +641,7 @@ impl RaftNode {
 
         self.state = RaftState::Leader;
         self.leader_id = Some(self.config.node_id);
+        self.heartbeat_elapsed = 0;
 
         // Initialize leader state.
         let next_idx = LogIndex::new(self.log.last_index().get() + 1);
@@ -514,7 +655,6 @@ impl RaftNode {
         debug_assert!(self.match_index.len() == self.config.peers().len());
 
         outputs.push(RaftOutput::BecameLeader);
-        outputs.push(RaftOutput::ResetHeartbeatTimer);
 
         // Send initial empty AppendEntries (heartbeat) to all peers.
         for peer in self.config.peers() {
@@ -557,8 +697,8 @@ impl RaftNode {
         // Remember the leader.
         self.leader_id = Some(req.leader_id);
 
-        // Reset election timer - we heard from a valid leader.
-        outputs.push(RaftOutput::ResetElectionTimer);
+        // Reset election timeout - we heard from a valid leader.
+        self.reset_election_elapsed();
 
         // Check if we have the prev_log entry.
         let log_ok = req.prev_log_index.get() == 0
@@ -676,7 +816,9 @@ impl RaftNode {
         self.votes_received.insert(self.config.node_id); // Vote for self.
         self.leader_id = None;
 
-        outputs.push(RaftOutput::ResetElectionTimer);
+        // Reset election timing.
+        self.reset_election_elapsed();
+        self.reset_randomized_election_timeout();
 
         // Send RequestVote to all peers.
         for peer in self.config.peers() {
@@ -877,12 +1019,30 @@ mod tests {
             NodeId::new(node_id),
             vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)],
         )
+        // Use faster tick config for tests.
+        .with_tick_config(5, 1)
+    }
+
+    /// Helper to tick a node until election timeout fires.
+    fn tick_until_election(node: &mut RaftNode) -> Vec<RaftOutput> {
+        let mut all_outputs = Vec::new();
+        // Tick enough times to trigger election (max 2x election_tick).
+        for _ in 0..(node.config.election_tick * 2) {
+            let outputs = node.tick();
+            all_outputs.extend(outputs);
+            if node.state() != RaftState::Follower {
+                break;
+            }
+        }
+        all_outputs
     }
 
     /// Helper to make a node become leader through the full pre-vote + vote phases.
-    fn make_leader(node: &mut RaftNode) {
-        // Phase 1: Election timeout starts pre-vote.
-        node.handle_election_timeout();
+    fn make_leader(node: &mut RaftNode) -> Vec<RaftOutput> {
+        let mut all_outputs = Vec::new();
+
+        // Phase 1: Tick until pre-vote starts.
+        all_outputs.extend(tick_until_election(node));
 
         // Phase 2: Receive pre-vote response to reach quorum.
         let prevote = PreVoteResponse::new(
@@ -891,7 +1051,7 @@ mod tests {
             node.config.node_id,
             true,
         );
-        node.handle_message(Message::PreVoteResponse(prevote));
+        all_outputs.extend(node.handle_message(Message::PreVoteResponse(prevote)));
 
         // Phase 3: Receive vote response to become leader.
         let vote = RequestVoteResponse::new(
@@ -900,7 +1060,9 @@ mod tests {
             node.config.node_id,
             true,
         );
-        node.handle_message(Message::RequestVoteResponse(vote));
+        all_outputs.extend(node.handle_message(Message::RequestVoteResponse(vote)));
+
+        all_outputs
     }
 
     #[test]
@@ -913,22 +1075,58 @@ mod tests {
     }
 
     #[test]
-    fn test_election_timeout_starts_prevote() {
+    fn test_tick_increments_election_elapsed() {
         let mut node = RaftNode::new(make_config(1));
 
-        let outputs = node.handle_election_timeout();
+        assert_eq!(node.election_elapsed(), 0);
 
-        // With pre-vote, node should become PreCandidate first.
+        node.tick();
+        assert_eq!(node.election_elapsed(), 1);
+
+        node.tick();
+        assert_eq!(node.election_elapsed(), 2);
+    }
+
+    #[test]
+    fn test_tick_triggers_election_after_timeout() {
+        let mut node = RaftNode::new(make_config(1));
+
+        // Tick until election fires.
+        let outputs = tick_until_election(&mut node);
+
+        // With pre-vote, node should become PreCandidate.
         assert_eq!(node.state(), RaftState::PreCandidate);
         // Term should NOT be incremented yet during pre-vote.
         assert_eq!(node.current_term(), TermId::new(0));
 
-        // Should have reset timer + sent 2 PreVote messages.
+        // Should have sent PreVote messages.
         let prevote_requests: Vec<_> = outputs
             .iter()
             .filter(|o| matches!(o, RaftOutput::SendMessage(Message::PreVote(_))))
             .collect();
         assert_eq!(prevote_requests.len(), 2);
+    }
+
+    #[test]
+    fn test_leader_tick_sends_heartbeats() {
+        let mut node = RaftNode::new(make_config(1));
+        make_leader(&mut node);
+        assert!(node.is_leader());
+
+        // Reset heartbeat elapsed.
+        node.heartbeat_elapsed = 0;
+
+        // Tick until heartbeat fires.
+        let mut heartbeat_sent = false;
+        for _ in 0..5 {
+            let outputs = node.tick();
+            if outputs.iter().any(|o| matches!(o, RaftOutput::SendMessage(Message::AppendEntries(_)))) {
+                heartbeat_sent = true;
+                break;
+            }
+        }
+
+        assert!(heartbeat_sent, "Leader should send heartbeats on tick");
     }
 
     #[test]
@@ -991,8 +1189,8 @@ mod tests {
     fn test_becomes_leader_with_quorum() {
         let mut node = RaftNode::new(make_config(1));
 
-        // Phase 1: Election timeout starts pre-vote.
-        node.handle_election_timeout();
+        // Phase 1: Tick until pre-vote starts.
+        tick_until_election(&mut node);
         assert_eq!(node.state(), RaftState::PreCandidate);
         assert_eq!(node.current_term(), TermId::new(0)); // No term increment yet.
 
@@ -1029,8 +1227,13 @@ mod tests {
     }
 
     #[test]
-    fn test_append_entries_resets_election_timer() {
+    fn test_append_entries_resets_election_elapsed() {
         let mut node = RaftNode::new(make_config(1));
+
+        // Tick a few times.
+        node.tick();
+        node.tick();
+        assert!(node.election_elapsed() > 0);
 
         let request = AppendEntriesRequest::heartbeat(
             TermId::new(1),
@@ -1041,11 +1244,10 @@ mod tests {
             LogIndex::new(0),
         );
 
-        let outputs = node.handle_message(Message::AppendEntries(request));
+        node.handle_message(Message::AppendEntries(request));
 
-        assert!(outputs
-            .iter()
-            .any(|o| matches!(o, RaftOutput::ResetElectionTimer)));
+        // Election elapsed should be reset.
+        assert_eq!(node.election_elapsed(), 0);
         assert_eq!(node.leader_id(), Some(NodeId::new(2)));
     }
 
@@ -1091,11 +1293,12 @@ mod tests {
 
     #[test]
     fn test_single_node_cluster_commits_immediately() {
-        let config = RaftConfig::new(NodeId::new(1), vec![NodeId::new(1)]);
+        let config = RaftConfig::new(NodeId::new(1), vec![NodeId::new(1)])
+            .with_tick_config(5, 1);
         let mut node = RaftNode::new(config);
 
-        // Should become leader immediately on election timeout.
-        let outputs = node.handle_election_timeout();
+        // Tick until election triggers - should become leader immediately.
+        let outputs = tick_until_election(&mut node);
         assert!(node.is_leader());
         assert!(outputs.iter().any(|o| matches!(o, RaftOutput::BecameLeader)));
 
@@ -1105,5 +1308,28 @@ mod tests {
 
         assert!(outputs.iter().any(|o| matches!(o, RaftOutput::CommitEntry { .. })));
         assert_eq!(node.commit_index().get(), 1);
+    }
+
+    #[test]
+    fn test_randomized_election_timeout_varies() {
+        // Create nodes with different seeds.
+        let config1 = make_config(1).with_random_seed(1);
+        let config2 = make_config(1).with_random_seed(2);
+        let config3 = make_config(1).with_random_seed(3);
+
+        let node1 = RaftNode::new(config1);
+        let node2 = RaftNode::new(config2);
+        let node3 = RaftNode::new(config3);
+
+        // Randomized timeouts should differ.
+        let timeouts = [
+            node1.randomized_election_timeout(),
+            node2.randomized_election_timeout(),
+            node3.randomized_election_timeout(),
+        ];
+
+        // At least two should be different (with high probability).
+        let unique: std::collections::HashSet<_> = timeouts.iter().collect();
+        assert!(unique.len() >= 2, "Expected different timeouts, got {:?}", timeouts);
     }
 }

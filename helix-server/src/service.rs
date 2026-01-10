@@ -29,11 +29,9 @@ const MAX_RECORDS_PER_WRITE: usize = 1000;
 /// Maximum bytes per read response.
 const MAX_BYTES_PER_READ: u32 = 1024 * 1024;
 
-/// Election timeout interval in milliseconds.
-const ELECTION_TICK_MS: u64 = 150;
-
-/// Heartbeat interval in milliseconds.
-const HEARTBEAT_TICK_MS: u64 = 50;
+/// Tick interval in milliseconds.
+/// A single tick drives both elections and heartbeats.
+const TICK_INTERVAL_MS: u64 = 50;
 
 /// Topic metadata.
 #[derive(Debug, Clone)]
@@ -92,17 +90,18 @@ impl HelixService {
         }
     }
 
-    /// Background task to handle Raft election and heartbeat ticks.
+    /// Background task to handle Raft ticks.
+    ///
+    /// A single tick timer drives both
+    /// election timeouts and leader heartbeats. The Raft library internally
+    /// tracks elapsed ticks and triggers actions when thresholds are reached.
     #[allow(clippy::significant_drop_tightening)]
     async fn tick_task(
         replication: Arc<RwLock<ReplicationManager>>,
         mut shutdown_rx: mpsc::Receiver<()>,
     ) {
-        let mut election_interval = tokio::time::interval(
-            tokio::time::Duration::from_millis(ELECTION_TICK_MS)
-        );
-        let mut heartbeat_interval = tokio::time::interval(
-            tokio::time::Duration::from_millis(HEARTBEAT_TICK_MS)
+        let mut tick_interval = tokio::time::interval(
+            tokio::time::Duration::from_millis(TICK_INTERVAL_MS)
         );
 
         loop {
@@ -111,16 +110,9 @@ impl HelixService {
                     debug!("Tick task shutting down");
                     break;
                 }
-                _ = election_interval.tick() => {
+                _ = tick_interval.tick() => {
                     let mut repl = replication.write().await;
-                    let outputs = repl.handle_election_timeouts();
-                    for ((topic_id, partition_id), partition_outputs) in outputs {
-                        Self::process_outputs(&mut repl, topic_id, partition_id, &partition_outputs);
-                    }
-                }
-                _ = heartbeat_interval.tick() => {
-                    let mut repl = replication.write().await;
-                    let outputs = repl.handle_heartbeat_timeouts();
+                    let outputs = repl.tick();
                     for ((topic_id, partition_id), partition_outputs) in outputs {
                         Self::process_outputs(&mut repl, topic_id, partition_id, &partition_outputs);
                     }
@@ -215,10 +207,24 @@ impl HelixService {
             );
             replication.add_partition(config);
 
-            // Trigger election for single-node cluster.
-            if let Some(partition) = replication.get_mut(topic_id, partition_id) {
-                let outputs = partition.handle_election_timeout();
-                Self::process_outputs(&mut replication, topic_id, partition_id, &outputs);
+            // For single-node cluster, tick until the node becomes leader.
+            // With default election_tick=10 and randomized timeout in [10, 20),
+            // we need up to 20 ticks to guarantee an election.
+            if self.cluster_nodes.len() == 1 {
+                for _ in 0..25 {
+                    let (outputs, is_leader) = {
+                        if let Some(partition) = replication.get_mut(topic_id, partition_id) {
+                            let outputs = partition.tick();
+                            (outputs, partition.is_leader())
+                        } else {
+                            break;
+                        }
+                    };
+                    Self::process_outputs(&mut replication, topic_id, partition_id, &outputs);
+                    if is_leader {
+                        break;
+                    }
+                }
             }
         }
 

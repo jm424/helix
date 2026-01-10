@@ -20,10 +20,9 @@ use helix_raft::{
 
 /// Timer IDs for Raft events.
 mod timer_ids {
-    /// Election timeout timer.
-    pub const ELECTION_TIMEOUT: u64 = 1;
-    /// Heartbeat timer (leader only).
-    pub const HEARTBEAT: u64 = 2;
+    /// Tick timer - drives both elections and heartbeats.
+    /// A single tick drives everything.
+    pub const TICK: u64 = 1;
 }
 
 /// Custom event names.
@@ -444,6 +443,12 @@ struct RaftActorCheckpoint {
     state: RaftState,
 }
 
+/// Tick interval in microseconds for simulation.
+///
+/// Each tick advances the Raft internal counters. The Raft library internally
+/// tracks `election_elapsed` and `heartbeat_elapsed`, triggering actions when thresholds are reached.
+const TICK_INTERVAL_US: u64 = 10_000; // 10ms per tick
+
 /// A Raft node wrapped as a Bloodhound `SimulatedActor`.
 pub struct RaftActor {
     /// The actor's unique ID.
@@ -459,11 +464,6 @@ pub struct RaftActor {
     /// Mapping from Bloodhound `ActorId` to Helix `NodeId`.
     #[allow(dead_code)]
     actor_to_node: BTreeMap<ActorId, NodeId>,
-    /// Configuration for election timeouts.
-    election_timeout_min_us: u64,
-    election_timeout_max_us: u64,
-    /// Heartbeat interval.
-    heartbeat_interval_us: u64,
     /// Whether this node is currently crashed (not processing events).
     crashed: bool,
     /// Shared network state for partition tracking.
@@ -492,10 +492,6 @@ impl RaftActor {
             .map(|(node, actor)| (*actor, *node))
             .collect();
 
-        let election_timeout_min_us = config.election_timeout_min_us;
-        let election_timeout_max_us = config.election_timeout_max_us;
-        let heartbeat_interval_us = config.heartbeat_interval_us;
-
         Self {
             actor_id,
             name,
@@ -503,9 +499,6 @@ impl RaftActor {
             config,
             node_to_actor: node_actor_mapping,
             actor_to_node,
-            election_timeout_min_us,
-            election_timeout_max_us,
-            heartbeat_interval_us,
             crashed: false,
             network_state: None,
             property_state: None,
@@ -650,12 +643,6 @@ impl RaftActor {
                 RaftOutput::SendMessage(msg) => {
                     self.send_raft_message(&msg, ctx);
                 }
-                RaftOutput::ResetElectionTimer => {
-                    self.schedule_election_timeout(ctx);
-                }
-                RaftOutput::ResetHeartbeatTimer => {
-                    self.schedule_heartbeat(ctx);
-                }
                 RaftOutput::CommitEntry { index, data } => {
                     // Record applied entry for StateMachineSafety verification.
                     self.record_applied_entry(index, &data);
@@ -725,19 +712,14 @@ impl RaftActor {
         }
     }
 
-    /// Schedules a random election timeout.
-    fn schedule_election_timeout(&self, ctx: &mut SimulationContext) {
-        let timeout_us =
-            ctx.random_range(self.election_timeout_min_us..=self.election_timeout_max_us);
-        ctx.set_timer(Duration::from_micros(timeout_us), timer_ids::ELECTION_TIMEOUT);
-    }
-
-    /// Schedules the next heartbeat.
-    fn schedule_heartbeat(&self, ctx: &mut SimulationContext) {
-        ctx.set_timer(
-            Duration::from_micros(self.heartbeat_interval_us),
-            timer_ids::HEARTBEAT,
-        );
+    /// Schedules the next tick.
+    ///
+    /// We call `tick()` at regular intervals.
+    /// The Raft library internally tracks elapsed ticks and triggers
+    /// elections/heartbeats when thresholds are reached.
+    #[allow(clippy::unused_self)]
+    fn schedule_tick(&self, ctx: &mut SimulationContext) {
+        ctx.set_timer(Duration::from_micros(TICK_INTERVAL_US), timer_ids::TICK);
     }
 
     /// Handles crash event.
@@ -763,7 +745,7 @@ impl RaftActor {
         self.node = RaftNode::new(self.config.clone());
         self.crashed = false;
         tracing::info!(actor = %self.name, "RECOVERED - starting fresh as follower");
-        self.schedule_election_timeout(ctx);
+        self.schedule_tick(ctx);
     }
 
     /// Handles network partition event.
@@ -814,23 +796,19 @@ impl SimulatedActor for RaftActor {
             }
 
             EventKind::ActorStart { .. } => {
-                self.schedule_election_timeout(ctx);
+                self.schedule_tick(ctx);
                 tracing::debug!(actor = %self.name, "started");
             }
 
             EventKind::TimerFired { timer_id, .. } => {
-                let outputs = match timer_id {
-                    timer_ids::ELECTION_TIMEOUT => {
-                        tracing::debug!(actor = %self.name, "election timeout");
-                        self.node.handle_election_timeout()
-                    }
-                    timer_ids::HEARTBEAT => {
-                        tracing::trace!(actor = %self.name, "heartbeat timeout");
-                        self.node.handle_heartbeat_timeout()
-                    }
-                    _ => Vec::new(),
-                };
-                self.process_outputs(outputs, ctx);
+                if timer_id == timer_ids::TICK {
+                    // Tick the Raft state machine - it internally tracks elapsed ticks
+                    // and triggers elections/heartbeats when appropriate.
+                    let outputs = self.node.tick();
+                    self.process_outputs(outputs, ctx);
+                    // Schedule the next tick.
+                    self.schedule_tick(ctx);
+                }
             }
 
             EventKind::PacketDelivery { payload, from, .. } => {

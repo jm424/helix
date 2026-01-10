@@ -382,14 +382,13 @@ impl ReplicatedPartition {
         }
     }
 
-    /// Handles an election timeout.
-    pub fn handle_election_timeout(&mut self) -> Vec<RaftOutput> {
-        self.raft.handle_election_timeout()
-    }
-
-    /// Handles a heartbeat timeout (leader only).
-    pub fn handle_heartbeat_timeout(&mut self) -> Vec<RaftOutput> {
-        self.raft.handle_heartbeat_timeout()
+    /// Advances the Raft state machine by one tick.
+    ///
+    /// This is the main driver for Raft timing. Call this at regular intervals
+    /// (e.g., every 100ms). Elections and heartbeats are triggered internally
+    /// based on elapsed ticks.
+    pub fn tick(&mut self) -> Vec<RaftOutput> {
+        self.raft.tick()
     }
 
     /// Handles a Raft message from another node.
@@ -466,23 +465,15 @@ impl ReplicationManager {
         self.partitions.values_mut()
     }
 
-    /// Handles election timeouts for all partitions.
-    pub fn handle_election_timeouts(
-        &mut self,
-    ) -> Vec<((TopicId, PartitionId), Vec<RaftOutput>)> {
+    /// Ticks all partitions, advancing their Raft state machines.
+    ///
+    /// This is the main driver for Raft timing. Call this at regular intervals
+    /// (e.g., every 100ms). Elections and heartbeats are triggered internally
+    /// based on elapsed ticks.
+    pub fn tick(&mut self) -> Vec<((TopicId, PartitionId), Vec<RaftOutput>)> {
         self.partitions
             .iter_mut()
-            .map(|(&key, partition)| (key, partition.handle_election_timeout()))
-            .collect()
-    }
-
-    /// Handles heartbeat timeouts for all partitions.
-    pub fn handle_heartbeat_timeouts(
-        &mut self,
-    ) -> Vec<((TopicId, PartitionId), Vec<RaftOutput>)> {
-        self.partitions
-            .iter_mut()
-            .map(|(&key, partition)| (key, partition.handle_heartbeat_timeout()))
+            .map(|(&key, partition)| (key, partition.tick()))
             .collect()
     }
 
@@ -574,19 +565,32 @@ mod tests {
     fn test_single_node_becomes_leader() {
         let mut partition = ReplicatedPartition::new(make_config());
 
-        // Trigger election timeout - single node cluster should become leader.
-        let outputs = partition.handle_election_timeout();
+        // Tick until election timeout triggers - single node cluster should become leader.
+        // With default election_tick=10 and randomized timeout in [10, 20), we need up to 20 ticks.
+        let mut became_leader = false;
+        for _ in 0..25 {
+            let outputs = partition.tick();
+            if outputs.iter().any(|o| matches!(o, RaftOutput::BecameLeader)) {
+                became_leader = true;
+                break;
+            }
+        }
 
+        assert!(became_leader);
         assert!(partition.is_leader());
-        assert!(outputs.iter().any(|o| matches!(o, RaftOutput::BecameLeader)));
     }
 
     #[test]
     fn test_single_node_propose_and_apply() {
         let mut partition = ReplicatedPartition::new(make_config());
 
-        // Become leader.
-        let _outputs = partition.handle_election_timeout();
+        // Become leader by ticking until election triggers.
+        for _ in 0..25 {
+            let outputs = partition.tick();
+            if outputs.iter().any(|o| matches!(o, RaftOutput::BecameLeader)) {
+                break;
+            }
+        }
         assert!(partition.is_leader());
 
         // Propose records.
@@ -635,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn test_election_timeouts() {
+    fn test_tick_triggers_election() {
         let mut manager = ReplicationManager::new(NodeId::new(1));
 
         let config = ReplicatedPartitionConfig::new(
@@ -647,8 +651,15 @@ mod tests {
 
         manager.add_partition(config);
 
-        let results = manager.handle_election_timeouts();
-        assert_eq!(results.len(), 1);
+        // Tick until election triggers.
+        for _ in 0..25 {
+            let results = manager.tick();
+            if results.iter().any(|(_, outputs)| {
+                outputs.iter().any(|o| matches!(o, RaftOutput::BecameLeader))
+            }) {
+                break;
+            }
+        }
 
         // Single node should become leader.
         let partition = manager.get(TopicId::new(1), PartitionId::new(0)).unwrap();

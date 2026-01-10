@@ -21,6 +21,8 @@ pub mod scenarios;
 
 // Test modules (only compiled for tests).
 #[cfg(test)]
+mod multi_raft_tests;
+#[cfg(test)]
 mod raft_tests;
 #[cfg(test)]
 mod server_tests;
@@ -28,3 +30,5 @@ mod server_tests;
 mod simulation_tests;
 #[cfg(test)]
 mod wal_tests;
+#[cfg(test)]
+mod multi_raft_verified_tests;

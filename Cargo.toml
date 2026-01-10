@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "helix-core",
     "helix-partition",
+    "helix-routing",
     "helix-runtime",
     "helix-server",
     "helix-wal",
@@ -21,6 +22,7 @@ rust-version = "1.75"
 # Internal crates.
 helix-core = { path = "helix-core" }
 helix-partition = { path = "helix-partition" }
+helix-routing = { path = "helix-routing" }
 helix-runtime = { path = "helix-runtime" }
 helix-server = { path = "helix-server" }
 helix-wal = { path = "helix-wal" }

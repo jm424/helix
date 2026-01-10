@@ -1,0 +1,25 @@
+[package]
+name = "helix-routing"
+description = "Shard routing and management for Helix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+helix-core = { workspace = true }
+helix-raft = { workspace = true }
+
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# Hash for consistent hashing
+xxhash-rust = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

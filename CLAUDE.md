@@ -330,6 +330,7 @@ Key decisions:
 - [ADR-0001](docs/adr/0001-raft-for-partition-replication.md): Use Raft for Partition Replication
 - [ADR-0002](docs/adr/0002-synchronous-state-machines.md): Synchronous State Machines in Core
 - [ADR-0003](docs/adr/0003-strongly-typed-identifiers.md): Strongly-Typed Identifiers
+- [ADR-0004](docs/adr/0004-tick-based-raft-timing.md): Tick-Based Raft Timing
 
 ### When to Write an ADR
 

@@ -2,9 +2,17 @@
 //!
 //! The `RaftServer` is the main entry point for running a Raft node in production.
 //! It handles:
-//! - Timer management (election and heartbeat timers)
+//! - Tick-based timer management (single tick drives elections and heartbeats)
 //! - Processing Raft outputs (sending messages, applying commits)
 //! - Coordinating between the network and the Raft state machine
+//!
+//! # Tick-Based Timing
+//!
+//! Timing is tick-based:
+//! - Call `tick()` at regular intervals (e.g., every 100ms)
+//! - The Raft library internally tracks elapsed ticks
+//! - Elections and heartbeats fire when thresholds are reached
+//! - Randomized election timeouts prevent thundering herd
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,7 +24,7 @@ use helix_raft::{
     RequestId,
 };
 use tokio::sync::{mpsc, oneshot, Mutex};
-use tokio::time::{interval, Instant};
+use tokio::time::interval;
 use tracing::{debug, info, warn};
 
 use crate::config::{ServerConfig, TimingConfig};
@@ -231,25 +239,25 @@ impl RaftServer {
     }
 
     /// Main server loop.
+    ///
+    /// Uses a single tick timer.
+    /// The Raft library internally tracks elapsed ticks and triggers
+    /// elections/heartbeats when appropriate.
     async fn run_loop(
         server: Arc<Mutex<Self>>,
         mut commands: mpsc::Receiver<ServerCommand>,
         transport: Option<TransportHandle>,
         mut incoming: Option<mpsc::Receiver<helix_raft::Message>>,
     ) {
-        // Get initial timing config.
-        let timing = {
+        // Get tick interval from config.
+        let tick_interval = {
             let s = server.lock().await;
-            s.timing.clone()
+            s.timing.tick_interval
         };
 
-        // Election timer.
-        let mut election_timeout = timing.random_election_timeout();
-        let mut election_deadline = Instant::now() + election_timeout;
-
-        // Heartbeat timer (only matters when leader).
-        let mut heartbeat = interval(timing.heartbeat_interval);
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Single tick timer drives both elections and heartbeats.
+        let mut tick_timer = interval(tick_interval);
+        tick_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -291,37 +299,20 @@ impl RaftServer {
                     Self::send_messages(messages, transport.as_ref()).await;
                 }
 
-                // Election timeout.
-                () = tokio::time::sleep_until(election_deadline) => {
+                // Tick the Raft state machine.
+                // This drives both election timeouts and leader heartbeats.
+                _ = tick_timer.tick() => {
                     let mut s = server.lock().await;
-                    debug!("Election timeout fired");
 
-                    let outputs = s.node.handle_election_timeout();
+                    // Tick the Raft node - it internally tracks elapsed ticks
+                    // and triggers elections/heartbeats when needed.
+                    let outputs = s.node.tick();
                     s.process_outputs(outputs).await;
-
-                    // Reset election timer.
-                    election_timeout = s.timing.random_election_timeout();
-                    election_deadline = Instant::now() + election_timeout;
 
                     // Drain outgoing messages.
                     let messages = std::mem::take(&mut s.outgoing);
                     drop(s);
                     Self::send_messages(messages, transport.as_ref()).await;
-                }
-
-                // Heartbeat timeout (leader only).
-                _ = heartbeat.tick() => {
-                    let mut s = server.lock().await;
-                    if s.node.is_leader() {
-                        debug!("Heartbeat timeout fired");
-                        let outputs = s.node.handle_heartbeat_timeout();
-                        s.process_outputs(outputs).await;
-
-                        // Drain outgoing messages.
-                        let messages = std::mem::take(&mut s.outgoing);
-                        drop(s);
-                        Self::send_messages(messages, transport.as_ref()).await;
-                    }
                 }
             }
         }
@@ -391,14 +382,6 @@ impl RaftServer {
                     message,
                 });
             }
-            RaftOutput::ResetElectionTimer => {
-                // Timer reset is handled in the main loop.
-                debug!("Election timer reset requested");
-            }
-            RaftOutput::ResetHeartbeatTimer => {
-                // Heartbeat timer is continuous when leader.
-                debug!("Heartbeat timer reset requested");
-            }
             RaftOutput::CommitEntry { index, data } => {
                 info!(index = index.get(), "Entry committed");
 
@@ -453,7 +436,6 @@ impl RaftServer {
             RaftOutput::SteppedDown => {
                 let _ = events.send(ServerEvent::SteppedDown).await;
             }
-            _ => {}
         }
     }
 
