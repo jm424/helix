@@ -72,6 +72,30 @@ These items from the plan are intentionally deferred:
 - CI pipeline setup (run tests locally for now)
 - io_uring storage implementation (use standard file I/O)
 
+## TLA+ Model Checking
+
+The Raft consensus implementation has a TLA+ specification in `specs/raft.tla` that includes:
+- Pre-vote extension (prevents disruption from partitioned nodes)
+- Leadership transfer (graceful handoff via TimeoutNow)
+
+### Running the TLC Model Checker
+
+The TLA+ tools jar is located in the `specs/` directory. To run the model checker:
+
+```bash
+cd specs
+java -XX:+UseParallelGC -Xmx4g -jar tla2tools.jar -workers auto -config raft.cfg raft.tla
+```
+
+The model checker will run until completion or you stop it. For quick verification, running until 10-50 million states is usually sufficient. The checker verifies:
+- `SingleLeaderPerTerm` - at most one leader per term
+- `LogMatching` - identical prefixes for entries with same index/term
+- `StateMachineSafety` - no two different values committed at same index
+
+### After Making Raft Changes
+
+When modifying the Raft implementation, update `specs/raft.tla` to match and run the model checker to verify correctness. Any safety violation will be reported with a counterexample trace.
+
 ## TigerStyle for Rust
 
 This project follows TigerStyle principles adapted for Rust. See `TIGER_STYLE.md` for the full philosophy.

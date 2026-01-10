@@ -1,12 +1,12 @@
 -------------------------------- MODULE raft --------------------------------
-\* Helix Raft Consensus Specification with Pre-Vote Extension
+\* Helix Raft Consensus Specification with Pre-Vote and Leadership Transfer
 \*
-\* This specification models the Raft consensus algorithm with the Pre-Vote
-\* extension that prevents disruption from partitioned nodes. Pre-vote allows
-\* a node to check if it would win an election before incrementing its term.
+\* This specification models the Raft consensus algorithm with:
+\* - Pre-Vote extension: prevents disruption from partitioned nodes
+\* - Leadership Transfer: enables graceful handoff via TimeoutNow message
 \*
-\* Based on the Raft paper by Ongaro and Ousterhout, with the Pre-Vote
-\* extension from "Consensus: Bridging Theory and Practice" (Ongaro PhD thesis).
+\* Based on the Raft paper by Ongaro and Ousterhout, with extensions from
+\* "Consensus: Bridging Theory and Practice" (Ongaro PhD thesis).
 
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
@@ -128,6 +128,13 @@ AppendEntriesResponse(src, dst, term, success, matchIdx) ==
      dst      |-> dst,
      success  |-> success,
      matchIdx |-> matchIdx]
+
+\* TimeoutNow RPC (for leadership transfer)
+TimeoutNowRequest(src, dst, term) ==
+    [type |-> "TimeoutNow",
+     term |-> term,
+     src  |-> src,
+     dst  |-> dst]
 
 \* ============================================================================
 \* PRE-VOTE ACTIONS
@@ -314,6 +321,39 @@ AdvanceCommitIndex(s) ==
     /\ UNCHANGED <<currentTerm, votedFor, log, state, nextIndex, matchIndex, messages, elections>>
 
 \* ============================================================================
+\* LEADERSHIP TRANSFER ACTIONS
+\* ============================================================================
+
+\* Leader s sends TimeoutNow to follower d to initiate leadership transfer
+\* The target must be caught up (matchIndex >= log length) for safety
+SendTimeoutNow(s, d) ==
+    /\ state[s] = "leader"
+    /\ s # d
+    /\ d \in Servers
+    \* Safety: Only send to a caught-up follower
+    /\ matchIndex[s][d] >= Len(log[s])
+    /\ messages' = messages \cup {TimeoutNowRequest(s, d, currentTerm[s])}
+    /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, state,
+                   nextIndex, matchIndex, elections, committed>>
+
+\* Server s handles TimeoutNow by immediately starting an election
+\* Key: This bypasses pre-vote because the leader explicitly requested the transfer
+HandleTimeoutNow(s, m) ==
+    /\ m.type = "TimeoutNow"
+    /\ m.dst = s
+    /\ m.term = currentTerm[s]  \* Only valid if term matches
+    /\ state[s] = "follower"    \* Must be a follower
+    /\ currentTerm[s] < MaxTerm
+    \* Bypass pre-vote: immediately become candidate and start election
+    /\ currentTerm' = [currentTerm EXCEPT ![s] = currentTerm[s] + 1]
+    /\ votedFor' = [votedFor EXCEPT ![s] = s]
+    /\ state' = [state EXCEPT ![s] = "candidate"]
+    /\ messages' = (messages \ {m}) \cup
+        {RequestVoteRequest(s, d, currentTerm[s] + 1,
+                           Len(log[s]), LastTerm(s)) : d \in Servers \ {s}}
+    /\ UNCHANGED <<log, commitIndex, nextIndex, matchIndex, elections, committed>>
+
+\* ============================================================================
 \* SPECIFICATION
 \* ============================================================================
 
@@ -343,6 +383,9 @@ Next ==
     \/ \E s \in Servers, m \in messages : HandleAppendEntries(s, m)
     \/ \E s \in Servers, m \in messages : HandleAppendEntriesResponse(s, m)
     \/ \E s \in Servers : AdvanceCommitIndex(s)
+    \* Leadership transfer
+    \/ \E s, d \in Servers : SendTimeoutNow(s, d)
+    \/ \E s \in Servers, m \in messages : HandleTimeoutNow(s, m)
 
 Spec == Init /\ [][Next]_vars
 
