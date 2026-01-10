@@ -35,7 +35,7 @@ impl PartitionConfig {
 
     /// Sets the segment configuration.
     #[must_use]
-    pub fn with_segment_config(mut self, config: SegmentConfig) -> Self {
+    pub const fn with_segment_config(mut self, config: SegmentConfig) -> Self {
         self.segment_config = config;
         self
     }
@@ -101,19 +101,19 @@ impl Partition {
 
     /// Returns the partition configuration.
     #[must_use]
-    pub fn config(&self) -> &PartitionConfig {
+    pub const fn config(&self) -> &PartitionConfig {
         &self.config
     }
 
     /// Returns the partition ID.
     #[must_use]
-    pub fn partition_id(&self) -> PartitionId {
+    pub const fn partition_id(&self) -> PartitionId {
         self.config.partition_id
     }
 
     /// Returns the topic ID.
     #[must_use]
-    pub fn topic_id(&self) -> TopicId {
+    pub const fn topic_id(&self) -> TopicId {
         self.config.topic_id
     }
 
@@ -122,7 +122,7 @@ impl Partition {
     pub fn log_start_offset(&self) -> Offset {
         self.segments
             .first()
-            .map_or(Offset::new(0), |s| s.base_offset())
+            .map_or(Offset::new(0), LogSegment::base_offset)
     }
 
     /// Returns the log end offset (next offset to be assigned).
@@ -130,12 +130,12 @@ impl Partition {
     pub fn log_end_offset(&self) -> Offset {
         self.segments
             .last()
-            .map_or(Offset::new(0), |s| s.next_offset())
+            .map_or(Offset::new(0), LogSegment::next_offset)
     }
 
     /// Returns the high watermark (last committed offset).
     #[must_use]
-    pub fn high_watermark(&self) -> Offset {
+    pub const fn high_watermark(&self) -> Offset {
         self.high_watermark
     }
 
@@ -146,7 +146,7 @@ impl Partition {
 
     /// Returns the leader epoch.
     #[must_use]
-    pub fn leader_epoch(&self) -> u32 {
+    pub const fn leader_epoch(&self) -> u32 {
         self.leader_epoch
     }
 
@@ -160,6 +160,10 @@ impl Partition {
     pub fn metadata(&self) -> PartitionMetadata {
         let size_bytes: u64 = self.segments.iter().map(LogSegment::size_bytes).sum();
 
+        // Safe cast: segment count is bounded by config.max_segments which fits in u32.
+        #[allow(clippy::cast_possible_truncation)]
+        let segment_count = self.segments.len() as u32;
+
         PartitionMetadata {
             topic_id: self.config.topic_id,
             partition_id: self.config.partition_id,
@@ -167,7 +171,7 @@ impl Partition {
             log_end_offset: self.log_end_offset(),
             high_watermark: self.high_watermark,
             leader_epoch: self.leader_epoch,
-            segment_count: self.segments.len() as u32,
+            segment_count,
             size_bytes,
         }
     }
@@ -230,7 +234,7 @@ impl Partition {
         let active = &self.segments[self.active_segment_idx];
         if !active.has_space_for(batch_size, record_count) {
             // Roll to a new segment.
-            self.roll_segment()?;
+            self.roll_segment();
         }
 
         // Invariant: active segment index is valid.
@@ -242,7 +246,7 @@ impl Partition {
     }
 
     /// Rolls to a new segment.
-    fn roll_segment(&mut self) -> PartitionResult<()> {
+    fn roll_segment(&mut self) {
         // Seal current segment.
         self.segments[self.active_segment_idx].seal();
 
@@ -260,10 +264,8 @@ impl Partition {
         self.cleanup_old_segments();
 
         // Postcondition: we have at least as many segments (may have cleaned up).
-        debug_assert!(self.segments.len() >= 1);
+        debug_assert!(!self.segments.is_empty());
         debug_assert!(self.active_segment_idx < self.segments.len());
-
-        Ok(())
     }
 
     /// Removes old segments if we exceed the limit.
@@ -323,7 +325,10 @@ impl Partition {
             }
 
             let segment_records = segment.read(current_offset, remaining)?;
-            remaining -= segment_records.len() as u32;
+            // Safe cast: segment_records.len() <= remaining which is u32.
+            #[allow(clippy::cast_possible_truncation)]
+            let records_len = segment_records.len() as u32;
+            remaining -= records_len;
 
             if let Some(last) = segment_records.last() {
                 current_offset = last.offset.next();
@@ -399,7 +404,7 @@ impl Partition {
 
     /// Returns true if the partition is closed.
     #[must_use]
-    pub fn is_closed(&self) -> bool {
+    pub const fn is_closed(&self) -> bool {
         self.closed
     }
 }

@@ -103,6 +103,9 @@ impl SegmentConfig {
     }
 
     /// Validates the configuration.
+    ///
+    /// # Errors
+    /// Returns an error if the configuration is invalid.
     pub fn validate(&self) -> WalResult<()> {
         if self.max_size_bytes < SEGMENT_SIZE_BYTES_MIN {
             return Err(WalError::Io {
@@ -226,7 +229,7 @@ pub struct Segment {
 impl Segment {
     /// Creates a new empty segment.
     #[must_use]
-    pub fn new(segment_id: SegmentId, first_index: u64, config: SegmentConfig) -> Self {
+    pub const fn new(segment_id: SegmentId, first_index: u64, config: SegmentConfig) -> Self {
         Self {
             header: SegmentHeader::new(segment_id, first_index),
             config,
@@ -279,7 +282,7 @@ impl Segment {
             return false;
         }
 
-        let entry_size = ENTRY_HEADER_SIZE as u64 + payload_size as u64;
+        let entry_size = ENTRY_HEADER_SIZE as u64 + u64::from(payload_size);
         let new_size = self.size_bytes + entry_size;
         let new_count = self.entries.len() as u64 + 1;
 
@@ -288,8 +291,11 @@ impl Segment {
 
     /// Appends an entry to the segment.
     ///
+    /// # Panics
+    /// Panics if the segment is sealed or if the entry index is not sequential.
+    ///
     /// # Errors
-    /// Returns an error if the segment is full or sealed.
+    /// Returns an error if the segment is full.
     pub fn append(&mut self, entry: Entry) -> WalResult<()> {
         // TigerStyle: Check preconditions.
         assert!(!self.sealed, "cannot append to sealed segment");
@@ -346,6 +352,7 @@ impl Segment {
             return Err(WalError::IndexOutOfBounds { index, first, last });
         }
 
+        #[allow(clippy::cast_possible_truncation)] // Entry count bounded by config.
         let offset = (index - first) as usize;
         Ok(&self.entries[offset])
     }
@@ -354,8 +361,11 @@ impl Segment {
     ///
     /// Keeps entries up to and including `last_index_to_keep`.
     ///
+    /// # Panics
+    /// Panics if the segment is sealed.
+    ///
     /// # Errors
-    /// Returns an error if the index is out of bounds.
+    /// Currently infallible, but returns `Result` for future extensibility.
     pub fn truncate_after(&mut self, last_index_to_keep: u64) -> WalResult<()> {
         assert!(!self.sealed, "cannot truncate sealed segment");
 
@@ -373,6 +383,7 @@ impl Segment {
             return Ok(());
         }
 
+        #[allow(clippy::cast_possible_truncation)] // Entry count bounded by config.
         let keep_count = (last_index_to_keep - first + 1) as usize;
         if keep_count >= self.entries.len() {
             return Ok(()); // Nothing to truncate.
@@ -393,6 +404,8 @@ impl Segment {
     }
 
     /// Encodes the entire segment to bytes.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // Size bounded by config.
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(self.size_bytes as usize);
 

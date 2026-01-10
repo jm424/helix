@@ -1,6 +1,6 @@
 //! Error types for Helix core operations.
 //!
-//! Following TigerStyle: all errors must be handled explicitly.
+//! Following `TigerStyle`: all errors must be handled explicitly.
 //! No silent failures, no ignored errors.
 
 use std::fmt;

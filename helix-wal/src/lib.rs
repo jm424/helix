@@ -3,7 +3,7 @@
 //! This crate provides a high-performance, crash-safe write-ahead log
 //! for durably storing Raft entries and partition data.
 //!
-//! # Design Principles (TigerStyle)
+//! # Design Principles (`TigerStyle`)
 //!
 //! - **Crash safety**: All committed data survives crashes
 //! - **Checksums**: CRC32 on every entry to detect corruption

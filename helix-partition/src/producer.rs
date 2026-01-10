@@ -153,7 +153,7 @@ impl Producer {
 
     /// Returns the producer configuration.
     #[must_use]
-    pub fn config(&self) -> &ProducerConfig {
+    pub const fn config(&self) -> &ProducerConfig {
         &self.config
     }
 
@@ -208,19 +208,25 @@ impl Producer {
             Partitioner::RoundRobin => {
                 let partition = self.round_robin_counter % partition_count as usize;
                 self.round_robin_counter = self.round_robin_counter.wrapping_add(1);
-                PartitionId::new(partition as u64)
+                // Safe cast: partition < partition_count which is u32, so fits in u64.
+                #[allow(clippy::cast_possible_truncation)]
+                let partition_u64 = partition as u64;
+                PartitionId::new(partition_u64)
             }
             Partitioner::KeyHash => {
                 if let Some(ref key) = record.key {
                     let mut hasher = std::collections::hash_map::DefaultHasher::new();
                     key.hash(&mut hasher);
                     let hash = hasher.finish();
-                    PartitionId::new(hash % partition_count as u64)
+                    PartitionId::new(hash % u64::from(partition_count))
                 } else {
                     // No key, fall back to round-robin.
                     let partition = self.round_robin_counter % partition_count as usize;
                     self.round_robin_counter = self.round_robin_counter.wrapping_add(1);
-                    PartitionId::new(partition as u64)
+                    // Safe cast: partition < partition_count which is u32, so fits in u64.
+                    #[allow(clippy::cast_possible_truncation)]
+                    let partition_u64 = partition as u64;
+                    PartitionId::new(partition_u64)
                 }
             }
             Partitioner::Sticky => {
@@ -228,20 +234,22 @@ impl Producer {
                 if let Some(partition) = self.sticky_partition {
                     partition
                 } else {
-                    let partition = PartitionId::new(
-                        (self.round_robin_counter % partition_count as usize) as u64,
-                    );
+                    let idx = self.round_robin_counter % partition_count as usize;
+                    // Safe cast: idx < partition_count which is u32, so fits in u64.
+                    #[allow(clippy::cast_possible_truncation)]
+                    let idx_u64 = idx as u64;
+                    let partition = PartitionId::new(idx_u64);
                     self.sticky_partition = Some(partition);
                     partition
                 }
             }
             Partitioner::Random => {
                 // Simple pseudo-random (not cryptographically secure).
-                let partition = (std::time::SystemTime::now()
+                let nanos = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
-                    .subsec_nanos() as u64)
-                    % partition_count as u64;
+                    .subsec_nanos();
+                let partition = u64::from(nanos) % u64::from(partition_count);
                 PartitionId::new(partition)
             }
         }
@@ -265,6 +273,8 @@ impl Producer {
                 continue;
             }
 
+            // Safe cast: batch.len() is bounded by config.max_batch_records which fits in u32.
+            #[allow(clippy::cast_possible_truncation)]
             let record_count = pending.batch.len() as u32;
 
             if let Some(partition) = partitions.get_mut(&partition_id) {
@@ -283,8 +293,9 @@ impl Producer {
                     }
                 }
             } else {
+                let id = partition_id.get();
                 results.push(Err(PartitionError::InvalidConfig {
-                    message: format!("partition {} not found", partition_id.get()),
+                    message: format!("partition {id} not found"),
                 }));
             }
         }

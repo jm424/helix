@@ -4,9 +4,9 @@
 //! provide Clock, Network, Storage, or Rng abstractions - those come from
 //! the Bloodhound DST framework.
 //!
-//! # Design Principles (TigerStyle)
+//! # Design Principles (`TigerStyle`)
 //!
-//! - **Strongly-typed IDs**: Prevent mixing up NodeId with PartitionId
+//! - **Strongly-typed IDs**: Prevent mixing up `NodeId` with `PartitionId`
 //! - **Explicit limits**: Every resource has a bounded maximum
 //! - **Explicit types**: Use u32/u64, not usize
 //! - **No unsafe code**: Safety > Performance

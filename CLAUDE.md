@@ -178,6 +178,25 @@ Enable all warnings and treat them as errors:
 #![warn(clippy::nursery)]
 ```
 
+**Running clippy**: Before committing, ensure no clippy warnings:
+
+```bash
+cargo clippy --workspace
+```
+
+Common fixes:
+- Add `const fn` where clippy suggests
+- Use inline format args: `"{var}"` instead of `"{}", var`
+- Add `# Errors` and `# Panics` doc sections for fallible functions
+- Use `#[allow(clippy::cast_possible_truncation)]` with a safety comment when casts are bounded by limits
+- Add backticks around code references in doc comments (e.g., `` `TigerStyle` ``)
+- For generated code (e.g., protobuf), suppress warnings at module level:
+  ```rust
+  #![allow(clippy::all)]
+  #![allow(clippy::pedantic)]
+  #![allow(clippy::nursery)]
+  ```
+
 ## Testing Requirements
 
 ### Unit Tests
@@ -218,7 +237,7 @@ Before submitting code:
 - [ ] Comments explain why, not what
 - [ ] Line length under 100 columns
 - [ ] All tests pass
-- [ ] No new compiler warnings
+- [ ] `cargo clippy --workspace` reports no warnings
 
 ## Architecture Decision Records
 

@@ -23,7 +23,7 @@ pub enum Message {
 impl Message {
     /// Returns the source node ID of this message.
     #[must_use]
-    pub fn from(&self) -> NodeId {
+    pub const fn from(&self) -> NodeId {
         match self {
             Self::RequestVote(r) => r.candidate_id,
             Self::RequestVoteResponse(r) => r.from,
@@ -34,7 +34,7 @@ impl Message {
 
     /// Returns the destination node ID of this message.
     #[must_use]
-    pub fn to(&self) -> NodeId {
+    pub const fn to(&self) -> NodeId {
         match self {
             Self::RequestVote(r) => r.to,
             Self::RequestVoteResponse(r) => r.to,
@@ -45,7 +45,7 @@ impl Message {
 
     /// Returns the term of this message.
     #[must_use]
-    pub fn term(&self) -> TermId {
+    pub const fn term(&self) -> TermId {
         match self {
             Self::RequestVote(r) => r.term,
             Self::RequestVoteResponse(r) => r.term,
@@ -55,11 +55,11 @@ impl Message {
     }
 }
 
-/// RequestVote RPC request.
+/// `RequestVote` RPC request.
 ///
 /// Sent by candidates to gather votes during leader election.
 /// Corresponds to TLA+ `RequestVoteRequest`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestVoteRequest {
     /// Candidate's term.
     pub term: TermId,
@@ -74,9 +74,9 @@ pub struct RequestVoteRequest {
 }
 
 impl RequestVoteRequest {
-    /// Creates a new RequestVote request.
+    /// Creates a new `RequestVote` request.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         term: TermId,
         candidate_id: NodeId,
         to: NodeId,
@@ -93,11 +93,11 @@ impl RequestVoteRequest {
     }
 }
 
-/// RequestVote RPC response.
+/// `RequestVote` RPC response.
 ///
-/// Sent by voters in response to RequestVote requests.
+/// Sent by voters in response to `RequestVote` requests.
 /// Corresponds to TLA+ `RequestVoteResponse`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestVoteResponse {
     /// Current term, for candidate to update itself.
     pub term: TermId,
@@ -110,9 +110,9 @@ pub struct RequestVoteResponse {
 }
 
 impl RequestVoteResponse {
-    /// Creates a new RequestVote response.
+    /// Creates a new `RequestVote` response.
     #[must_use]
-    pub fn new(term: TermId, from: NodeId, to: NodeId, vote_granted: bool) -> Self {
+    pub const fn new(term: TermId, from: NodeId, to: NodeId, vote_granted: bool) -> Self {
         Self {
             term,
             from,
@@ -122,7 +122,7 @@ impl RequestVoteResponse {
     }
 }
 
-/// AppendEntries RPC request.
+/// `AppendEntries` RPC request.
 ///
 /// Sent by leader to replicate log entries and as heartbeat.
 /// Corresponds to TLA+ `AppendEntriesRequest`.
@@ -145,10 +145,10 @@ pub struct AppendEntriesRequest {
 }
 
 impl AppendEntriesRequest {
-    /// Creates a new AppendEntries request.
+    /// Creates a new `AppendEntries` request.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub const fn new(
         term: TermId,
         leader_id: NodeId,
         to: NodeId,
@@ -168,9 +168,9 @@ impl AppendEntriesRequest {
         }
     }
 
-    /// Creates a heartbeat (AppendEntries with no entries).
+    /// Creates a heartbeat (`AppendEntries` with no entries).
     #[must_use]
-    pub fn heartbeat(
+    pub const fn heartbeat(
         term: TermId,
         leader_id: NodeId,
         to: NodeId,
@@ -196,11 +196,11 @@ impl AppendEntriesRequest {
     }
 }
 
-/// AppendEntries RPC response.
+/// `AppendEntries` RPC response.
 ///
-/// Sent by followers in response to AppendEntries requests.
+/// Sent by followers in response to `AppendEntries` requests.
 /// Corresponds to TLA+ `AppendEntriesResponse`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppendEntriesResponse {
     /// Current term, for leader to update itself.
     pub term: TermId,
@@ -208,16 +208,16 @@ pub struct AppendEntriesResponse {
     pub from: NodeId,
     /// Leader that sent the request.
     pub to: NodeId,
-    /// True if follower contained entry matching prev_log_index/term.
+    /// True if follower contained entry matching `prev_log_index`/term.
     pub success: bool,
     /// The follower's last log index (for fast backup).
     pub match_index: LogIndex,
 }
 
 impl AppendEntriesResponse {
-    /// Creates a new AppendEntries response.
+    /// Creates a new `AppendEntries` response.
     #[must_use]
-    pub fn new(term: TermId, from: NodeId, to: NodeId, success: bool, match_index: LogIndex) -> Self {
+    pub const fn new(term: TermId, from: NodeId, to: NodeId, success: bool, match_index: LogIndex) -> Self {
         Self {
             term,
             from,
@@ -238,7 +238,7 @@ pub struct ClientRequest {
 impl ClientRequest {
     /// Creates a new client request.
     #[must_use]
-    pub fn new(data: Bytes) -> Self {
+    pub const fn new(data: Bytes) -> Self {
         Self { data }
     }
 }

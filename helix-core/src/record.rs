@@ -49,11 +49,12 @@ impl Header {
 
     /// Returns the encoded size of this header.
     #[must_use]
-    pub fn encoded_size(&self) -> usize {
+    pub const fn encoded_size(&self) -> usize {
         4 + self.key.len() + 4 + self.value.len()
     }
 
     /// Encodes the header to bytes.
+    #[allow(clippy::cast_possible_truncation)] // Sizes bounded by limits.
     pub fn encode(&self, buf: &mut BytesMut) {
         buf.put_u32_le(self.key.len() as u32);
         buf.put_slice(&self.key);
@@ -104,6 +105,7 @@ impl Timestamp {
 
     /// Returns the current time as a timestamp.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // Timestamps won't overflow i64 for centuries.
     pub fn now() -> Self {
         let duration = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -214,7 +216,7 @@ impl Record {
 
     /// Sets the timestamp.
     #[must_use]
-    pub fn with_timestamp(mut self, timestamp: Timestamp) -> Self {
+    pub const fn with_timestamp(mut self, timestamp: Timestamp) -> Self {
         self.timestamp = timestamp;
         self
     }
@@ -271,6 +273,7 @@ impl Record {
     }
 
     /// Encodes the record to bytes.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)] // Sizes bounded by limits.
     pub fn encode(&self, buf: &mut BytesMut) {
         // Offset.
         buf.put_u64_le(self.offset.get());
@@ -300,6 +303,7 @@ impl Record {
     ///
     /// # Errors
     /// Returns `None` if the buffer is invalid.
+    #[allow(clippy::cast_sign_loss)] // key_len is checked to be non-negative before cast.
     pub fn decode(buf: &mut impl Buf) -> Option<Self> {
         if buf.remaining() < 8 + 8 + 4 {
             return None;
@@ -366,7 +370,7 @@ pub enum Compression {
 impl Compression {
     /// Creates a compression from a raw byte.
     #[must_use]
-    pub fn from_byte(b: u8) -> Option<Self> {
+    pub const fn from_byte(b: u8) -> Option<Self> {
         match b {
             0 => Some(Self::None),
             1 => Some(Self::Gzip),
@@ -446,7 +450,7 @@ impl RecordBatch {
         }
     }
 
-    /// Assigns offsets to all records starting from base_offset.
+    /// Assigns offsets to all records starting from `base_offset`.
     pub fn assign_offsets(&mut self, base: Offset) {
         self.base_offset = base;
         let mut offset = base.get();
@@ -527,19 +531,19 @@ impl std::fmt::Display for RecordError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ValueTooLarge { size, max } => {
-                write!(f, "record value too large: {} > {}", size, max)
+                write!(f, "record value too large: {size} > {max}")
             }
             Self::KeyTooLarge { size, max } => {
-                write!(f, "record key too large: {} > {}", size, max)
+                write!(f, "record key too large: {size} > {max}")
             }
             Self::TooManyHeaders { count, max } => {
-                write!(f, "too many headers: {} > {}", count, max)
+                write!(f, "too many headers: {count} > {max}")
             }
             Self::BatchTooLarge { count, max } => {
-                write!(f, "batch too large: {} records > {}", count, max)
+                write!(f, "batch too large: {count} records > {max}")
             }
             Self::Codec { message } => {
-                write!(f, "codec error: {}", message)
+                write!(f, "codec error: {message}")
             }
         }
     }

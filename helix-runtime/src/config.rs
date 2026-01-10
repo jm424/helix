@@ -55,7 +55,7 @@ impl ServerConfig {
 
     /// Sets the timing configuration.
     #[must_use]
-    pub fn with_timing(mut self, timing: TimingConfig) -> Self {
+    pub const fn with_timing(mut self, timing: TimingConfig) -> Self {
         self.timing = timing;
         self
     }
@@ -84,7 +84,7 @@ pub struct PeerConfig {
 impl PeerConfig {
     /// Creates a new peer configuration.
     #[must_use]
-    pub fn new(node_id: NodeId, addr: SocketAddr) -> Self {
+    pub const fn new(node_id: NodeId, addr: SocketAddr) -> Self {
         Self { node_id, addr }
     }
 }
@@ -116,7 +116,7 @@ impl Default for TimingConfig {
 impl TimingConfig {
     /// Creates timing config suitable for testing (faster timeouts).
     #[must_use]
-    pub fn fast_for_testing() -> Self {
+    pub const fn fast_for_testing() -> Self {
         Self {
             election_timeout_min: Duration::from_millis(50),
             election_timeout_max: Duration::from_millis(100),
@@ -152,7 +152,10 @@ impl TimingConfig {
     pub fn random_election_timeout(&self) -> Duration {
         use rand::Rng;
 
+        // Safe cast: election timeouts in milliseconds always fit in u64.
+        #[allow(clippy::cast_possible_truncation)]
         let min_ms = self.election_timeout_min.as_millis() as u64;
+        #[allow(clippy::cast_possible_truncation)]
         let max_ms = self.election_timeout_max.as_millis() as u64;
         let ms = rand::thread_rng().gen_range(min_ms..=max_ms);
         Duration::from_millis(ms)
@@ -177,8 +180,8 @@ pub enum ConfigError {
 impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidTiming { message } => write!(f, "invalid timing: {}", message),
-            Self::InvalidPeer { message } => write!(f, "invalid peer: {}", message),
+            Self::InvalidTiming { message } => write!(f, "invalid timing: {message}"),
+            Self::InvalidPeer { message } => write!(f, "invalid peer: {message}"),
         }
     }
 }

@@ -42,7 +42,7 @@ struct StoredRecord {
 }
 
 impl PartitionState {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             records: Vec::new(),
             high_watermark: 0,
@@ -103,6 +103,10 @@ impl HelixService {
     ///
     /// # Errors
     /// Returns an error if the topic already exists.
+    ///
+    /// # Panics
+    /// Panics if `partition_count` is not in the range (0, 256].
+    #[allow(clippy::significant_drop_tightening)]
     pub async fn create_topic(
         &self,
         name: String,
@@ -114,7 +118,7 @@ impl HelixService {
         let mut topics = self.topics.write().await;
         if topics.contains_key(&name) {
             return Err(ServerError::Internal {
-                message: format!("topic already exists: {}", name),
+                message: format!("topic already exists: {name}"),
             });
         }
 
@@ -129,6 +133,7 @@ impl HelixService {
     }
 
     /// Internal write implementation.
+    #[allow(clippy::significant_drop_tightening)]
     async fn write_internal(&self, request: WriteRequest) -> ServerResult<WriteResponse> {
         // Validate request.
         assert!(!request.topic.is_empty(), "topic cannot be empty");
@@ -168,11 +173,16 @@ impl HelixService {
         let record_count = request.records.len();
 
         for (i, record) in request.records.into_iter().enumerate() {
+            // Safe cast: i is bounded by MAX_RECORDS_PER_WRITE which fits in u64.
+            #[allow(clippy::cast_possible_truncation)]
             let offset = base_offset + i as u64;
             partition.records.push(StoredRecord { record, offset });
         }
 
-        partition.high_watermark = base_offset + record_count as u64;
+        // Safe cast: record_count is bounded by MAX_RECORDS_PER_WRITE which fits in u64.
+        #[allow(clippy::cast_possible_truncation)]
+        let record_count_u64 = record_count as u64;
+        partition.high_watermark = base_offset + record_count_u64;
 
         debug!(
             topic = %request.topic,
@@ -182,15 +192,19 @@ impl HelixService {
             "Wrote records"
         );
 
+        // Safe cast: record_count is bounded by MAX_RECORDS_PER_WRITE which fits in u32.
+        #[allow(clippy::cast_possible_truncation)]
+        let record_count_u32 = record_count as u32;
         Ok(WriteResponse {
             base_offset,
-            record_count: record_count as u32,
+            record_count: record_count_u32,
             error_code: ErrorCode::None.into(),
             error_message: None,
         })
     }
 
     /// Internal read implementation.
+    #[allow(clippy::significant_drop_tightening)]
     async fn read_internal(&self, request: ReadRequest) -> ServerResult<ReadResponse> {
         // Validate request.
         assert!(!request.topic.is_empty(), "topic cannot be empty");
@@ -251,9 +265,12 @@ impl HelixService {
             }
 
             // Estimate record size.
-            let record_size = stored.record.value.len() as u32
-                + stored.record.key.as_ref().map_or(0, |k| k.len() as u32)
-                + 16; // Overhead.
+            // Safe cast: record value/key sizes are bounded by message limits which fit in u32.
+            #[allow(clippy::cast_possible_truncation)]
+            let value_size = stored.record.value.len() as u32;
+            #[allow(clippy::cast_possible_truncation)]
+            let key_size = stored.record.key.as_ref().map_or(0, |k| k.len() as u32);
+            let record_size = value_size + key_size + 16; // Overhead.
 
             if bytes_read + record_size > max_bytes && !records.is_empty() {
                 break;
@@ -342,6 +359,7 @@ impl HelixService {
     }
 
     /// Internal partition info implementation.
+    #[allow(clippy::significant_drop_tightening)]
     async fn get_partition_info_internal(
         &self,
         request: GetPartitionInfoRequest,

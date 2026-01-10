@@ -1,6 +1,6 @@
 //! Raft server implementation.
 //!
-//! The RaftServer is the main entry point for running a Raft node in production.
+//! The `RaftServer` is the main entry point for running a Raft node in production.
 //! It handles:
 //! - Timer management (election and heartbeat timers)
 //! - Processing Raft outputs (sending messages, applying commits)
@@ -138,11 +138,14 @@ impl std::fmt::Display for ServerError {
         match self {
             Self::ServerUnavailable => write!(f, "server unavailable"),
             Self::NotLeader { leader_hint } => match leader_hint {
-                Some(id) => write!(f, "not leader, try node {}", id.get()),
+                Some(id) => {
+                    let id_val = id.get();
+                    write!(f, "not leader, try node {id_val}")
+                }
                 None => write!(f, "not leader"),
             },
             Self::Timeout => write!(f, "request timed out"),
-            Self::Internal { message } => write!(f, "internal error: {}", message),
+            Self::Internal { message } => write!(f, "internal error: {message}"),
         }
     }
 }
@@ -289,7 +292,7 @@ impl RaftServer {
                 }
 
                 // Election timeout.
-                _ = tokio::time::sleep_until(election_deadline) => {
+                () = tokio::time::sleep_until(election_deadline) => {
                     let mut s = server.lock().await;
                     debug!("Election timeout fired");
 
@@ -483,19 +486,19 @@ impl RaftServer {
 
     /// Returns the current Raft state.
     #[must_use]
-    pub fn state(&self) -> RaftState {
+    pub const fn state(&self) -> RaftState {
         self.node.state()
     }
 
     /// Returns true if this node is the leader.
     #[must_use]
-    pub fn is_leader(&self) -> bool {
+    pub const fn is_leader(&self) -> bool {
         self.node.is_leader()
     }
 
     /// Returns the current leader ID if known.
     #[must_use]
-    pub fn leader_id(&self) -> Option<NodeId> {
+    pub const fn leader_id(&self) -> Option<NodeId> {
         self.node.leader_id()
     }
 }

@@ -62,16 +62,16 @@ impl std::fmt::Display for PartitionError {
                     last.get()
                 )
             }
-            Self::SegmentFull { reason } => write!(f, "segment full: {}", reason),
+            Self::SegmentFull { reason } => write!(f, "segment full: {reason}"),
             Self::BatchTooLarge { size, max } => {
-                write!(f, "batch too large: {} > {} bytes", size, max)
+                write!(f, "batch too large: {size} > {max} bytes")
             }
-            Self::Corruption { message } => write!(f, "data corruption: {}", message),
+            Self::Corruption { message } => write!(f, "data corruption: {message}"),
             Self::Io { operation, message } => {
-                write!(f, "I/O error during {}: {}", operation, message)
+                write!(f, "I/O error during {operation}: {message}")
             }
             Self::Closed => write!(f, "partition is closed"),
-            Self::InvalidConfig { message } => write!(f, "invalid config: {}", message),
+            Self::InvalidConfig { message } => write!(f, "invalid config: {message}"),
         }
     }
 }

@@ -3,7 +3,7 @@
 //! This crate provides a correct, well-tested Raft consensus implementation
 //! designed for deterministic simulation testing with Bloodhound.
 //!
-//! # Design Principles (TigerStyle)
+//! # Design Principles (`TigerStyle`)
 //!
 //! - **Correctness first**: Matches TLA+ specification exactly
 //! - **Deterministic**: All randomness comes from seeded RNG
@@ -40,7 +40,7 @@ pub use wal_storage::WalStorage;
 
 /// Raft configuration limits.
 pub mod limits {
-    /// Maximum number of entries in a single AppendEntries request.
+    /// Maximum number of entries in a single `AppendEntries` request.
     pub const APPEND_ENTRIES_BATCH_SIZE_MAX: u32 = 1000;
 
     /// Maximum time to wait for election timeout (microseconds).

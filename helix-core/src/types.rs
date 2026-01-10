@@ -1,6 +1,6 @@
 //! Strongly-typed identifiers for Helix entities.
 //!
-//! Following TigerStyle: explicit types prevent bugs from mixing up IDs.
+//! Following `TigerStyle`: explicit types prevent bugs from mixing up IDs.
 //! All IDs are 64-bit to handle large-scale deployments.
 
 use std::fmt;
@@ -8,7 +8,7 @@ use std::fmt;
 /// Macro to generate strongly-typed ID wrappers.
 ///
 /// Each ID type wraps a u64 and provides:
-/// - Type safety (can't mix NodeId with PartitionId)
+/// - Type safety (can't mix `NodeId` with `PartitionId`)
 /// - Debug/Display formatting
 /// - Zero-cost abstraction (same as raw u64)
 macro_rules! define_id {

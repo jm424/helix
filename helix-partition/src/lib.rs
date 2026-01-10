@@ -17,7 +17,7 @@
 //! - `read`: Fetch records starting from an offset
 //! - `truncate`: Remove records after a given offset (for replication)
 //!
-//! # TigerStyle Principles
+//! # `TigerStyle` Principles
 //!
 //! - Explicit limits on segment size and record count
 //! - CRC checksums on all data

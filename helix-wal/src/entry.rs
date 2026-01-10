@@ -53,6 +53,7 @@ impl EntryHeader {
 
         // TigerStyle: Check limits explicitly.
         if length > ENTRY_LENGTH_MAX as usize {
+            #[allow(clippy::cast_possible_truncation)] // Truncated value is fine for error reporting.
             return Err(WalError::EntryTooLarge {
                 size: length as u32,
                 max: ENTRY_LENGTH_MAX,

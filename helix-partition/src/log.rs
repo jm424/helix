@@ -82,19 +82,19 @@ impl LogSegment {
 
     /// Returns the base offset of this segment.
     #[must_use]
-    pub fn base_offset(&self) -> Offset {
+    pub const fn base_offset(&self) -> Offset {
         self.base_offset
     }
 
     /// Returns the next offset that will be assigned.
     #[must_use]
-    pub fn next_offset(&self) -> Offset {
+    pub const fn next_offset(&self) -> Offset {
         self.next_offset
     }
 
     /// Returns the last offset in this segment, or None if empty.
     #[must_use]
-    pub fn last_offset(&self) -> Option<Offset> {
+    pub const fn last_offset(&self) -> Option<Offset> {
         if self.next_offset.get() > self.base_offset.get() {
             Some(Offset::new(self.next_offset.get() - 1))
         } else {
@@ -104,7 +104,7 @@ impl LogSegment {
 
     /// Returns the number of records in this segment.
     #[must_use]
-    pub fn record_count(&self) -> u64 {
+    pub const fn record_count(&self) -> u64 {
         self.next_offset.get() - self.base_offset.get()
     }
 
@@ -116,7 +116,7 @@ impl LogSegment {
 
     /// Returns true if the segment is sealed (read-only).
     #[must_use]
-    pub fn is_sealed(&self) -> bool {
+    pub const fn is_sealed(&self) -> bool {
         self.sealed
     }
 
@@ -171,7 +171,10 @@ impl LogSegment {
 
         // Update state.
         self.next_offset = Offset::new(self.next_offset.get() + record_count);
-        self.records_since_index += record_count as u32;
+        // Safe cast: record_count is bounded by config.max_records which fits in u32.
+        #[allow(clippy::cast_possible_truncation)]
+        let record_count_u32 = record_count as u32;
+        self.records_since_index += record_count_u32;
 
         Ok(first_offset)
     }
@@ -183,7 +186,10 @@ impl LogSegment {
         self.data.put_i64_le(batch.base_timestamp.as_millis());
         self.data.put_i64_le(batch.max_timestamp.as_millis());
         self.data.put_u8(batch.compression as u8);
-        self.data.put_u32_le(batch.records.len() as u32);
+        // Safe cast: batch.records.len() is bounded by max_batch_records which fits in u32.
+        #[allow(clippy::cast_possible_truncation)]
+        let record_count = batch.records.len() as u32;
+        self.data.put_u32_le(record_count);
 
         // CRC placeholder (we'll compute it over the records).
         let crc_pos = self.data.len();
@@ -231,7 +237,10 @@ impl LogSegment {
         let position = self.find_position(start_offset);
 
         // Read records from position.
-        let mut reader = SegmentReader::new(&self.data[position as usize..]);
+        // Safe cast: position is bounded by segment size which fits in memory.
+        #[allow(clippy::cast_possible_truncation)]
+        let position_usize = position as usize;
+        let mut reader = SegmentReader::new(&self.data[position_usize..]);
         let mut records = Vec::new();
         let mut count = 0u32;
 
@@ -302,8 +311,11 @@ impl LogSegment {
         // This is a simplified implementation - just truncate at the index position.
         let position = self.find_position(from_offset);
 
+        // Safe cast: position is bounded by segment size which fits in memory.
+        #[allow(clippy::cast_possible_truncation)]
+        let position_usize = position as usize;
         // Truncate data and index.
-        self.data.truncate(position as usize);
+        self.data.truncate(position_usize);
         self.index.retain(|e| e.offset < from_offset);
         self.next_offset = from_offset;
         self.records_since_index = 0;
@@ -327,7 +339,7 @@ pub struct SegmentReader<'a> {
 impl<'a> SegmentReader<'a> {
     /// Creates a new segment reader.
     #[must_use]
-    pub fn new(data: &'a [u8]) -> Self {
+    pub const fn new(data: &'a [u8]) -> Self {
         Self { data, position: 0 }
     }
 
@@ -360,7 +372,7 @@ impl<'a> SegmentReader<'a> {
 
         let _compression = helix_core::Compression::from_byte(compression_byte)
             .ok_or_else(|| PartitionError::Corruption {
-                message: format!("invalid compression byte: {}", compression_byte),
+                message: format!("invalid compression byte: {compression_byte}"),
             })?;
 
         // Header size for CRC verification (same as BATCH_HEADER_SIZE).
@@ -381,8 +393,7 @@ impl<'a> SegmentReader<'a> {
         if actual_crc != expected_crc {
             return Err(PartitionError::Corruption {
                 message: format!(
-                    "CRC mismatch: expected {:08x}, got {:08x}",
-                    expected_crc, actual_crc
+                    "CRC mismatch: expected {expected_crc:08x}, got {actual_crc:08x}"
                 ),
             });
         }

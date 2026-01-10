@@ -10,7 +10,7 @@
 //! # Design
 //!
 //! The storage layer is kept separate from the core state machine to maintain
-//! deterministic simulation testing. RaftNode remains a pure state machine
+//! deterministic simulation testing. `RaftNode` remains a pure state machine
 //! that produces `PersistState` and `PersistEntries` outputs which the
 //! runtime layer handles.
 
@@ -26,14 +26,14 @@ use crate::log::LogEntry;
 pub struct PersistentState {
     /// Latest term server has seen (initialized to 0, increases monotonically).
     pub current_term: TermId,
-    /// CandidateId that received vote in current term (or None).
+    /// `CandidateId` that received vote in current term (or None).
     pub voted_for: Option<NodeId>,
 }
 
 impl PersistentState {
     /// Creates a new persistent state with initial values.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             current_term: TermId::new(0),
             voted_for: None,
@@ -42,7 +42,7 @@ impl PersistentState {
 
     /// Creates a persistent state with the given values.
     #[must_use]
-    pub fn with_values(current_term: TermId, voted_for: Option<NodeId>) -> Self {
+    pub const fn with_values(current_term: TermId, voted_for: Option<NodeId>) -> Self {
         Self {
             current_term,
             voted_for,
@@ -51,7 +51,7 @@ impl PersistentState {
 
     /// Encodes the persistent state to bytes.
     ///
-    /// Format: term (8 bytes) + voted_for_present (1 byte) + voted_for (8 bytes if present)
+    /// Format: term (8 bytes) + `voted_for_present` (1 byte) + `voted_for` (8 bytes if present)
     pub fn encode(&self, buf: &mut BytesMut) {
         use bytes::BufMut;
 
@@ -130,10 +130,10 @@ impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io { operation, message } => {
-                write!(f, "storage I/O error during {}: {}", operation, message)
+                write!(f, "storage I/O error during {operation}: {message}")
             }
             Self::Corruption { message } => {
-                write!(f, "storage corruption: {}", message)
+                write!(f, "storage corruption: {message}")
             }
             Self::NotFound { index } => {
                 write!(f, "entry not found at index {}", index.get())
@@ -149,10 +149,10 @@ impl std::error::Error for StorageError {}
 /// Implementations must guarantee durability - data must survive crashes
 /// after methods return successfully.
 pub trait RaftStorage {
-    /// Saves the persistent state (term and voted_for).
+    /// Saves the persistent state (term and `voted_for`).
     ///
-    /// This must be called before responding to RequestVote or AppendEntries RPCs
-    /// when the term or votedFor changes.
+    /// This must be called before responding to `RequestVote` or `AppendEntries` RPCs
+    /// when the term or `votedFor` changes.
     ///
     /// # Errors
     /// Returns an error if the state cannot be persisted.
@@ -180,7 +180,7 @@ pub trait RaftStorage {
     /// Returns `NotFound` if the entry doesn't exist.
     fn get_entry(&self, index: LogIndex) -> StorageResult<LogEntry>;
 
-    /// Returns entries from start_index to end_index (inclusive).
+    /// Returns entries from `start_index` to `end_index` (inclusive).
     ///
     /// # Errors
     /// Returns an error if entries cannot be read.
@@ -229,7 +229,7 @@ pub struct MemoryStorage {
 impl MemoryStorage {
     /// Creates a new in-memory storage.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             state: None,
             entries: Vec::new(),
@@ -276,6 +276,8 @@ impl RaftStorage for MemoryStorage {
         if self.entries.is_empty() || index.get() < self.first_index {
             return Err(StorageError::NotFound { index });
         }
+        // Safe cast: offset is bounded by entries.len() which fits in usize.
+        #[allow(clippy::cast_possible_truncation)]
         let offset = (index.get() - self.first_index) as usize;
         self.entries
             .get(offset)
@@ -289,6 +291,8 @@ impl RaftStorage for MemoryStorage {
         }
 
         let first = self.first_index;
+        // Safe cast: entries.len() is bounded by system memory which always fits in u64.
+        #[allow(clippy::cast_possible_truncation)]
         let last = first + self.entries.len() as u64 - 1;
 
         let actual_start = start.get().max(first);
@@ -298,7 +302,10 @@ impl RaftStorage for MemoryStorage {
             return Ok(Vec::new());
         }
 
+        // Safe casts: offsets are bounded by entries.len() which fits in usize.
+        #[allow(clippy::cast_possible_truncation)]
         let start_offset = (actual_start - first) as usize;
+        #[allow(clippy::cast_possible_truncation)]
         let end_offset = (actual_end - first) as usize + 1;
 
         Ok(self.entries[start_offset..end_offset].to_vec())
@@ -315,6 +322,8 @@ impl RaftStorage for MemoryStorage {
             return Ok(());
         }
 
+        // Safe cast: keep_count is bounded by entries.len() which fits in usize.
+        #[allow(clippy::cast_possible_truncation)]
         let keep_count = (last_to_keep.get() - self.first_index + 1) as usize;
         if keep_count < self.entries.len() {
             self.entries.truncate(keep_count);
@@ -335,7 +344,10 @@ impl RaftStorage for MemoryStorage {
         if self.entries.is_empty() {
             LogIndex::new(0)
         } else {
-            LogIndex::new(self.first_index + self.entries.len() as u64 - 1)
+            // Safe cast: entries.len() is bounded by system memory which always fits in u64.
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = self.first_index + self.entries.len() as u64 - 1;
+            LogIndex::new(idx)
         }
     }
 

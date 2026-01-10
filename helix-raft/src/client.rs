@@ -87,7 +87,7 @@ pub struct ClientCommand {
 impl ClientCommand {
     /// Creates a new client command.
     #[must_use]
-    pub fn new(id: RequestId, command: Bytes) -> Self {
+    pub const fn new(id: RequestId, command: Bytes) -> Self {
         Self { id, command }
     }
 }
@@ -119,34 +119,29 @@ pub enum ClientResult {
 impl ClientResult {
     /// Returns true if the request succeeded.
     #[must_use]
-    pub fn is_success(&self) -> bool {
+    pub const fn is_success(&self) -> bool {
         matches!(self, Self::Success { .. })
     }
 
     /// Returns true if we should redirect to another node.
     #[must_use]
-    pub fn should_redirect(&self) -> bool {
+    pub const fn should_redirect(&self) -> bool {
         matches!(self, Self::NotLeader { .. })
     }
 }
 
 /// Read consistency levels for client queries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ReadConsistency {
     /// Read from the leader only, ensuring linearizability.
     /// This requires a round of heartbeats to confirm leadership.
+    #[default]
     Linearizable,
     /// Read from the leader without confirmation.
     /// May return stale data if the leader has been partitioned.
     LeaderLease,
     /// Read from any node. May return stale data.
     Stale,
-}
-
-impl Default for ReadConsistency {
-    fn default() -> Self {
-        Self::Linearizable
-    }
 }
 
 /// A read-only query to the Raft cluster.
@@ -173,7 +168,7 @@ impl ClientQuery {
 
     /// Creates a query with specified consistency level.
     #[must_use]
-    pub fn with_consistency(id: RequestId, query: Bytes, consistency: ReadConsistency) -> Self {
+    pub const fn with_consistency(id: RequestId, query: Bytes, consistency: ReadConsistency) -> Self {
         Self {
             id,
             query,
@@ -332,7 +327,7 @@ pub struct RaftClient {
 impl RaftClient {
     /// Creates a new Raft client.
     #[must_use]
-    pub fn new(client_id: ClientId, cluster: Vec<NodeId>) -> Self {
+    pub const fn new(client_id: ClientId, cluster: Vec<NodeId>) -> Self {
         Self {
             client_id,
             next_sequence: 1,
@@ -343,7 +338,7 @@ impl RaftClient {
 
     /// Returns our client ID.
     #[must_use]
-    pub fn client_id(&self) -> ClientId {
+    pub const fn client_id(&self) -> ClientId {
         self.client_id
     }
 
@@ -370,7 +365,7 @@ impl RaftClient {
 
     /// Returns the last known leader.
     #[must_use]
-    pub fn leader(&self) -> Option<NodeId> {
+    pub const fn leader(&self) -> Option<NodeId> {
         self.leader
     }
 

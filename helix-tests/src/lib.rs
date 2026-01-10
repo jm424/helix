@@ -3,10 +3,10 @@
 //! This crate contains deterministic simulation tests using the Bloodhound
 //! framework. Tests are organized by component:
 //!
-//! - `raft_actor`: Raft SimulatedActor for Bloodhound simulation
+//! - `raft_actor`: Raft `SimulatedActor` for Bloodhound simulation
 //! - `raft_tests`: Raft consensus safety and liveness properties
 //! - `wal_tests`: Write-ahead log crash recovery and integrity
-//! - `properties`: Property definitions (SingleLeaderPerTerm, LogMatching, etc.)
+//! - `properties`: Property definitions (`SingleLeaderPerTerm`, `LogMatching`, etc.)
 //! - `scenarios`: Reusable test scenarios
 
 #![forbid(unsafe_code)]

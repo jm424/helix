@@ -17,7 +17,7 @@ pub struct LogEntry {
 impl LogEntry {
     /// Creates a new log entry.
     #[must_use]
-    pub fn new(term: TermId, index: LogIndex, data: Bytes) -> Self {
+    pub const fn new(term: TermId, index: LogIndex, data: Bytes) -> Self {
         Self { term, index, data }
     }
 }
@@ -28,7 +28,7 @@ impl LogEntry {
 /// Production would use the WAL for persistence.
 #[derive(Debug, Default)]
 pub struct RaftLog {
-    /// Log entries (0-indexed internally, but LogIndex starts at 1).
+    /// Log entries (0-indexed internally, but `LogIndex` starts at 1).
     entries: Vec<LogEntry>,
     /// Index of first entry (1 if non-empty, 0 if empty).
     first_index: u64,
@@ -37,7 +37,7 @@ pub struct RaftLog {
 impl RaftLog {
     /// Creates a new empty log.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             entries: Vec::new(),
             first_index: 0,
@@ -53,7 +53,10 @@ impl RaftLog {
     /// Returns the number of entries in the log.
     #[must_use]
     pub fn len(&self) -> u64 {
-        self.entries.len() as u64
+        // Safe cast: entries.len() is bounded by system memory which is always < u64::MAX.
+        #[allow(clippy::cast_possible_truncation)]
+        let len = self.entries.len() as u64;
+        len
     }
 
     /// Returns the first log index, or 0 if empty.
@@ -72,7 +75,10 @@ impl RaftLog {
         if self.entries.is_empty() {
             LogIndex::new(0)
         } else {
-            LogIndex::new(self.first_index + self.entries.len() as u64 - 1)
+            // Safe cast: entries.len() is bounded by system memory which always fits in u64.
+            #[allow(clippy::cast_possible_truncation)]
+            let idx = self.first_index + self.entries.len() as u64 - 1;
+            LogIndex::new(idx)
         }
     }
 
@@ -90,6 +96,8 @@ impl RaftLog {
         if self.entries.is_empty() || index.get() < self.first_index {
             return None;
         }
+        // Safe cast: index difference is bounded by entries.len() which fits in usize.
+        #[allow(clippy::cast_possible_truncation)]
         let offset = (index.get() - self.first_index) as usize;
         self.entries.get(offset)
     }
@@ -159,13 +167,15 @@ impl RaftLog {
             return;
         }
 
+        // Safe cast: keep_count is bounded by entries.len() which fits in usize.
+        #[allow(clippy::cast_possible_truncation)]
         let keep_count = (last_to_keep.get() - self.first_index + 1) as usize;
         if keep_count < self.entries.len() {
             self.entries.truncate(keep_count);
         }
     }
 
-    /// Returns entries from start_index to the end.
+    /// Returns entries from `start_index` to the end.
     #[must_use]
     pub fn entries_from(&self, start_index: LogIndex) -> Vec<LogEntry> {
         if self.entries.is_empty() || start_index.get() > self.last_index().get() {
@@ -175,13 +185,16 @@ impl RaftLog {
         let start = if start_index.get() < self.first_index {
             0
         } else {
-            (start_index.get() - self.first_index) as usize
+            // Safe cast: start is bounded by entries.len() which fits in usize.
+            #[allow(clippy::cast_possible_truncation)]
+            let s = (start_index.get() - self.first_index) as usize;
+            s
         };
 
         self.entries[start..].to_vec()
     }
 
-    /// Checks if our log is at least as up-to-date as (last_term, last_index).
+    /// Checks if our log is at least as up-to-date as (`last_term`, `last_index`).
     ///
     /// Used in leader election to determine if we should grant a vote.
     #[must_use]

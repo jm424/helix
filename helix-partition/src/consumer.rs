@@ -140,7 +140,7 @@ impl OffsetStore {
 
     /// Returns all committed offsets.
     #[must_use]
-    pub fn all(&self) -> &HashMap<PartitionId, Offset> {
+    pub const fn all(&self) -> &HashMap<PartitionId, Offset> {
         &self.committed
     }
 }
@@ -180,7 +180,7 @@ impl Consumer {
 
     /// Returns the consumer configuration.
     #[must_use]
-    pub fn config(&self) -> &ConsumerConfig {
+    pub const fn config(&self) -> &ConsumerConfig {
         &self.config
     }
 
@@ -288,6 +288,9 @@ impl Consumer {
     }
 
     /// Fetches records from a specific partition.
+    ///
+    /// # Errors
+    /// Returns an error if offset is out of range or the partition is closed.
     pub fn fetch(
         &mut self,
         partition_id: PartitionId,

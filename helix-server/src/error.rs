@@ -63,7 +63,7 @@ pub enum ServerError {
 impl ServerError {
     /// Converts the error to a protobuf error code.
     #[must_use]
-    pub fn to_error_code(&self) -> ErrorCode {
+    pub const fn to_error_code(&self) -> ErrorCode {
         match self {
             Self::TopicNotFound { .. } => ErrorCode::InvalidTopic,
             Self::PartitionNotFound { .. } => ErrorCode::InvalidPartition,

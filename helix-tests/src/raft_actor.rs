@@ -1,4 +1,4 @@
-//! Raft SimulatedActor for Bloodhound simulation.
+//! Raft `SimulatedActor` for Bloodhound simulation.
 //!
 //! This module wraps the Raft state machine in a Bloodhound `SimulatedActor`
 //! for deterministic simulation testing.
@@ -64,11 +64,17 @@ fn serialize_message(msg: &Message) -> Vec<u8> {
             buf.extend_from_slice(&req.prev_log_term.get().to_le_bytes());
             buf.extend_from_slice(&req.leader_commit.get().to_le_bytes());
             // Entries count.
-            buf.extend_from_slice(&(req.entries.len() as u32).to_le_bytes());
+            // Safe cast: entries count is bounded by batch limits which fit in u32.
+            #[allow(clippy::cast_possible_truncation)]
+            let entry_count = req.entries.len() as u32;
+            buf.extend_from_slice(&entry_count.to_le_bytes());
             for entry in &req.entries {
                 buf.extend_from_slice(&entry.term.get().to_le_bytes());
                 buf.extend_from_slice(&entry.index.get().to_le_bytes());
-                buf.extend_from_slice(&(entry.data.len() as u32).to_le_bytes());
+                // Safe cast: entry data size is bounded by message limits which fit in u32.
+                #[allow(clippy::cast_possible_truncation)]
+                let data_len = entry.data.len() as u32;
+                buf.extend_from_slice(&data_len.to_le_bytes());
                 buf.extend_from_slice(&entry.data);
             }
         }
@@ -192,7 +198,7 @@ fn deserialize_message(data: &[u8]) -> Option<Message> {
     }
 }
 
-/// Checkpoint state for RaftActor.
+/// Checkpoint state for `RaftActor`.
 ///
 /// Note: Fields are stored for future checkpoint/restore implementation.
 #[derive(Clone)]
@@ -206,7 +212,7 @@ struct RaftActorCheckpoint {
     state: RaftState,
 }
 
-/// A Raft node wrapped as a Bloodhound SimulatedActor.
+/// A Raft node wrapped as a Bloodhound `SimulatedActor`.
 pub struct RaftActor {
     /// The actor's unique ID.
     actor_id: ActorId,
@@ -214,9 +220,9 @@ pub struct RaftActor {
     name: String,
     /// The Raft node state machine.
     node: RaftNode,
-    /// Mapping from Helix NodeId to Bloodhound ActorId.
+    /// Mapping from Helix `NodeId` to Bloodhound `ActorId`.
     node_to_actor: BTreeMap<NodeId, ActorId>,
-    /// Mapping from Bloodhound ActorId to Helix NodeId.
+    /// Mapping from Bloodhound `ActorId` to Helix `NodeId`.
     #[allow(dead_code)]
     actor_to_node: BTreeMap<ActorId, NodeId>,
     /// Configuration for election timeouts.
@@ -232,7 +238,7 @@ impl RaftActor {
     /// # Arguments
     /// * `actor_id` - The Bloodhound actor ID for this node.
     /// * `config` - The Raft configuration.
-    /// * `node_actor_mapping` - Mapping from Helix NodeId to Bloodhound ActorId.
+    /// * `node_actor_mapping` - Mapping from Helix `NodeId` to Bloodhound `ActorId`.
     #[must_use]
     pub fn new(
         actor_id: ActorId,
@@ -264,25 +270,25 @@ impl RaftActor {
 
     /// Returns true if this node is currently the leader.
     #[must_use]
-    pub fn is_leader(&self) -> bool {
+    pub const fn is_leader(&self) -> bool {
         self.node.is_leader()
     }
 
     /// Returns the current term.
     #[must_use]
-    pub fn current_term(&self) -> TermId {
+    pub const fn current_term(&self) -> TermId {
         self.node.current_term()
     }
 
     /// Returns the current state.
     #[must_use]
-    pub fn state(&self) -> RaftState {
+    pub const fn state(&self) -> RaftState {
         self.node.state()
     }
 
     /// Returns the commit index.
     #[must_use]
-    pub fn commit_index(&self) -> LogIndex {
+    pub const fn commit_index(&self) -> LogIndex {
         self.node.commit_index()
     }
 
@@ -325,7 +331,7 @@ impl RaftActor {
         }
     }
 
-    /// Sends a Raft message to another actor using PacketDelivery.
+    /// Sends a Raft message to another actor using `PacketDelivery`.
     fn send_raft_message(&self, msg: &Message, ctx: &mut SimulationContext) {
         let to_node = msg.to();
         if let Some(&to_actor) = self.node_to_actor.get(&to_node) {
@@ -453,14 +459,20 @@ impl SimulatedActor for RaftActor {
 ///
 /// # Returns
 /// A vector of `RaftActor` instances configured as a cluster.
+///
+/// # Panics
+/// Panics if `node_count` is 0 or greater than 7.
 #[must_use]
 pub fn create_raft_cluster(node_count: usize) -> Vec<RaftActor> {
     assert!(node_count > 0, "cluster must have at least one node");
     assert!(node_count <= 7, "cluster size exceeds maximum");
 
     // Create node IDs and actor IDs.
-    let node_ids: Vec<NodeId> = (1..=node_count as u64).map(NodeId::new).collect();
-    let actor_ids: Vec<ActorId> = (1..=node_count as u64).map(ActorId::new).collect();
+    // Safe cast: node_count is bounded by assert to <= 7, which fits in u64.
+    #[allow(clippy::cast_possible_truncation)]
+    let node_count_u64 = node_count as u64;
+    let node_ids: Vec<NodeId> = (1..=node_count_u64).map(NodeId::new).collect();
+    let actor_ids: Vec<ActorId> = (1..=node_count_u64).map(ActorId::new).collect();
 
     // Create mapping.
     let node_to_actor: BTreeMap<NodeId, ActorId> = node_ids

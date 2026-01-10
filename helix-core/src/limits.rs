@@ -1,6 +1,6 @@
 //! System limits and configuration bounds.
 //!
-//! Following TigerStyle: put limits on everything.
+//! Following `TigerStyle`: put limits on everything.
 //! Every queue, buffer, and resource has an explicit maximum size.
 //! This prevents unbounded growth and makes the system predictable.
 
@@ -123,7 +123,7 @@ impl Limits {
     ///
     /// # Errors
     /// Returns an error if any limits are invalid or inconsistent.
-    pub fn validate(&self) -> crate::Result<()> {
+    pub const fn validate(&self) -> crate::Result<()> {
         // Message limits must be positive.
         if self.max_message_bytes == 0 {
             return Err(crate::Error::InvalidArgument {

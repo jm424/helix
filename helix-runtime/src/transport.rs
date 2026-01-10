@@ -112,7 +112,7 @@ pub struct TransportConfig {
 impl TransportConfig {
     /// Creates a new transport configuration.
     #[must_use]
-    pub fn new(node_id: NodeId, listen_addr: SocketAddr) -> Self {
+    pub const fn new(node_id: NodeId, listen_addr: SocketAddr) -> Self {
         Self {
             node_id,
             listen_addr,
@@ -154,6 +154,7 @@ impl TransportHandle {
     ///
     /// # Errors
     /// Returns an error if the peer is unknown or the send queue is full.
+    #[allow(clippy::significant_drop_tightening)]
     pub async fn send(&self, to: NodeId, message: Message) -> TransportResult<()> {
         // Precondition: can't send to self.
         debug_assert!(to != self.node_id, "cannot send message to self");
@@ -306,6 +307,7 @@ impl Transport {
     }
 
     /// Loop that sends messages to a peer.
+    #[allow(clippy::items_after_statements)]
     async fn sender_loop(
         node_id: NodeId,
         peer_id: NodeId,
@@ -328,9 +330,8 @@ impl Transport {
             }
 
             // Wait for a message.
-            let message = match rx.recv().await {
-                Some(msg) => msg,
-                None => break, // Channel closed.
+            let Some(message) = rx.recv().await else {
+                break; // Channel closed.
             };
 
             // Ensure we have a connection.
@@ -486,7 +487,7 @@ pub struct TransportBuilder {
 impl TransportBuilder {
     /// Creates a new transport builder.
     #[must_use]
-    pub fn new(node_id: NodeId, listen_addr: SocketAddr) -> Self {
+    pub const fn new(node_id: NodeId, listen_addr: SocketAddr) -> Self {
         Self {
             config: TransportConfig::new(node_id, listen_addr),
         }

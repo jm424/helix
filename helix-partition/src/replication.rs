@@ -65,7 +65,7 @@ impl ReplicatedPartitionConfig {
             topic_id,
             partition_id,
             node_id,
-            nodes: nodes.clone(),
+            nodes,
             partition_config: PartitionConfig::new(topic_id, partition_id),
         }
     }
@@ -99,7 +99,10 @@ impl PartitionCommand {
         match self {
             Self::Append { records } => {
                 buf.put_u8(0); // Command type
-                buf.put_u32_le(records.len() as u32);
+                // Safe cast: records.len() is bounded by partition limits which fit in u32.
+                #[allow(clippy::cast_possible_truncation)]
+                let count = records.len() as u32;
+                buf.put_u32_le(count);
                 for record in records {
                     record.encode(&mut buf);
                 }
@@ -208,7 +211,7 @@ impl ReplicatedPartition {
 
     /// Returns the current replication state.
     #[must_use]
-    pub fn state(&self) -> ReplicationState {
+    pub const fn state(&self) -> ReplicationState {
         match self.raft.state() {
             RaftState::Leader => ReplicationState::Leader,
             RaftState::Follower => ReplicationState::Follower,
@@ -224,25 +227,25 @@ impl ReplicatedPartition {
 
     /// Returns the leader node ID if known.
     #[must_use]
-    pub fn leader(&self) -> Option<NodeId> {
+    pub const fn leader(&self) -> Option<NodeId> {
         self.raft.leader_id()
     }
 
     /// Returns the current term.
     #[must_use]
-    pub fn term(&self) -> TermId {
+    pub const fn term(&self) -> TermId {
         self.raft.current_term()
     }
 
     /// Returns the partition ID.
     #[must_use]
-    pub fn partition_id(&self) -> PartitionId {
+    pub const fn partition_id(&self) -> PartitionId {
         self.config.partition_id
     }
 
     /// Returns the topic ID.
     #[must_use]
-    pub fn topic_id(&self) -> TopicId {
+    pub const fn topic_id(&self) -> TopicId {
         self.config.topic_id
     }
 
@@ -260,7 +263,7 @@ impl ReplicatedPartition {
 
     /// Returns the high watermark (committed offset).
     #[must_use]
-    pub fn high_watermark(&self) -> Offset {
+    pub const fn high_watermark(&self) -> Offset {
         self.partition.high_watermark()
     }
 
@@ -271,7 +274,7 @@ impl ReplicatedPartition {
 
     /// Returns the underlying Raft node.
     #[must_use]
-    pub fn raft(&self) -> &RaftNode {
+    pub const fn raft(&self) -> &RaftNode {
         &self.raft
     }
 
@@ -393,13 +396,13 @@ impl ReplicatedPartition {
 
     /// Returns the Raft commit index.
     #[must_use]
-    pub fn commit_index(&self) -> LogIndex {
+    pub const fn commit_index(&self) -> LogIndex {
         self.raft.commit_index()
     }
 
     /// Returns the last applied index.
     #[must_use]
-    pub fn last_applied(&self) -> LogIndex {
+    pub const fn last_applied(&self) -> LogIndex {
         self.last_applied
     }
 }
@@ -444,8 +447,7 @@ impl ReplicationManager {
         self.partitions.get_mut(&(topic_id, partition_id))
     }
 
-    /// Returns all partitions.
-    #[must_use]
+    /// Returns all partitions as an iterator.
     pub fn partitions(&self) -> impl Iterator<Item = &ReplicatedPartition> {
         self.partitions.values()
     }
@@ -477,7 +479,7 @@ impl ReplicationManager {
 
     /// Returns the node ID.
     #[must_use]
-    pub fn node_id(&self) -> NodeId {
+    pub const fn node_id(&self) -> NodeId {
         self.node_id
     }
 

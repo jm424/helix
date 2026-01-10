@@ -15,20 +15,15 @@ use crate::message::{
 };
 
 /// Raft node state (role).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RaftState {
     /// Follower state - passive, responds to RPCs.
+    #[default]
     Follower,
     /// Candidate state - actively seeking votes.
     Candidate,
     /// Leader state - handles client requests, replicates log.
     Leader,
-}
-
-impl Default for RaftState {
-    fn default() -> Self {
-        Self::Follower
-    }
 }
 
 /// Output actions from the Raft state machine.
@@ -124,49 +119,49 @@ impl RaftNode {
 
     /// Returns this node's ID.
     #[must_use]
-    pub fn node_id(&self) -> NodeId {
+    pub const fn node_id(&self) -> NodeId {
         self.config.node_id
     }
 
     /// Returns the current term.
     #[must_use]
-    pub fn current_term(&self) -> TermId {
+    pub const fn current_term(&self) -> TermId {
         self.current_term
     }
 
     /// Returns the current state (role).
     #[must_use]
-    pub fn state(&self) -> RaftState {
+    pub const fn state(&self) -> RaftState {
         self.state
     }
 
     /// Returns true if this node is the leader.
     #[must_use]
-    pub fn is_leader(&self) -> bool {
-        self.state == RaftState::Leader
+    pub const fn is_leader(&self) -> bool {
+        matches!(self.state, RaftState::Leader)
     }
 
     /// Returns the current leader ID if known.
     #[must_use]
-    pub fn leader_id(&self) -> Option<NodeId> {
+    pub const fn leader_id(&self) -> Option<NodeId> {
         self.leader_id
     }
 
     /// Returns the commit index.
     #[must_use]
-    pub fn commit_index(&self) -> LogIndex {
+    pub const fn commit_index(&self) -> LogIndex {
         self.commit_index
     }
 
     /// Returns the last applied index.
     #[must_use]
-    pub fn last_applied(&self) -> LogIndex {
+    pub const fn last_applied(&self) -> LogIndex {
         self.last_applied
     }
 
     /// Returns a reference to the log.
     #[must_use]
-    pub fn log(&self) -> &RaftLog {
+    pub const fn log(&self) -> &RaftLog {
         &self.log
     }
 
@@ -314,7 +309,7 @@ impl RaftNode {
         self.votes_received.clear();
     }
 
-    /// Handles a RequestVote request.
+    /// Handles a `RequestVote` request.
     fn handle_request_vote(&mut self, req: RequestVoteRequest) -> Vec<RaftOutput> {
         let mut outputs = Vec::new();
 
@@ -346,10 +341,7 @@ impl RaftNode {
         }
 
         // Check if we can vote for this candidate.
-        let can_vote = match self.voted_for {
-            None => true,
-            Some(id) => id == req.candidate_id,
-        };
+        let can_vote = self.voted_for.map_or(true, |id| id == req.candidate_id);
 
         if !can_vote {
             return false;
@@ -359,7 +351,7 @@ impl RaftNode {
         self.log.is_up_to_date(req.last_log_term, req.last_log_index)
     }
 
-    /// Handles a RequestVote response.
+    /// Handles a `RequestVote` response.
     fn handle_request_vote_response(&mut self, resp: RequestVoteResponse) -> Vec<RaftOutput> {
         let mut outputs = Vec::new();
 
@@ -416,7 +408,7 @@ impl RaftNode {
         outputs
     }
 
-    /// Handles an AppendEntries request.
+    /// Handles an `AppendEntries` request.
     fn handle_append_entries(&mut self, req: AppendEntriesRequest) -> Vec<RaftOutput> {
         let mut outputs = Vec::new();
 
@@ -494,7 +486,7 @@ impl RaftNode {
         outputs
     }
 
-    /// Handles an AppendEntries response (leader only).
+    /// Handles an `AppendEntries` response (leader only).
     fn handle_append_entries_response(
         &mut self,
         resp: AppendEntriesResponse,
@@ -529,7 +521,7 @@ impl RaftNode {
         outputs
     }
 
-    /// Sends AppendEntries to a specific peer.
+    /// Sends `AppendEntries` to a specific peer.
     fn send_append_entries(&self, peer: NodeId) -> Vec<RaftOutput> {
         let mut outputs = Vec::new();
 
@@ -574,8 +566,8 @@ impl RaftNode {
 
         // Check each index from commit_index+1 to last_index.
         // Bounded loop: at most (last_index - commit_index) iterations.
-        let loop_bound = self.log.last_index().get().saturating_sub(self.commit_index.get());
-        debug_assert!(loop_bound <= u64::MAX); // Explicit bound check.
+        let _loop_bound = self.log.last_index().get().saturating_sub(self.commit_index.get());
+        // Loop is bounded by the log length which is finite.
 
         for n in (self.commit_index.get() + 1)..=self.log.last_index().get() {
             let idx = LogIndex::new(n);

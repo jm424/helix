@@ -52,7 +52,7 @@ pub struct WalStorage {
 impl WalStorage {
     /// Creates a new WAL storage.
     #[must_use]
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         let config = SegmentConfig::new();
         // Segment starts at index 0 to hold metadata.
         let segment = Segment::new(SegmentId::new(0), 0, config);
@@ -69,7 +69,7 @@ impl WalStorage {
 
     /// Creates WAL storage with a custom segment configuration.
     #[must_use]
-    pub fn with_config(config: SegmentConfig) -> Self {
+    pub const fn with_config(config: SegmentConfig) -> Self {
         let segment = Segment::new(SegmentId::new(0), 0, config);
 
         Self {
@@ -88,7 +88,7 @@ impl WalStorage {
     /// Returns an error if recovery fails.
     pub fn recover(data: Bytes, config: SegmentConfig) -> StorageResult<Self> {
         let segment = Segment::decode(data, config).map_err(|e| StorageError::Corruption {
-            message: format!("failed to decode segment: {}", e),
+            message: format!("failed to decode segment: {e}"),
         })?;
 
         let mut storage = Self {
@@ -140,17 +140,17 @@ impl WalStorage {
         Ok(())
     }
 
-    /// Converts a Raft LogEntry to a WAL Entry.
+    /// Converts a Raft `LogEntry` to a WAL Entry.
     fn log_to_wal_entry(entry: &LogEntry) -> StorageResult<Entry> {
         Entry::new(entry.term.get(), entry.index.get(), entry.data.clone()).map_err(|e| {
             StorageError::Io {
                 operation: "encode",
-                message: format!("failed to create WAL entry: {}", e),
+                message: format!("failed to create WAL entry: {e}"),
             }
         })
     }
 
-    /// Converts a WAL Entry to a Raft LogEntry.
+    /// Converts a WAL Entry to a Raft `LogEntry`.
     fn wal_to_log_entry(entry: &helix_wal::Entry) -> LogEntry {
         LogEntry::new(
             TermId::new(entry.term()),
@@ -181,7 +181,7 @@ impl RaftStorage for WalStorage {
         let wal_entry = Entry::new(METADATA_TERM, METADATA_INDEX, payload).map_err(|e| {
             StorageError::Io {
                 operation: "save_state",
-                message: format!("failed to create metadata entry: {}", e),
+                message: format!("failed to create metadata entry: {e}"),
             }
         })?;
 
@@ -196,7 +196,7 @@ impl RaftStorage for WalStorage {
         if self.segment.entry_count() == 0 {
             self.segment.append(wal_entry).map_err(|e| StorageError::Io {
                 operation: "save_state",
-                message: format!("failed to append metadata: {}", e),
+                message: format!("failed to append metadata: {e}"),
             })?;
         }
         // Otherwise, the metadata is cached and will be persisted on full rebuild.
@@ -215,7 +215,7 @@ impl RaftStorage for WalStorage {
 
             self.segment.append(wal_entry).map_err(|e| StorageError::Io {
                 operation: "append",
-                message: format!("failed to append entry: {}", e),
+                message: format!("failed to append entry: {e}"),
             })?;
 
             // Update tracking.
@@ -234,7 +234,7 @@ impl RaftStorage for WalStorage {
             helix_wal::WalError::IndexOutOfBounds { .. } => StorageError::NotFound { index },
             other => StorageError::Io {
                 operation: "read",
-                message: format!("{}", other),
+                message: format!("{other}"),
             },
         })?;
 
@@ -264,7 +264,7 @@ impl RaftStorage for WalStorage {
                 Err(e) => {
                     return Err(StorageError::Io {
                         operation: "read",
-                        message: format!("{}", e),
+                        message: format!("{e}"),
                     });
                 }
             }
@@ -276,7 +276,7 @@ impl RaftStorage for WalStorage {
     fn truncate_after(&mut self, last_to_keep: LogIndex) -> StorageResult<()> {
         self.segment.truncate_after(last_to_keep.get()).map_err(|e| StorageError::Io {
             operation: "truncate",
-            message: format!("{}", e),
+            message: format!("{e}"),
         })?;
 
         // Update tracking.

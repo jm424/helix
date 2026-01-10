@@ -12,10 +12,10 @@
 //!
 //! # Message Types
 //!
-//! - 0: RequestVote
-//! - 1: RequestVoteResponse
-//! - 2: AppendEntries
-//! - 3: AppendEntriesResponse
+//! - 0: `RequestVote`
+//! - 1: `RequestVoteResponse`
+//! - 2: `AppendEntries`
+//! - 3: `AppendEntriesResponse`
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use helix_core::{LogIndex, NodeId, TermId};
@@ -100,6 +100,8 @@ pub fn encode_message(message: &Message) -> CodecResult<Bytes> {
     }
 
     // Fill in length (excluding the 4-byte header).
+    // Safe cast: message size is bounded by MAX_MESSAGE_SIZE which fits in u32.
+    #[allow(clippy::cast_possible_truncation)]
     let len = (buf.len() - 4) as u32;
     if len > MAX_MESSAGE_SIZE {
         return Err(CodecError::MessageTooLarge {
@@ -130,9 +132,12 @@ pub fn decode_message(data: &[u8]) -> CodecResult<(Message, usize)> {
 
     let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
 
+    // Safe cast: len is bounded by MAX_MESSAGE_SIZE which fits in u32.
+    #[allow(clippy::cast_possible_truncation)]
+    let len_u32 = len as u32;
     if len > MAX_MESSAGE_SIZE as usize {
         return Err(CodecError::MessageTooLarge {
-            size: len as u32,
+            size: len_u32,
             max: MAX_MESSAGE_SIZE,
         });
     }
@@ -230,7 +235,10 @@ fn encode_append_entries(buf: &mut BytesMut, req: &AppendEntriesRequest) {
     buf.put_u64_le(req.leader_commit.get());
 
     // Encode entries count and entries.
-    buf.put_u32_le(req.entries.len() as u32);
+    // Safe cast: entries count is bounded by batch limits which fit in u32.
+    #[allow(clippy::cast_possible_truncation)]
+    let entry_count = req.entries.len() as u32;
+    buf.put_u32_le(entry_count);
     for entry in &req.entries {
         encode_log_entry(buf, entry);
     }
@@ -297,7 +305,10 @@ fn decode_append_entries_response(buf: &mut &[u8]) -> CodecResult<AppendEntriesR
 fn encode_log_entry(buf: &mut BytesMut, entry: &LogEntry) {
     buf.put_u64_le(entry.term.get());
     buf.put_u64_le(entry.index.get());
-    buf.put_u32_le(entry.data.len() as u32);
+    // Safe cast: entry data size is bounded by message limits which fit in u32.
+    #[allow(clippy::cast_possible_truncation)]
+    let data_len = entry.data.len() as u32;
+    buf.put_u32_le(data_len);
     buf.put_slice(&entry.data);
 }
 
@@ -317,7 +328,7 @@ fn decode_log_entry(buf: &mut &[u8]) -> CodecResult<LogEntry> {
 }
 
 /// Ensures the buffer has at least `need` bytes remaining.
-fn ensure_remaining(buf: &[u8], need: usize) -> CodecResult<()> {
+const fn ensure_remaining(buf: &[u8], need: usize) -> CodecResult<()> {
     if buf.len() < need {
         return Err(CodecError::InsufficientData {
             need,
