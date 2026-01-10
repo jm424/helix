@@ -66,6 +66,12 @@ And verifying these properties ALWAYS hold:
 - Do NOT create new crates not in the plan without discussion
 - Do NOT mark phases complete without testing milestones
 
+### Deferred Items
+
+These items from the plan are intentionally deferred:
+- CI pipeline setup (run tests locally for now)
+- io_uring storage implementation (use standard file I/O)
+
 ## TigerStyle for Rust
 
 This project follows TigerStyle principles adapted for Rust. See `TIGER_STYLE.md` for the full philosophy.

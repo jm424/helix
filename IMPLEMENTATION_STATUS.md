@@ -50,7 +50,7 @@ The plan requires:
 | `multi_raft.tla` - Multi-group coordination | ❌ Not Started | |
 | `progress.tla` - Consumer progress tracking | ❌ Not Started | |
 | `tiering.tla` - Tiered storage consistency | ❌ Not Started | |
-| Model checking CI job (TLC) | ❌ Not Started | |
+| Model checking CI job (TLC) | 🔜 Deferred | Run locally for now |
 
 #### 0.2 Helix Core Types
 
@@ -70,7 +70,7 @@ The plan requires:
 | `RaftActor` implementing `SimulatedActor` | ✅ Done | `helix-tests/raft_actor.rs` |
 | Property definitions for Raft invariants | ⚠️ Basic | `properties.rs` exists but minimal |
 | ScenarioBuilder test examples | ❌ Not Used | Tests don't use ScenarioBuilder |
-| CI with multiple seed runs | ❌ Not Set Up | |
+| CI with multiple seed runs | 🔜 Deferred | Run locally for now |
 
 #### 0.4 Production Runtime
 
@@ -212,25 +212,44 @@ Missing: `helix-kafka-proxy` crate.
 
 To get back on track with the plan:
 
-1. **Complete Phase 1 Testing Milestones** (CRITICAL)
-   - Implement comprehensive Bloodhound simulation tests
-   - Run 10,000+ simulated hours with fault injection
-   - Verify SingleLeaderPerTerm and LogMatching properties
-   - Add TLA+ trace validation
+### Immediate Priority: Phase 1 Testing Milestones (CRITICAL)
 
-2. **Complete Missing Raft Features**
-   - Pre-vote extension
-   - Leadership transfer
+**Goal**: Run 10,000+ simulated hours with fault injection, zero safety violations.
+
+1. **Enhance Bloodhound simulation tests**
+   - Add network partition injection
+   - Add node crash/restart scenarios
+   - Add message delay/reordering
+   - Run with multiple random seeds
+
+2. **Implement property checking**
+   - `SingleLeaderPerTerm` - verify at every simulation step
+   - `LogMatching` - verify logs are consistent across nodes
+   - `LeaderCompleteness` - committed entries in future leaders
+
+3. **Add TLA+ trace validation** (optional but valuable)
+   - Compare implementation traces against TLA+ spec
+
+### After Testing Milestones
+
+4. **Complete Missing Raft Features**
+   - Pre-vote extension (prevents disruption from partitioned nodes)
+   - Leadership transfer (graceful leader handoff)
    - (Optional) Configuration changes
 
-3. **Implement Multi-Raft (Phase 2)**
+5. **Implement Multi-Raft (Phase 2)**
    - Create `MultiRaft` engine
    - Message batching
    - Election staggering
    - Create `helix-routing` for shard management
 
-4. **Refactor helix-server**
+6. **Refactor helix-server**
    - Wire to Multi-Raft instead of individual RaftNodes per partition
+
+### Deferred
+
+- CI pipeline setup (run tests locally for now)
+- io_uring storage implementation
 
 ---
 
