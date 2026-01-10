@@ -1,0 +1,15 @@
+# Build artifacts
+/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# TLC model checker artifacts
+specs/*.toolbox/
+specs/states/

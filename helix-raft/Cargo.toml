@@ -1,0 +1,22 @@
+[package]
+name = "helix-raft"
+description = "Raft consensus implementation for Helix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+helix-core = { workspace = true }
+helix-wal = { workspace = true }
+bloodhound = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tokio = { workspace = true }

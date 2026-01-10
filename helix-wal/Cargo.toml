@@ -1,0 +1,22 @@
+[package]
+name = "helix-wal"
+description = "Write-Ahead Log implementation for Helix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+helix-core = { workspace = true }
+bloodhound = { workspace = true }
+bytes = { workspace = true }
+crc32fast = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tokio = { workspace = true }

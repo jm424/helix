@@ -1,0 +1,18 @@
+[package]
+name = "helix-core"
+description = "Core types and configuration for Helix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# No external dependencies - this crate is pure Rust types.
+# Clock, Network, Storage, Rng come from Bloodhound.
+
+[dev-dependencies]
+proptest = { workspace = true }
