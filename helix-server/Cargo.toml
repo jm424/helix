@@ -1,6 +1,6 @@
 [package]
-name = "helix-tests"
-description = "Bloodhound simulation tests for Helix"
+name = "helix-server"
+description = "Helix distributed log server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,21 +10,27 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[[bin]]
+name = "helix-server"
+path = "src/main.rs"
+
 [dependencies]
 helix-core = { workspace = true }
-helix-wal = { workspace = true }
 helix-raft = { workspace = true }
-helix-server = { workspace = true }
-bloodhound = { workspace = true }
+helix-runtime = { workspace = true }
+helix-partition = { workspace = true }
 tokio = { workspace = true }
-tokio-stream = { workspace = true }
 tonic = { workspace = true }
-async-trait = { workspace = true }
-rand_chacha = { workspace = true }
-rand = { workspace = true }
+prost = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
-tracing-subscriber = { workspace = true }

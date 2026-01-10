@@ -1,0 +1,184 @@
+syntax = "proto3";
+
+package helix.v1;
+
+// Helix storage service for distributed log operations.
+service Helix {
+    // Write records to a topic partition.
+    rpc Write(WriteRequest) returns (WriteResponse);
+
+    // Read records from a topic partition.
+    rpc Read(ReadRequest) returns (ReadResponse);
+
+    // Get cluster metadata.
+    rpc GetMetadata(GetMetadataRequest) returns (GetMetadataResponse);
+
+    // Get partition info.
+    rpc GetPartitionInfo(GetPartitionInfoRequest) returns (GetPartitionInfoResponse);
+}
+
+// A single record to be written or read.
+message Record {
+    // Optional key for partitioning.
+    optional bytes key = 1;
+    // Record value/payload.
+    bytes value = 2;
+    // Optional headers.
+    map<string, bytes> headers = 3;
+    // Timestamp in milliseconds since epoch (set by server if not provided).
+    optional int64 timestamp_ms = 4;
+}
+
+// Request to write records.
+message WriteRequest {
+    // Topic to write to.
+    string topic = 1;
+    // Partition to write to (or -1 for automatic partitioning).
+    int32 partition = 2;
+    // Records to write.
+    repeated Record records = 3;
+    // Required acknowledgments: 0=none, 1=leader, -1=all.
+    int32 required_acks = 4;
+}
+
+// Response from write operation.
+message WriteResponse {
+    // Base offset of the first record written.
+    uint64 base_offset = 1;
+    // Number of records written.
+    uint32 record_count = 2;
+    // Error code (0 = success).
+    ErrorCode error_code = 3;
+    // Error message if any.
+    optional string error_message = 4;
+}
+
+// Request to read records.
+message ReadRequest {
+    // Topic to read from.
+    string topic = 1;
+    // Partition to read from.
+    int32 partition = 2;
+    // Starting offset.
+    uint64 offset = 3;
+    // Maximum number of records to return.
+    uint32 max_records = 4;
+    // Maximum bytes to return.
+    uint32 max_bytes = 5;
+}
+
+// Response from read operation.
+message ReadResponse {
+    // Records read.
+    repeated RecordWithOffset records = 1;
+    // High watermark (last committed offset + 1).
+    uint64 high_watermark = 2;
+    // Error code (0 = success).
+    ErrorCode error_code = 3;
+    // Error message if any.
+    optional string error_message = 4;
+}
+
+// A record with its offset.
+message RecordWithOffset {
+    // The offset of this record.
+    uint64 offset = 1;
+    // The record data.
+    Record record = 2;
+}
+
+// Request for cluster metadata.
+message GetMetadataRequest {
+    // Topics to get metadata for (empty = all topics).
+    repeated string topics = 1;
+}
+
+// Response with cluster metadata.
+message GetMetadataResponse {
+    // Cluster ID.
+    string cluster_id = 1;
+    // Controller node ID.
+    uint64 controller_id = 2;
+    // Broker information.
+    repeated BrokerInfo brokers = 3;
+    // Topic information.
+    repeated TopicInfo topics = 4;
+}
+
+// Information about a broker.
+message BrokerInfo {
+    // Node ID.
+    uint64 node_id = 1;
+    // Host address.
+    string host = 2;
+    // Port for client connections.
+    uint32 port = 3;
+}
+
+// Information about a topic.
+message TopicInfo {
+    // Topic name.
+    string name = 1;
+    // Topic ID.
+    uint64 topic_id = 2;
+    // Partition information.
+    repeated PartitionInfo partitions = 3;
+}
+
+// Information about a partition.
+message PartitionInfo {
+    // Partition index.
+    int32 partition = 1;
+    // Leader node ID.
+    uint64 leader = 2;
+    // Replica node IDs.
+    repeated uint64 replicas = 3;
+    // In-sync replica node IDs.
+    repeated uint64 isr = 4;
+}
+
+// Request for partition info.
+message GetPartitionInfoRequest {
+    // Topic name.
+    string topic = 1;
+    // Partition index.
+    int32 partition = 2;
+}
+
+// Response with partition info.
+message GetPartitionInfoResponse {
+    // Partition info.
+    PartitionInfo partition = 1;
+    // Log start offset.
+    uint64 log_start_offset = 2;
+    // Log end offset.
+    uint64 log_end_offset = 3;
+    // High watermark.
+    uint64 high_watermark = 4;
+    // Error code.
+    ErrorCode error_code = 5;
+    // Error message if any.
+    optional string error_message = 6;
+}
+
+// Error codes.
+enum ErrorCode {
+    // No error.
+    NONE = 0;
+    // Unknown error.
+    UNKNOWN = 1;
+    // Offset out of range.
+    OFFSET_OUT_OF_RANGE = 2;
+    // Invalid topic.
+    INVALID_TOPIC = 3;
+    // Invalid partition.
+    INVALID_PARTITION = 4;
+    // Not leader for partition.
+    NOT_LEADER = 5;
+    // Request timed out.
+    REQUEST_TIMEOUT = 6;
+    // Broker not available.
+    BROKER_NOT_AVAILABLE = 7;
+    // Record batch too large.
+    RECORD_BATCH_TOO_LARGE = 8;
+}

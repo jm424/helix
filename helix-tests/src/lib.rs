@@ -23,4 +23,6 @@ pub mod scenarios;
 #[cfg(test)]
 mod raft_tests;
 #[cfg(test)]
+mod server_tests;
+#[cfg(test)]
 mod wal_tests;
