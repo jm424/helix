@@ -3,15 +3,17 @@
 //! This module implements the Helix gRPC service, handling Write, Read,
 //! and Metadata requests from clients.
 //!
-//! The service is backed by Raft-replicated partitions for durability
-//! and consistency.
+//! The service is backed by Multi-Raft for consensus across multiple
+//! partition groups, with separate partition storage for durability.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use helix_core::{NodeId, Offset, PartitionId, Record, TopicId};
-use helix_partition::{ReplicatedPartitionConfig, ReplicationManager, ReplicationState};
-use helix_raft::RaftOutput;
+use bytes::Bytes;
+use helix_core::{GroupId, LogIndex, NodeId, Offset, PartitionId, Record, TopicId};
+use helix_partition::{Partition, PartitionConfig, PartitionCommand};
+use helix_raft::multi::{MultiRaft, MultiRaftOutput};
+use helix_raft::RaftState;
 use tokio::sync::{mpsc, RwLock};
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
@@ -30,7 +32,7 @@ const MAX_RECORDS_PER_WRITE: usize = 1000;
 const MAX_BYTES_PER_READ: u32 = 1024 * 1024;
 
 /// Tick interval in milliseconds.
-/// A single tick drives both elections and heartbeats.
+/// A single tick drives both elections and heartbeats for all groups.
 const TICK_INTERVAL_MS: u64 = 50;
 
 /// Topic metadata.
@@ -42,16 +44,147 @@ struct TopicMetadata {
     partition_count: i32,
 }
 
-/// The Helix gRPC service.
+/// Storage for a single partition.
+struct PartitionStorage {
+    /// Topic ID.
+    #[allow(dead_code)]
+    topic_id: TopicId,
+    /// Partition ID.
+    #[allow(dead_code)]
+    partition_id: PartitionId,
+    /// The underlying partition storage.
+    partition: Partition,
+    /// Last applied Raft log index.
+    last_applied: LogIndex,
+}
+
+impl PartitionStorage {
+    /// Creates new partition storage.
+    fn new(topic_id: TopicId, partition_id: PartitionId) -> Self {
+        let config = PartitionConfig::new(topic_id, partition_id);
+        Self {
+            topic_id,
+            partition_id,
+            partition: Partition::new(config),
+            last_applied: LogIndex::new(0),
+        }
+    }
+
+    /// Applies a committed entry to the partition.
+    fn apply_entry(&mut self, index: LogIndex, data: &Bytes) -> ServerResult<Option<Offset>> {
+        // Skip if already applied.
+        if index <= self.last_applied {
+            return Ok(None);
+        }
+
+        // Skip empty entries (e.g., no-op entries).
+        if data.is_empty() {
+            self.last_applied = index;
+            return Ok(None);
+        }
+
+        let command = PartitionCommand::decode(data).ok_or_else(|| ServerError::Internal {
+            message: "failed to decode partition command".to_string(),
+        })?;
+
+        let base_offset = match command {
+            PartitionCommand::Append { records } => {
+                let offset = self.partition.append(records).map_err(|e| {
+                    ServerError::Internal {
+                        message: format!("failed to append: {e}"),
+                    }
+                })?;
+
+                // Update high watermark since entry is committed.
+                let new_hwm = self.partition.log_end_offset();
+                self.partition.set_high_watermark(new_hwm);
+
+                Some(offset)
+            }
+            PartitionCommand::Truncate { from_offset } => {
+                self.partition.truncate(from_offset).map_err(|e| {
+                    ServerError::Internal {
+                        message: format!("failed to truncate: {e}"),
+                    }
+                })?;
+                None
+            }
+            PartitionCommand::UpdateHighWatermark { high_watermark } => {
+                self.partition.set_high_watermark(high_watermark);
+                None
+            }
+        };
+
+        self.last_applied = index;
+        Ok(base_offset)
+    }
+}
+
+/// Maps between (TopicId, PartitionId) and GroupId.
+struct GroupMap {
+    /// Forward mapping: (TopicId, PartitionId) -> GroupId.
+    by_key: HashMap<(TopicId, PartitionId), GroupId>,
+    /// Reverse mapping: GroupId -> (TopicId, PartitionId).
+    by_group: HashMap<GroupId, (TopicId, PartitionId)>,
+    /// Next group ID to assign.
+    next_group_id: u64,
+}
+
+impl GroupMap {
+    /// Creates a new empty group map.
+    fn new() -> Self {
+        Self {
+            by_key: HashMap::new(),
+            by_group: HashMap::new(),
+            next_group_id: 1,
+        }
+    }
+
+    /// Allocates a new group ID for a topic/partition pair.
+    fn allocate(&mut self, topic_id: TopicId, partition_id: PartitionId) -> GroupId {
+        let key = (topic_id, partition_id);
+
+        // Return existing if already allocated.
+        if let Some(&group_id) = self.by_key.get(&key) {
+            return group_id;
+        }
+
+        // Allocate new group ID.
+        let group_id = GroupId::new(self.next_group_id);
+        self.next_group_id += 1;
+
+        self.by_key.insert(key, group_id);
+        self.by_group.insert(group_id, key);
+
+        group_id
+    }
+
+    /// Gets the group ID for a topic/partition pair.
+    fn get(&self, topic_id: TopicId, partition_id: PartitionId) -> Option<GroupId> {
+        self.by_key.get(&(topic_id, partition_id)).copied()
+    }
+
+    /// Gets the topic/partition pair for a group ID.
+    fn get_key(&self, group_id: GroupId) -> Option<(TopicId, PartitionId)> {
+        self.by_group.get(&group_id).copied()
+    }
+}
+
+/// The Helix gRPC service backed by Multi-Raft.
 ///
-/// This provides a Raft-replicated implementation for production use.
+/// This provides a Raft-replicated implementation using the Multi-Raft
+/// engine for efficient management of many partition groups.
 pub struct HelixService {
     /// Cluster ID.
     cluster_id: String,
     /// This node's ID.
     node_id: NodeId,
-    /// Replication manager for all partitions.
-    replication: Arc<RwLock<ReplicationManager>>,
+    /// Multi-Raft engine for consensus.
+    multi_raft: Arc<RwLock<MultiRaft>>,
+    /// Partition storage indexed by GroupId.
+    partition_storage: Arc<RwLock<HashMap<GroupId, PartitionStorage>>>,
+    /// Group ID mapping.
+    group_map: Arc<RwLock<GroupMap>>,
     /// Topic name to metadata mapping.
     topics: Arc<RwLock<HashMap<String, TopicMetadata>>>,
     /// Next topic ID.
@@ -63,26 +196,34 @@ pub struct HelixService {
 }
 
 impl HelixService {
-    /// Creates a new Helix service.
+    /// Creates a new Helix service backed by Multi-Raft.
     ///
-    /// This starts a background task to handle Raft ticks.
+    /// This starts a background task to handle Raft ticks for all groups.
     #[must_use]
     pub fn new(cluster_id: String, node_id: u64) -> Self {
         let node_id = NodeId::new(node_id);
         let cluster_nodes = vec![node_id]; // Single node for now.
 
-        let replication = Arc::new(RwLock::new(ReplicationManager::new(node_id)));
-        let replication_clone = Arc::clone(&replication);
+        let multi_raft = Arc::new(RwLock::new(MultiRaft::new(node_id)));
+        let partition_storage = Arc::new(RwLock::new(HashMap::new()));
+        let group_map = Arc::new(RwLock::new(GroupMap::new()));
 
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
         // Start background tick task.
-        tokio::spawn(Self::tick_task(replication_clone, shutdown_rx));
+        tokio::spawn(Self::tick_task(
+            Arc::clone(&multi_raft),
+            Arc::clone(&partition_storage),
+            Arc::clone(&group_map),
+            shutdown_rx,
+        ));
 
         Self {
             cluster_id,
             node_id,
-            replication,
+            multi_raft,
+            partition_storage,
+            group_map,
             topics: Arc::new(RwLock::new(HashMap::new())),
             next_topic_id: Arc::new(RwLock::new(1)),
             cluster_nodes,
@@ -90,19 +231,20 @@ impl HelixService {
         }
     }
 
-    /// Background task to handle Raft ticks.
+    /// Background task to handle Raft ticks for all groups.
     ///
-    /// A single tick timer drives both
-    /// election timeouts and leader heartbeats. The Raft library internally
-    /// tracks elapsed ticks and triggers actions when thresholds are reached.
+    /// A single tick timer drives elections and heartbeats for all groups.
+    /// Each group internally tracks elapsed ticks and triggers actions
+    /// when thresholds are reached.
     #[allow(clippy::significant_drop_tightening)]
     async fn tick_task(
-        replication: Arc<RwLock<ReplicationManager>>,
+        multi_raft: Arc<RwLock<MultiRaft>>,
+        partition_storage: Arc<RwLock<HashMap<GroupId, PartitionStorage>>>,
+        group_map: Arc<RwLock<GroupMap>>,
         mut shutdown_rx: mpsc::Receiver<()>,
     ) {
-        let mut tick_interval = tokio::time::interval(
-            tokio::time::Duration::from_millis(TICK_INTERVAL_MS)
-        );
+        let mut tick_interval =
+            tokio::time::interval(tokio::time::Duration::from_millis(TICK_INTERVAL_MS));
 
         loop {
             tokio::select! {
@@ -111,57 +253,90 @@ impl HelixService {
                     break;
                 }
                 _ = tick_interval.tick() => {
-                    let mut repl = replication.write().await;
-                    let outputs = repl.tick();
-                    for ((topic_id, partition_id), partition_outputs) in outputs {
-                        Self::process_outputs(&mut repl, topic_id, partition_id, &partition_outputs);
-                    }
+                    let outputs = {
+                        let mut mr = multi_raft.write().await;
+                        mr.tick()
+                    };
+                    Self::process_outputs(
+                        &outputs,
+                        &partition_storage,
+                        &group_map,
+                    ).await;
                 }
             }
         }
     }
 
-    /// Processes Raft outputs for a partition.
-    fn process_outputs(
-        replication: &mut ReplicationManager,
-        topic_id: TopicId,
-        partition_id: PartitionId,
-        outputs: &[RaftOutput],
+    /// Processes Multi-Raft outputs.
+    async fn process_outputs(
+        outputs: &[MultiRaftOutput],
+        partition_storage: &Arc<RwLock<HashMap<GroupId, PartitionStorage>>>,
+        group_map: &Arc<RwLock<GroupMap>>,
     ) {
-        if outputs.is_empty() {
-            return;
-        }
-
-        // Apply committed entries.
-        if let Some(partition) = replication.get_mut(topic_id, partition_id) {
-            if let Err(e) = partition.apply_outputs(outputs) {
-                warn!(
-                    topic = topic_id.get(),
-                    partition = partition_id.get(),
-                    error = %e,
-                    "Failed to apply outputs"
-                );
-            }
-        }
-
-        // Log state changes.
         for output in outputs {
             match output {
-                RaftOutput::BecameLeader => {
-                    info!(
-                        topic = topic_id.get(),
-                        partition = partition_id.get(),
-                        "Became leader"
+                MultiRaftOutput::CommitEntry {
+                    group_id,
+                    index,
+                    data,
+                } => {
+                    let key = {
+                        let gm = group_map.read().await;
+                        gm.get_key(*group_id)
+                    };
+
+                    if let Some((topic_id, partition_id)) = key {
+                        let mut storage = partition_storage.write().await;
+                        if let Some(ps) = storage.get_mut(group_id) {
+                            if let Err(e) = ps.apply_entry(*index, data) {
+                                warn!(
+                                    topic = topic_id.get(),
+                                    partition = partition_id.get(),
+                                    error = %e,
+                                    "Failed to apply committed entry"
+                                );
+                            }
+                        }
+                    }
+                }
+                MultiRaftOutput::BecameLeader { group_id } => {
+                    let key = {
+                        let gm = group_map.read().await;
+                        gm.get_key(*group_id)
+                    };
+                    if let Some((topic_id, partition_id)) = key {
+                        info!(
+                            topic = topic_id.get(),
+                            partition = partition_id.get(),
+                            group = group_id.get(),
+                            "Became leader"
+                        );
+                    }
+                }
+                MultiRaftOutput::SteppedDown { group_id } => {
+                    let key = {
+                        let gm = group_map.read().await;
+                        gm.get_key(*group_id)
+                    };
+                    if let Some((topic_id, partition_id)) = key {
+                        info!(
+                            topic = topic_id.get(),
+                            partition = partition_id.get(),
+                            group = group_id.get(),
+                            "Stepped down from leader"
+                        );
+                    }
+                }
+                MultiRaftOutput::SendMessages { to, messages } => {
+                    // For multi-node clusters, this is where we'd send
+                    // messages over the network. For now (single-node),
+                    // we can ignore these.
+                    debug!(
+                        to = to.get(),
+                        count = messages.len(),
+                        "Would send messages (single-node, ignoring)"
                     );
                 }
-                RaftOutput::SteppedDown => {
-                    info!(
-                        topic = topic_id.get(),
-                        partition = partition_id.get(),
-                        "Stepped down from leader"
-                    );
-                }
-                _ => {}
             }
         }
     }
@@ -174,11 +349,7 @@ impl HelixService {
     /// # Panics
     /// Panics if `partition_count` is not in the range (0, 256].
     #[allow(clippy::significant_drop_tightening)]
-    pub async fn create_topic(
-        &self,
-        name: String,
-        partition_count: i32,
-    ) -> ServerResult<()> {
+    pub async fn create_topic(&self, name: String, partition_count: i32) -> ServerResult<()> {
         assert!(partition_count > 0, "partition_count must be positive");
         assert!(partition_count <= 256, "partition_count exceeds limit");
 
@@ -193,34 +364,57 @@ impl HelixService {
         let topic_id = TopicId::new(*next_id);
         *next_id += 1;
 
-        // Create partitions.
-        let mut replication = self.replication.write().await;
+        // Create partition groups.
+        let mut multi_raft = self.multi_raft.write().await;
+        let mut group_map = self.group_map.write().await;
+        let mut partition_storage = self.partition_storage.write().await;
+
         for i in 0..partition_count {
             // Safe cast: partition_count is bounded by 256.
             #[allow(clippy::cast_sign_loss)]
             let partition_id = PartitionId::new(i as u64);
-            let config = ReplicatedPartitionConfig::new(
-                topic_id,
-                partition_id,
-                self.node_id,
-                self.cluster_nodes.clone(),
-            );
-            replication.add_partition(config);
+
+            // Allocate group ID for this partition.
+            let group_id = group_map.allocate(topic_id, partition_id);
+
+            // Create Raft group (single-node cluster).
+            multi_raft
+                .create_group(group_id, self.cluster_nodes.clone())
+                .map_err(|e| ServerError::Internal {
+                    message: format!("failed to create Raft group: {e}"),
+                })?;
+
+            // Create partition storage.
+            partition_storage.insert(group_id, PartitionStorage::new(topic_id, partition_id));
 
             // For single-node cluster, tick until the node becomes leader.
             // With default election_tick=10 and randomized timeout in [10, 20),
             // we need up to 20 ticks to guarantee an election.
             if self.cluster_nodes.len() == 1 {
                 for _ in 0..25 {
-                    let (outputs, is_leader) = {
-                        if let Some(partition) = replication.get_mut(topic_id, partition_id) {
-                            let outputs = partition.tick();
-                            (outputs, partition.is_leader())
-                        } else {
-                            break;
+                    let outputs = multi_raft.tick();
+
+                    // Apply any committed entries.
+                    for output in &outputs {
+                        if let MultiRaftOutput::CommitEntry {
+                            group_id: gid,
+                            index,
+                            data,
+                        } = output
+                        {
+                            if *gid == group_id {
+                                if let Some(ps) = partition_storage.get_mut(&group_id) {
+                                    let _ = ps.apply_entry(*index, data);
+                                }
+                            }
                         }
-                    };
-                    Self::process_outputs(&mut replication, topic_id, partition_id, &outputs);
+                    }
+
+                    // Check if became leader.
+                    let is_leader = multi_raft
+                        .group_state(group_id)
+                        .map_or(false, |s| s.state == RaftState::Leader);
+
                     if is_leader {
                         break;
                     }
@@ -251,18 +445,18 @@ impl HelixService {
     fn proto_to_record(proto: &ProtoRecord) -> Record {
         let mut record = if let Some(key) = &proto.key {
             Record::with_key(
-                bytes::Bytes::from(key.clone()),
-                bytes::Bytes::from(proto.value.clone()),
+                Bytes::from(key.clone()),
+                Bytes::from(proto.value.clone()),
             )
         } else {
-            Record::new(bytes::Bytes::from(proto.value.clone()))
+            Record::new(Bytes::from(proto.value.clone()))
         };
 
         if let Some(ts) = proto.timestamp_ms {
             record = record.with_timestamp(helix_core::Timestamp::from_millis(ts));
         }
         for (k, v) in &proto.headers {
-            record = record.with_header(k.clone(), bytes::Bytes::from(v.clone()));
+            record = record.with_header(k.clone(), Bytes::from(v.clone()));
         }
         record
     }
@@ -281,7 +475,7 @@ impl HelixService {
         }
     }
 
-    /// Internal write implementation.
+    /// Internal write implementation using Multi-Raft.
     #[allow(clippy::significant_drop_tightening)]
     async fn write_internal(&self, request: WriteRequest) -> ServerResult<WriteResponse> {
         // Validate request.
@@ -316,48 +510,77 @@ impl HelixService {
         #[allow(clippy::cast_sign_loss)]
         let partition_id = PartitionId::new(partition_idx as u64);
 
+        // Get the group ID for this partition.
+        let group_id = {
+            let gm = self.group_map.read().await;
+            gm.get(topic_meta.topic_id, partition_id).ok_or_else(|| {
+                ServerError::PartitionNotFound {
+                    topic: request.topic.clone(),
+                    partition: partition_idx,
+                }
+            })?
+        };
+
         // Convert proto records to core records.
-        let records: Vec<Record> = request
-            .records
-            .iter()
-            .map(Self::proto_to_record)
-            .collect();
+        let records: Vec<Record> = request.records.iter().map(Self::proto_to_record).collect();
 
         let record_count = records.len();
 
-        // Propose to Raft.
-        let mut replication = self.replication.write().await;
-        let partition = replication
-            .get_mut(topic_meta.topic_id, partition_id)
-            .ok_or_else(|| ServerError::PartitionNotFound {
+        // Get base offset before proposing.
+        let base_offset = {
+            let storage = self.partition_storage.read().await;
+            let ps = storage.get(&group_id).ok_or_else(|| ServerError::PartitionNotFound {
                 topic: request.topic.clone(),
                 partition: partition_idx,
             })?;
+            ps.partition.log_end_offset()
+        };
 
         // Check if we're the leader.
-        if partition.state() != ReplicationState::Leader {
+        let (is_leader, leader_hint) = {
+            let mr = self.multi_raft.read().await;
+            let state = mr.group_state(group_id);
+            let is_leader = state.as_ref().map_or(false, |s| s.state == RaftState::Leader);
+            let leader = state.and_then(|s| s.leader_id);
+            (is_leader, leader)
+        };
+
+        if !is_leader {
             return Err(ServerError::NotLeader {
                 topic: request.topic.clone(),
                 partition: partition_idx,
-                leader_hint: partition.leader().map(helix_core::NodeId::get),
+                leader_hint: leader_hint.map(NodeId::get),
             });
         }
 
-        // Get the base offset before appending.
-        let base_offset = partition.log_end_offset();
+        // Encode command and propose to Raft.
+        let command = PartitionCommand::Append { records };
+        let data = command.encode();
 
-        // Propose and wait for commit.
-        let outputs = partition
-            .propose_append(records)
-            .map_err(|e| ServerError::Internal {
-                message: format!("failed to propose: {e}"),
-            })?;
+        let outputs = {
+            let mut mr = self.multi_raft.write().await;
+            mr.propose(group_id, data)
+        };
 
-        // Apply the outputs (single-node: immediate commit).
+        // Apply any committed entries (single-node: immediate commit).
         if let Some(outputs) = outputs {
-            partition.apply_outputs(&outputs).map_err(|e| ServerError::Internal {
-                message: format!("failed to apply: {e}"),
-            })?;
+            for output in &outputs {
+                if let MultiRaftOutput::CommitEntry {
+                    group_id: gid,
+                    index,
+                    data,
+                } = output
+                {
+                    if *gid == group_id {
+                        let mut storage = self.partition_storage.write().await;
+                        if let Some(ps) = storage.get_mut(&group_id) {
+                            ps.apply_entry(*index, data).map_err(|e| ServerError::Internal {
+                                message: format!("failed to apply: {e}"),
+                            })?;
+                        }
+                    }
+                }
+            }
         }
 
         debug!(
@@ -404,17 +627,26 @@ impl HelixService {
         #[allow(clippy::cast_sign_loss)]
         let partition_id = PartitionId::new(request.partition as u64);
 
-        let replication = self.replication.read().await;
-        let partition = replication
-            .get(topic_meta.topic_id, partition_id)
-            .ok_or_else(|| ServerError::PartitionNotFound {
-                topic: request.topic.clone(),
-                partition: request.partition,
-            })?;
+        // Get the group ID for this partition.
+        let group_id = {
+            let gm = self.group_map.read().await;
+            gm.get(topic_meta.topic_id, partition_id).ok_or_else(|| {
+                ServerError::PartitionNotFound {
+                    topic: request.topic.clone(),
+                    partition: request.partition,
+                }
+            })?
+        };
+
+        let storage = self.partition_storage.read().await;
+        let ps = storage.get(&group_id).ok_or_else(|| ServerError::PartitionNotFound {
+            topic: request.topic.clone(),
+            partition: request.partition,
+        })?;
 
         // Check offset bounds.
-        let log_start = partition.log_start_offset();
-        let log_end = partition.log_end_offset();
+        let log_start = ps.partition.log_start_offset();
+        let log_end = ps.partition.log_end_offset();
 
         if request.offset < log_start.get() || request.offset > log_end.get() {
             return Err(ServerError::OffsetOutOfRange {
@@ -437,7 +669,7 @@ impl HelixService {
         };
 
         let start_offset = Offset::new(request.offset);
-        let records = partition.read(start_offset, max_records).map_err(|e| {
+        let records = ps.partition.read(start_offset, max_records).map_err(|e| {
             ServerError::Internal {
                 message: format!("failed to read: {e}"),
             }
@@ -454,7 +686,7 @@ impl HelixService {
             #[allow(clippy::cast_possible_truncation)]
             let value_size = record.value.len() as u32;
             #[allow(clippy::cast_possible_truncation)]
-            let key_size = record.key.as_ref().map_or(0, |k| k.len() as u32);
+            let key_size = record.key.as_ref().map_or(0, |k: &Bytes| k.len() as u32);
             let record_size = value_size + key_size + 16; // Overhead.
 
             if bytes_read + record_size > max_bytes && !proto_records.is_empty() {
@@ -469,6 +701,8 @@ impl HelixService {
             current_offset += 1;
         }
 
+        let high_watermark = ps.partition.high_watermark();
+
         debug!(
             topic = %request.topic,
             partition = request.partition,
@@ -479,7 +713,7 @@ impl HelixService {
 
         Ok(ReadResponse {
             records: proto_records,
-            high_watermark: partition.high_watermark().get(),
+            high_watermark: high_watermark.get(),
             error_code: ErrorCode::None.into(),
             error_message: None,
         })
@@ -491,14 +725,15 @@ impl HelixService {
         request: GetMetadataRequest,
     ) -> ServerResult<GetMetadataResponse> {
         let topics = self.topics.read().await;
-        let replication = self.replication.read().await;
+        let multi_raft = self.multi_raft.read().await;
+        let group_map = self.group_map.read().await;
 
         // Filter topics if specific ones requested.
         let topic_infos: Vec<TopicInfo> = if request.topics.is_empty() {
             // Return all topics.
             topics
                 .iter()
-                .map(|(name, meta)| self.make_topic_info(name, meta, &replication))
+                .map(|(name, meta)| self.make_topic_info(name, meta, &multi_raft, &group_map))
                 .collect()
         } else {
             // Return only requested topics.
@@ -508,7 +743,7 @@ impl HelixService {
                 .filter_map(|name| {
                     topics
                         .get(name)
-                        .map(|meta| self.make_topic_info(name, meta, &replication))
+                        .map(|meta| self.make_topic_info(name, meta, &multi_raft, &group_map))
                 })
                 .collect()
         };
@@ -530,7 +765,8 @@ impl HelixService {
         &self,
         name: &str,
         meta: &TopicMetadata,
-        replication: &ReplicationManager,
+        multi_raft: &MultiRaft,
+        group_map: &GroupMap,
     ) -> TopicInfo {
         let mut partitions = Vec::new();
 
@@ -538,10 +774,12 @@ impl HelixService {
             // Safe cast: i is in range [0, partition_count) and partition_count <= 256.
             #[allow(clippy::cast_sign_loss)]
             let partition_id = PartitionId::new(i as u64);
-            let leader = replication
+
+            let leader = group_map
                 .get(meta.topic_id, partition_id)
-                .and_then(helix_partition::ReplicatedPartition::leader)
-                .map_or_else(|| self.node_id.get(), helix_core::NodeId::get);
+                .and_then(|gid| multi_raft.group_state(gid))
+                .and_then(|state| state.leader_id)
+                .map_or_else(|| self.node_id.get(), NodeId::get);
 
             partitions.push(PartitionInfo {
                 partition: i,
@@ -581,17 +819,29 @@ impl HelixService {
         #[allow(clippy::cast_sign_loss)]
         let partition_id = PartitionId::new(request.partition as u64);
 
-        let replication = self.replication.read().await;
-        let partition = replication
-            .get(topic_meta.topic_id, partition_id)
-            .ok_or_else(|| ServerError::PartitionNotFound {
-                topic: request.topic.clone(),
-                partition: request.partition,
-            })?;
+        // Get the group ID for this partition.
+        let group_id = {
+            let gm = self.group_map.read().await;
+            gm.get(topic_meta.topic_id, partition_id).ok_or_else(|| {
+                ServerError::PartitionNotFound {
+                    topic: request.topic.clone(),
+                    partition: request.partition,
+                }
+            })?
+        };
 
-        let leader = partition
-            .leader()
-            .map_or_else(|| self.node_id.get(), helix_core::NodeId::get);
+        let multi_raft = self.multi_raft.read().await;
+        let storage = self.partition_storage.read().await;
+
+        let ps = storage.get(&group_id).ok_or_else(|| ServerError::PartitionNotFound {
+            topic: request.topic.clone(),
+            partition: request.partition,
+        })?;
+
+        let leader = multi_raft
+            .group_state(group_id)
+            .and_then(|state| state.leader_id)
+            .map_or_else(|| self.node_id.get(), NodeId::get);
 
         Ok(GetPartitionInfoResponse {
             partition: Some(PartitionInfo {
@@ -600,9 +850,9 @@ impl HelixService {
                 replicas: self.cluster_nodes.iter().map(|n| n.get()).collect(),
                 isr: vec![leader],
             }),
-            log_start_offset: partition.log_start_offset().get(),
-            log_end_offset: partition.log_end_offset().get(),
-            high_watermark: partition.high_watermark().get(),
+            log_start_offset: ps.partition.log_start_offset().get(),
+            log_end_offset: ps.partition.log_end_offset().get(),
+            high_watermark: ps.partition.high_watermark().get(),
             error_code: ErrorCode::None.into(),
             error_message: None,
         })
@@ -815,5 +1065,73 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ServerError::OffsetOutOfRange { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_multi_partition_topic() {
+        let service = HelixService::new("test-cluster".to_string(), 1);
+        service
+            .create_topic("multi-topic".to_string(), 4)
+            .await
+            .unwrap();
+
+        // Write to different partitions.
+        for partition in 0..4 {
+            let write_response = service
+                .write_internal(WriteRequest {
+                    topic: "multi-topic".to_string(),
+                    partition,
+                    records: vec![ProtoRecord {
+                        key: Some(format!("key-{partition}").into_bytes()),
+                        value: format!("value-{partition}").into_bytes(),
+                        headers: HashMap::new(),
+                        timestamp_ms: Some(1000),
+                    }],
+                    required_acks: 1,
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(write_response.base_offset, 0);
+            assert_eq!(write_response.record_count, 1);
+        }
+
+        // Read from each partition.
+        for partition in 0..4 {
+            let read_response = service
+                .read_internal(ReadRequest {
+                    topic: "multi-topic".to_string(),
+                    partition,
+                    offset: 0,
+                    max_records: 10,
+                    max_bytes: 1024,
+                })
+                .await
+                .unwrap();
+
+            assert_eq!(read_response.records.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_group_map() {
+        let mut gm = GroupMap::new();
+
+        let g1 = gm.allocate(TopicId::new(1), PartitionId::new(0));
+        let g2 = gm.allocate(TopicId::new(1), PartitionId::new(1));
+        let g3 = gm.allocate(TopicId::new(2), PartitionId::new(0));
+
+        // Each should get unique group IDs.
+        assert_ne!(g1, g2);
+        assert_ne!(g2, g3);
+        assert_ne!(g1, g3);
+
+        // Same allocation should return same ID.
+        let g1_again = gm.allocate(TopicId::new(1), PartitionId::new(0));
+        assert_eq!(g1, g1_again);
+
+        // Lookups should work.
+        assert_eq!(gm.get(TopicId::new(1), PartitionId::new(0)), Some(g1));
+        assert_eq!(gm.get_key(g1), Some((TopicId::new(1), PartitionId::new(0))));
     }
 }

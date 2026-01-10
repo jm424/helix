@@ -10,7 +10,7 @@ This document tracks progress against the [implementation plan](../helix-impleme
 | Phase 1: Core Consensus | ✅ Complete | ~95% |
 | Phase 2: Multi-Raft & Sharding | ✅ Complete | ~90% |
 | Phase 3: Storage Features | Not Started | 0% |
-| Phase 4: API & Flow Control | Partial (out of order) | ~30% |
+| Phase 4: API & Flow Control | Partial | ~50% |
 | Phase 5: Production Readiness | Not Started | 0% |
 
 ## Deviations from Plan
@@ -219,12 +219,16 @@ Missing crates:
 
 | Item | Status | Notes |
 |------|--------|-------|
-| HelixServer struct | ⚠️ Done but simple | `helix-server` |
+| HelixServer struct | ✅ Done | `helix-server` backed by Multi-Raft |
 | Write/Read/Metadata RPCs | ✅ Done | |
-| Integration with Multi-Raft | ❌ No Multi-Raft yet | |
-| Integration with ShardRouter | ❌ No routing yet | |
+| Integration with Multi-Raft | ✅ Done | Replaced ReplicationManager with MultiRaft engine |
+| Integration with ShardRouter | ⚠️ Partial | GroupMap for partition→group, ShardRouter ready but not wired |
 
-**Note:** Built out of order. Plan says this comes after Multi-Raft (Phase 2).
+**Architecture:**
+- `MultiRaft` manages all Raft groups (one per partition)
+- `GroupMap` maps (TopicId, PartitionId) ↔ GroupId
+- `PartitionStorage` holds partition state separate from Raft
+- Single tick task drives all groups
 
 #### 4.2 Flow Control
 
@@ -250,7 +254,7 @@ Missing: `helix-kafka-proxy` crate.
 
 ### Recently Completed
 
-1. **Tick-based timing ** ✅ Done
+1. **Tick-based timing** ✅ Done
    - Refactored `RaftNode` to use internal tick counter
    - `tick()` API drives both elections and heartbeats
    - Randomized election timeout prevents thundering herd
@@ -267,31 +271,38 @@ Missing: `helix-kafka-proxy` crate.
    - Tick-based timing for all groups
    - Internal randomized election timeouts
 
-### Immediate Priority: Extended DST Testing
+4. **helix-server Multi-Raft integration** ✅ Done
+   - Replaced `ReplicationManager` with `MultiRaft` engine
+   - Added `GroupMap` for (TopicId, PartitionId) ↔ GroupId mapping
+   - Separated `PartitionStorage` from Raft consensus
+   - Single tick task drives all groups efficiently
+   - All 6 server tests pass
 
-**Goal**: Run 10,000+ simulated hours with fault injection, zero safety violations.
+### Immediate Priority
 
-1. **Run longer simulation tests**
-   - Increase simulation time to cover more edge cases
-   - Run with 100+ different seeds
-   - Add more complex partition scenarios
+1. **Add hash-based routing** (optional)
+   - Wire `ShardRouter` for key-based routing
+   - Currently using explicit partition routing (Kafka-compatible)
 
 2. **Add TLA+ trace validation** (optional but valuable)
    - Compare implementation traces against TLA+ spec
 
-### Next Phase: Integration
+### Next Phase: Storage Features (Phase 3)
 
-3. **Refactor helix-server**
-   - Wire to Multi-Raft instead of individual RaftNodes per partition
-   - Integrate with ShardRouter for key-based routing
+3. **helix-tier** - Tiered storage to S3
+   - Move cold data to object storage
+   - Transparent read-through
 
-4. **Remaining Raft Features** (Optional)
-   - Configuration changes (joint consensus) - if needed
+4. **helix-progress** - Consumer progress tracking
+   - Offset commits with leases
+   - Consumer group coordination
 
 ### Deferred
 
 - CI pipeline setup (run tests locally for now)
 - io_uring storage implementation
+- Kafka compatibility proxy
+- Configuration changes (joint consensus)
 
 ---
 
@@ -307,7 +318,7 @@ Missing: `helix-kafka-proxy` crate.
 | `helix-tier` | ❌ Missing | Need to create |
 | `helix-progress` | ❌ Missing | Need to create |
 | `helix-flow` | ❌ Missing | Need to create |
-| `helix-server` | ⚠️ Exists | Built early, needs Multi-Raft integration |
+| `helix-server` | ✅ Complete | Multi-Raft integration done, GroupMap, PartitionStorage |
 | `helix-kafka-proxy` | ❌ Missing | Need to create |
 | `helix-cli` | ❌ Missing | Need to create |
 | `helix-tests` | ✅ Good | DST-friendly tick-based tests, faults, 150+ seeds |
