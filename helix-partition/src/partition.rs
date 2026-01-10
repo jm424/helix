@@ -188,13 +188,21 @@ impl Partition {
             return Ok(self.log_end_offset());
         }
 
+        let prev_end_offset = self.log_end_offset();
+        let record_count = records.len();
+
         // Create a batch.
         let mut batch = RecordBatch::new(self.config.partition_id);
         for record in records {
             batch.push(record);
         }
 
-        self.append_batch(batch)
+        let result = self.append_batch(batch)?;
+
+        // Postcondition: log end offset advanced by record count.
+        debug_assert!(self.log_end_offset().get() == prev_end_offset.get() + record_count as u64);
+
+        Ok(result)
     }
 
     /// Appends a record batch to the partition.
@@ -205,9 +213,15 @@ impl Partition {
     /// # Errors
     /// Returns an error if the partition is closed or the append fails.
     pub fn append_batch(&mut self, mut batch: RecordBatch) -> PartitionResult<Offset> {
+        // Precondition: partition must be open.
+        debug_assert!(!self.closed);
+
         if self.closed {
             return Err(PartitionError::Closed);
         }
+
+        // Precondition: batch must not be empty.
+        debug_assert!(!batch.is_empty());
 
         let batch_size = batch.size();
         let record_count = batch.len() as u64;
@@ -219,6 +233,9 @@ impl Partition {
             self.roll_segment()?;
         }
 
+        // Invariant: active segment index is valid.
+        debug_assert!(self.active_segment_idx < self.segments.len());
+
         // Append to active segment.
         let active = &mut self.segments[self.active_segment_idx];
         active.append(&mut batch)
@@ -228,6 +245,9 @@ impl Partition {
     fn roll_segment(&mut self) -> PartitionResult<()> {
         // Seal current segment.
         self.segments[self.active_segment_idx].seal();
+
+        // Postcondition: current segment is sealed.
+        debug_assert!(self.segments[self.active_segment_idx].is_sealed());
 
         // Create new segment.
         let next_offset = self.log_end_offset();
@@ -239,16 +259,24 @@ impl Partition {
         // Clean up old segments if we have too many.
         self.cleanup_old_segments();
 
+        // Postcondition: we have at least as many segments (may have cleaned up).
+        debug_assert!(self.segments.len() >= 1);
+        debug_assert!(self.active_segment_idx < self.segments.len());
+
         Ok(())
     }
 
     /// Removes old segments if we exceed the limit.
     fn cleanup_old_segments(&mut self) {
+        // Bounded loop: at most (segments.len() - max_segments) iterations.
         while self.segments.len() > self.config.max_segments as usize {
             // Remove the oldest segment.
             self.segments.remove(0);
             self.active_segment_idx = self.active_segment_idx.saturating_sub(1);
         }
+
+        // Postcondition: segment count within limit.
+        debug_assert!(self.segments.len() <= self.config.max_segments as usize);
     }
 
     /// Reads records starting at the given offset.
@@ -256,6 +284,9 @@ impl Partition {
     /// # Errors
     /// Returns an error if the offset is out of range.
     pub fn read(&self, start_offset: Offset, max_records: u32) -> PartitionResult<Vec<Record>> {
+        // Precondition: max_records should be positive for useful reads.
+        debug_assert!(max_records > 0);
+
         if self.closed {
             return Err(PartitionError::Closed);
         }
@@ -277,10 +308,15 @@ impl Partition {
 
         // Find the segment containing start_offset.
         let segment_idx = self.find_segment(start_offset);
+
+        // Invariant: segment_idx must be valid.
+        debug_assert!(segment_idx < self.segments.len());
+
         let mut records = Vec::new();
         let mut remaining = max_records;
         let mut current_offset = start_offset;
 
+        // Bounded loop: iterates over segments starting from segment_idx.
         for segment in &self.segments[segment_idx..] {
             if remaining == 0 {
                 break;
@@ -296,16 +332,27 @@ impl Partition {
             records.extend(segment_records);
         }
 
+        // Postcondition: returned at most max_records.
+        debug_assert!(records.len() <= max_records as usize);
+
         Ok(records)
     }
 
     /// Finds the segment containing the given offset.
     fn find_segment(&self, offset: Offset) -> usize {
+        // Precondition: segments must not be empty.
+        debug_assert!(!self.segments.is_empty());
+
         // Binary search for the segment.
-        self.segments
+        let result = self.segments
             .partition_point(|s| s.next_offset() <= offset)
             .saturating_sub(1)
-            .min(self.segments.len() - 1)
+            .min(self.segments.len() - 1);
+
+        // Postcondition: result is a valid index.
+        debug_assert!(result < self.segments.len());
+
+        result
     }
 
     /// Truncates the partition to the given offset (exclusive).

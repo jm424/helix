@@ -176,6 +176,7 @@ impl RaftNode {
     /// Returns the actions to take.
     pub fn handle_election_timeout(&mut self) -> Vec<RaftOutput> {
         let mut outputs = Vec::new();
+        let prev_term = self.current_term;
 
         // Only followers and candidates start elections.
         if self.state == RaftState::Leader {
@@ -189,6 +190,11 @@ impl RaftNode {
         self.votes_received.clear();
         self.votes_received.insert(self.config.node_id);
         self.leader_id = None;
+
+        // Postcondition: term incremented, we voted for ourselves.
+        debug_assert!(self.current_term.get() == prev_term.get() + 1);
+        debug_assert!(self.voted_for == Some(self.config.node_id));
+        debug_assert!(self.votes_received.contains(&self.config.node_id));
 
         // Reset election timer.
         outputs.push(RaftOutput::ResetElectionTimer);
@@ -210,6 +216,9 @@ impl RaftNode {
             outputs.extend(self.become_leader());
         }
 
+        // Postcondition: we are either candidate or leader (if single-node).
+        debug_assert!(self.state == RaftState::Candidate || self.state == RaftState::Leader);
+
         outputs
     }
 
@@ -221,15 +230,25 @@ impl RaftNode {
         let mut outputs = Vec::new();
 
         if self.state != RaftState::Leader {
+            // Precondition: only leaders send heartbeats.
+            debug_assert!(outputs.is_empty());
             return outputs;
         }
 
+        // Invariant: leader always knows it is the leader.
+        debug_assert!(self.leader_id == Some(self.config.node_id));
+
         // Send heartbeats to all peers.
+        let peer_count = self.config.peers().len();
         for peer in self.config.peers() {
             outputs.extend(self.send_append_entries(peer));
         }
 
         outputs.push(RaftOutput::ResetHeartbeatTimer);
+
+        // Postcondition: sent messages to all peers plus timer reset.
+        debug_assert!(outputs.len() >= peer_count);
+
         outputs
     }
 
@@ -241,12 +260,19 @@ impl RaftNode {
             return None;
         }
 
+        // Precondition: leader always knows it is the leader.
+        debug_assert!(self.leader_id == Some(self.config.node_id));
+
         let mut outputs = Vec::new();
+        let prev_last_index = self.log.last_index();
 
         // Append entry to our log.
         let index = LogIndex::new(self.log.last_index().get() + 1);
         let entry = LogEntry::new(self.current_term, index, request.data);
         self.log.append(entry);
+
+        // Postcondition: log grew by exactly one entry.
+        debug_assert!(self.log.last_index().get() == prev_last_index.get() + 1);
 
         // Update our own match_index.
         // (Leader implicitly has all its own entries.)
@@ -356,6 +382,9 @@ impl RaftNode {
 
     /// Becomes leader.
     fn become_leader(&mut self) -> Vec<RaftOutput> {
+        // Precondition: must have received quorum of votes.
+        debug_assert!(self.votes_received.len() >= self.config.quorum_size());
+
         let mut outputs = Vec::new();
 
         self.state = RaftState::Leader;
@@ -368,6 +397,10 @@ impl RaftNode {
             self.match_index.insert(peer, LogIndex::new(0));
         }
 
+        // Postcondition: leader state initialized for all peers.
+        debug_assert!(self.next_index.len() == self.config.peers().len());
+        debug_assert!(self.match_index.len() == self.config.peers().len());
+
         outputs.push(RaftOutput::BecameLeader);
         outputs.push(RaftOutput::ResetHeartbeatTimer);
 
@@ -375,6 +408,10 @@ impl RaftNode {
         for peer in self.config.peers() {
             outputs.extend(self.send_append_entries(peer));
         }
+
+        // Postcondition: we are now the leader.
+        debug_assert!(self.state == RaftState::Leader);
+        debug_assert!(self.leader_id == Some(self.config.node_id));
 
         outputs
     }
@@ -522,6 +559,11 @@ impl RaftNode {
             return Vec::new();
         }
 
+        // Precondition: must be leader to advance commit.
+        debug_assert!(self.leader_id == Some(self.config.node_id));
+
+        let prev_commit = self.commit_index;
+
         // Find the highest index that a majority has replicated.
         // An index can be committed if:
         // 1. It exists in our log.
@@ -531,6 +573,10 @@ impl RaftNode {
         let mut outputs = Vec::new();
 
         // Check each index from commit_index+1 to last_index.
+        // Bounded loop: at most (last_index - commit_index) iterations.
+        let loop_bound = self.log.last_index().get().saturating_sub(self.commit_index.get());
+        debug_assert!(loop_bound <= u64::MAX); // Explicit bound check.
+
         for n in (self.commit_index.get() + 1)..=self.log.last_index().get() {
             let idx = LogIndex::new(n);
 
@@ -556,12 +602,19 @@ impl RaftNode {
             }
         }
 
+        // Postcondition: commit index never decreases.
+        debug_assert!(self.commit_index >= prev_commit);
+
         outputs
     }
 
     /// Applies committed entries up to the given index.
     fn apply_committed_entries(&mut self, new_commit: LogIndex) -> Vec<RaftOutput> {
+        // Precondition: new_commit must be valid log index.
+        debug_assert!(new_commit <= self.log.last_index());
+
         let mut outputs = Vec::new();
+        let prev_last_applied = self.last_applied;
 
         if new_commit <= self.commit_index {
             return outputs;
@@ -570,6 +623,7 @@ impl RaftNode {
         self.commit_index = new_commit;
 
         // Apply entries from last_applied+1 to commit_index.
+        // Loop is bounded: at most (commit_index - last_applied) iterations.
         while self.last_applied < self.commit_index {
             let idx = LogIndex::new(self.last_applied.get() + 1);
             if let Some(entry) = self.log.get(idx) {
@@ -580,6 +634,10 @@ impl RaftNode {
             }
             self.last_applied = idx;
         }
+
+        // Postcondition: last_applied advanced, commit index set.
+        debug_assert!(self.last_applied >= prev_last_applied);
+        debug_assert!(self.last_applied == self.commit_index);
 
         outputs
     }
