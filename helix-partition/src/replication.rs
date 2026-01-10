@@ -349,6 +349,15 @@ impl ReplicatedPartition {
             PartitionCommand::Append { records } => {
                 let base_offset = self.partition.append(records)?;
                 self.last_applied = index;
+
+                // Update high watermark to log end offset.
+                // For a replicated partition, the high watermark represents the offset
+                // up to which all in-sync replicas have replicated. Since this entry
+                // is now committed (by Raft consensus), it's safe to advance the
+                // high watermark.
+                let new_hwm = self.partition.log_end_offset();
+                self.partition.set_high_watermark(new_hwm);
+
                 Ok(Some(ApplyResult {
                     index,
                     base_offset: Some(base_offset),
