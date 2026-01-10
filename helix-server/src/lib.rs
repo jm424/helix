@@ -8,6 +8,7 @@
 
 mod error;
 mod service;
+mod storage;
 
 pub mod generated {
     //! Generated protobuf types.

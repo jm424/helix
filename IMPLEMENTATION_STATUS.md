@@ -7,10 +7,10 @@ This document tracks progress against the [implementation plan](../helix-impleme
 | Phase | Status | Completion |
 |-------|--------|------------|
 | Phase 0: Foundations | Partial | ~80% |
-| Phase 1: Core Consensus | ✅ Complete | ~95% |
+| Phase 1: Core Consensus | ⚠️ Partial | ~90% (WAL complete, benchmarks not done) |
 | Phase 2: Multi-Raft & Sharding | ✅ Complete | ~90% |
 | Phase 3: Storage Features | Not Started | 0% |
-| Phase 4: API & Flow Control | Partial | ~50% |
+| Phase 4: API & Flow Control | ⚠️ Partial | ~60% (WAL integrated, needs multi-node networking) |
 | Phase 5: Production Readiness | Not Started | 0% |
 
 ## Deviations from Plan
@@ -18,8 +18,8 @@ This document tracks progress against the [implementation plan](../helix-impleme
 ### 1. Out-of-Order Implementation
 
 We built components out of order:
-- Built `helix-partition` (not in original plan) before completing Phase 1
-- Built `helix-server` gRPC API (Phase 4.1) before Phase 2 (Multi-Raft)
+- Built `helix-server` gRPC API (Phase 4.1) before completing Phase 3 (Storage Features)
+- Phase 1.4 Benchmarking skipped
 
 ### 2. Testing Milestones
 
@@ -31,10 +31,10 @@ The plan requires:
 - **Message chaos testing** - ✅ DONE (duplication, reordering, delays)
 - **TLA+ trace validation** - NOT IMPLEMENTED
 
-### 3. Architecture Differences
+### 3. Architecture Notes
 
-- **helix-partition**: Created but not in original plan. Combines partition storage with Raft replication.
 - **Multi-Raft**: ✅ DONE - `MultiRaft` engine manages multiple groups per node with message batching.
+- **Storage**: ✅ DONE - `DurablePartition` integrates `helix-wal` for crash-safe storage per RFC Tier 1 design.
 
 ---
 
@@ -98,10 +98,12 @@ The plan requires:
 | Segment format and serialization | ✅ Done | |
 | Append-only writes with CRC32 | ✅ Done | |
 | Read by index | ✅ Done | |
-| Fsync batching (group commit) | ⚠️ Basic | |
+| Fsync batching (group commit) | ✅ Done | `sync_on_write` config option |
 | Segment rotation | ✅ Done | |
-| Crash recovery | ✅ Done | |
+| Crash recovery | ✅ Done | Recovers from segment files on open |
 | Truncation for compaction | ✅ Done | |
+| Disk persistence | ✅ Done | Storage trait with TokioStorage |
+| Storage abstraction | ✅ Done | Trait for future `io_uring` support |
 
 **Testing Milestones:**
 | Item | Status |
@@ -222,12 +224,13 @@ Missing crates:
 | HelixServer struct | ✅ Done | `helix-server` backed by Multi-Raft |
 | Write/Read/Metadata RPCs | ✅ Done | |
 | Integration with Multi-Raft | ✅ Done | Replaced ReplicationManager with MultiRaft engine |
+| Integration with helix-wal | ✅ Done | DurablePartition for crash-safe storage |
 | Integration with ShardRouter | ⚠️ Partial | GroupMap for partition→group, ShardRouter ready but not wired |
 
 **Architecture:**
 - `MultiRaft` manages all Raft groups (one per partition)
 - `GroupMap` maps (TopicId, PartitionId) ↔ GroupId
-- `PartitionStorage` holds partition state separate from Raft
+- `DurablePartition` wraps WAL + in-memory cache (Tier 1 storage per RFC)
 - Single tick task drives all groups
 
 #### 4.2 Flow Control
@@ -274,26 +277,51 @@ Missing: `helix-kafka-proxy` crate.
 4. **helix-server Multi-Raft integration** ✅ Done
    - Replaced `ReplicationManager` with `MultiRaft` engine
    - Added `GroupMap` for (TopicId, PartitionId) ↔ GroupId mapping
-   - Separated `PartitionStorage` from Raft consensus
    - Single tick task drives all groups efficiently
-   - All 6 server tests pass
+   - All 10 server tests pass
+
+5. **helix-wal disk persistence** ✅ Done
+   - Storage trait abstraction for future `io_uring` support
+   - TokioStorage implementation using `tokio::fs`
+   - Wal struct managing segments with disk I/O
+   - Group commit via `sync_on_write` config
+   - Crash recovery from segment files
+   - 20 tests passing
+
+6. **helix-wal integration into helix-server** ✅ Done
+   - `DurablePartition` wraps WAL for crash-safe storage
+   - In-memory cache (`Partition`) for fast reads
+   - Configurable: `HelixService::new()` for in-memory, `with_data_dir()` for durable
+   - Write path: WAL append → sync (if configured) → update cache
+   - Recovery: Replay WAL entries to rebuild cache on startup
+   - Per RFC: WAL is the source of truth for Tier 1 (Hot) data
 
 ### Immediate Priority
 
-1. **Add hash-based routing** (optional)
+1. **Wire multi-node Raft networking** (CRITICAL for RF>1 benchmarks)
+   - Connect MultiRaftOutput::SendMessages to TCP transport
+   - Docker compose for multi-node testing
+
+2. **Phase 1.4 Benchmarking** (after multi-node working)
+   - Single-node write throughput
+   - 3-node replication latency
+
+### Optional Enhancements
+
+4. **Add hash-based routing**
    - Wire `ShardRouter` for key-based routing
    - Currently using explicit partition routing (Kafka-compatible)
 
-2. **Add TLA+ trace validation** (optional but valuable)
+5. **Add TLA+ trace validation**
    - Compare implementation traces against TLA+ spec
 
 ### Next Phase: Storage Features (Phase 3)
 
-3. **helix-tier** - Tiered storage to S3
+6. **helix-tier** - Tiered storage to S3
    - Move cold data to object storage
    - Transparent read-through
 
-4. **helix-progress** - Consumer progress tracking
+7. **helix-progress** - Consumer progress tracking
    - Offset commits with leases
    - Consumer group coordination
 
@@ -311,15 +339,14 @@ Missing: `helix-kafka-proxy` crate.
 | Planned Crate | Status | Actual Implementation |
 |---------------|--------|----------------------|
 | `helix-core` | ✅ Exists | As planned |
-| `helix-wal` | ✅ Exists | As planned |
+| `helix-wal` | ✅ Complete | Storage trait, TokioStorage, Wal struct with disk persistence |
 | `helix-raft` | ✅ Complete | Pre-vote, leadership transfer, tick-based timing, MultiRaft engine |
 | `helix-routing` | ✅ Exists | ShardMap, LeaderCache, ShardRouter |
 | `helix-runtime` | ⚠️ Partial | Tick-based server, missing io_uring |
 | `helix-tier` | ❌ Missing | Need to create |
 | `helix-progress` | ❌ Missing | Need to create |
 | `helix-flow` | ❌ Missing | Need to create |
-| `helix-server` | ✅ Complete | Multi-Raft integration done, GroupMap, PartitionStorage |
+| `helix-server` | ✅ Complete | Multi-Raft done, WAL-backed durable storage integrated |
 | `helix-kafka-proxy` | ❌ Missing | Need to create |
 | `helix-cli` | ❌ Missing | Need to create |
 | `helix-tests` | ✅ Good | DST-friendly tick-based tests, faults, 150+ seeds |
-| `helix-partition` | ⚠️ Extra | NOT IN PLAN - combines partition + replication |

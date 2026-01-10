@@ -913,21 +913,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "helix-partition"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "crc32fast",
- "helix-core",
- "helix-raft",
- "helix-wal",
- "proptest",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "helix-raft"
 version = "0.1.0"
 dependencies = [
@@ -975,12 +960,13 @@ dependencies = [
  "bytes",
  "clap",
  "helix-core",
- "helix-partition",
  "helix-raft",
  "helix-runtime",
+ "helix-wal",
  "proptest",
  "prost",
  "serde",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tonic",
@@ -1014,13 +1000,16 @@ dependencies = [
 name = "helix-wal"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bloodhound",
  "bytes",
  "crc32fast",
  "helix-core",
  "proptest",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

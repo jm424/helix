@@ -7,9 +7,9 @@ Helix is a Kafka replacement built with Deterministic Simulation Testing (DST) u
 ### Crate Structure
 
 - `helix-core` - Shared types, IDs, limits, records
-- `helix-wal` - Write-ahead log with CRC checksums
+- `helix-wal` - Write-ahead log with CRC checksums (durable storage)
 - `helix-raft` - Raft consensus implementation (TLA+ verified)
-- `helix-partition` - Kafka-style partitions, producer, consumer, replication
+- `helix-routing` - Shard routing and leader caching
 - `helix-runtime` - Production runtime with async timers
 - `helix-server` - gRPC API server
 - `helix-tests` - Deterministic simulation tests using Bloodhound

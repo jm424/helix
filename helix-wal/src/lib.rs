@@ -9,6 +9,26 @@
 //! - **Checksums**: CRC32 on every entry to detect corruption
 //! - **Explicit limits**: Bounded segment sizes, entry counts
 //! - **No unsafe code**: Safety > Performance
+//!
+//! # Example
+//!
+//! ```ignore
+//! use helix_wal::{Wal, WalConfig, TokioStorage, Entry};
+//! use bytes::Bytes;
+//!
+//! let config = WalConfig::new("/tmp/wal");
+//! let mut wal = Wal::open(TokioStorage::new(), config).await?;
+//!
+//! // Append entries.
+//! let entry = Entry::new(term, index, Bytes::from("data"))?;
+//! wal.append(entry).await?;
+//!
+//! // Sync for durability.
+//! wal.sync().await?;
+//!
+//! // Read entries.
+//! let entry = wal.read(index)?;
+//! ```
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -19,10 +39,14 @@
 mod entry;
 mod error;
 mod segment;
+mod storage;
+mod wal;
 
 pub use entry::{Entry, EntryHeader, ENTRY_HEADER_SIZE};
 pub use error::{WalError, WalResult};
-pub use segment::{Segment, SegmentConfig, SegmentId};
+pub use segment::{Segment, SegmentConfig, SegmentHeader, SegmentId, SEGMENT_HEADER_SIZE};
+pub use storage::{Storage, StorageFile, TokioStorage};
+pub use wal::{Wal, WalConfig};
 
 /// WAL configuration limits.
 pub mod limits {

@@ -4,19 +4,27 @@
 //! and Metadata requests from clients.
 //!
 //! The service is backed by Multi-Raft for consensus across multiple
-//! partition groups, with separate partition storage for durability.
+//! partition groups, with in-memory partition storage.
+//!
+//! NOTE: This uses temporary in-memory storage. Per the RFC design,
+//! storage should use `helix-wal` for durability. See storage.rs.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use helix_core::{GroupId, LogIndex, NodeId, Offset, PartitionId, Record, TopicId};
-use helix_partition::{Partition, PartitionConfig, PartitionCommand};
 use helix_raft::multi::{MultiRaft, MultiRaftOutput};
 use helix_raft::RaftState;
 use tokio::sync::{mpsc, RwLock};
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
+
+use crate::storage::{
+    DurablePartition, DurablePartitionConfig, DurablePartitionError, Partition, PartitionCommand,
+    PartitionConfig,
+};
 
 use crate::error::{ServerError, ServerResult};
 use crate::generated::{
@@ -44,6 +52,15 @@ struct TopicMetadata {
     partition_count: i32,
 }
 
+/// Inner storage type for a partition.
+enum PartitionStorageInner {
+    /// In-memory storage (for testing).
+    InMemory(Partition),
+    /// Durable WAL-backed storage (for production).
+    /// Boxed to reduce enum size difference between variants.
+    Durable(Box<DurablePartition>),
+}
+
 /// Storage for a single partition.
 struct PartitionStorage {
     /// Topic ID.
@@ -53,25 +70,87 @@ struct PartitionStorage {
     #[allow(dead_code)]
     partition_id: PartitionId,
     /// The underlying partition storage.
-    partition: Partition,
+    inner: PartitionStorageInner,
     /// Last applied Raft log index.
     last_applied: LogIndex,
 }
 
 impl PartitionStorage {
-    /// Creates new partition storage.
-    fn new(topic_id: TopicId, partition_id: PartitionId) -> Self {
+    /// Creates new in-memory partition storage.
+    const fn new_in_memory(topic_id: TopicId, partition_id: PartitionId) -> Self {
         let config = PartitionConfig::new(topic_id, partition_id);
         Self {
             topic_id,
             partition_id,
-            partition: Partition::new(config),
+            inner: PartitionStorageInner::InMemory(Partition::new(config)),
             last_applied: LogIndex::new(0),
         }
     }
 
-    /// Applies a committed entry to the partition.
-    fn apply_entry(&mut self, index: LogIndex, data: &Bytes) -> ServerResult<Option<Offset>> {
+    /// Creates new durable partition storage.
+    ///
+    /// # Errors
+    /// Returns an error if the WAL cannot be opened.
+    async fn new_durable(
+        data_dir: &PathBuf,
+        topic_id: TopicId,
+        partition_id: PartitionId,
+    ) -> Result<Self, DurablePartitionError> {
+        let config = DurablePartitionConfig::new(data_dir, topic_id, partition_id);
+        let durable = DurablePartition::open(config).await?;
+        Ok(Self {
+            topic_id,
+            partition_id,
+            inner: PartitionStorageInner::Durable(Box::new(durable)),
+            last_applied: LogIndex::new(0),
+        })
+    }
+
+    /// Returns the log start offset.
+    #[allow(clippy::missing_const_for_fn)] // Const match not stable yet.
+    fn log_start_offset(&self) -> Offset {
+        match &self.inner {
+            PartitionStorageInner::InMemory(p) => p.log_start_offset(),
+            PartitionStorageInner::Durable(p) => p.log_start_offset(),
+        }
+    }
+
+    /// Returns the log end offset.
+    fn log_end_offset(&self) -> Offset {
+        match &self.inner {
+            PartitionStorageInner::InMemory(p) => p.log_end_offset(),
+            PartitionStorageInner::Durable(p) => p.log_end_offset(),
+        }
+    }
+
+    /// Returns the high watermark.
+    #[allow(clippy::missing_const_for_fn)] // Const match not stable yet.
+    fn high_watermark(&self) -> Offset {
+        match &self.inner {
+            PartitionStorageInner::InMemory(p) => p.high_watermark(),
+            PartitionStorageInner::Durable(p) => p.high_watermark(),
+        }
+    }
+
+    /// Reads records from the partition.
+    fn read(&self, start_offset: Offset, max_records: u32) -> ServerResult<Vec<Record>> {
+        match &self.inner {
+            PartitionStorageInner::InMemory(p) => p.read(start_offset, max_records).map_err(|e| {
+                ServerError::Internal {
+                    message: format!("failed to read: {e}"),
+                }
+            }),
+            PartitionStorageInner::Durable(p) => p.read(start_offset, max_records).map_err(|e| {
+                ServerError::Internal {
+                    message: format!("failed to read: {e}"),
+                }
+            }),
+        }
+    }
+
+    /// Applies a committed entry to the partition (sync version for in-memory).
+    #[allow(dead_code)] // Kept for potential future use; async version used everywhere.
+    fn apply_entry_sync(&mut self, index: LogIndex, data: &Bytes) -> ServerResult<Option<Offset>> {
         // Skip if already applied.
         if index <= self.last_applied {
             return Ok(None);
@@ -87,32 +166,105 @@ impl PartitionStorage {
             message: "failed to decode partition command".to_string(),
         })?;
 
-        let base_offset = match command {
-            PartitionCommand::Append { records } => {
-                let offset = self.partition.append(records).map_err(|e| {
-                    ServerError::Internal {
+        let base_offset = match &mut self.inner {
+            PartitionStorageInner::InMemory(partition) => match command {
+                PartitionCommand::Append { records } => {
+                    let offset = partition.append(records).map_err(|e| ServerError::Internal {
                         message: format!("failed to append: {e}"),
-                    }
-                })?;
+                    })?;
 
-                // Update high watermark since entry is committed.
-                let new_hwm = self.partition.log_end_offset();
-                self.partition.set_high_watermark(new_hwm);
+                    // Update high watermark since entry is committed.
+                    let new_hwm = partition.log_end_offset();
+                    partition.set_high_watermark(new_hwm);
 
-                Some(offset)
-            }
-            PartitionCommand::Truncate { from_offset } => {
-                self.partition.truncate(from_offset).map_err(|e| {
-                    ServerError::Internal {
+                    Some(offset)
+                }
+                PartitionCommand::Truncate { from_offset } => {
+                    partition.truncate(from_offset).map_err(|e| ServerError::Internal {
                         message: format!("failed to truncate: {e}"),
-                    }
-                })?;
-                None
+                    })?;
+                    None
+                }
+                PartitionCommand::UpdateHighWatermark { high_watermark } => {
+                    partition.set_high_watermark(high_watermark);
+                    None
+                }
+            },
+            PartitionStorageInner::Durable(_) => {
+                // Durable storage should use apply_entry_async.
+                return Err(ServerError::Internal {
+                    message: "durable storage requires async apply".to_string(),
+                });
             }
-            PartitionCommand::UpdateHighWatermark { high_watermark } => {
-                self.partition.set_high_watermark(high_watermark);
-                None
-            }
+        };
+
+        self.last_applied = index;
+        Ok(base_offset)
+    }
+
+    /// Applies a committed entry to the partition (async version for durable).
+    async fn apply_entry_async(
+        &mut self,
+        index: LogIndex,
+        data: &Bytes,
+    ) -> ServerResult<Option<Offset>> {
+        // Skip if already applied.
+        if index <= self.last_applied {
+            return Ok(None);
+        }
+
+        // Skip empty entries (e.g., no-op entries).
+        if data.is_empty() {
+            self.last_applied = index;
+            return Ok(None);
+        }
+
+        let command = PartitionCommand::decode(data).ok_or_else(|| ServerError::Internal {
+            message: "failed to decode partition command".to_string(),
+        })?;
+
+        let base_offset = match &mut self.inner {
+            PartitionStorageInner::InMemory(partition) => match command {
+                PartitionCommand::Append { records } => {
+                    let offset = partition.append(records).map_err(|e| ServerError::Internal {
+                        message: format!("failed to append: {e}"),
+                    })?;
+
+                    let new_hwm = partition.log_end_offset();
+                    partition.set_high_watermark(new_hwm);
+
+                    Some(offset)
+                }
+                PartitionCommand::Truncate { from_offset } => {
+                    partition.truncate(from_offset).map_err(|e| ServerError::Internal {
+                        message: format!("failed to truncate: {e}"),
+                    })?;
+                    None
+                }
+                PartitionCommand::UpdateHighWatermark { high_watermark } => {
+                    partition.set_high_watermark(high_watermark);
+                    None
+                }
+            },
+            PartitionStorageInner::Durable(partition) => match command {
+                PartitionCommand::Append { records } => {
+                    let offset = partition.append(records).await.map_err(|e| {
+                        ServerError::Internal {
+                            message: format!("failed to append: {e}"),
+                        }
+                    })?;
+                    Some(offset)
+                }
+                PartitionCommand::Truncate { from_offset: _ } => {
+                    // TODO: Implement truncate for durable partition.
+                    warn!("Truncate not yet implemented for durable partition");
+                    None
+                }
+                PartitionCommand::UpdateHighWatermark { high_watermark } => {
+                    partition.set_high_watermark(high_watermark);
+                    None
+                }
+            },
         };
 
         self.last_applied = index;
@@ -120,11 +272,11 @@ impl PartitionStorage {
     }
 }
 
-/// Maps between (TopicId, PartitionId) and GroupId.
+/// Maps between (`TopicId`, `PartitionId`) and `GroupId`.
 struct GroupMap {
-    /// Forward mapping: (TopicId, PartitionId) -> GroupId.
+    /// Forward mapping: (`TopicId`, `PartitionId`) -> `GroupId`.
     by_key: HashMap<(TopicId, PartitionId), GroupId>,
-    /// Reverse mapping: GroupId -> (TopicId, PartitionId).
+    /// Reverse mapping: `GroupId` -> (`TopicId`, `PartitionId`).
     by_group: HashMap<GroupId, (TopicId, PartitionId)>,
     /// Next group ID to assign.
     next_group_id: u64,
@@ -181,7 +333,7 @@ pub struct HelixService {
     node_id: NodeId,
     /// Multi-Raft engine for consensus.
     multi_raft: Arc<RwLock<MultiRaft>>,
-    /// Partition storage indexed by GroupId.
+    /// Partition storage indexed by `GroupId`.
     partition_storage: Arc<RwLock<HashMap<GroupId, PartitionStorage>>>,
     /// Group ID mapping.
     group_map: Arc<RwLock<GroupMap>>,
@@ -193,14 +345,30 @@ pub struct HelixService {
     cluster_nodes: Vec<NodeId>,
     /// Shutdown signal sender.
     _shutdown_tx: mpsc::Sender<()>,
+    /// Data directory for durable storage (None = in-memory only).
+    data_dir: Option<PathBuf>,
 }
 
 impl HelixService {
-    /// Creates a new Helix service backed by Multi-Raft.
+    /// Creates a new Helix service with in-memory storage (for testing).
     ///
     /// This starts a background task to handle Raft ticks for all groups.
     #[must_use]
     pub fn new(cluster_id: String, node_id: u64) -> Self {
+        Self::new_internal(cluster_id, node_id, None)
+    }
+
+    /// Creates a new Helix service with durable WAL-backed storage.
+    ///
+    /// This starts a background task to handle Raft ticks for all groups.
+    /// Partition data is persisted to the specified directory.
+    #[must_use]
+    pub fn with_data_dir(cluster_id: String, node_id: u64, data_dir: PathBuf) -> Self {
+        Self::new_internal(cluster_id, node_id, Some(data_dir))
+    }
+
+    /// Internal constructor.
+    fn new_internal(cluster_id: String, node_id: u64, data_dir: Option<PathBuf>) -> Self {
         let node_id = NodeId::new(node_id);
         let cluster_nodes = vec![node_id]; // Single node for now.
 
@@ -228,6 +396,7 @@ impl HelixService {
             next_topic_id: Arc::new(RwLock::new(1)),
             cluster_nodes,
             _shutdown_tx: shutdown_tx,
+            data_dir,
         }
     }
 
@@ -288,7 +457,7 @@ impl HelixService {
                     if let Some((topic_id, partition_id)) = key {
                         let mut storage = partition_storage.write().await;
                         if let Some(ps) = storage.get_mut(group_id) {
-                            if let Err(e) = ps.apply_entry(*index, data) {
+                            if let Err(e) = ps.apply_entry_async(*index, data).await {
                                 warn!(
                                     topic = topic_id.get(),
                                     partition = partition_id.get(),
@@ -384,8 +553,17 @@ impl HelixService {
                     message: format!("failed to create Raft group: {e}"),
                 })?;
 
-            // Create partition storage.
-            partition_storage.insert(group_id, PartitionStorage::new(topic_id, partition_id));
+            // Create partition storage (durable or in-memory based on config).
+            let ps = if let Some(data_dir) = &self.data_dir {
+                PartitionStorage::new_durable(data_dir, topic_id, partition_id)
+                    .await
+                    .map_err(|e| ServerError::Internal {
+                        message: format!("failed to create durable partition: {e}"),
+                    })?
+            } else {
+                PartitionStorage::new_in_memory(topic_id, partition_id)
+            };
+            partition_storage.insert(group_id, ps);
 
             // For single-node cluster, tick until the node becomes leader.
             // With default election_tick=10 and randomized timeout in [10, 20),
@@ -404,7 +582,7 @@ impl HelixService {
                         {
                             if *gid == group_id {
                                 if let Some(ps) = partition_storage.get_mut(&group_id) {
-                                    let _ = ps.apply_entry(*index, data);
+                                    let _ = ps.apply_entry_async(*index, data).await;
                                 }
                             }
                         }
@@ -413,7 +591,7 @@ impl HelixService {
                     // Check if became leader.
                     let is_leader = multi_raft
                         .group_state(group_id)
-                        .map_or(false, |s| s.state == RaftState::Leader);
+                        .is_some_and(|s| s.state == RaftState::Leader);
 
                     if is_leader {
                         break;
@@ -477,6 +655,7 @@ impl HelixService {
 
     /// Internal write implementation using Multi-Raft.
     #[allow(clippy::significant_drop_tightening)]
+    #[allow(clippy::too_many_lines)] // Complex flow with validation, Raft, and storage.
     async fn write_internal(&self, request: WriteRequest) -> ServerResult<WriteResponse> {
         // Validate request.
         assert!(!request.topic.is_empty(), "topic cannot be empty");
@@ -533,14 +712,14 @@ impl HelixService {
                 topic: request.topic.clone(),
                 partition: partition_idx,
             })?;
-            ps.partition.log_end_offset()
+            ps.log_end_offset()
         };
 
         // Check if we're the leader.
         let (is_leader, leader_hint) = {
             let mr = self.multi_raft.read().await;
             let state = mr.group_state(group_id);
-            let is_leader = state.as_ref().map_or(false, |s| s.state == RaftState::Leader);
+            let is_leader = state.as_ref().is_some_and(|s| s.state == RaftState::Leader);
             let leader = state.and_then(|s| s.leader_id);
             (is_leader, leader)
         };
@@ -574,9 +753,11 @@ impl HelixService {
                     if *gid == group_id {
                         let mut storage = self.partition_storage.write().await;
                         if let Some(ps) = storage.get_mut(&group_id) {
-                            ps.apply_entry(*index, data).map_err(|e| ServerError::Internal {
-                                message: format!("failed to apply: {e}"),
-                            })?;
+                            ps.apply_entry_async(*index, data)
+                                .await
+                                .map_err(|e| ServerError::Internal {
+                                    message: format!("failed to apply: {e}"),
+                                })?;
                         }
                     }
                 }
@@ -645,8 +826,8 @@ impl HelixService {
         })?;
 
         // Check offset bounds.
-        let log_start = ps.partition.log_start_offset();
-        let log_end = ps.partition.log_end_offset();
+        let log_start = ps.log_start_offset();
+        let log_end = ps.log_end_offset();
 
         if request.offset < log_start.get() || request.offset > log_end.get() {
             return Err(ServerError::OffsetOutOfRange {
@@ -669,11 +850,7 @@ impl HelixService {
         };
 
         let start_offset = Offset::new(request.offset);
-        let records = ps.partition.read(start_offset, max_records).map_err(|e| {
-            ServerError::Internal {
-                message: format!("failed to read: {e}"),
-            }
-        })?;
+        let records = ps.read(start_offset, max_records)?;
 
         // Convert to proto records with offsets.
         let mut proto_records = Vec::new();
@@ -701,7 +878,7 @@ impl HelixService {
             current_offset += 1;
         }
 
-        let high_watermark = ps.partition.high_watermark();
+        let high_watermark = ps.high_watermark();
 
         debug!(
             topic = %request.topic,
@@ -850,9 +1027,9 @@ impl HelixService {
                 replicas: self.cluster_nodes.iter().map(|n| n.get()).collect(),
                 isr: vec![leader],
             }),
-            log_start_offset: ps.partition.log_start_offset().get(),
-            log_end_offset: ps.partition.log_end_offset().get(),
-            high_watermark: ps.partition.high_watermark().get(),
+            log_start_offset: ps.log_start_offset().get(),
+            log_end_offset: ps.log_end_offset().get(),
+            high_watermark: ps.high_watermark().get(),
             error_code: ErrorCode::None.into(),
             error_message: None,
         })

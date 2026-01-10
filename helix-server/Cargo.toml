@@ -18,7 +18,7 @@ path = "src/main.rs"
 helix-core = { workspace = true }
 helix-raft = { workspace = true }
 helix-runtime = { workspace = true }
-helix-partition = { workspace = true }
+helix-wal = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
@@ -34,3 +34,4 @@ tonic-build = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+tempfile = "3.10"
