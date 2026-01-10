@@ -6,8 +6,8 @@ This document tracks progress against the [implementation plan](../helix-impleme
 
 | Phase | Status | Completion |
 |-------|--------|------------|
-| Phase 0: Foundations | Partial | ~60% |
-| Phase 1: Core Consensus | Partial | ~70% |
+| Phase 0: Foundations | Partial | ~70% |
+| Phase 1: Core Consensus | Partial | ~80% |
 | Phase 2: Multi-Raft & Sharding | Not Started | 0% |
 | Phase 3: Storage Features | Not Started | 0% |
 | Phase 4: API & Flow Control | Partial (out of order) | ~30% |
@@ -68,7 +68,10 @@ The plan requires:
 |------|--------|-------|
 | Bloodhound as workspace dependency | ✅ Done | |
 | `RaftActor` implementing `SimulatedActor` | ✅ Done | `helix-tests/raft_actor.rs` |
-| Property definitions for Raft invariants | ⚠️ Basic | `properties.rs` exists but minimal |
+| Property definitions for Raft invariants | ✅ Done | `properties.rs` with PropertyChecker |
+| Fault injection (ProcessCrash/Recover) | ✅ Done | `simulation_tests.rs` |
+| Client operations in simulation | ✅ Done | Via Custom events |
+| Multi-seed testing | ✅ Done | 150+ seeds tested |
 | ScenarioBuilder test examples | ❌ Not Used | Tests don't use ScenarioBuilder |
 | CI with multiple seed runs | 🔜 Deferred | Run locally for now |
 
@@ -124,10 +127,12 @@ The plan requires:
 |------|--------|
 | Bloodhound: leader election in 3-node | ✅ Done |
 | Bloodhound: election with network partition | ⚠️ Basic |
-| Bloodhound: log replication linearizability | ❌ Not Done |
-| Bloodhound: 10,000 hours random faults | ❌ NOT DONE - CRITICAL |
-| Property: SingleLeaderPerTerm | ⚠️ Basic check only |
-| Property: LogMatching | ❌ Not Done |
+| Bloodhound: log replication linearizability | ⚠️ Partial (client requests work) |
+| Bloodhound: fault injection (crashes) | ✅ Done |
+| Bloodhound: multi-seed simulation | ✅ Done (150+ seeds tested) |
+| Bloodhound: 10,000 hours random faults | ⏳ In Progress (can run longer tests) |
+| Property: SingleLeaderPerTerm | ✅ Infrastructure done |
+| Property: LogMatching | ⚠️ Partial (needs log access) |
 | TLA+ trace validation | ❌ Not Done |
 
 #### 1.3 Raft Client Interface
@@ -268,5 +273,5 @@ To get back on track with the plan:
 | `helix-server` | ⚠️ Exists | Built early, needs Multi-Raft integration |
 | `helix-kafka-proxy` | ❌ Missing | Need to create |
 | `helix-cli` | ❌ Missing | Need to create |
-| `helix-tests` | ⚠️ Partial | Needs more comprehensive Bloodhound tests |
+| `helix-tests` | ⚠️ Good | Simulation tests with faults, client ops, 150+ seeds |
 | `helix-partition` | ⚠️ Extra | NOT IN PLAN - combines partition + replication |

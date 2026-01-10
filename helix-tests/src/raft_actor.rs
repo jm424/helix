@@ -12,8 +12,8 @@ use bloodhound::simulation::discrete::event::{ActorId, EventKind};
 use bytes::Bytes;
 use helix_core::{LogIndex, NodeId, TermId};
 use helix_raft::{
-    AppendEntriesRequest, AppendEntriesResponse, LogEntry, Message, RaftConfig, RaftNode,
-    RaftOutput, RaftState, RequestVoteRequest, RequestVoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, ClientRequest, LogEntry, Message, RaftConfig,
+    RaftNode, RaftOutput, RaftState, RequestVoteRequest, RequestVoteResponse,
 };
 
 /// Timer IDs for Raft events.
@@ -22,6 +22,12 @@ mod timer_ids {
     pub const ELECTION_TIMEOUT: u64 = 1;
     /// Heartbeat timer (leader only).
     pub const HEARTBEAT: u64 = 2;
+}
+
+/// Custom event names.
+pub mod custom_events {
+    /// Client request submission.
+    pub const CLIENT_REQUEST: &str = "client_request";
 }
 
 /// Network latency for message delivery (simulated).
@@ -292,6 +298,37 @@ impl RaftActor {
         self.node.commit_index()
     }
 
+    /// Returns the node ID.
+    #[must_use]
+    pub const fn node_id(&self) -> NodeId {
+        self.node.node_id()
+    }
+
+    /// Returns the log length (number of entries).
+    #[must_use]
+    pub fn log_len(&self) -> u64 {
+        self.node.log().len()
+    }
+
+    /// Returns the last log index.
+    #[must_use]
+    pub fn last_log_index(&self) -> LogIndex {
+        self.node.log().last_index()
+    }
+
+    /// Submits a client request to the Raft node.
+    ///
+    /// Returns outputs to process if this node is the leader, None otherwise.
+    pub fn submit_request(&mut self, data: Bytes, ctx: &mut SimulationContext) -> bool {
+        let request = ClientRequest::new(data);
+        self.node
+            .handle_client_request(request)
+            .is_some_and(|outputs| {
+                self.process_outputs(outputs, ctx);
+                true
+            })
+    }
+
     /// Processes outputs from the Raft state machine.
     fn process_outputs(&self, outputs: Vec<RaftOutput>, ctx: &mut SimulationContext) {
         for output in outputs {
@@ -404,6 +441,26 @@ impl SimulatedActor for RaftActor {
                 tracing::info!(actor = %self.name, "recovered");
                 // In a full implementation, we'd reload from WAL here.
                 self.schedule_election_timeout(ctx);
+            }
+
+            EventKind::Custom { name, data, .. } => {
+                if name == custom_events::CLIENT_REQUEST {
+                    // Handle client request.
+                    let request = ClientRequest::new(Bytes::from(data));
+                    if let Some(outputs) = self.node.handle_client_request(request) {
+                        self.process_outputs(outputs, ctx);
+                        tracing::debug!(
+                            actor = %self.name,
+                            log_len = self.node.log().len(),
+                            "accepted client request"
+                        );
+                    } else {
+                        tracing::debug!(
+                            actor = %self.name,
+                            "rejected client request (not leader)"
+                        );
+                    }
+                }
             }
 
             _ => {
