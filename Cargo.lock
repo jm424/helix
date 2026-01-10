@@ -818,10 +818,15 @@ dependencies = [
 name = "helix-runtime"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "helix-core",
+ "helix-raft",
+ "helix-wal",
  "proptest",
+ "rand 0.8.5",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

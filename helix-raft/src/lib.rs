@@ -16,15 +16,27 @@
 #![warn(clippy::pedantic)]
 #![warn(clippy::nursery)]
 
+mod client;
 mod config;
 mod log;
 mod message;
 mod state;
+mod storage;
+mod wal_storage;
 
+pub use client::{
+    ClientCommand, ClientId, ClientQuery, ClientResult, ClientSessions, PendingRequests,
+    RaftClient, ReadConsistency, RequestId,
+};
 pub use config::RaftConfig;
 pub use log::{LogEntry, RaftLog};
-pub use message::{AppendEntriesRequest, AppendEntriesResponse, Message, RequestVoteRequest, RequestVoteResponse};
+pub use message::{
+    AppendEntriesRequest, AppendEntriesResponse, ClientRequest, Message, RequestVoteRequest,
+    RequestVoteResponse,
+};
 pub use state::{RaftNode, RaftOutput, RaftState};
+pub use storage::{MemoryStorage, PersistentState, RaftStorage, StorageError, StorageResult};
+pub use wal_storage::WalStorage;
 
 /// Raft configuration limits.
 pub mod limits {

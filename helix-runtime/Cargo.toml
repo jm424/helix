@@ -12,8 +12,14 @@ workspace = true
 
 [dependencies]
 helix-core = { workspace = true }
+helix-raft = { workspace = true }
+helix-wal = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
