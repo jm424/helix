@@ -220,26 +220,35 @@ Before submitting code:
 - [ ] All tests pass
 - [ ] No new compiler warnings
 
-## Architecture Decisions
+## Architecture Decision Records
 
-### Why Raft for Partition Replication?
+Significant architectural decisions are documented in `docs/adr/`. See [docs/adr/README.md](docs/adr/README.md) for the full index.
 
-Raft provides:
-- Linearizable writes through leader
-- Automatic leader election
-- Log compaction (via snapshots)
-- Well-understood correctness properties (TLA+ verified)
+Key decisions:
+- [ADR-0001](docs/adr/0001-raft-for-partition-replication.md): Use Raft for Partition Replication
+- [ADR-0002](docs/adr/0002-synchronous-state-machines.md): Synchronous State Machines in Core
+- [ADR-0003](docs/adr/0003-strongly-typed-identifiers.md): Strongly-Typed Identifiers
 
-### Why Not Async in Core?
+### When to Write an ADR
 
-The core Raft and partition code is synchronous state machines. Benefits:
-- Deterministic testing (no async runtime in tests)
-- Easier reasoning about state transitions
-- Async only at the edges (network, timers)
+Write an ADR when:
+- Choosing between multiple viable approaches
+- Making a decision that would be costly to reverse
+- The decision affects multiple components
+- Future developers will ask "why did we do it this way?"
 
-### Why Explicit Offset Types?
+### ADR Process
 
-`Offset`, `LogIndex`, `TermId` are newtype wrappers preventing:
-- Mixing incompatible values
-- Accidental arithmetic errors
-- Better documentation through types
+1. Copy `docs/adr/0000-template.md` to `docs/adr/NNNN-title.md`
+2. Fill in Context, Decision, Consequences, and Options Considered
+3. Set status to "Proposed"
+4. After review/discussion, update status to "Accepted"
+5. Update `docs/adr/README.md` index
+
+### ADR Quality Checklist
+
+- [ ] Context explains the forces at play (not just the problem)
+- [ ] Decision is clear and actionable
+- [ ] Consequences include both benefits AND tradeoffs
+- [ ] At least 2 alternatives considered with pros/cons
+- [ ] References link to relevant resources
