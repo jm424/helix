@@ -12,16 +12,19 @@
 //!
 //! # Message Types
 //!
-//! - 0: `RequestVote`
-//! - 1: `RequestVoteResponse`
-//! - 2: `AppendEntries`
-//! - 3: `AppendEntriesResponse`
+//! - 0: `PreVote`
+//! - 1: `PreVoteResponse`
+//! - 2: `RequestVote`
+//! - 3: `RequestVoteResponse`
+//! - 4: `AppendEntries`
+//! - 5: `AppendEntriesResponse`
+//! - 6: `TimeoutNow`
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use helix_core::{LogIndex, NodeId, TermId};
 use helix_raft::{
-    AppendEntriesRequest, AppendEntriesResponse, LogEntry, Message, RequestVoteRequest,
-    RequestVoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, LogEntry, Message, PreVoteRequest,
+    PreVoteResponse, RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
 };
 use thiserror::Error;
 
@@ -29,10 +32,13 @@ use thiserror::Error;
 const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 
 /// Message type tags.
-const TAG_REQUEST_VOTE: u8 = 0;
-const TAG_REQUEST_VOTE_RESPONSE: u8 = 1;
-const TAG_APPEND_ENTRIES: u8 = 2;
-const TAG_APPEND_ENTRIES_RESPONSE: u8 = 3;
+const TAG_PRE_VOTE: u8 = 0;
+const TAG_PRE_VOTE_RESPONSE: u8 = 1;
+const TAG_REQUEST_VOTE: u8 = 2;
+const TAG_REQUEST_VOTE_RESPONSE: u8 = 3;
+const TAG_APPEND_ENTRIES: u8 = 4;
+const TAG_APPEND_ENTRIES_RESPONSE: u8 = 5;
+const TAG_TIMEOUT_NOW: u8 = 6;
 
 /// Codec errors.
 #[derive(Debug, Error)]
@@ -81,6 +87,14 @@ pub fn encode_message(message: &Message) -> CodecResult<Bytes> {
     buf.put_u32_le(0);
 
     match message {
+        Message::PreVote(req) => {
+            buf.put_u8(TAG_PRE_VOTE);
+            encode_pre_vote(&mut buf, req);
+        }
+        Message::PreVoteResponse(resp) => {
+            buf.put_u8(TAG_PRE_VOTE_RESPONSE);
+            encode_pre_vote_response(&mut buf, resp);
+        }
         Message::RequestVote(req) => {
             buf.put_u8(TAG_REQUEST_VOTE);
             encode_request_vote(&mut buf, req);
@@ -96,6 +110,10 @@ pub fn encode_message(message: &Message) -> CodecResult<Bytes> {
         Message::AppendEntriesResponse(resp) => {
             buf.put_u8(TAG_APPEND_ENTRIES_RESPONSE);
             encode_append_entries_response(&mut buf, resp);
+        }
+        Message::TimeoutNow(req) => {
+            buf.put_u8(TAG_TIMEOUT_NOW);
+            encode_timeout_now(&mut buf, req);
         }
     }
 
@@ -163,6 +181,8 @@ pub fn decode_message(data: &[u8]) -> CodecResult<(Message, usize)> {
     let mut buf = body;
 
     let message = match tag {
+        TAG_PRE_VOTE => Message::PreVote(decode_pre_vote(&mut buf)?),
+        TAG_PRE_VOTE_RESPONSE => Message::PreVoteResponse(decode_pre_vote_response(&mut buf)?),
         TAG_REQUEST_VOTE => Message::RequestVote(decode_request_vote(&mut buf)?),
         TAG_REQUEST_VOTE_RESPONSE => {
             Message::RequestVoteResponse(decode_request_vote_response(&mut buf)?)
@@ -171,10 +191,59 @@ pub fn decode_message(data: &[u8]) -> CodecResult<(Message, usize)> {
         TAG_APPEND_ENTRIES_RESPONSE => {
             Message::AppendEntriesResponse(decode_append_entries_response(&mut buf)?)
         }
+        TAG_TIMEOUT_NOW => Message::TimeoutNow(decode_timeout_now(&mut buf)?),
         _ => return Err(CodecError::UnknownMessageType { tag }),
     };
 
     Ok((message, total_len))
+}
+
+/// Encodes a `PreVoteRequest`.
+fn encode_pre_vote(buf: &mut BytesMut, req: &PreVoteRequest) {
+    buf.put_u64_le(req.term.get());
+    buf.put_u64_le(req.candidate_id.get());
+    buf.put_u64_le(req.to.get());
+    buf.put_u64_le(req.last_log_index.get());
+    buf.put_u64_le(req.last_log_term.get());
+}
+
+/// Decodes a `PreVoteRequest`.
+fn decode_pre_vote(buf: &mut &[u8]) -> CodecResult<PreVoteRequest> {
+    ensure_remaining(buf, 40)?;
+
+    let term = TermId::new(buf.get_u64_le());
+    let candidate_id = NodeId::new(buf.get_u64_le());
+    let to = NodeId::new(buf.get_u64_le());
+    let last_log_index = LogIndex::new(buf.get_u64_le());
+    let last_log_term = TermId::new(buf.get_u64_le());
+
+    Ok(PreVoteRequest::new(
+        term,
+        candidate_id,
+        to,
+        last_log_index,
+        last_log_term,
+    ))
+}
+
+/// Encodes a `PreVoteResponse`.
+fn encode_pre_vote_response(buf: &mut BytesMut, resp: &PreVoteResponse) {
+    buf.put_u64_le(resp.term.get());
+    buf.put_u64_le(resp.from.get());
+    buf.put_u64_le(resp.to.get());
+    buf.put_u8(u8::from(resp.vote_granted));
+}
+
+/// Decodes a `PreVoteResponse`.
+fn decode_pre_vote_response(buf: &mut &[u8]) -> CodecResult<PreVoteResponse> {
+    ensure_remaining(buf, 25)?;
+
+    let term = TermId::new(buf.get_u64_le());
+    let from = NodeId::new(buf.get_u64_le());
+    let to = NodeId::new(buf.get_u64_le());
+    let vote_granted = buf.get_u8() != 0;
+
+    Ok(PreVoteResponse::new(term, from, to, vote_granted))
 }
 
 /// Encodes a `RequestVoteRequest`.
@@ -299,6 +368,24 @@ fn decode_append_entries_response(buf: &mut &[u8]) -> CodecResult<AppendEntriesR
         success,
         match_index,
     ))
+}
+
+/// Encodes a `TimeoutNowRequest`.
+fn encode_timeout_now(buf: &mut BytesMut, req: &TimeoutNowRequest) {
+    buf.put_u64_le(req.term.get());
+    buf.put_u64_le(req.from.get());
+    buf.put_u64_le(req.to.get());
+}
+
+/// Decodes a `TimeoutNowRequest`.
+fn decode_timeout_now(buf: &mut &[u8]) -> CodecResult<TimeoutNowRequest> {
+    ensure_remaining(buf, 24)?;
+
+    let term = TermId::new(buf.get_u64_le());
+    let from = NodeId::new(buf.get_u64_le());
+    let to = NodeId::new(buf.get_u64_le());
+
+    Ok(TimeoutNowRequest::new(term, from, to))
 }
 
 /// Encodes a log entry.

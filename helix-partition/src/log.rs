@@ -422,7 +422,8 @@ mod tests {
     fn make_batch(offset: u64, count: usize) -> RecordBatch {
         let mut batch = RecordBatch::new(PartitionId::new(0));
         for i in 0..count {
-            let record = Record::new(Bytes::from(format!("value-{}", offset as usize + i)));
+            let label = offset + i as u64;
+            let record = Record::new(Bytes::from(format!("value-{label}")));
             batch.push(record);
         }
         batch

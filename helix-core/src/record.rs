@@ -581,7 +581,7 @@ mod tests {
     #[test]
     fn test_record_roundtrip() {
         let original = Record::with_key("key", "value")
-            .with_timestamp(Timestamp::from_millis(1234567890))
+            .with_timestamp(Timestamp::from_millis(1_234_567_890))
             .with_header("h1", "v1");
 
         let mut buf = BytesMut::new();

@@ -127,8 +127,8 @@ mod tests {
     fn test_error_display() {
         let err = WalError::ChecksumMismatch {
             offset: 1024,
-            expected: 0xDEADBEEF,
-            actual: 0xCAFEBABE,
+            expected: 0xDEAD_BEEF,
+            actual: 0xCAFE_BABE,
         };
         let msg = format!("{err}");
         assert!(msg.contains("1024"));

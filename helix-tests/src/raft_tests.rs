@@ -16,7 +16,7 @@ use crate::scenarios::seeds::REGRESSION_SEEDS;
 
 /// Helper to check if a leader has been elected.
 fn has_leader(actors: &[RaftActor]) -> bool {
-    actors.iter().any(|a| a.is_leader())
+    actors.iter().any(RaftActor::is_leader)
 }
 
 /// Helper to count leaders in the cluster.
@@ -38,10 +38,10 @@ fn leaders_by_term(actors: &[RaftActor]) -> BTreeMap<u64, Vec<usize>> {
     result
 }
 
-/// Verify SingleLeaderPerTerm property.
+/// Verify `SingleLeaderPerTerm` property.
 fn check_single_leader_per_term(actors: &[RaftActor]) -> bool {
     let leaders = leaders_by_term(actors);
-    for (_term, leader_indices) in &leaders {
+    for leader_indices in leaders.values() {
         if leader_indices.len() > 1 {
             return false;
         }
@@ -126,7 +126,7 @@ fn test_simulation_leader_election() {
 }
 
 fn run_leader_election_simulation(seed: u64) {
-    let node_count = 3;
+    let node_count: u64 = 3;
 
     // Create engine with seed.
     let config = EngineConfig::new(seed)
@@ -135,8 +135,8 @@ fn run_leader_election_simulation(seed: u64) {
     let mut engine = DiscreteSimulationEngine::with_config(config);
 
     // Create actors.
-    let node_ids: Vec<NodeId> = (1..=node_count as u64).map(NodeId::new).collect();
-    let actor_ids: Vec<ActorId> = (1..=node_count as u64).map(ActorId::new).collect();
+    let node_ids: Vec<NodeId> = (1..=node_count).map(NodeId::new).collect();
+    let actor_ids: Vec<ActorId> = (1..=node_count).map(ActorId::new).collect();
 
     let node_to_actor: BTreeMap<NodeId, ActorId> = node_ids
         .iter()
@@ -214,9 +214,9 @@ fn test_simulation_five_node_cluster() {
         .with_stats(true);
     let mut engine = DiscreteSimulationEngine::with_config(config);
 
-    let node_count = 5;
-    let node_ids: Vec<NodeId> = (1..=node_count as u64).map(NodeId::new).collect();
-    let actor_ids: Vec<ActorId> = (1..=node_count as u64).map(ActorId::new).collect();
+    let node_count: u64 = 5;
+    let node_ids: Vec<NodeId> = (1..=node_count).map(NodeId::new).collect();
+    let actor_ids: Vec<ActorId> = (1..=node_count).map(ActorId::new).collect();
 
     let node_to_actor: BTreeMap<NodeId, ActorId> = node_ids
         .iter()
@@ -250,9 +250,9 @@ fn test_simulation_regression_seeds() {
             .with_stats(false); // Disable stats for speed
         let mut engine = DiscreteSimulationEngine::with_config(config);
 
-        let node_count = 3;
-        let node_ids: Vec<NodeId> = (1..=node_count as u64).map(NodeId::new).collect();
-        let actor_ids: Vec<ActorId> = (1..=node_count as u64).map(ActorId::new).collect();
+        let node_count: u64 = 3;
+        let node_ids: Vec<NodeId> = (1..=node_count).map(NodeId::new).collect();
+        let actor_ids: Vec<ActorId> = (1..=node_count).map(ActorId::new).collect();
 
         let node_to_actor: BTreeMap<NodeId, ActorId> = node_ids
             .iter()

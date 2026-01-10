@@ -31,8 +31,8 @@ pub use client::{
 pub use config::RaftConfig;
 pub use log::{LogEntry, RaftLog};
 pub use message::{
-    AppendEntriesRequest, AppendEntriesResponse, ClientRequest, Message, RequestVoteRequest,
-    RequestVoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, ClientRequest, Message, PreVoteRequest,
+    PreVoteResponse, RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
 };
 pub use state::{RaftNode, RaftOutput, RaftState};
 pub use storage::{MemoryStorage, PersistentState, RaftStorage, StorageError, StorageResult};

@@ -542,7 +542,7 @@ mod tests {
         assert!(result.is_ok());
         match result.unwrap() {
             ClientResult::NotLeader { .. } => {}
-            other => panic!("Expected NotLeader, got {:?}", other),
+            other => panic!("Expected NotLeader, got {other:?}"),
         }
 
         // Shutdown.

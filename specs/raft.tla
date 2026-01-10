@@ -1,12 +1,12 @@
 -------------------------------- MODULE raft --------------------------------
-\* Helix Raft Consensus Specification
+\* Helix Raft Consensus Specification with Pre-Vote Extension
 \*
-\* This specification models the core Raft consensus algorithm focusing on
-\* leader election and log replication. It is designed to be model-checked
-\* with TLC to verify safety properties before implementation.
+\* This specification models the Raft consensus algorithm with the Pre-Vote
+\* extension that prevents disruption from partitioned nodes. Pre-vote allows
+\* a node to check if it would win an election before incrementing its term.
 \*
-\* Based on the Raft paper by Ongaro and Ousterhout, with adaptations for
-\* Helix's specific requirements.
+\* Based on the Raft paper by Ongaro and Ousterhout, with the Pre-Vote
+\* extension from "Consensus: Bridging Theory and Practice" (Ongaro PhD thesis).
 
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
@@ -37,7 +37,7 @@ VARIABLES currentTerm,  \* Latest term server has seen (persisted)
 
 \* Volatile state on all servers
 VARIABLES commitIndex,  \* Index of highest log entry known to be committed
-          state         \* One of: "follower", "candidate", "leader"
+          state         \* One of: "follower", "preCandidate", "candidate", "leader"
 
 \* Volatile state on leaders (reinitialized after election)
 VARIABLES nextIndex,    \* For each server, index of next log entry to send
@@ -78,6 +78,22 @@ LogIsAtLeastAsUpToDate(termA, lastIdxA, termB, lastIdxB) ==
 \* MESSAGE TYPES
 \* ============================================================================
 
+\* Pre-vote RPC (doesn't increment term)
+PreVoteRequest(src, dst, term, lastLogIndex, lastLogTerm) ==
+    [type        |-> "PreVote",
+     term        |-> term,      \* The term that would be used if pre-vote succeeds
+     src         |-> src,
+     dst         |-> dst,
+     lastLogIdx  |-> lastLogIndex,
+     lastLogTerm |-> lastLogTerm]
+
+PreVoteResponse(src, dst, term, granted) ==
+    [type    |-> "PreVoteResponse",
+     term    |-> term,
+     src     |-> src,
+     dst     |-> dst,
+     granted |-> granted]
+
 \* Request vote RPC
 RequestVoteRequest(src, dst, term, lastLogIndex, lastLogTerm) ==
     [type        |-> "RequestVote",
@@ -114,13 +130,47 @@ AppendEntriesResponse(src, dst, term, success, matchIdx) ==
      matchIdx |-> matchIdx]
 
 \* ============================================================================
-\* ACTIONS
+\* PRE-VOTE ACTIONS
 \* ============================================================================
 
-\* Server s times out and starts an election
-StartElection(s) ==
-    /\ state[s] \in {"follower", "candidate"}
+\* Server s times out and starts a pre-vote (without incrementing term)
+StartPreVote(s) ==
+    /\ state[s] \in {"follower", "candidate", "preCandidate"}
     /\ currentTerm[s] < MaxTerm
+    \* Don't increment term yet - that's the key difference from regular election
+    /\ state' = [state EXCEPT ![s] = "preCandidate"]
+    /\ messages' = messages \cup
+        {PreVoteRequest(s, d, currentTerm[s] + 1,
+                       Len(log[s]), LastTerm(s)) : d \in Servers \ {s}}
+    /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, nextIndex, matchIndex, elections, committed>>
+
+\* Server s handles a PreVote request
+\* Key: Pre-vote doesn't change votedFor or currentTerm
+HandlePreVote(s, m) ==
+    /\ m.type = "PreVote"
+    /\ m.dst = s
+    \* Grant pre-vote if:
+    \* 1. The candidate's term would be at least as high as ours
+    \* 2. The candidate's log is at least as up-to-date as ours
+    \* Note: We don't check votedFor because pre-vote doesn't consume votes
+    /\ LET grant == /\ m.term >= currentTerm[s]
+                    /\ LogIsAtLeastAsUpToDate(m.lastLogTerm, m.lastLogIdx,
+                                              LastTerm(s), Len(log[s]))
+       IN messages' = (messages \ {m}) \cup
+            {PreVoteResponse(s, m.src, m.term, grant)}
+    \* Pre-vote doesn't change persistent state
+    /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, state,
+                  nextIndex, matchIndex, elections, committed>>
+
+\* PreCandidate s receives enough pre-votes to start actual election
+BecomeCandidate(s) ==
+    /\ state[s] = "preCandidate"
+    /\ currentTerm[s] < MaxTerm
+    /\ LET preVotesReceived == {m.src : m \in {m \in messages :
+            m.type = "PreVoteResponse" /\ m.dst = s /\
+            m.term = currentTerm[s] + 1 /\ m.granted}} \cup {s}
+       IN Cardinality(preVotesReceived) * 2 > Cardinality(Servers)
+    \* Now we can safely increment term and start actual election
     /\ currentTerm' = [currentTerm EXCEPT ![s] = currentTerm[s] + 1]
     /\ votedFor' = [votedFor EXCEPT ![s] = s]
     /\ state' = [state EXCEPT ![s] = "candidate"]
@@ -128,6 +178,10 @@ StartElection(s) ==
         {RequestVoteRequest(s, d, currentTerm[s] + 1,
                            Len(log[s]), LastTerm(s)) : d \in Servers \ {s}}
     /\ UNCHANGED <<log, commitIndex, nextIndex, matchIndex, elections, committed>>
+
+\* ============================================================================
+\* VOTE ACTIONS
+\* ============================================================================
 
 \* Server s receives a RequestVote request from candidate c
 HandleRequestVote(s, m) ==
@@ -162,6 +216,10 @@ BecomeLeader(s) ==
     /\ matchIndex' = [matchIndex EXCEPT ![s] = [d \in Servers |-> 0]]
     /\ elections' = elections \cup {[term |-> currentTerm[s], leader |-> s]}
     /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, messages, committed>>
+
+\* ============================================================================
+\* LOG REPLICATION ACTIONS
+\* ============================================================================
 
 \* Leader s appends a new entry to its log (client request)
 ClientRequest(s, v) ==
@@ -240,19 +298,13 @@ HandleAppendEntriesResponse(s, m) ==
     /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, state, elections, committed>>
 
 \* Leader s advances commit index
-\* An index n can be committed if:
-\*   - n > current commitIndex
-\*   - Entry at n is from current term
-\*   - A majority have replicated index n
 AdvanceCommitIndex(s) ==
     /\ state[s] = "leader"
     /\ Len(log[s]) > 0
-    \* Define the set of indices that could become the new commit index
     /\ LET committableIndices == {n \in (commitIndex[s]+1)..Len(log[s]) :
                /\ log[s][n].term = currentTerm[s]
                /\ Cardinality({d \in Servers : matchIndex[s][d] >= n}) * 2 > Cardinality(Servers)}
        IN
-       \* Only proceed if there's something to commit
        /\ committableIndices # {}
        /\ LET newCommitIdx == Max(committableIndices)
           IN /\ commitIndex' = [commitIndex EXCEPT ![s] = newCommitIdx]
@@ -278,10 +330,15 @@ Init ==
     /\ committed = {}
 
 Next ==
-    \/ \E s \in Servers : StartElection(s)
+    \* Pre-vote phase
+    \/ \E s \in Servers : StartPreVote(s)
+    \/ \E s \in Servers, m \in messages : HandlePreVote(s, m)
+    \/ \E s \in Servers : BecomeCandidate(s)
+    \* Vote phase
     \/ \E s \in Servers, m \in messages : HandleRequestVote(s, m)
     \/ \E s \in Servers : BecomeLeader(s)
-    \/ \E s \in Servers, v \in 1..3 : ClientRequest(s, v)  \* Values 1-3 for testing
+    \* Log replication
+    \/ \E s \in Servers, v \in 1..3 : ClientRequest(s, v)
     \/ \E s, d \in Servers : SendAppendEntries(s, d)
     \/ \E s \in Servers, m \in messages : HandleAppendEntries(s, m)
     \/ \E s \in Servers, m \in messages : HandleAppendEntriesResponse(s, m)
@@ -307,7 +364,6 @@ LogMatching ==
                 \A j \in 1..i : log[s1][j] = log[s2][j]
 
 \* LeaderCompleteness: If an entry is committed, it will be in all future leaders' logs
-\* (Checked via committed set)
 LeaderCompleteness ==
     \A c \in committed :
         \A e \in elections :
@@ -322,6 +378,10 @@ StateMachineSafety ==
     \A c1, c2 \in committed :
         c1.idx = c2.idx => c1.value = c2.value
 
+\* PreVotePreservesTerms: A node cannot increment its term without first winning a pre-vote
+\* This is implicit in the state machine - only BecomeCandidate increments term,
+\* and it requires being in preCandidate state with a pre-vote quorum.
+
 \* Combined safety property
 Safety == SingleLeaderPerTerm /\ LogMatching /\ StateMachineSafety
 
@@ -332,7 +392,7 @@ Safety == SingleLeaderPerTerm /\ LogMatching /\ StateMachineSafety
 TypeOK ==
     /\ currentTerm \in [Servers -> Nat]
     /\ votedFor \in [Servers -> Servers \cup {Nil}]
-    /\ state \in [Servers -> {"follower", "candidate", "leader"}]
+    /\ state \in [Servers -> {"follower", "preCandidate", "candidate", "leader"}]
     /\ commitIndex \in [Servers -> Nat]
 
 =============================================================================

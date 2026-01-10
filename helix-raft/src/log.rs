@@ -194,16 +194,26 @@ impl RaftLog {
         self.entries[start..].to_vec()
     }
 
-    /// Checks if our log is at least as up-to-date as (`last_term`, `last_index`).
+    /// Checks if the candidate's log (`other_term`, `other_index`) is at least as
+    /// up-to-date as ours.
     ///
     /// Used in leader election to determine if we should grant a vote.
+    /// A vote is granted if the candidate's log is at least as up-to-date as ours.
+    ///
+    /// From the Raft paper: "Raft determines which of two logs is more up-to-date
+    /// by comparing the index and term of the last entries in the logs. If the logs
+    /// have last entries with different terms, then the log with the later term is
+    /// more up-to-date. If the logs end with the same term, then whichever log is
+    /// longer is more up-to-date."
     #[must_use]
     pub fn is_up_to_date(&self, other_term: TermId, other_index: LogIndex) -> bool {
         let my_term = self.last_term();
         let my_index = self.last_index();
 
-        // Compare by term first, then by index.
-        my_term > other_term || (my_term == other_term && my_index >= other_index)
+        // Candidate's log is at least as up-to-date if:
+        // 1. Candidate's last term > our last term, OR
+        // 2. Terms are equal AND candidate's last index >= our last index
+        other_term > my_term || (other_term == my_term && other_index >= my_index)
     }
 }
 
@@ -292,18 +302,22 @@ mod tests {
         log.append(make_entry(2, 2));
 
         // Our log: term=2, index=2
+        // is_up_to_date returns true if the CANDIDATE's log is at least as up-to-date as ours.
 
-        // Higher term always wins.
-        assert!(!log.is_up_to_date(TermId::new(3), LogIndex::new(1)));
+        // Candidate has higher term - they're more up-to-date, grant vote.
+        assert!(log.is_up_to_date(TermId::new(3), LogIndex::new(1)));
 
-        // Same term, longer log wins.
-        assert!(!log.is_up_to_date(TermId::new(2), LogIndex::new(3)));
+        // Candidate has same term but longer log - they're more up-to-date, grant vote.
+        assert!(log.is_up_to_date(TermId::new(2), LogIndex::new(3)));
 
-        // Same term and index - we're up to date.
+        // Candidate has same term and same index - equal, grant vote.
         assert!(log.is_up_to_date(TermId::new(2), LogIndex::new(2)));
 
-        // Lower term - we're more up to date.
-        assert!(log.is_up_to_date(TermId::new(1), LogIndex::new(5)));
+        // Candidate has lower term - we're more up-to-date, deny vote.
+        assert!(!log.is_up_to_date(TermId::new(1), LogIndex::new(5)));
+
+        // Candidate has same term but shorter log - we're more up-to-date, deny vote.
+        assert!(!log.is_up_to_date(TermId::new(2), LogIndex::new(1)));
     }
 
     #[test]

@@ -10,6 +10,10 @@ use crate::LogEntry;
 /// Raft message types for communication between nodes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
+    /// Pre-vote request (doesn't increment term).
+    PreVote(PreVoteRequest),
+    /// Response to pre-vote request.
+    PreVoteResponse(PreVoteResponse),
     /// Request vote from candidate to other nodes.
     RequestVote(RequestVoteRequest),
     /// Response to vote request.
@@ -18,6 +22,8 @@ pub enum Message {
     AppendEntries(AppendEntriesRequest),
     /// Response to append entries.
     AppendEntriesResponse(AppendEntriesResponse),
+    /// Leadership transfer: tells target to start election immediately.
+    TimeoutNow(TimeoutNowRequest),
 }
 
 impl Message {
@@ -25,10 +31,13 @@ impl Message {
     #[must_use]
     pub const fn from(&self) -> NodeId {
         match self {
+            Self::PreVote(r) => r.candidate_id,
+            Self::PreVoteResponse(r) => r.from,
             Self::RequestVote(r) => r.candidate_id,
             Self::RequestVoteResponse(r) => r.from,
             Self::AppendEntries(r) => r.leader_id,
             Self::AppendEntriesResponse(r) => r.from,
+            Self::TimeoutNow(r) => r.from,
         }
     }
 
@@ -36,10 +45,13 @@ impl Message {
     #[must_use]
     pub const fn to(&self) -> NodeId {
         match self {
+            Self::PreVote(r) => r.to,
+            Self::PreVoteResponse(r) => r.to,
             Self::RequestVote(r) => r.to,
             Self::RequestVoteResponse(r) => r.to,
             Self::AppendEntries(r) => r.to,
             Self::AppendEntriesResponse(r) => r.to,
+            Self::TimeoutNow(r) => r.to,
         }
     }
 
@@ -47,10 +59,81 @@ impl Message {
     #[must_use]
     pub const fn term(&self) -> TermId {
         match self {
+            Self::PreVote(r) => r.term,
+            Self::PreVoteResponse(r) => r.term,
             Self::RequestVote(r) => r.term,
             Self::RequestVoteResponse(r) => r.term,
             Self::AppendEntries(r) => r.term,
             Self::AppendEntriesResponse(r) => r.term,
+            Self::TimeoutNow(r) => r.term,
+        }
+    }
+}
+
+/// Pre-vote request (Raft extension for preventing disruption).
+///
+/// Sent before starting an actual election. The candidate asks "would you vote
+/// for me if I started an election?" without actually incrementing its term.
+/// This prevents partitioned nodes from disrupting the cluster with high terms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreVoteRequest {
+    /// The term the candidate would use if it wins the pre-vote.
+    /// This is `current_term` + 1, but the candidate hasn't incremented yet.
+    pub term: TermId,
+    /// Candidate requesting pre-vote.
+    pub candidate_id: NodeId,
+    /// Target node.
+    pub to: NodeId,
+    /// Index of candidate's last log entry.
+    pub last_log_index: LogIndex,
+    /// Term of candidate's last log entry.
+    pub last_log_term: TermId,
+}
+
+impl PreVoteRequest {
+    /// Creates a new pre-vote request.
+    #[must_use]
+    pub const fn new(
+        term: TermId,
+        candidate_id: NodeId,
+        to: NodeId,
+        last_log_index: LogIndex,
+        last_log_term: TermId,
+    ) -> Self {
+        Self {
+            term,
+            candidate_id,
+            to,
+            last_log_index,
+            last_log_term,
+        }
+    }
+}
+
+/// Pre-vote response.
+///
+/// Sent in response to a pre-vote request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreVoteResponse {
+    /// The term from the pre-vote request.
+    pub term: TermId,
+    /// Sender of this response.
+    pub from: NodeId,
+    /// Candidate that requested the pre-vote.
+    pub to: NodeId,
+    /// True if pre-vote was granted.
+    pub vote_granted: bool,
+}
+
+impl PreVoteResponse {
+    /// Creates a new pre-vote response.
+    #[must_use]
+    pub const fn new(term: TermId, from: NodeId, to: NodeId, vote_granted: bool) -> Self {
+        Self {
+            term,
+            from,
+            to,
+            vote_granted,
         }
     }
 }
@@ -240,6 +323,29 @@ impl ClientRequest {
     #[must_use]
     pub const fn new(data: Bytes) -> Self {
         Self { data }
+    }
+}
+
+/// `TimeoutNow` request for leadership transfer.
+///
+/// Sent by a leader to a follower to request that it immediately start
+/// an election. The follower should bypass the pre-vote phase and directly
+/// become a candidate. This enables graceful leadership transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeoutNowRequest {
+    /// The leader's current term.
+    pub term: TermId,
+    /// The leader sending this request.
+    pub from: NodeId,
+    /// The target follower that should become leader.
+    pub to: NodeId,
+}
+
+impl TimeoutNowRequest {
+    /// Creates a new `TimeoutNow` request.
+    #[must_use]
+    pub const fn new(term: TermId, from: NodeId, to: NodeId) -> Self {
+        Self { term, from, to }
     }
 }
 

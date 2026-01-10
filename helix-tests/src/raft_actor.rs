@@ -13,8 +13,9 @@ use bloodhound::simulation::discrete::event::{ActorId, EventKind};
 use bytes::Bytes;
 use helix_core::{LogIndex, NodeId, TermId};
 use helix_raft::{
-    AppendEntriesRequest, AppendEntriesResponse, ClientRequest, LogEntry, Message, RaftConfig,
-    RaftNode, RaftOutput, RaftState, RequestVoteRequest, RequestVoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, ClientRequest, LogEntry, Message, PreVoteRequest,
+    PreVoteResponse, RaftConfig, RaftNode, RaftOutput, RaftState, RequestVoteRequest,
+    RequestVoteResponse, TimeoutNowRequest,
 };
 
 /// Timer IDs for Raft events.
@@ -95,12 +96,109 @@ impl NetworkState {
 /// Shared network state handle.
 pub type SharedNetworkState = Arc<Mutex<NetworkState>>;
 
+// ============================================================================
+// Property State Tracking (for real-time property verification)
+// ============================================================================
+
+/// Snapshot of a single node's state for property checking.
+#[derive(Debug, Clone)]
+pub struct NodeSnapshot {
+    /// Node ID.
+    pub node_id: u64,
+    /// Current term.
+    pub current_term: u64,
+    /// Current role.
+    pub state: RaftState,
+    /// Commit index.
+    pub commit_index: u64,
+    /// Last log index.
+    pub last_log_index: u64,
+    /// Log entries: index -> term.
+    pub log_terms: BTreeMap<u64, u64>,
+    /// Whether the node is crashed.
+    pub crashed: bool,
+}
+
+/// Entry that was applied to the state machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedEntry {
+    /// The log index.
+    pub index: u64,
+    /// The term of the entry.
+    pub term: u64,
+    /// Hash of the data (for comparison without storing full data).
+    pub data_hash: u64,
+}
+
+/// Shared property state for real-time verification during simulation.
+#[derive(Debug, Default)]
+pub struct PropertyState {
+    /// Current snapshot of each node: `node_id` -> snapshot.
+    pub nodes: BTreeMap<u64, NodeSnapshot>,
+    /// Applied entries per node: `node_id` -> list of applied entries.
+    pub applied_entries: BTreeMap<u64, Vec<AppliedEntry>>,
+    /// Leaders observed per term: term -> set of node IDs.
+    pub leaders_by_term: BTreeMap<u64, BTreeSet<u64>>,
+    /// Total events processed (for debugging).
+    pub events_processed: u64,
+}
+
+impl PropertyState {
+    /// Creates a new empty property state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Updates the snapshot for a node.
+    pub fn update_node(&mut self, snapshot: NodeSnapshot) {
+        // Track leaders by term.
+        if snapshot.state == RaftState::Leader {
+            self.leaders_by_term
+                .entry(snapshot.current_term)
+                .or_default()
+                .insert(snapshot.node_id);
+        }
+        self.nodes.insert(snapshot.node_id, snapshot);
+    }
+
+    /// Records an applied entry.
+    pub fn record_applied(&mut self, node_id: u64, entry: AppliedEntry) {
+        self.applied_entries
+            .entry(node_id)
+            .or_default()
+            .push(entry);
+    }
+
+    /// Increments the event counter.
+    pub fn increment_events(&mut self) {
+        self.events_processed += 1;
+    }
+}
+
+/// Shared property state handle.
+pub type SharedPropertyState = Arc<Mutex<PropertyState>>;
+
+/// Simple hash function for data comparison.
+fn hash_data(data: &[u8]) -> u64 {
+    // FNV-1a hash.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in data {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
 /// Message type tags for serialization.
 mod message_tags {
-    pub const REQUEST_VOTE: u8 = 1;
-    pub const REQUEST_VOTE_RESPONSE: u8 = 2;
-    pub const APPEND_ENTRIES: u8 = 3;
-    pub const APPEND_ENTRIES_RESPONSE: u8 = 4;
+    pub const PRE_VOTE: u8 = 1;
+    pub const PRE_VOTE_RESPONSE: u8 = 2;
+    pub const REQUEST_VOTE: u8 = 3;
+    pub const REQUEST_VOTE_RESPONSE: u8 = 4;
+    pub const APPEND_ENTRIES: u8 = 5;
+    pub const APPEND_ENTRIES_RESPONSE: u8 = 6;
+    pub const TIMEOUT_NOW: u8 = 7;
 }
 
 /// Serialize a Raft message to bytes for network transmission.
@@ -108,6 +206,21 @@ fn serialize_message(msg: &Message) -> Vec<u8> {
     let mut buf = Vec::new();
 
     match msg {
+        Message::PreVote(req) => {
+            buf.push(message_tags::PRE_VOTE);
+            buf.extend_from_slice(&req.term.get().to_le_bytes());
+            buf.extend_from_slice(&req.candidate_id.get().to_le_bytes());
+            buf.extend_from_slice(&req.to.get().to_le_bytes());
+            buf.extend_from_slice(&req.last_log_index.get().to_le_bytes());
+            buf.extend_from_slice(&req.last_log_term.get().to_le_bytes());
+        }
+        Message::PreVoteResponse(resp) => {
+            buf.push(message_tags::PRE_VOTE_RESPONSE);
+            buf.extend_from_slice(&resp.term.get().to_le_bytes());
+            buf.extend_from_slice(&resp.from.get().to_le_bytes());
+            buf.extend_from_slice(&resp.to.get().to_le_bytes());
+            buf.push(u8::from(resp.vote_granted));
+        }
         Message::RequestVote(req) => {
             buf.push(message_tags::REQUEST_VOTE);
             buf.extend_from_slice(&req.term.get().to_le_bytes());
@@ -154,6 +267,12 @@ fn serialize_message(msg: &Message) -> Vec<u8> {
             buf.push(u8::from(resp.success));
             buf.extend_from_slice(&resp.match_index.get().to_le_bytes());
         }
+        Message::TimeoutNow(req) => {
+            buf.push(message_tags::TIMEOUT_NOW);
+            buf.extend_from_slice(&req.term.get().to_le_bytes());
+            buf.extend_from_slice(&req.from.get().to_le_bytes());
+            buf.extend_from_slice(&req.to.get().to_le_bytes());
+        }
     }
 
     buf
@@ -166,104 +285,149 @@ fn deserialize_message(data: &[u8]) -> Option<Message> {
     }
 
     let tag = data[0];
-    let data = &data[1..];
+    let payload = &data[1..];
 
     match tag {
-        message_tags::REQUEST_VOTE => {
-            if data.len() < 40 {
-                return None;
-            }
-            let term = TermId::new(u64::from_le_bytes(data[0..8].try_into().ok()?));
-            let candidate_id = NodeId::new(u64::from_le_bytes(data[8..16].try_into().ok()?));
-            let to = NodeId::new(u64::from_le_bytes(data[16..24].try_into().ok()?));
-            let last_log_index = LogIndex::new(u64::from_le_bytes(data[24..32].try_into().ok()?));
-            let last_log_term = TermId::new(u64::from_le_bytes(data[32..40].try_into().ok()?));
-            Some(Message::RequestVote(RequestVoteRequest::new(
-                term,
-                candidate_id,
-                to,
-                last_log_index,
-                last_log_term,
-            )))
-        }
-        message_tags::REQUEST_VOTE_RESPONSE => {
-            if data.len() < 25 {
-                return None;
-            }
-            let term = TermId::new(u64::from_le_bytes(data[0..8].try_into().ok()?));
-            let from = NodeId::new(u64::from_le_bytes(data[8..16].try_into().ok()?));
-            let to = NodeId::new(u64::from_le_bytes(data[16..24].try_into().ok()?));
-            let vote_granted = data[24] != 0;
-            Some(Message::RequestVoteResponse(RequestVoteResponse::new(
-                term,
-                from,
-                to,
-                vote_granted,
-            )))
-        }
-        message_tags::APPEND_ENTRIES => {
-            if data.len() < 52 {
-                return None;
-            }
-            let term = TermId::new(u64::from_le_bytes(data[0..8].try_into().ok()?));
-            let leader_id = NodeId::new(u64::from_le_bytes(data[8..16].try_into().ok()?));
-            let to = NodeId::new(u64::from_le_bytes(data[16..24].try_into().ok()?));
-            let prev_log_index = LogIndex::new(u64::from_le_bytes(data[24..32].try_into().ok()?));
-            let prev_log_term = TermId::new(u64::from_le_bytes(data[32..40].try_into().ok()?));
-            let leader_commit = LogIndex::new(u64::from_le_bytes(data[40..48].try_into().ok()?));
-            let entry_count = u32::from_le_bytes(data[48..52].try_into().ok()?) as usize;
-
-            let mut offset = 52;
-            let mut entries = Vec::with_capacity(entry_count);
-            for _ in 0..entry_count {
-                if offset + 20 > data.len() {
-                    return None;
-                }
-                let entry_term =
-                    TermId::new(u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?));
-                let entry_index = LogIndex::new(u64::from_le_bytes(
-                    data[offset + 8..offset + 16].try_into().ok()?,
-                ));
-                let data_len =
-                    u32::from_le_bytes(data[offset + 16..offset + 20].try_into().ok()?) as usize;
-                offset += 20;
-                if offset + data_len > data.len() {
-                    return None;
-                }
-                let entry_data = Bytes::copy_from_slice(&data[offset..offset + data_len]);
-                offset += data_len;
-                entries.push(LogEntry::new(entry_term, entry_index, entry_data));
-            }
-
-            Some(Message::AppendEntries(AppendEntriesRequest::new(
-                term,
-                leader_id,
-                to,
-                prev_log_index,
-                prev_log_term,
-                entries,
-                leader_commit,
-            )))
-        }
-        message_tags::APPEND_ENTRIES_RESPONSE => {
-            if data.len() < 33 {
-                return None;
-            }
-            let term = TermId::new(u64::from_le_bytes(data[0..8].try_into().ok()?));
-            let from = NodeId::new(u64::from_le_bytes(data[8..16].try_into().ok()?));
-            let to = NodeId::new(u64::from_le_bytes(data[16..24].try_into().ok()?));
-            let success = data[24] != 0;
-            let match_index = LogIndex::new(u64::from_le_bytes(data[25..33].try_into().ok()?));
-            Some(Message::AppendEntriesResponse(AppendEntriesResponse::new(
-                term,
-                from,
-                to,
-                success,
-                match_index,
-            )))
-        }
+        message_tags::PRE_VOTE => deserialize_pre_vote(payload),
+        message_tags::PRE_VOTE_RESPONSE => deserialize_pre_vote_response(payload),
+        message_tags::REQUEST_VOTE => deserialize_request_vote(payload),
+        message_tags::REQUEST_VOTE_RESPONSE => deserialize_request_vote_response(payload),
+        message_tags::APPEND_ENTRIES => deserialize_append_entries(payload),
+        message_tags::APPEND_ENTRIES_RESPONSE => deserialize_append_entries_response(payload),
+        message_tags::TIMEOUT_NOW => deserialize_timeout_now(payload),
         _ => None,
     }
+}
+
+/// Deserialize a pre-vote request.
+fn deserialize_pre_vote(data: &[u8]) -> Option<Message> {
+    if data.len() < 40 {
+        return None;
+    }
+    let term = TermId::new(u64::from_le_bytes(data[0..8].try_into().ok()?));
+    let candidate_id = NodeId::new(u64::from_le_bytes(data[8..16].try_into().ok()?));
+    let to = NodeId::new(u64::from_le_bytes(data[16..24].try_into().ok()?));
+    let last_log_index = LogIndex::new(u64::from_le_bytes(data[24..32].try_into().ok()?));
+    let last_log_term = TermId::new(u64::from_le_bytes(data[32..40].try_into().ok()?));
+    Some(Message::PreVote(PreVoteRequest::new(
+        term,
+        candidate_id,
+        to,
+        last_log_index,
+        last_log_term,
+    )))
+}
+
+/// Deserialize a pre-vote response.
+fn deserialize_pre_vote_response(data: &[u8]) -> Option<Message> {
+    if data.len() < 25 {
+        return None;
+    }
+    let term = TermId::new(u64::from_le_bytes(data[0..8].try_into().ok()?));
+    let from = NodeId::new(u64::from_le_bytes(data[8..16].try_into().ok()?));
+    let to = NodeId::new(u64::from_le_bytes(data[16..24].try_into().ok()?));
+    let vote_granted = data[24] != 0;
+    Some(Message::PreVoteResponse(PreVoteResponse::new(
+        term, from, to, vote_granted,
+    )))
+}
+
+/// Deserialize a request vote request.
+fn deserialize_request_vote(data: &[u8]) -> Option<Message> {
+    if data.len() < 40 {
+        return None;
+    }
+    let term = TermId::new(u64::from_le_bytes(data[0..8].try_into().ok()?));
+    let candidate_id = NodeId::new(u64::from_le_bytes(data[8..16].try_into().ok()?));
+    let to = NodeId::new(u64::from_le_bytes(data[16..24].try_into().ok()?));
+    let last_log_index = LogIndex::new(u64::from_le_bytes(data[24..32].try_into().ok()?));
+    let last_log_term = TermId::new(u64::from_le_bytes(data[32..40].try_into().ok()?));
+    Some(Message::RequestVote(RequestVoteRequest::new(
+        term,
+        candidate_id,
+        to,
+        last_log_index,
+        last_log_term,
+    )))
+}
+
+/// Deserialize a request vote response.
+fn deserialize_request_vote_response(data: &[u8]) -> Option<Message> {
+    if data.len() < 25 {
+        return None;
+    }
+    let term = TermId::new(u64::from_le_bytes(data[0..8].try_into().ok()?));
+    let from = NodeId::new(u64::from_le_bytes(data[8..16].try_into().ok()?));
+    let to = NodeId::new(u64::from_le_bytes(data[16..24].try_into().ok()?));
+    let vote_granted = data[24] != 0;
+    Some(Message::RequestVoteResponse(RequestVoteResponse::new(
+        term, from, to, vote_granted,
+    )))
+}
+
+/// Deserialize an append entries request.
+fn deserialize_append_entries(data: &[u8]) -> Option<Message> {
+    if data.len() < 52 {
+        return None;
+    }
+    let term = TermId::new(u64::from_le_bytes(data[0..8].try_into().ok()?));
+    let leader_id = NodeId::new(u64::from_le_bytes(data[8..16].try_into().ok()?));
+    let to = NodeId::new(u64::from_le_bytes(data[16..24].try_into().ok()?));
+    let prev_log_index = LogIndex::new(u64::from_le_bytes(data[24..32].try_into().ok()?));
+    let prev_log_term = TermId::new(u64::from_le_bytes(data[32..40].try_into().ok()?));
+    let leader_commit = LogIndex::new(u64::from_le_bytes(data[40..48].try_into().ok()?));
+    let entry_count = u32::from_le_bytes(data[48..52].try_into().ok()?) as usize;
+
+    let mut offset = 52;
+    let mut entries = Vec::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        if offset + 20 > data.len() {
+            return None;
+        }
+        let entry_term =
+            TermId::new(u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?));
+        let entry_index =
+            LogIndex::new(u64::from_le_bytes(data[offset + 8..offset + 16].try_into().ok()?));
+        let data_len =
+            u32::from_le_bytes(data[offset + 16..offset + 20].try_into().ok()?) as usize;
+        offset += 20;
+        if offset + data_len > data.len() {
+            return None;
+        }
+        let entry_data = Bytes::copy_from_slice(&data[offset..offset + data_len]);
+        offset += data_len;
+        entries.push(LogEntry::new(entry_term, entry_index, entry_data));
+    }
+
+    Some(Message::AppendEntries(AppendEntriesRequest::new(
+        term, leader_id, to, prev_log_index, prev_log_term, entries, leader_commit,
+    )))
+}
+
+/// Deserialize an append entries response.
+fn deserialize_append_entries_response(data: &[u8]) -> Option<Message> {
+    if data.len() < 33 {
+        return None;
+    }
+    let term = TermId::new(u64::from_le_bytes(data[0..8].try_into().ok()?));
+    let from = NodeId::new(u64::from_le_bytes(data[8..16].try_into().ok()?));
+    let to = NodeId::new(u64::from_le_bytes(data[16..24].try_into().ok()?));
+    let success = data[24] != 0;
+    let match_index = LogIndex::new(u64::from_le_bytes(data[25..33].try_into().ok()?));
+    Some(Message::AppendEntriesResponse(AppendEntriesResponse::new(
+        term, from, to, success, match_index,
+    )))
+}
+
+/// Deserialize a timeout now request.
+fn deserialize_timeout_now(data: &[u8]) -> Option<Message> {
+    if data.len() < 24 {
+        return None;
+    }
+    let term = TermId::new(u64::from_le_bytes(data[0..8].try_into().ok()?));
+    let from = NodeId::new(u64::from_le_bytes(data[8..16].try_into().ok()?));
+    let to = NodeId::new(u64::from_le_bytes(data[16..24].try_into().ok()?));
+    Some(Message::TimeoutNow(TimeoutNowRequest::new(term, from, to)))
 }
 
 /// Checkpoint state for `RaftActor`.
@@ -304,6 +468,8 @@ pub struct RaftActor {
     crashed: bool,
     /// Shared network state for partition tracking.
     network_state: Option<SharedNetworkState>,
+    /// Shared property state for real-time verification.
+    property_state: Option<SharedPropertyState>,
 }
 
 impl RaftActor {
@@ -342,12 +508,64 @@ impl RaftActor {
             heartbeat_interval_us,
             crashed: false,
             network_state: None,
+            property_state: None,
         }
     }
 
     /// Sets the shared network state for partition tracking.
     pub fn set_network_state(&mut self, state: SharedNetworkState) {
         self.network_state = Some(state);
+    }
+
+    /// Sets the shared property state for real-time verification.
+    pub fn set_property_state(&mut self, state: SharedPropertyState) {
+        self.property_state = Some(state);
+    }
+
+    /// Reports current state to the shared property state.
+    fn report_state(&self) {
+        if let Some(ref property_state) = self.property_state {
+            if let Ok(mut state) = property_state.lock() {
+                // Build log terms map.
+                let mut log_terms = BTreeMap::new();
+                let first = self.node.log().first_index().get();
+                let last = self.node.log().last_index().get();
+                // Bounded loop: iterate over log entries.
+                for idx in first..=last {
+                    let term = self.node.log().term_at(LogIndex::new(idx));
+                    if term.get() > 0 {
+                        log_terms.insert(idx, term.get());
+                    }
+                }
+
+                let snapshot = NodeSnapshot {
+                    node_id: self.node.node_id().get(),
+                    current_term: self.node.current_term().get(),
+                    state: self.node.state(),
+                    commit_index: self.node.commit_index().get(),
+                    last_log_index: last,
+                    log_terms,
+                    crashed: self.crashed,
+                };
+                state.update_node(snapshot);
+                state.increment_events();
+            }
+        }
+    }
+
+    /// Records an applied entry to the shared property state.
+    fn record_applied_entry(&self, index: LogIndex, data: &Bytes) {
+        if let Some(ref property_state) = self.property_state {
+            if let Ok(mut state) = property_state.lock() {
+                let term = self.node.log().term_at(index);
+                let entry = AppliedEntry {
+                    index: index.get(),
+                    term: term.get(),
+                    data_hash: hash_data(data),
+                };
+                state.record_applied(self.node.node_id().get(), entry);
+            }
+        }
     }
 
     /// Returns true if this node is currently crashed.
@@ -398,6 +616,20 @@ impl RaftActor {
         self.node.log().last_index()
     }
 
+    /// Returns the term at a specific log index, or 0 if not found.
+    ///
+    /// Used for `LogMatching` property verification.
+    #[must_use]
+    pub fn term_at(&self, index: LogIndex) -> TermId {
+        self.node.log().term_at(index)
+    }
+
+    /// Returns the first log index.
+    #[must_use]
+    pub fn first_log_index(&self) -> LogIndex {
+        self.node.log().first_index()
+    }
+
     /// Submits a client request to the Raft node.
     ///
     /// Returns outputs to process if this node is the leader, None otherwise.
@@ -425,6 +657,8 @@ impl RaftActor {
                     self.schedule_heartbeat(ctx);
                 }
                 RaftOutput::CommitEntry { index, data } => {
+                    // Record applied entry for StateMachineSafety verification.
+                    self.record_applied_entry(index, &data);
                     tracing::debug!(
                         actor = %self.name,
                         index = index.get(),
@@ -448,6 +682,8 @@ impl RaftActor {
                 }
             }
         }
+        // Report state after processing all outputs.
+        self.report_state();
     }
 
     /// Sends a Raft message to another actor using `PacketDelivery`.

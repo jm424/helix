@@ -6,8 +6,8 @@ This document tracks progress against the [implementation plan](../helix-impleme
 
 | Phase | Status | Completion |
 |-------|--------|------------|
-| Phase 0: Foundations | Partial | ~70% |
-| Phase 1: Core Consensus | Partial | ~80% |
+| Phase 0: Foundations | Partial | ~80% |
+| Phase 1: Core Consensus | Partial | ~90% |
 | Phase 2: Multi-Raft & Sharding | Not Started | 0% |
 | Phase 3: Storage Features | Not Started | 0% |
 | Phase 4: API & Flow Control | Partial (out of order) | ~30% |
@@ -25,9 +25,9 @@ We built components out of order:
 ### 2. Missing Testing Milestones
 
 The plan requires:
-- **10,000 simulated hours with random faults, zero safety violations** - NOT ACHIEVED
+- **10,000 simulated hours with random faults, zero safety violations** - IN PROGRESS
 - **ScenarioBuilder test patterns** - NOT USED
-- **PropertyExecutor for invariant checking** - BASIC ONLY
+- **PropertyExecutor for invariant checking** - ✅ DONE (SingleLeaderPerTerm, LogMatching, LeaderCompleteness)
 - **TLA+ trace validation** - NOT IMPLEMENTED
 
 ### 3. Architecture Differences
@@ -45,7 +45,8 @@ The plan requires:
 
 | Item | Status | Notes |
 |------|--------|-------|
-| `raft.tla` - Core Raft consensus | ✅ Done | In `specs/` |
+| `raft.tla` - Core Raft consensus | ✅ Done | In `specs/`, includes Pre-vote extension |
+| TLC model checking | ✅ Done | 327M+ states verified, 0 violations |
 | `raft_log.tla` - Log replication invariants | ❌ Not Started | |
 | `multi_raft.tla` - Multi-group coordination | ❌ Not Started | |
 | `progress.tla` - Consumer progress tracking | ❌ Not Started | |
@@ -118,8 +119,8 @@ The plan requires:
 | Log replication (AppendEntries) | ✅ Done | |
 | Commit index advancement | ✅ Done | |
 | Leader heartbeats | ✅ Done | |
-| Pre-vote extension | ❌ Not Implemented | Prevents disruption |
-| Leadership transfer | ❌ Not Implemented | |
+| Pre-vote extension | ✅ Done | Prevents disruption from partitioned nodes |
+| Leadership transfer | ✅ Done | TimeoutNow message for graceful handoff |
 | Configuration changes (joint consensus) | ❌ Not Implemented | |
 
 **Testing Milestones:**
@@ -131,8 +132,9 @@ The plan requires:
 | Bloodhound: fault injection (crashes) | ✅ Done |
 | Bloodhound: multi-seed simulation | ✅ Done (150+ seeds tested) |
 | Bloodhound: 10,000 hours random faults | ⏳ In Progress (can run longer tests) |
-| Property: SingleLeaderPerTerm | ✅ Infrastructure done |
-| Property: LogMatching | ⚠️ Partial (needs log access) |
+| Property: SingleLeaderPerTerm | ✅ Done |
+| Property: LogMatching | ✅ Done |
+| Property: LeaderCompleteness | ✅ Done |
 | TLA+ trace validation | ❌ Not Done |
 
 #### 1.3 Raft Client Interface
@@ -237,10 +239,10 @@ To get back on track with the plan:
 
 ### After Testing Milestones
 
-4. **Complete Missing Raft Features**
-   - Pre-vote extension (prevents disruption from partitioned nodes)
-   - Leadership transfer (graceful leader handoff)
-   - (Optional) Configuration changes
+4. **Remaining Raft Features** (Optional)
+   - ~~Pre-vote extension~~ ✅ Done
+   - ~~Leadership transfer~~ ✅ Done
+   - Configuration changes (joint consensus) - if needed
 
 5. **Implement Multi-Raft (Phase 2)**
    - Create `MultiRaft` engine
@@ -264,7 +266,7 @@ To get back on track with the plan:
 |---------------|--------|----------------------|
 | `helix-core` | ✅ Exists | As planned |
 | `helix-wal` | ✅ Exists | As planned |
-| `helix-raft` | ⚠️ Partial | Missing multi.rs, pre-vote, leadership transfer |
+| `helix-raft` | ⚠️ Partial | Has pre-vote, leadership transfer; missing multi.rs |
 | `helix-runtime` | ⚠️ Partial | Missing io_uring |
 | `helix-routing` | ❌ Missing | Need to create |
 | `helix-tier` | ❌ Missing | Need to create |

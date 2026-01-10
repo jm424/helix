@@ -299,19 +299,17 @@ fn test_property_checker_with_simulation() {
     // Full property checking during simulation requires step-by-step execution
     // which is shown here.
 
+    const CHECK_INTERVAL: u64 = 100; // Check every 100 steps.
     let seed = 42;
-    let node_count = 3;
+    let node_count: u64 = 3;
 
     let engine_config = EngineConfig::new(seed)
         .with_max_time(Duration::from_secs(5))
         .with_stats(true);
     let mut engine = DiscreteSimulationEngine::with_config(engine_config);
 
-    // Safe cast: node_count is bounded.
-    #[allow(clippy::cast_possible_truncation)]
-    let node_count_u64 = node_count as u64;
-    let node_ids: Vec<NodeId> = (1..=node_count_u64).map(NodeId::new).collect();
-    let actor_ids: Vec<ActorId> = (1..=node_count_u64).map(ActorId::new).collect();
+    let node_ids: Vec<NodeId> = (1..=node_count).map(NodeId::new).collect();
+    let actor_ids: Vec<ActorId> = (1..=node_count).map(ActorId::new).collect();
 
     let node_to_actor: BTreeMap<NodeId, ActorId> = node_ids
         .iter()
@@ -331,7 +329,6 @@ fn test_property_checker_with_simulation() {
     // Run simulation step by step, checking for violations.
     let property_checker = PropertyChecker::new();
     let mut step_count = 0u64;
-    const CHECK_INTERVAL: u64 = 100; // Check every 100 steps.
 
     // Start the simulation (initializes actors).
     engine.start();
@@ -380,7 +377,7 @@ fn test_property_functions_standalone() {
 // ============================================================================
 
 #[test]
-#[ignore] // Run with --ignored for longer tests.
+#[ignore = "Long-running test, run with --ignored"]
 fn test_simulation_extended_duration() {
     // Run for longer simulated time to find rare bugs.
     let config = SimulationTestConfig {
@@ -396,7 +393,7 @@ fn test_simulation_extended_duration() {
 }
 
 #[test]
-#[ignore] // Run with --ignored for longer tests.
+#[ignore = "Long-running test, run with --ignored"]
 fn test_simulation_many_seeds() {
     // Run with many seeds for statistical confidence.
     let seed_count = 100;
@@ -416,7 +413,7 @@ fn test_simulation_many_seeds() {
 }
 
 #[test]
-#[ignore] // Run with --ignored for longer tests.
+#[ignore = "Long-running test, run with --ignored"]
 fn test_simulation_many_seeds_with_faults() {
     // Run with many seeds and fault injection.
     let seed_count = 50;
@@ -428,7 +425,7 @@ fn test_simulation_many_seeds_with_faults() {
             inject_faults: true,
             crash_time_ms: 2000 + (seed % 3000), // Vary crash time.
             recover_time_ms: 6000 + (seed % 2000), // Vary recovery time.
-            crash_node_index: (seed as usize) % 3, // Vary crashed node.
+            crash_node_index: (seed % 3) as usize, // Vary crashed node.
             ..Default::default()
         };
         assert!(
@@ -456,18 +453,15 @@ fn client_request_event(actor: ActorId, data: &[u8]) -> EventKind {
 fn test_simulation_client_request_basic() {
     // Test that client requests are processed after leader election.
     let seed = 42;
-    let node_count = 3;
+    let node_count: u64 = 3;
 
     let engine_config = EngineConfig::new(seed)
         .with_max_time(Duration::from_secs(10))
         .with_stats(true);
     let mut engine = DiscreteSimulationEngine::with_config(engine_config);
 
-    // Safe cast: node_count is bounded.
-    #[allow(clippy::cast_possible_truncation)]
-    let node_count_u64 = node_count as u64;
-    let node_ids: Vec<NodeId> = (1..=node_count_u64).map(NodeId::new).collect();
-    let actor_ids: Vec<ActorId> = (1..=node_count_u64).map(ActorId::new).collect();
+    let node_ids: Vec<NodeId> = (1..=node_count).map(NodeId::new).collect();
+    let actor_ids: Vec<ActorId> = (1..=node_count).map(ActorId::new).collect();
 
     let node_to_actor: BTreeMap<NodeId, ActorId> = node_ids
         .iter()
@@ -505,17 +499,15 @@ fn test_simulation_client_request_basic() {
 fn test_simulation_client_requests_multiple() {
     // Test multiple client requests over time.
     let seed = 123;
-    let node_count = 3;
+    let node_count: u64 = 3;
 
     let engine_config = EngineConfig::new(seed)
         .with_max_time(Duration::from_secs(15))
         .with_stats(true);
     let mut engine = DiscreteSimulationEngine::with_config(engine_config);
 
-    #[allow(clippy::cast_possible_truncation)]
-    let node_count_u64 = node_count as u64;
-    let node_ids: Vec<NodeId> = (1..=node_count_u64).map(NodeId::new).collect();
-    let actor_ids: Vec<ActorId> = (1..=node_count_u64).map(ActorId::new).collect();
+    let node_ids: Vec<NodeId> = (1..=node_count).map(NodeId::new).collect();
+    let actor_ids: Vec<ActorId> = (1..=node_count).map(ActorId::new).collect();
 
     let node_to_actor: BTreeMap<NodeId, ActorId> = node_ids
         .iter()
@@ -556,17 +548,15 @@ fn test_simulation_client_requests_multiple() {
 fn test_simulation_client_requests_with_crash() {
     // Test client requests during fault injection.
     let seed = 456;
-    let node_count = 3;
+    let node_count: u64 = 3;
 
     let engine_config = EngineConfig::new(seed)
         .with_max_time(Duration::from_secs(15))
         .with_stats(true);
     let mut engine = DiscreteSimulationEngine::with_config(engine_config);
 
-    #[allow(clippy::cast_possible_truncation)]
-    let node_count_u64 = node_count as u64;
-    let node_ids: Vec<NodeId> = (1..=node_count_u64).map(NodeId::new).collect();
-    let actor_ids: Vec<ActorId> = (1..=node_count_u64).map(ActorId::new).collect();
+    let node_ids: Vec<NodeId> = (1..=node_count).map(NodeId::new).collect();
+    let actor_ids: Vec<ActorId> = (1..=node_count).map(ActorId::new).collect();
 
     let node_to_actor: BTreeMap<NodeId, ActorId> = node_ids
         .iter()
@@ -646,17 +636,15 @@ fn test_simulation_client_requests_multiple_seeds() {
     let seeds = [10, 20, 30, 40, 50];
 
     for seed in seeds {
-        let node_count = 3;
+        let node_count: u64 = 3;
 
         let engine_config = EngineConfig::new(seed)
             .with_max_time(Duration::from_secs(10))
             .with_stats(false);
         let mut engine = DiscreteSimulationEngine::with_config(engine_config);
 
-        #[allow(clippy::cast_possible_truncation)]
-        let node_count_u64 = node_count as u64;
-        let node_ids: Vec<NodeId> = (1..=node_count_u64).map(NodeId::new).collect();
-        let actor_ids: Vec<ActorId> = (1..=node_count_u64).map(ActorId::new).collect();
+        let node_ids: Vec<NodeId> = (1..=node_count).map(NodeId::new).collect();
+        let actor_ids: Vec<ActorId> = (1..=node_count).map(ActorId::new).collect();
 
         let node_to_actor: BTreeMap<NodeId, ActorId> = node_ids
             .iter()
@@ -773,9 +761,11 @@ fn test_simulation_network_partition_minority() {
     assert!(result.success);
 
     // Check that network state is clean after heal.
-    let state = network_state.lock().unwrap();
     assert!(
-        !state.is_partitioned(actor_ids[0], actor_ids[1]),
+        !network_state
+            .lock()
+            .unwrap()
+            .is_partitioned(actor_ids[0], actor_ids[1]),
         "partition should be healed"
     );
 
@@ -982,19 +972,6 @@ fn test_simulation_split_brain_scenario() {
     let majority = &actor_ids[2..5];
 
     // Partition after initial election at 3s.
-    engine.schedule_after(Duration::from_millis(3000), {
-        let mut partition_nodes = Vec::new();
-        for &m in minority {
-            for &j in majority {
-                partition_nodes.push((m, j));
-            }
-        }
-        // Schedule individual partitions.
-        EventKind::NetworkPartition {
-            nodes: vec![minority[0], majority[0]],
-        }
-    });
-
     // Add all partition pairs.
     for &m in minority {
         for &j in majority {
@@ -1022,4 +999,483 @@ fn test_simulation_split_brain_scenario() {
         result.stats.events_processed,
         result.stats.final_time_ns / 1_000_000
     );
+}
+
+// ============================================================================
+// Property-Verified Simulation Tests
+// ============================================================================
+
+use crate::properties::{check_shared_state, PropertyCheckResult};
+use crate::raft_actor::{PropertyState, SharedPropertyState};
+
+/// Creates a simulation with property checking enabled.
+///
+/// Returns the engine, actor IDs, network state, and property state.
+fn create_verified_simulation(
+    seed: u64,
+    node_count: usize,
+    max_time_secs: u64,
+) -> (
+    DiscreteSimulationEngine,
+    Vec<ActorId>,
+    SharedNetworkState,
+    SharedPropertyState,
+) {
+    let engine_config = EngineConfig::new(seed)
+        .with_max_time(Duration::from_secs(max_time_secs))
+        .with_stats(true);
+    let mut engine = DiscreteSimulationEngine::with_config(engine_config);
+
+    // Create shared state for network and properties.
+    let network_state: SharedNetworkState = Arc::new(Mutex::new(NetworkState::new()));
+    let property_state: SharedPropertyState = Arc::new(Mutex::new(PropertyState::new()));
+
+    // Safe cast: node_count is bounded.
+    #[allow(clippy::cast_possible_truncation)]
+    let node_count_u64 = node_count as u64;
+    let node_ids: Vec<NodeId> = (1..=node_count_u64).map(NodeId::new).collect();
+    let actor_ids: Vec<ActorId> = (1..=node_count_u64).map(ActorId::new).collect();
+
+    let node_to_actor: BTreeMap<NodeId, ActorId> = node_ids
+        .iter()
+        .zip(actor_ids.iter())
+        .map(|(&n, &a)| (n, a))
+        .collect();
+
+    // Register actors with property checking.
+    for (&node_id, &actor_id) in node_ids.iter().zip(actor_ids.iter()) {
+        let raft_config = RaftConfig::new(node_id, node_ids.clone())
+            .with_election_timeout(500_000, 1_500_000);
+        let mut actor = RaftActor::new(actor_id, raft_config, node_to_actor.clone());
+        actor.set_network_state(Arc::clone(&network_state));
+        actor.set_property_state(Arc::clone(&property_state));
+        engine.register_actor(Box::new(actor));
+    }
+
+    (engine, actor_ids, network_state, property_state)
+}
+
+/// Checks property state and panics with details if violations found.
+fn assert_no_violations(result: &PropertyCheckResult, context: &str) {
+    if !result.is_valid() {
+        let mut msg = format!("Property violations in {context}:\n");
+        for v in &result.leader_violations {
+            msg.push_str(&format!("  - {v}\n"));
+        }
+        for v in &result.log_violations {
+            msg.push_str(&format!("  - {v}\n"));
+        }
+        for v in &result.state_machine_violations {
+            msg.push_str(&format!("  - {v}\n"));
+        }
+        panic!("{msg}");
+    }
+}
+
+#[test]
+fn test_verified_basic_election() {
+    // Test basic election with property verification.
+    let seed = 42;
+    let (mut engine, _actor_ids, _network_state, property_state) =
+        create_verified_simulation(seed, 3, 10);
+
+    let result = engine.run();
+    assert!(result.success);
+
+    // Verify properties.
+    let check = check_shared_state(&property_state).expect("lock failed");
+    assert_no_violations(&check, "basic election");
+
+    let state = property_state.lock().unwrap();
+    println!(
+        "Verified basic election: {} events, {} state updates, leaders by term: {:?}",
+        result.stats.events_processed,
+        state.events_processed,
+        state.leaders_by_term
+    );
+}
+
+#[test]
+fn test_verified_with_crash_recovery() {
+    // Test crash/recovery with property verification.
+    let seed = 123;
+    let (mut engine, actor_ids, _network_state, property_state) =
+        create_verified_simulation(seed, 3, 15);
+
+    // Schedule crash and recovery.
+    engine.schedule_after(
+        Duration::from_millis(3000),
+        EventKind::ProcessCrash {
+            actor: actor_ids[0],
+        },
+    );
+    engine.schedule_after(
+        Duration::from_millis(8000),
+        EventKind::ProcessRecover {
+            actor: actor_ids[0],
+        },
+    );
+
+    let result = engine.run();
+    assert!(result.success);
+
+    let check = check_shared_state(&property_state).expect("lock failed");
+    assert_no_violations(&check, "crash recovery");
+
+    println!(
+        "Verified crash recovery: {} events, {} violations",
+        result.stats.events_processed,
+        check.violation_count()
+    );
+}
+
+#[test]
+fn test_verified_with_partition() {
+    // Test network partition with property verification.
+    let seed = 456;
+    let (mut engine, actor_ids, _network_state, property_state) =
+        create_verified_simulation(seed, 3, 20);
+
+    // Partition node 0 from nodes 1 and 2.
+    engine.schedule_after(
+        Duration::from_millis(3000),
+        EventKind::NetworkPartition {
+            nodes: vec![actor_ids[0], actor_ids[1]],
+        },
+    );
+    engine.schedule_after(
+        Duration::from_millis(3000),
+        EventKind::NetworkPartition {
+            nodes: vec![actor_ids[0], actor_ids[2]],
+        },
+    );
+
+    // Heal after 12 seconds.
+    engine.schedule_after(
+        Duration::from_millis(12000),
+        EventKind::NetworkHeal {
+            nodes: vec![actor_ids[0], actor_ids[1]],
+        },
+    );
+    engine.schedule_after(
+        Duration::from_millis(12000),
+        EventKind::NetworkHeal {
+            nodes: vec![actor_ids[0], actor_ids[2]],
+        },
+    );
+
+    let result = engine.run();
+    assert!(result.success);
+
+    let check = check_shared_state(&property_state).expect("lock failed");
+    assert_no_violations(&check, "network partition");
+
+    println!(
+        "Verified partition test: {} events, {} violations",
+        result.stats.events_processed,
+        check.violation_count()
+    );
+}
+
+#[test]
+fn test_verified_split_brain_scenario() {
+    // Test split-brain scenario with property verification.
+    // This is the critical test - 5 nodes split into [0,1] and [2,3,4].
+    let seed = 789;
+    let (mut engine, actor_ids, _network_state, property_state) =
+        create_verified_simulation(seed, 5, 25);
+
+    let minority = &actor_ids[0..2];
+    let majority = &actor_ids[2..5];
+
+    // Partition after initial election.
+    for &m in minority {
+        for &j in majority {
+            engine.schedule_after(
+                Duration::from_millis(3000),
+                EventKind::NetworkPartition { nodes: vec![m, j] },
+            );
+        }
+    }
+
+    // Heal after 15 seconds.
+    for &m in minority {
+        for &j in majority {
+            engine.schedule_after(
+                Duration::from_millis(15000),
+                EventKind::NetworkHeal { nodes: vec![m, j] },
+            );
+        }
+    }
+
+    let result = engine.run();
+    assert!(result.success);
+
+    let check = check_shared_state(&property_state).expect("lock failed");
+    assert_no_violations(&check, "split-brain scenario");
+
+    let state = property_state.lock().unwrap();
+    println!(
+        "Verified split-brain: {} events, leaders by term: {:?}",
+        result.stats.events_processed,
+        state.leaders_by_term
+    );
+}
+
+#[test]
+fn test_verified_sustained_client_load() {
+    // Test sustained client requests with property verification.
+    let seed = 111;
+    let (mut engine, actor_ids, _network_state, property_state) =
+        create_verified_simulation(seed, 3, 30);
+
+    // Schedule continuous client requests every 200ms for 20 seconds.
+    // Bounded loop: 100 requests maximum.
+    for i in 0..100u64 {
+        let time_ms = 2000 + i * 200; // Start at 2s, every 200ms.
+        for &actor_id in &actor_ids {
+            engine.schedule_after(
+                Duration::from_millis(time_ms),
+                client_request_event(actor_id, format!("sustained-req-{i}").as_bytes()),
+            );
+        }
+    }
+
+    let result = engine.run();
+    assert!(result.success);
+
+    let check = check_shared_state(&property_state).expect("lock failed");
+    assert_no_violations(&check, "sustained client load");
+
+    let state = property_state.lock().unwrap();
+    let total_applied: usize = state.applied_entries.values().map(Vec::len).sum();
+    println!(
+        "Verified sustained load: {} events, {} entries applied",
+        result.stats.events_processed,
+        total_applied
+    );
+}
+
+#[test]
+fn test_verified_load_with_crash() {
+    // Test client load during crash/recovery with property verification.
+    let seed = 222;
+    let (mut engine, actor_ids, _network_state, property_state) =
+        create_verified_simulation(seed, 3, 30);
+
+    // Schedule crash at 5s, recovery at 15s.
+    engine.schedule_after(
+        Duration::from_millis(5000),
+        EventKind::ProcessCrash {
+            actor: actor_ids[0],
+        },
+    );
+    engine.schedule_after(
+        Duration::from_millis(15000),
+        EventKind::ProcessRecover {
+            actor: actor_ids[0],
+        },
+    );
+
+    // Continuous client requests throughout.
+    for i in 0..80u64 {
+        let time_ms = 2000 + i * 300;
+        for &actor_id in &actor_ids {
+            engine.schedule_after(
+                Duration::from_millis(time_ms),
+                client_request_event(actor_id, format!("crash-req-{i}").as_bytes()),
+            );
+        }
+    }
+
+    let result = engine.run();
+    assert!(result.success);
+
+    let check = check_shared_state(&property_state).expect("lock failed");
+    assert_no_violations(&check, "load with crash");
+
+    let state = property_state.lock().unwrap();
+    println!(
+        "Verified load with crash: {} events, leaders: {:?}",
+        result.stats.events_processed,
+        state.leaders_by_term.keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_verified_load_with_partition() {
+    // Test client load during network partition with property verification.
+    let seed = 333;
+    let (mut engine, actor_ids, _network_state, property_state) =
+        create_verified_simulation(seed, 3, 30);
+
+    // Partition at 5s, heal at 15s.
+    engine.schedule_after(
+        Duration::from_millis(5000),
+        EventKind::NetworkPartition {
+            nodes: vec![actor_ids[0], actor_ids[1]],
+        },
+    );
+    engine.schedule_after(
+        Duration::from_millis(5000),
+        EventKind::NetworkPartition {
+            nodes: vec![actor_ids[0], actor_ids[2]],
+        },
+    );
+    engine.schedule_after(
+        Duration::from_millis(15000),
+        EventKind::NetworkHeal {
+            nodes: vec![actor_ids[0], actor_ids[1]],
+        },
+    );
+    engine.schedule_after(
+        Duration::from_millis(15000),
+        EventKind::NetworkHeal {
+            nodes: vec![actor_ids[0], actor_ids[2]],
+        },
+    );
+
+    // Continuous client requests throughout.
+    for i in 0..80u64 {
+        let time_ms = 2000 + i * 300;
+        for &actor_id in &actor_ids {
+            engine.schedule_after(
+                Duration::from_millis(time_ms),
+                client_request_event(actor_id, format!("partition-req-{i}").as_bytes()),
+            );
+        }
+    }
+
+    let result = engine.run();
+    assert!(result.success);
+
+    let check = check_shared_state(&property_state).expect("lock failed");
+    assert_no_violations(&check, "load with partition");
+
+    let state = property_state.lock().unwrap();
+    let total_applied: usize = state.applied_entries.values().map(Vec::len).sum();
+    println!(
+        "Verified load with partition: {} events, {} applied",
+        result.stats.events_processed,
+        total_applied
+    );
+}
+
+#[test]
+fn test_verified_multiple_seeds() {
+    // Run multiple seeds with property verification.
+    let seeds = [1, 2, 3, 4, 5, 10, 20, 30, 42, 100];
+
+    for seed in seeds {
+        let (mut engine, actor_ids, _network_state, property_state) =
+            create_verified_simulation(seed, 3, 10);
+
+        // Add some client requests.
+        for i in 0..10u64 {
+            let time_ms = 2000 + i * 200;
+            for &actor_id in &actor_ids {
+                engine.schedule_after(
+                    Duration::from_millis(time_ms),
+                    client_request_event(actor_id, format!("seed{seed}-req{i}").as_bytes()),
+                );
+            }
+        }
+
+        let result = engine.run();
+        assert!(result.success, "seed {seed} failed to complete");
+
+        let check = check_shared_state(&property_state).expect("lock failed");
+        assert_no_violations(&check, &format!("seed {seed}"));
+    }
+    println!("All {} verified seeds passed", seeds.len());
+}
+
+#[test]
+#[ignore = "Long-running test, run with --ignored"]
+fn test_verified_extensive_seeds() {
+    // Run many seeds with property verification.
+    let seed_count = 100;
+    let mut violations_found = 0;
+
+    for seed in 0..seed_count {
+        let (mut engine, actor_ids, _network_state, property_state) =
+            create_verified_simulation(seed, 3, 15);
+
+        // Vary the scenario based on seed.
+        match seed % 3 {
+            0 => {
+                // Crash scenario.
+                engine.schedule_after(
+                    Duration::from_millis(3000),
+                    EventKind::ProcessCrash {
+                        actor: actor_ids[(seed as usize) % 3],
+                    },
+                );
+                engine.schedule_after(
+                    Duration::from_millis(8000),
+                    EventKind::ProcessRecover {
+                        actor: actor_ids[(seed as usize) % 3],
+                    },
+                );
+            }
+            1 => {
+                // Partition scenario.
+                let isolated = (seed as usize) % 3;
+                for j in 0..3 {
+                    if j != isolated {
+                        engine.schedule_after(
+                            Duration::from_millis(3000),
+                            EventKind::NetworkPartition {
+                                nodes: vec![actor_ids[isolated], actor_ids[j]],
+                            },
+                        );
+                        engine.schedule_after(
+                            Duration::from_millis(10000),
+                            EventKind::NetworkHeal {
+                                nodes: vec![actor_ids[isolated], actor_ids[j]],
+                            },
+                        );
+                    }
+                }
+            }
+            _ => {
+                // No faults, just client load.
+            }
+        }
+
+        // Add client requests.
+        for i in 0..20u64 {
+            let time_ms = 2000 + i * 200;
+            for &actor_id in &actor_ids {
+                engine.schedule_after(
+                    Duration::from_millis(time_ms),
+                    client_request_event(actor_id, format!("ext-{seed}-{i}").as_bytes()),
+                );
+            }
+        }
+
+        let result = engine.run();
+        assert!(result.success, "seed {seed} failed to complete");
+
+        let check = check_shared_state(&property_state).expect("lock failed");
+        if !check.is_valid() {
+            violations_found += 1;
+            println!("Seed {seed} found {} violations!", check.violation_count());
+            for v in &check.leader_violations {
+                println!("  - {v}");
+            }
+            for v in &check.log_violations {
+                println!("  - {v}");
+            }
+            for v in &check.state_machine_violations {
+                println!("  - {v}");
+            }
+        }
+    }
+
+    assert_eq!(
+        violations_found, 0,
+        "Found violations in {violations_found} of {seed_count} seeds"
+    );
+    println!("All {} extensive seeds passed", seed_count);
 }

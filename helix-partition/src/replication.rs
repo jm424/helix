@@ -215,7 +215,7 @@ impl ReplicatedPartition {
         match self.raft.state() {
             RaftState::Leader => ReplicationState::Leader,
             RaftState::Follower => ReplicationState::Follower,
-            RaftState::Candidate => ReplicationState::Candidate,
+            RaftState::PreCandidate | RaftState::Candidate => ReplicationState::Candidate,
         }
     }
 
@@ -526,9 +526,7 @@ mod tests {
     #[test]
     fn test_command_encode_decode() {
         let records = vec![make_record("test1"), make_record("test2")];
-        let cmd = PartitionCommand::Append {
-            records: records.clone(),
-        };
+        let cmd = PartitionCommand::Append { records };
         let encoded = cmd.encode();
         let decoded = PartitionCommand::decode(&encoded).unwrap();
 

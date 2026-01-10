@@ -420,7 +420,7 @@ mod tests {
 
     fn make_records(count: usize) -> Vec<Record> {
         (0..count)
-            .map(|i| Record::new(Bytes::from(format!("message-{}", i))))
+            .map(|i| Record::new(Bytes::from(format!("message-{i}"))))
             .collect()
     }
 

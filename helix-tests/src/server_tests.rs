@@ -49,7 +49,7 @@ async fn start_test_server() -> (HelixClient<tonic::transport::Channel>, SocketA
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Connect the client.
-    let client = HelixClient::connect(format!("http://{}", addr))
+    let client = HelixClient::connect(format!("http://{addr}"))
         .await
         .unwrap();
 
@@ -267,7 +267,7 @@ async fn test_read_from_offset() {
                 partition: 0,
                 records: vec![Record {
                     key: None,
-                    value: format!("record-{}", i).into_bytes(),
+                    value: format!("record-{i}").into_bytes(),
                     headers: HashMap::new(),
                     timestamp_ms: None,
                 }],
@@ -558,7 +558,7 @@ async fn test_concurrent_writes() {
                     partition: 0,
                     records: vec![Record {
                         key: None,
-                        value: format!("concurrent-{}", i).into_bytes(),
+                        value: format!("concurrent-{i}").into_bytes(),
                         headers: HashMap::new(),
                         timestamp_ms: None,
                     }],

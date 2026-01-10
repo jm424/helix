@@ -586,7 +586,7 @@ mod tests {
         // Send a message from node 1 to node 2.
         let message = make_test_message(1, 2);
         let result = handle1.send(NodeId::new(2), message.clone()).await;
-        assert!(result.is_ok(), "Failed to send: {:?}", result);
+        assert!(result.is_ok(), "Failed to send: {result:?}");
 
         // Wait for the message to be received.
         let received = tokio::time::timeout(

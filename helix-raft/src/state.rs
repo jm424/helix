@@ -10,8 +10,8 @@ use helix_core::{LogIndex, NodeId, TermId};
 use crate::config::RaftConfig;
 use crate::log::{LogEntry, RaftLog};
 use crate::message::{
-    AppendEntriesRequest, AppendEntriesResponse, ClientRequest, Message, RequestVoteRequest,
-    RequestVoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, ClientRequest, Message, PreVoteRequest,
+    PreVoteResponse, RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
 };
 
 /// Raft node state (role).
@@ -20,6 +20,9 @@ pub enum RaftState {
     /// Follower state - passive, responds to RPCs.
     #[default]
     Follower,
+    /// Pre-candidate state - gathering pre-votes before starting election.
+    /// This prevents disruption from partitioned nodes.
+    PreCandidate,
     /// Candidate state - actively seeking votes.
     Candidate,
     /// Leader state - handles client requests, replicates log.
@@ -80,12 +83,20 @@ pub struct RaftNode {
     /// For each server, index of highest log entry known to be replicated.
     match_index: HashMap<NodeId, LogIndex>,
 
+    // Pre-candidate state.
+    /// Pre-votes received in current pre-election.
+    pre_votes_received: HashSet<NodeId>,
+
     // Candidate state.
     /// Votes received in current election.
     votes_received: HashSet<NodeId>,
 
     /// Current leader (if known).
     leader_id: Option<NodeId>,
+
+    // Leadership transfer state.
+    /// Target node for leadership transfer (if in progress).
+    transfer_target: Option<NodeId>,
 }
 
 impl RaftNode {
@@ -112,8 +123,10 @@ impl RaftNode {
             last_applied: LogIndex::new(0),
             next_index,
             match_index,
+            pre_votes_received: HashSet::new(),
             votes_received: HashSet::new(),
             leader_id: None,
+            transfer_target: None,
         }
     }
 
@@ -169,50 +182,54 @@ impl RaftNode {
     ///
     /// This should be called when the election timer fires.
     /// Returns the actions to take.
+    ///
+    /// With pre-vote enabled, this starts a pre-election phase first.
+    /// Only if pre-votes succeed does the node increment its term and
+    /// become a candidate. This prevents disruption from partitioned nodes.
     pub fn handle_election_timeout(&mut self) -> Vec<RaftOutput> {
         let mut outputs = Vec::new();
-        let prev_term = self.current_term;
 
-        // Only followers and candidates start elections.
+        // Only followers, pre-candidates, and candidates start elections.
         if self.state == RaftState::Leader {
             return outputs;
         }
 
-        // Start election: increment term, become candidate, vote for self.
-        self.current_term = TermId::new(self.current_term.get() + 1);
-        self.state = RaftState::Candidate;
-        self.voted_for = Some(self.config.node_id);
-        self.votes_received.clear();
-        self.votes_received.insert(self.config.node_id);
+        // Start pre-election: become pre-candidate, gather pre-votes.
+        // Don't increment term yet - that happens only after pre-vote succeeds.
+        self.state = RaftState::PreCandidate;
+        self.pre_votes_received.clear();
+        self.pre_votes_received.insert(self.config.node_id); // Vote for self.
         self.leader_id = None;
-
-        // Postcondition: term incremented, we voted for ourselves.
-        debug_assert!(self.current_term.get() == prev_term.get() + 1);
-        debug_assert!(self.voted_for == Some(self.config.node_id));
-        debug_assert!(self.votes_received.contains(&self.config.node_id));
 
         // Reset election timer.
         outputs.push(RaftOutput::ResetElectionTimer);
 
-        // Send RequestVote to all peers.
+        // The term we would use if we win the pre-vote.
+        let proposed_term = TermId::new(self.current_term.get() + 1);
+
+        // Send PreVote to all peers.
         for peer in self.config.peers() {
-            let request = RequestVoteRequest::new(
-                self.current_term,
+            let request = PreVoteRequest::new(
+                proposed_term,
                 self.config.node_id,
                 peer,
                 self.log.last_index(),
                 self.log.last_term(),
             );
-            outputs.push(RaftOutput::SendMessage(Message::RequestVote(request)));
+            outputs.push(RaftOutput::SendMessage(Message::PreVote(request)));
         }
 
         // Check if we already have quorum (single-node cluster).
-        if self.votes_received.len() >= self.config.quorum_size() {
-            outputs.extend(self.become_leader());
+        if self.pre_votes_received.len() >= self.config.quorum_size() {
+            outputs.extend(self.start_election());
         }
 
-        // Postcondition: we are either candidate or leader (if single-node).
-        debug_assert!(self.state == RaftState::Candidate || self.state == RaftState::Leader);
+        // Postcondition: we are pre-candidate, candidate, or leader.
+        debug_assert!(
+            self.state == RaftState::PreCandidate
+                || self.state == RaftState::Candidate
+                || self.state == RaftState::Leader
+        );
 
         outputs
     }
@@ -249,9 +266,14 @@ impl RaftNode {
 
     /// Handles a client request (leader only).
     ///
-    /// Returns the actions to take, or None if not leader.
+    /// Returns the actions to take, or None if not leader or transfer in progress.
     pub fn handle_client_request(&mut self, request: ClientRequest) -> Option<Vec<RaftOutput>> {
         if self.state != RaftState::Leader {
+            return None;
+        }
+
+        // Reject new requests during leadership transfer.
+        if self.transfer_target.is_some() {
             return None;
         }
 
@@ -287,17 +309,25 @@ impl RaftNode {
     ///
     /// Returns the actions to take.
     pub fn handle_message(&mut self, message: Message) -> Vec<RaftOutput> {
+        // For pre-vote messages, don't step down based on term.
+        // Pre-vote terms are speculative and shouldn't cause state changes.
+        let is_pre_vote = matches!(message, Message::PreVote(_) | Message::PreVoteResponse(_));
+
         // Check if message term is newer - step down if so.
+        // Don't step down for pre-vote messages.
         let msg_term = message.term();
-        if msg_term > self.current_term {
+        if !is_pre_vote && msg_term > self.current_term {
             self.step_down(msg_term);
         }
 
         match message {
+            Message::PreVote(req) => self.handle_pre_vote(req),
+            Message::PreVoteResponse(resp) => self.handle_pre_vote_response(resp),
             Message::RequestVote(req) => self.handle_request_vote(req),
             Message::RequestVoteResponse(resp) => self.handle_request_vote_response(resp),
             Message::AppendEntries(req) => self.handle_append_entries(req),
             Message::AppendEntriesResponse(resp) => self.handle_append_entries_response(resp),
+            Message::TimeoutNow(req) => self.handle_timeout_now(req),
         }
     }
 
@@ -306,7 +336,97 @@ impl RaftNode {
         self.current_term = new_term;
         self.state = RaftState::Follower;
         self.voted_for = None;
+        self.pre_votes_received.clear();
         self.votes_received.clear();
+        self.transfer_target = None;
+    }
+
+    /// Handles a pre-vote request.
+    ///
+    /// Pre-vote doesn't update term or `voted_for` state - it's speculative.
+    fn handle_pre_vote(&self, req: PreVoteRequest) -> Vec<RaftOutput> {
+        let mut outputs = Vec::new();
+
+        // Grant pre-vote if:
+        // 1. The candidate's proposed term is >= our term
+        // 2. We don't have a current leader (or the proposed term is higher)
+        // 3. The candidate's log is at least as up-to-date as ours
+        let vote_granted = req.term >= self.current_term
+            && (self.leader_id.is_none() || req.term > self.current_term)
+            && self.log.is_up_to_date(req.last_log_term, req.last_log_index);
+
+        let response = PreVoteResponse::new(
+            req.term, // Echo back the proposed term.
+            self.config.node_id,
+            req.candidate_id,
+            vote_granted,
+        );
+        outputs.push(RaftOutput::SendMessage(Message::PreVoteResponse(response)));
+
+        outputs
+    }
+
+    /// Handles a pre-vote response.
+    fn handle_pre_vote_response(&mut self, resp: PreVoteResponse) -> Vec<RaftOutput> {
+        let mut outputs = Vec::new();
+
+        // Ignore if not a pre-candidate.
+        if self.state != RaftState::PreCandidate {
+            return outputs;
+        }
+
+        // Ignore if the response is for a different term than we're proposing.
+        let proposed_term = self.current_term.get() + 1;
+        if resp.term.get() != proposed_term {
+            return outputs;
+        }
+
+        if resp.vote_granted {
+            self.pre_votes_received.insert(resp.from);
+
+            // Check if we have quorum - if so, start real election.
+            if self.pre_votes_received.len() >= self.config.quorum_size() {
+                outputs.extend(self.start_election());
+            }
+        }
+
+        outputs
+    }
+
+    /// Starts a real election after pre-vote succeeds.
+    ///
+    /// This increments term and sends actual `RequestVote` messages.
+    fn start_election(&mut self) -> Vec<RaftOutput> {
+        let mut outputs = Vec::new();
+
+        // Precondition: we have quorum of pre-votes.
+        debug_assert!(self.pre_votes_received.len() >= self.config.quorum_size());
+
+        // Now increment term and become candidate.
+        self.current_term = TermId::new(self.current_term.get() + 1);
+        self.state = RaftState::Candidate;
+        self.voted_for = Some(self.config.node_id);
+        self.votes_received.clear();
+        self.votes_received.insert(self.config.node_id);
+
+        // Send RequestVote to all peers.
+        for peer in self.config.peers() {
+            let request = RequestVoteRequest::new(
+                self.current_term,
+                self.config.node_id,
+                peer,
+                self.log.last_index(),
+                self.log.last_term(),
+            );
+            outputs.push(RaftOutput::SendMessage(Message::RequestVote(request)));
+        }
+
+        // Check if we already have quorum (single-node cluster).
+        if self.votes_received.len() >= self.config.quorum_size() {
+            outputs.extend(self.become_leader());
+        }
+
+        outputs
     }
 
     /// Handles a `RequestVote` request.
@@ -507,6 +627,19 @@ impl RaftNode {
 
             // Try to advance commit index.
             outputs.extend(self.try_advance_commit_index());
+
+            // Check if leadership transfer can complete.
+            if self.transfer_target == Some(resp.from) {
+                // Target is now caught up, send TimeoutNow.
+                if new_match >= self.log.last_index() {
+                    let timeout_now = TimeoutNowRequest::new(
+                        self.current_term,
+                        self.config.node_id,
+                        resp.from,
+                    );
+                    outputs.push(RaftOutput::SendMessage(Message::TimeoutNow(timeout_now)));
+                }
+            }
         } else {
             // Decrement next_index and retry.
             let next = self.next_index.get(&resp.from).copied().unwrap_or(LogIndex::new(1));
@@ -519,6 +652,106 @@ impl RaftNode {
         }
 
         outputs
+    }
+
+    /// Handles a `TimeoutNow` request (leadership transfer target).
+    ///
+    /// When receiving this message, the node immediately starts an election
+    /// without waiting for the election timeout. This bypasses pre-vote
+    /// since the leader explicitly requested the transfer.
+    fn handle_timeout_now(&mut self, req: TimeoutNowRequest) -> Vec<RaftOutput> {
+        let mut outputs = Vec::new();
+
+        // Only process if the term matches and we're a follower.
+        if req.term != self.current_term || self.state != RaftState::Follower {
+            return outputs;
+        }
+
+        // Start election immediately (bypass pre-vote).
+        // The leader has explicitly requested this node become leader.
+        self.current_term = TermId::new(self.current_term.get() + 1);
+        self.state = RaftState::Candidate;
+        self.voted_for = Some(self.config.node_id);
+        self.votes_received.clear();
+        self.votes_received.insert(self.config.node_id); // Vote for self.
+        self.leader_id = None;
+
+        outputs.push(RaftOutput::ResetElectionTimer);
+
+        // Send RequestVote to all peers.
+        for peer in self.config.peers() {
+            let request = RequestVoteRequest::new(
+                self.current_term,
+                self.config.node_id,
+                peer,
+                self.log.last_index(),
+                self.log.last_term(),
+            );
+            outputs.push(RaftOutput::SendMessage(Message::RequestVote(request)));
+        }
+
+        // Check if we already have quorum (single-node cluster).
+        if self.votes_received.len() >= self.config.quorum_size() {
+            outputs.extend(self.become_leader());
+        }
+
+        outputs
+    }
+
+    /// Initiates leadership transfer to the specified target node.
+    ///
+    /// Returns outputs to send, or None if transfer cannot be started.
+    /// The leader will stop accepting new client requests and send
+    /// `AppendEntries` to catch up the target, then send `TimeoutNow`.
+    pub fn transfer_leadership(&mut self, target: NodeId) -> Option<Vec<RaftOutput>> {
+        // Must be leader to transfer.
+        if self.state != RaftState::Leader {
+            return None;
+        }
+
+        // Cannot transfer to self.
+        if target == self.config.node_id {
+            return None;
+        }
+
+        // Target must be in the cluster.
+        if !self.config.cluster.contains(&target) {
+            return None;
+        }
+
+        // Cannot start a new transfer if one is in progress.
+        if self.transfer_target.is_some() {
+            return None;
+        }
+
+        let mut outputs = Vec::new();
+
+        // Set the transfer target.
+        self.transfer_target = Some(target);
+
+        // Check if target is already caught up.
+        let target_match = self.match_index.get(&target).copied().unwrap_or(LogIndex::new(0));
+        if target_match >= self.log.last_index() {
+            // Target is already caught up, send TimeoutNow immediately.
+            let timeout_now = TimeoutNowRequest::new(self.current_term, self.config.node_id, target);
+            outputs.push(RaftOutput::SendMessage(Message::TimeoutNow(timeout_now)));
+        } else {
+            // Send AppendEntries to catch up the target.
+            outputs.extend(self.send_append_entries(target));
+        }
+
+        Some(outputs)
+    }
+
+    /// Aborts an in-progress leadership transfer.
+    pub fn abort_transfer(&mut self) {
+        self.transfer_target = None;
+    }
+
+    /// Returns the current transfer target, if any.
+    #[must_use]
+    pub const fn transfer_target(&self) -> Option<NodeId> {
+        self.transfer_target
     }
 
     /// Sends `AppendEntries` to a specific peer.
@@ -646,6 +879,30 @@ mod tests {
         )
     }
 
+    /// Helper to make a node become leader through the full pre-vote + vote phases.
+    fn make_leader(node: &mut RaftNode) {
+        // Phase 1: Election timeout starts pre-vote.
+        node.handle_election_timeout();
+
+        // Phase 2: Receive pre-vote response to reach quorum.
+        let prevote = PreVoteResponse::new(
+            TermId::new(node.current_term().get() + 1),
+            NodeId::new(2),
+            node.config.node_id,
+            true,
+        );
+        node.handle_message(Message::PreVoteResponse(prevote));
+
+        // Phase 3: Receive vote response to become leader.
+        let vote = RequestVoteResponse::new(
+            node.current_term(),
+            NodeId::new(2),
+            node.config.node_id,
+            true,
+        );
+        node.handle_message(Message::RequestVoteResponse(vote));
+    }
+
     #[test]
     fn test_new_node_is_follower() {
         let node = RaftNode::new(make_config(1));
@@ -656,20 +913,22 @@ mod tests {
     }
 
     #[test]
-    fn test_election_timeout_starts_election() {
+    fn test_election_timeout_starts_prevote() {
         let mut node = RaftNode::new(make_config(1));
 
         let outputs = node.handle_election_timeout();
 
-        assert_eq!(node.state(), RaftState::Candidate);
-        assert_eq!(node.current_term(), TermId::new(1));
+        // With pre-vote, node should become PreCandidate first.
+        assert_eq!(node.state(), RaftState::PreCandidate);
+        // Term should NOT be incremented yet during pre-vote.
+        assert_eq!(node.current_term(), TermId::new(0));
 
-        // Should have reset timer + sent 2 RequestVote messages.
-        let vote_requests: Vec<_> = outputs
+        // Should have reset timer + sent 2 PreVote messages.
+        let prevote_requests: Vec<_> = outputs
             .iter()
-            .filter(|o| matches!(o, RaftOutput::SendMessage(Message::RequestVote(_))))
+            .filter(|o| matches!(o, RaftOutput::SendMessage(Message::PreVote(_))))
             .collect();
-        assert_eq!(vote_requests.len(), 2);
+        assert_eq!(prevote_requests.len(), 2);
     }
 
     #[test]
@@ -732,11 +991,30 @@ mod tests {
     fn test_becomes_leader_with_quorum() {
         let mut node = RaftNode::new(make_config(1));
 
-        // Start election.
+        // Phase 1: Election timeout starts pre-vote.
         node.handle_election_timeout();
-        assert_eq!(node.state(), RaftState::Candidate);
+        assert_eq!(node.state(), RaftState::PreCandidate);
+        assert_eq!(node.current_term(), TermId::new(0)); // No term increment yet.
 
-        // Receive vote from node 2.
+        // Phase 2: Receive pre-vote from node 2 (quorum reached).
+        let prevote = PreVoteResponse::new(
+            TermId::new(1), // The term that would be used.
+            NodeId::new(2),
+            NodeId::new(1),
+            true,
+        );
+        let outputs = node.handle_message(Message::PreVoteResponse(prevote));
+
+        // Should transition to Candidate and send actual RequestVote messages.
+        assert_eq!(node.state(), RaftState::Candidate);
+        assert_eq!(node.current_term(), TermId::new(1)); // Term now incremented.
+        let vote_requests: Vec<_> = outputs
+            .iter()
+            .filter(|o| matches!(o, RaftOutput::SendMessage(Message::RequestVote(_))))
+            .collect();
+        assert_eq!(vote_requests.len(), 2);
+
+        // Phase 3: Receive vote from node 2.
         let vote = RequestVoteResponse::new(
             TermId::new(1),
             NodeId::new(2),
@@ -775,11 +1053,8 @@ mod tests {
     fn test_client_request_appends_to_log() {
         let mut node = RaftNode::new(make_config(1));
 
-        // Become leader first.
-        node.handle_election_timeout();
-        let vote = RequestVoteResponse::new(TermId::new(1), NodeId::new(2), NodeId::new(1), true);
-        node.handle_message(Message::RequestVoteResponse(vote));
-
+        // Become leader first (through pre-vote + vote phases).
+        make_leader(&mut node);
         assert!(node.is_leader());
 
         // Send client request.
@@ -795,10 +1070,8 @@ mod tests {
     fn test_step_down_on_higher_term() {
         let mut node = RaftNode::new(make_config(1));
 
-        // Become leader.
-        node.handle_election_timeout();
-        let vote = RequestVoteResponse::new(TermId::new(1), NodeId::new(2), NodeId::new(1), true);
-        node.handle_message(Message::RequestVoteResponse(vote));
+        // Become leader (through pre-vote + vote phases).
+        make_leader(&mut node);
         assert!(node.is_leader());
 
         // Receive message with higher term.

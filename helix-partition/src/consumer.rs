@@ -390,7 +390,7 @@ mod tests {
         let mut partition = Partition::new(config);
 
         let records: Vec<Record> = (0..count)
-            .map(|i| Record::new(Bytes::from(format!("msg-{}", i))))
+            .map(|i| Record::new(Bytes::from(format!("msg-{i}"))))
             .collect();
         partition.append(records).unwrap();
 
