@@ -11,8 +11,10 @@ use bloodhound::simulation::discrete::event::{ActorId, EventKind};
 use helix_core::NodeId;
 use helix_raft::RaftConfig;
 
+use std::sync::{Arc, Mutex};
+
 use crate::properties::{check_single_leader_per_term, has_leader, leader_count, PropertyChecker};
-use crate::raft_actor::{custom_events, RaftActor};
+use crate::raft_actor::{custom_events, NetworkState, RaftActor, SharedNetworkState};
 
 /// Test configuration for simulation runs.
 struct SimulationTestConfig {
@@ -683,4 +685,335 @@ fn test_simulation_client_requests_multiple_seeds() {
         );
     }
     println!("All {} client request seeds passed", seeds.len());
+}
+
+// ============================================================================
+// Network Partition Tests
+// ============================================================================
+
+/// Creates a simulation with shared network state for partition testing.
+fn create_simulation_with_network_state(
+    seed: u64,
+    node_count: usize,
+    max_time_secs: u64,
+) -> (DiscreteSimulationEngine, Vec<ActorId>, SharedNetworkState) {
+    let engine_config = EngineConfig::new(seed)
+        .with_max_time(Duration::from_secs(max_time_secs))
+        .with_stats(true);
+    let mut engine = DiscreteSimulationEngine::with_config(engine_config);
+
+    // Create shared network state.
+    let network_state: SharedNetworkState = Arc::new(Mutex::new(NetworkState::new()));
+
+    // Safe cast: node_count is bounded.
+    #[allow(clippy::cast_possible_truncation)]
+    let node_count_u64 = node_count as u64;
+    let node_ids: Vec<NodeId> = (1..=node_count_u64).map(NodeId::new).collect();
+    let actor_ids: Vec<ActorId> = (1..=node_count_u64).map(ActorId::new).collect();
+
+    let node_to_actor: BTreeMap<NodeId, ActorId> = node_ids
+        .iter()
+        .zip(actor_ids.iter())
+        .map(|(&n, &a)| (n, a))
+        .collect();
+
+    for (&node_id, &actor_id) in node_ids.iter().zip(actor_ids.iter()) {
+        let raft_config = RaftConfig::new(node_id, node_ids.clone());
+        let mut actor = RaftActor::new(actor_id, raft_config, node_to_actor.clone());
+        actor.set_network_state(Arc::clone(&network_state));
+        engine.register_actor(Box::new(actor));
+    }
+
+    (engine, actor_ids, network_state)
+}
+
+#[test]
+fn test_simulation_network_partition_minority() {
+    // Partition one node from the other two. The majority should still elect a leader.
+    let seed = 42;
+    let (mut engine, actor_ids, network_state) =
+        create_simulation_with_network_state(seed, 3, 15);
+
+    // After 2 seconds, partition node 1 from nodes 2 and 3.
+    // Node 1 is isolated, nodes 2 and 3 can communicate.
+    engine.schedule_after(
+        Duration::from_millis(2000),
+        EventKind::NetworkPartition {
+            nodes: vec![actor_ids[0], actor_ids[1]], // 1 partitioned from 2
+        },
+    );
+    engine.schedule_after(
+        Duration::from_millis(2000),
+        EventKind::NetworkPartition {
+            nodes: vec![actor_ids[0], actor_ids[2]], // 1 partitioned from 3
+        },
+    );
+
+    // Heal partition at 10 seconds.
+    engine.schedule_after(
+        Duration::from_millis(10000),
+        EventKind::NetworkHeal {
+            nodes: vec![actor_ids[0], actor_ids[1]],
+        },
+    );
+    engine.schedule_after(
+        Duration::from_millis(10000),
+        EventKind::NetworkHeal {
+            nodes: vec![actor_ids[0], actor_ids[2]],
+        },
+    );
+
+    let result = engine.run();
+    assert!(result.success);
+
+    // Check that network state is clean after heal.
+    let state = network_state.lock().unwrap();
+    assert!(
+        !state.is_partitioned(actor_ids[0], actor_ids[1]),
+        "partition should be healed"
+    );
+
+    println!(
+        "Minority partition test: {} events, {}ms",
+        result.stats.events_processed,
+        result.stats.final_time_ns / 1_000_000
+    );
+}
+
+#[test]
+fn test_simulation_network_partition_leader_isolated() {
+    // More challenging: isolate the leader after it's elected.
+    // The remaining nodes should elect a new leader.
+    for seed in [100, 200, 300] {
+        let (mut engine, actor_ids, _network_state) =
+            create_simulation_with_network_state(seed, 3, 20);
+
+        // Wait for leader election (3s), then partition node 1 (may be leader).
+        engine.schedule_after(
+            Duration::from_millis(3000),
+            EventKind::NetworkPartition {
+                nodes: vec![actor_ids[0], actor_ids[1]],
+            },
+        );
+        engine.schedule_after(
+            Duration::from_millis(3000),
+            EventKind::NetworkPartition {
+                nodes: vec![actor_ids[0], actor_ids[2]],
+            },
+        );
+
+        // Heal at 15s.
+        engine.schedule_after(
+            Duration::from_millis(15000),
+            EventKind::NetworkHeal {
+                nodes: vec![actor_ids[0], actor_ids[1]],
+            },
+        );
+        engine.schedule_after(
+            Duration::from_millis(15000),
+            EventKind::NetworkHeal {
+                nodes: vec![actor_ids[0], actor_ids[2]],
+            },
+        );
+
+        let result = engine.run();
+        assert!(
+            result.success,
+            "Leader isolation test failed with seed {seed}"
+        );
+    }
+    println!("Leader isolation tests passed");
+}
+
+#[test]
+fn test_simulation_network_partition_with_client_requests() {
+    // Test client requests during partition - they should fail on isolated nodes.
+    let seed = 42;
+    let (mut engine, actor_ids, _network_state) =
+        create_simulation_with_network_state(seed, 3, 20);
+
+    // Partition node 0 at 3s.
+    engine.schedule_after(
+        Duration::from_millis(3000),
+        EventKind::NetworkPartition {
+            nodes: vec![actor_ids[0], actor_ids[1]],
+        },
+    );
+    engine.schedule_after(
+        Duration::from_millis(3000),
+        EventKind::NetworkPartition {
+            nodes: vec![actor_ids[0], actor_ids[2]],
+        },
+    );
+
+    // Send client requests during partition.
+    for i in 0..5u64 {
+        let time_ms = 5000 + i * 500;
+        for &actor_id in &actor_ids {
+            engine.schedule_after(
+                Duration::from_millis(time_ms),
+                client_request_event(actor_id, format!("partition-req-{i}").as_bytes()),
+            );
+        }
+    }
+
+    // Heal at 12s.
+    engine.schedule_after(
+        Duration::from_millis(12000),
+        EventKind::NetworkHeal {
+            nodes: vec![actor_ids[0], actor_ids[1]],
+        },
+    );
+    engine.schedule_after(
+        Duration::from_millis(12000),
+        EventKind::NetworkHeal {
+            nodes: vec![actor_ids[0], actor_ids[2]],
+        },
+    );
+
+    // More requests after heal.
+    for i in 0..3u64 {
+        let time_ms = 14000 + i * 300;
+        for &actor_id in &actor_ids {
+            engine.schedule_after(
+                Duration::from_millis(time_ms),
+                client_request_event(actor_id, format!("post-heal-req-{i}").as_bytes()),
+            );
+        }
+    }
+
+    let result = engine.run();
+    assert!(result.success);
+    println!(
+        "Partition with requests: {} events, {}ms",
+        result.stats.events_processed,
+        result.stats.final_time_ns / 1_000_000
+    );
+}
+
+#[test]
+fn test_simulation_combined_crash_and_partition() {
+    // Ultimate stress test: combine crashes AND partitions.
+    for seed in [111, 222, 333] {
+        let (mut engine, actor_ids, _network_state) =
+            create_simulation_with_network_state(seed, 5, 30);
+
+        // Phase 1: Partition at 2s - isolate nodes 0 and 1 from rest.
+        for &isolated in &actor_ids[0..2] {
+            for &other in &actor_ids[2..] {
+                engine.schedule_after(
+                    Duration::from_millis(2000),
+                    EventKind::NetworkPartition {
+                        nodes: vec![isolated, other],
+                    },
+                );
+            }
+        }
+
+        // Phase 2: Crash node 2 at 5s.
+        engine.schedule_after(
+            Duration::from_millis(5000),
+            EventKind::ProcessCrash {
+                actor: actor_ids[2],
+            },
+        );
+
+        // Phase 3: Recover node 2 at 10s.
+        engine.schedule_after(
+            Duration::from_millis(10000),
+            EventKind::ProcessRecover {
+                actor: actor_ids[2],
+            },
+        );
+
+        // Phase 4: Heal partition at 15s.
+        for &isolated in &actor_ids[0..2] {
+            for &other in &actor_ids[2..] {
+                engine.schedule_after(
+                    Duration::from_millis(15000),
+                    EventKind::NetworkHeal {
+                        nodes: vec![isolated, other],
+                    },
+                );
+            }
+        }
+
+        // Phase 5: Another crash at 20s.
+        engine.schedule_after(
+            Duration::from_millis(20000),
+            EventKind::ProcessCrash {
+                actor: actor_ids[4],
+            },
+        );
+        engine.schedule_after(
+            Duration::from_millis(25000),
+            EventKind::ProcessRecover {
+                actor: actor_ids[4],
+            },
+        );
+
+        let result = engine.run();
+        assert!(
+            result.success,
+            "Combined crash/partition test failed with seed {seed}"
+        );
+    }
+    println!("Combined crash and partition tests passed");
+}
+
+#[test]
+fn test_simulation_split_brain_scenario() {
+    // Scenario that could cause split-brain if Raft is buggy:
+    // - 5 nodes, partition into two groups: [0,1] and [2,3,4]
+    // - Both groups try to elect leaders
+    // - Only [2,3,4] should succeed (majority)
+    let seed = 12345;
+    let (mut engine, actor_ids, _network_state) =
+        create_simulation_with_network_state(seed, 5, 20);
+
+    // Create partition: [0,1] <-> [2,3,4]
+    let minority = &actor_ids[0..2];
+    let majority = &actor_ids[2..5];
+
+    // Partition after initial election at 3s.
+    engine.schedule_after(Duration::from_millis(3000), {
+        let mut partition_nodes = Vec::new();
+        for &m in minority {
+            for &j in majority {
+                partition_nodes.push((m, j));
+            }
+        }
+        // Schedule individual partitions.
+        EventKind::NetworkPartition {
+            nodes: vec![minority[0], majority[0]],
+        }
+    });
+
+    // Add all partition pairs.
+    for &m in minority {
+        for &j in majority {
+            engine.schedule_after(
+                Duration::from_millis(3000),
+                EventKind::NetworkPartition { nodes: vec![m, j] },
+            );
+        }
+    }
+
+    // Let it run with partition for a while, then heal.
+    for &m in minority {
+        for &j in majority {
+            engine.schedule_after(
+                Duration::from_millis(15000),
+                EventKind::NetworkHeal { nodes: vec![m, j] },
+            );
+        }
+    }
+
+    let result = engine.run();
+    assert!(result.success);
+    println!(
+        "Split-brain scenario: {} events, {}ms",
+        result.stats.events_processed,
+        result.stats.final_time_ns / 1_000_000
+    );
 }

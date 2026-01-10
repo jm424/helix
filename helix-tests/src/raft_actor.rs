@@ -4,7 +4,8 @@
 //! for deterministic simulation testing.
 
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bloodhound::simulation::discrete::actors::{SimulatedActor, SimulationContext};
@@ -32,6 +33,67 @@ pub mod custom_events {
 
 /// Network latency for message delivery (simulated).
 const NETWORK_LATENCY_US: u64 = 1_000; // 1ms
+
+// ============================================================================
+// Network Partition Tracking
+// ============================================================================
+
+/// Tracks network partition state across the cluster.
+///
+/// When a partition is active, messages between partitioned nodes are dropped.
+/// This is shared across all actors in the simulation.
+#[derive(Debug, Default)]
+pub struct NetworkState {
+    /// Set of partitioned actor pairs. If (a, b) is in the set, messages
+    /// from a to b are dropped. Partitions are bidirectional, so both
+    /// (a, b) and (b, a) are added.
+    partitioned_pairs: BTreeSet<(ActorId, ActorId)>,
+}
+
+impl NetworkState {
+    /// Creates a new network state with no partitions.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Partitions the given nodes from each other.
+    ///
+    /// Messages between any pair of nodes in the list will be dropped.
+    pub fn partition(&mut self, nodes: &[ActorId]) {
+        // Add all pairs in both directions.
+        for (i, &a) in nodes.iter().enumerate() {
+            for &b in &nodes[i + 1..] {
+                self.partitioned_pairs.insert((a, b));
+                self.partitioned_pairs.insert((b, a));
+            }
+        }
+    }
+
+    /// Heals the partition between the given nodes.
+    pub fn heal(&mut self, nodes: &[ActorId]) {
+        for (i, &a) in nodes.iter().enumerate() {
+            for &b in &nodes[i + 1..] {
+                self.partitioned_pairs.remove(&(a, b));
+                self.partitioned_pairs.remove(&(b, a));
+            }
+        }
+    }
+
+    /// Returns true if messages from `from` to `to` should be dropped.
+    #[must_use]
+    pub fn is_partitioned(&self, from: ActorId, to: ActorId) -> bool {
+        self.partitioned_pairs.contains(&(from, to))
+    }
+
+    /// Clears all partitions.
+    pub fn clear(&mut self) {
+        self.partitioned_pairs.clear();
+    }
+}
+
+/// Shared network state handle.
+pub type SharedNetworkState = Arc<Mutex<NetworkState>>;
 
 /// Message type tags for serialization.
 mod message_tags {
@@ -226,6 +288,8 @@ pub struct RaftActor {
     name: String,
     /// The Raft node state machine.
     node: RaftNode,
+    /// Original configuration (for recreating node after crash).
+    config: RaftConfig,
     /// Mapping from Helix `NodeId` to Bloodhound `ActorId`.
     node_to_actor: BTreeMap<NodeId, ActorId>,
     /// Mapping from Bloodhound `ActorId` to Helix `NodeId`.
@@ -236,6 +300,10 @@ pub struct RaftActor {
     election_timeout_max_us: u64,
     /// Heartbeat interval.
     heartbeat_interval_us: u64,
+    /// Whether this node is currently crashed (not processing events).
+    crashed: bool,
+    /// Shared network state for partition tracking.
+    network_state: Option<SharedNetworkState>,
 }
 
 impl RaftActor {
@@ -265,13 +333,27 @@ impl RaftActor {
         Self {
             actor_id,
             name,
-            node: RaftNode::new(config),
+            node: RaftNode::new(config.clone()),
+            config,
             node_to_actor: node_actor_mapping,
             actor_to_node,
             election_timeout_min_us,
             election_timeout_max_us,
             heartbeat_interval_us,
+            crashed: false,
+            network_state: None,
         }
+    }
+
+    /// Sets the shared network state for partition tracking.
+    pub fn set_network_state(&mut self, state: SharedNetworkState) {
+        self.network_state = Some(state);
+    }
+
+    /// Returns true if this node is currently crashed.
+    #[must_use]
+    pub const fn is_crashed(&self) -> bool {
+        self.crashed
     }
 
     /// Returns true if this node is currently the leader.
@@ -369,9 +451,32 @@ impl RaftActor {
     }
 
     /// Sends a Raft message to another actor using `PacketDelivery`.
+    ///
+    /// Messages are dropped if:
+    /// - The sender is crashed
+    /// - There's a network partition between sender and receiver
     fn send_raft_message(&self, msg: &Message, ctx: &mut SimulationContext) {
+        // Don't send if we're crashed.
+        if self.crashed {
+            return;
+        }
+
         let to_node = msg.to();
         if let Some(&to_actor) = self.node_to_actor.get(&to_node) {
+            // Check for network partition.
+            if let Some(ref network_state) = self.network_state {
+                if let Ok(state) = network_state.lock() {
+                    if state.is_partitioned(self.actor_id, to_actor) {
+                        tracing::trace!(
+                            actor = %self.name,
+                            to = %to_actor,
+                            "message dropped due to partition"
+                        );
+                        return;
+                    }
+                }
+            }
+
             let payload = serialize_message(msg);
             ctx.schedule_after(
                 Duration::from_micros(NETWORK_LATENCY_US),
@@ -398,13 +503,81 @@ impl RaftActor {
             timer_ids::HEARTBEAT,
         );
     }
+
+    /// Handles crash event.
+    fn handle_crash(&mut self) {
+        if self.crashed {
+            return;
+        }
+        self.crashed = true;
+        tracing::info!(
+            actor = %self.name,
+            term = self.node.current_term().get(),
+            state = ?self.node.state(),
+            log_len = self.node.log().len(),
+            "CRASHED - all volatile state lost"
+        );
+    }
+
+    /// Handles recovery event.
+    fn handle_recover(&mut self, ctx: &mut SimulationContext) {
+        if !self.crashed {
+            return;
+        }
+        self.node = RaftNode::new(self.config.clone());
+        self.crashed = false;
+        tracing::info!(actor = %self.name, "RECOVERED - starting fresh as follower");
+        self.schedule_election_timeout(ctx);
+    }
+
+    /// Handles network partition event.
+    fn handle_partition(&self, nodes: &[ActorId]) {
+        if let Some(ref network_state) = self.network_state {
+            if let Ok(mut state) = network_state.lock() {
+                state.partition(nodes);
+                tracing::info!(actor = %self.name, ?nodes, "network partition active");
+            }
+        }
+    }
+
+    /// Handles network heal event.
+    fn handle_heal(&self, nodes: &[ActorId]) {
+        if let Some(ref network_state) = self.network_state {
+            if let Ok(mut state) = network_state.lock() {
+                state.heal(nodes);
+                tracing::info!(actor = %self.name, ?nodes, "network partition healed");
+            }
+        }
+    }
+
+    /// Checks if a packet should be dropped due to partition.
+    fn is_packet_partitioned(&self, from: ActorId) -> bool {
+        if let Some(ref network_state) = self.network_state {
+            if let Ok(state) = network_state.lock() {
+                return state.is_partitioned(from, self.actor_id);
+            }
+        }
+        false
+    }
 }
 
 impl SimulatedActor for RaftActor {
     fn handle(&mut self, event: EventKind, ctx: &mut SimulationContext) {
         match event {
+            // Crash/Recovery - always handled regardless of crash state.
+            EventKind::ProcessCrash { .. } => self.handle_crash(),
+            EventKind::ProcessRecover { .. } => self.handle_recover(ctx),
+
+            // Network events - update shared state.
+            EventKind::NetworkPartition { ref nodes } => self.handle_partition(nodes),
+            EventKind::NetworkHeal { ref nodes } => self.handle_heal(nodes),
+
+            // All other events - skip if crashed.
+            _ if self.crashed => {
+                tracing::trace!(actor = %self.name, "ignoring event while crashed");
+            }
+
             EventKind::ActorStart { .. } => {
-                // Schedule initial election timeout.
                 self.schedule_election_timeout(ctx);
                 tracing::debug!(actor = %self.name, "started");
             }
@@ -424,48 +597,30 @@ impl SimulatedActor for RaftActor {
                 self.process_outputs(outputs, ctx);
             }
 
-            EventKind::PacketDelivery { payload, .. } => {
-                // Deserialize and handle the Raft message.
+            EventKind::PacketDelivery { payload, from, .. } => {
+                if self.is_packet_partitioned(from) {
+                    tracing::trace!(actor = %self.name, %from, "dropping partitioned packet");
+                    return;
+                }
                 if let Some(msg) = deserialize_message(&payload) {
                     let outputs = self.node.handle_message(msg);
                     self.process_outputs(outputs, ctx);
                 }
             }
 
-            EventKind::ProcessCrash { .. } => {
-                tracing::info!(actor = %self.name, "crashed");
-                // In a full implementation, we'd clear volatile state here.
-            }
-
-            EventKind::ProcessRecover { .. } => {
-                tracing::info!(actor = %self.name, "recovered");
-                // In a full implementation, we'd reload from WAL here.
-                self.schedule_election_timeout(ctx);
-            }
-
             EventKind::Custom { name, data, .. } => {
                 if name == custom_events::CLIENT_REQUEST {
-                    // Handle client request.
                     let request = ClientRequest::new(Bytes::from(data));
                     if let Some(outputs) = self.node.handle_client_request(request) {
                         self.process_outputs(outputs, ctx);
-                        tracing::debug!(
-                            actor = %self.name,
-                            log_len = self.node.log().len(),
-                            "accepted client request"
-                        );
+                        tracing::debug!(actor = %self.name, "accepted client request");
                     } else {
-                        tracing::debug!(
-                            actor = %self.name,
-                            "rejected client request (not leader)"
-                        );
+                        tracing::debug!(actor = %self.name, "rejected client request (not leader)");
                     }
                 }
             }
 
-            _ => {
-                // Ignore other events.
-            }
+            _ => {}
         }
     }
 
