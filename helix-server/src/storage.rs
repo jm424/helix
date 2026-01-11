@@ -723,6 +723,10 @@ impl DurablePartition {
     /// # Errors
     ///
     /// Returns an error if registration with the tiering manager fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if more than 100 segments are registered in a single call (`TigerStyle` bound).
     pub async fn check_and_register_sealed_segments(&mut self) -> Result<u32, DurablePartitionError> {
         let Some(tiering) = &self.tiering else {
             return Ok(0);
@@ -899,9 +903,15 @@ impl DurablePartition {
         Ok(tiered_count)
     }
 
+    /// Returns whether tiering is enabled.
+    #[must_use]
+    pub const fn has_tiering(&self) -> bool {
+        self.tiering.is_some()
+    }
+
     /// Returns the tiering manager for testing purposes.
-    #[cfg(test)]
-    pub fn tiering_manager(&self) -> Option<&SimulatedTieringManager> {
+    #[must_use]
+    pub const fn tiering_manager(&self) -> Option<&SimulatedTieringManager> {
         self.tiering.as_ref()
     }
 }

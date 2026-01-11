@@ -8,7 +8,8 @@
 
 mod error;
 mod service;
-mod storage;
+/// Partition storage implementations.
+pub mod storage;
 
 pub mod generated {
     //! Generated protobuf types.

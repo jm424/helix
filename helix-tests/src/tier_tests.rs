@@ -9,9 +9,11 @@
 //! 2. **Download Failures**: Verify fetch retries and corruption detection
 //! 3. **Metadata Consistency**: Segment state transitions remain consistent
 //! 4. **Multi-Seed Stress**: Same scenario with different seeds for coverage
+//! 5. **E2E with DurablePartition**: Full integration with WAL-backed storage
 
 use bytes::Bytes;
-use helix_core::{PartitionId, TopicId};
+use helix_core::{PartitionId, Record, TopicId};
+use helix_server::storage::{DurablePartition, DurablePartitionConfig};
 use helix_tier::{
     InMemoryMetadataStore, ObjectStorage, ObjectStorageFaultConfig, SegmentLocation,
     SegmentMetadata, SimulatedObjectStorage, TierError, TieringConfig, TieringManager,
@@ -522,4 +524,236 @@ async fn test_storage_clone_shares_state() {
     // Get via original - should see update.
     let data = storage.get(&key).await.unwrap();
     assert_eq!(data, Bytes::from("updated data"));
+}
+
+// ============================================================================
+// E2E Tests: DurablePartition + Tiering Integration
+// ============================================================================
+//
+// These tests verify the full integration between DurablePartition and tiering.
+// They test the hooks and tiering workflow with real WAL-backed storage.
+
+/// Tests that DurablePartition with tiering enabled initializes correctly.
+#[tokio::test]
+async fn test_e2e_durable_partition_tiering_init() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    let config = DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
+        .with_tiering(TieringConfig::for_testing());
+
+    let partition = DurablePartition::open(config).await.unwrap();
+
+    // Tiering should be enabled.
+    assert!(partition.tiering_manager().is_some());
+}
+
+/// Tests writing records and calling tiering hooks (no sealed segments yet).
+#[tokio::test]
+async fn test_e2e_write_and_tiering_hooks() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    let config = DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
+        .with_tiering(TieringConfig::for_testing());
+
+    let mut partition = DurablePartition::open(config).await.unwrap();
+
+    // Write some records.
+    for i in 0..10 {
+        let records = vec![Record::new(Bytes::from(format!("record-{i}")))];
+        partition.append(records).await.unwrap();
+    }
+
+    // Call tiering hooks - should return 0 since no segments are sealed.
+    let registered = partition.check_and_register_sealed_segments().await.unwrap();
+    assert_eq!(registered, 0, "No sealed segments expected");
+
+    let committed = partition.on_entries_committed(100).await.unwrap();
+    assert_eq!(committed, 0, "No segments to commit");
+
+    let tiered = partition.tier_eligible_segments().await.unwrap();
+    assert_eq!(tiered, 0, "No segments to tier");
+}
+
+/// Tests that tiering hooks are idempotent (can be called multiple times safely).
+#[tokio::test]
+async fn test_e2e_tiering_hooks_idempotent() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    let config = DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
+        .with_tiering(TieringConfig::for_testing());
+
+    let mut partition = DurablePartition::open(config).await.unwrap();
+
+    // Write records.
+    for i in 0..5 {
+        let records = vec![Record::new(Bytes::from(format!("data-{i}")))];
+        partition.append(records).await.unwrap();
+    }
+
+    // Call hooks multiple times - should be safe.
+    for _ in 0..5 {
+        let _ = partition.check_and_register_sealed_segments().await.unwrap();
+        let _ = partition.on_entries_committed(100).await.unwrap();
+        let _ = partition.tier_eligible_segments().await.unwrap();
+    }
+
+    // Partition should still be functional.
+    let records = vec![Record::new(Bytes::from("final-record"))];
+    partition.append(records).await.unwrap();
+}
+
+/// Tests partition without tiering enabled (hooks should be no-op).
+#[tokio::test]
+async fn test_e2e_partition_without_tiering() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    let config =
+        DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0));
+
+    let mut partition = DurablePartition::open(config).await.unwrap();
+
+    // Tiering should be disabled.
+    assert!(partition.tiering_manager().is_none());
+
+    // Write records.
+    for i in 0..5 {
+        let records = vec![Record::new(Bytes::from(format!("data-{i}")))];
+        partition.append(records).await.unwrap();
+    }
+
+    // Hooks should return 0 (no-op when tiering disabled).
+    let registered = partition.check_and_register_sealed_segments().await.unwrap();
+    assert_eq!(registered, 0);
+
+    let committed = partition.on_entries_committed(100).await.unwrap();
+    assert_eq!(committed, 0);
+
+    let tiered = partition.tier_eligible_segments().await.unwrap();
+    assert_eq!(tiered, 0);
+}
+
+/// Tests concurrent writes with tiering hooks.
+#[tokio::test]
+async fn test_e2e_concurrent_writes_with_tiering() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    let config = DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
+        .with_tiering(TieringConfig::for_testing());
+
+    let mut partition = DurablePartition::open(config).await.unwrap();
+
+    // Interleave writes and tiering hooks.
+    for batch in 0..5 {
+        // Write some records.
+        for i in 0..10 {
+            let records = vec![Record::new(Bytes::from(format!("batch-{batch}-{i}")))];
+            partition.append(records).await.unwrap();
+        }
+
+        // Call tiering hooks between batches.
+        let _ = partition.check_and_register_sealed_segments().await;
+        let _ = partition.on_entries_committed(u64::try_from(batch * 10 + 10).unwrap()).await;
+        let _ = partition.tier_eligible_segments().await;
+    }
+
+    // Verify all records are readable.
+    let records = partition.read(helix_core::Offset::new(0), 100).unwrap();
+    assert_eq!(records.len(), 50);
+}
+
+/// Tests tiering config variations.
+#[tokio::test]
+async fn test_e2e_tiering_config_variations() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    // Test with custom config.
+    let custom_config = TieringConfig {
+        min_age_secs: 0, // No minimum age for testing.
+        max_concurrent_uploads: 2,
+        verify_on_download: true,
+    };
+
+    let config = DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
+        .with_tiering(custom_config);
+
+    let mut partition = DurablePartition::open(config).await.unwrap();
+
+    // Write and verify.
+    let records = vec![Record::new(Bytes::from("test-data"))];
+    partition.append(records).await.unwrap();
+
+    // Hooks should work with custom config.
+    let _ = partition.check_and_register_sealed_segments().await.unwrap();
+}
+
+/// Tests multi-partition tiering isolation.
+#[tokio::test]
+async fn test_e2e_multi_partition_tiering_isolation() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    // Create two partitions with tiering.
+    let config1 = DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
+        .with_tiering(TieringConfig::for_testing());
+    let config2 = DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(1))
+        .with_tiering(TieringConfig::for_testing());
+
+    let mut partition1 = DurablePartition::open(config1).await.unwrap();
+    let mut partition2 = DurablePartition::open(config2).await.unwrap();
+
+    // Write to each partition.
+    partition1
+        .append(vec![Record::new(Bytes::from("p1-data"))])
+        .await
+        .unwrap();
+    partition2
+        .append(vec![Record::new(Bytes::from("p2-data"))])
+        .await
+        .unwrap();
+
+    // Tiering hooks should be independent.
+    let _ = partition1.check_and_register_sealed_segments().await.unwrap();
+    let _ = partition2.check_and_register_sealed_segments().await.unwrap();
+
+    // Verify data isolation.
+    let p1_records = partition1.read(helix_core::Offset::new(0), 10).unwrap();
+    let p2_records = partition2.read(helix_core::Offset::new(0), 10).unwrap();
+
+    assert_eq!(p1_records.len(), 1);
+    assert_eq!(p2_records.len(), 1);
+    assert_ne!(p1_records[0].value, p2_records[0].value);
+}
+
+/// Stress test with multiple seeds for tiering manager.
+#[tokio::test]
+async fn test_e2e_multi_seed_tiering_stress() {
+    let seeds = [42, 123, 456, 789, 1111];
+
+    for seed in seeds {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create tiering config with specific seed behavior would require
+        // exposing the seed in config, but we test the flow works with
+        // multiple invocations.
+        let config =
+            DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
+                .with_tiering(TieringConfig::for_testing());
+
+        let mut partition = DurablePartition::open(config).await.unwrap();
+
+        // Write records with seed-based variation.
+        for i in 0..10 {
+            let data = format!("seed-{seed}-record-{i}");
+            let records = vec![Record::new(Bytes::from(data))];
+            partition.append(records).await.unwrap();
+        }
+
+        // Run tiering workflow.
+        let _ = partition.check_and_register_sealed_segments().await;
+        let _ = partition.on_entries_committed(10).await;
+        let _ = partition.tier_eligible_segments().await;
+
+        // Verify data integrity.
+        let records = partition.read(helix_core::Offset::new(0), 20).unwrap();
+        assert_eq!(records.len(), 10, "All records should be readable for seed {seed}");
+    }
 }

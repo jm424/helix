@@ -102,6 +102,23 @@ impl SegmentConfig {
         self
     }
 
+    /// Sets the maximum number of entries per segment.
+    ///
+    /// This is useful for testing segment rotation with small entry counts.
+    ///
+    /// # Panics
+    /// Panics if entries is 0 or exceeds `ENTRIES_PER_SEGMENT_MAX`.
+    #[must_use]
+    pub const fn with_max_entries(mut self, entries: u64) -> Self {
+        assert!(entries > 0, "max_entries must be positive");
+        assert!(
+            entries <= ENTRIES_PER_SEGMENT_MAX,
+            "max_entries exceeds limit"
+        );
+        self.max_entries = entries;
+        self
+    }
+
     /// Validates the configuration.
     ///
     /// # Errors

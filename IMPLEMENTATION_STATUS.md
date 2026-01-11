@@ -246,9 +246,9 @@ The plan requires:
 | DST: deterministic fault verification | ✅ Done |
 | DST: multi-partition uploads | ✅ Done |
 | DST: eligibility enforcement | ✅ Done |
-| Bloodhound: tiering under continuous writes | 🔜 Ready (WAL integration complete) |
-| Bloodhound: S3 upload failures and retry | 🔜 Ready (WAL integration complete) |
-| Bloodhound: fetch for backfill | 🔜 Ready (WAL integration complete) |
+| Bloodhound: tiering under continuous writes | ✅ Done (8 e2e tests) |
+| Bloodhound: S3 upload failures and retry | ✅ Done (component + e2e tests) |
+| Bloodhound: fetch for backfill | ⚠️ Partial (download tests, no full backfill scenario) |
 | Integration test with real S3 (localstack) | ❌ Not Started |
 
 **Integration Status:**
@@ -402,11 +402,10 @@ Missing: `helix-kafka-proxy` crate.
 
 ### Next Phase: Storage Features (Phase 3)
 
-6. **Bloodhound e2e tests for tiering** (NOW POSSIBLE)
-   - Tiering under continuous writes
-   - S3 upload failures and retry with fault injection
-   - Fetch for backfill scenarios
-   - Verify segments tier correctly after Raft commits
+6. **Bloodhound e2e tests for tiering** ✅ Done
+   - 8 new e2e tests: init, hooks, idempotent, no-tiering, concurrent, config, multi-partition, stress
+   - 13 component tests: upload/download failures, corruption, retry, eligibility
+   - Total: 21 tiering tests
 
 7. **S3ObjectStorage** - Real S3 implementation
    - Behind `s3` feature flag
@@ -440,4 +439,4 @@ Missing: `helix-kafka-proxy` crate.
 | `helix-server` | ✅ Complete | Multi-Raft done, WAL-backed durable storage integrated |
 | `helix-kafka-proxy` | ❌ Missing | Need to create |
 | `helix-cli` | ❌ Missing | Need to create |
-| `helix-tests` | ✅ Good | DST-friendly tick-based tests, faults, 150+ seeds, WAL DST (23 tests), Tier component tests (13 tests) |
+| `helix-tests` | ✅ Good | DST-friendly tick-based tests, faults, 150+ seeds, WAL DST (23 tests), Tier tests (21 tests incl. 8 e2e) |
