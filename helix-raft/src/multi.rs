@@ -673,7 +673,7 @@ mod tests {
         // Tick enough times to trigger election.
         let outputs = tick_until(&mut multi, 20, |m| {
             m.group_state(GroupId::new(1))
-                .map_or(false, |s| s.state != RaftState::Follower)
+                .is_some_and(|s| s.state != RaftState::Follower)
         });
 
         // Should have sent messages (pre-vote requests).
@@ -698,7 +698,7 @@ mod tests {
         // Tick until leader.
         let outputs = tick_until(&mut multi, 20, |m| {
             m.group_state(GroupId::new(1))
-                .map_or(false, |s| s.state == RaftState::Leader)
+                .is_some_and(|s| s.state == RaftState::Leader)
         });
 
         // Should become leader.
@@ -732,7 +732,7 @@ mod tests {
         // Tick until leader.
         tick_until(&mut multi, 20, |m| {
             m.group_state(GroupId::new(1))
-                .map_or(false, |s| s.state == RaftState::Leader)
+                .is_some_and(|s| s.state == RaftState::Leader)
         });
 
         // Now we can propose.
@@ -777,9 +777,9 @@ mod tests {
         // Tick until the single-node groups become leaders.
         tick_until(&mut multi, 30, |m| {
             m.group_state(GroupId::new(1))
-                .map_or(false, |s| s.state == RaftState::Leader)
+                .is_some_and(|s| s.state == RaftState::Leader)
                 && m.group_state(GroupId::new(2))
-                    .map_or(false, |s| s.state == RaftState::Leader)
+                    .is_some_and(|s| s.state == RaftState::Leader)
         });
 
         let leaders = multi.leader_groups();
@@ -803,7 +803,7 @@ mod tests {
         let outputs = tick_until(&mut multi, 20, |m| {
             (0..5).all(|i| {
                 m.group_state(GroupId::new(i))
-                    .map_or(false, |s| s.state != RaftState::Follower)
+                    .is_some_and(|s| s.state != RaftState::Follower)
             })
         });
 
@@ -845,8 +845,7 @@ mod tests {
             .map(|i| {
                 multi
                     .group_state(GroupId::new(i))
-                    .map(|s| s.state)
-                    .unwrap_or(RaftState::Follower)
+                    .map_or(RaftState::Follower, |s| s.state)
             })
             .collect();
 
@@ -855,8 +854,7 @@ mod tests {
         let followers = states.iter().filter(|&&s| s == RaftState::Follower).count();
         assert!(
             followers >= 4,
-            "Expected most groups to still be followers after 2 ticks, got {} followers",
-            followers
+            "Expected most groups to still be followers after 2 ticks, got {followers} followers"
         );
     }
 }

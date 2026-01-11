@@ -1,7 +1,25 @@
 //! Multi-Raft simulation tests.
 //!
-//! These tests verify the MultiRaft engine behavior under simulation,
+//! These tests verify the `MultiRaft` engine behavior under simulation,
 //! including election staggering, message batching, and multiple groups.
+
+// Test-specific lint allowances - these are less critical in test code.
+#![allow(clippy::cast_precision_loss)] // f64 precision loss acceptable in test stats
+#![allow(clippy::cast_possible_truncation)] // u64 to usize safe on 64-bit test machines
+#![allow(clippy::too_many_lines)] // Test functions can be longer for clarity
+#![allow(clippy::significant_drop_tightening)] // Test code clarity > drop optimization
+#![allow(clippy::doc_markdown)] // Backticks in docs not critical for tests
+#![allow(clippy::uninlined_format_args)] // Format string style not critical for tests
+#![allow(clippy::needless_pass_by_value)] // Pass by value can improve test clarity
+#![allow(clippy::items_after_test_module)] // Test module organization
+#![allow(clippy::cast_sign_loss)] // Test data is always positive
+#![allow(clippy::type_complexity)] // Complex types acceptable in test utilities
+#![allow(clippy::iter_over_hash_type)] // Iteration order doesn't matter in tests
+#![allow(clippy::explicit_iter_loop)] // Explicit iteration can be clearer
+#![allow(clippy::format_push_string)] // String building style not critical
+#![allow(clippy::for_kv_map)] // Iterate over keys may be intentional for clarity
+#![allow(clippy::panic_in_result_fn)] // Tests may intentionally panic
+#![allow(clippy::manual_assert)] // if + panic pattern is clear
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -945,15 +963,14 @@ mod tests {
         let leaders = leaders.lock().unwrap();
         println!("Leaders map has {} entries", leaders.len());
         for ((group, term), nodes) in leaders.iter() {
-            println!("  Group {} Term {}: {:?}", group, term, nodes);
+            println!("  Group {group} Term {term}: {nodes:?}");
         }
         let mut violations = Vec::new();
 
         for ((group, term), leader_list) in leaders.iter() {
             if leader_list.len() > 1 {
                 violations.push(format!(
-                    "Group {} Term {}: multiple leaders {:?}",
-                    group, term, leader_list
+                    "Group {group} Term {term}: multiple leaders {leader_list:?}"
                 ));
             }
         }

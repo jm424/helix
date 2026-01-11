@@ -28,6 +28,19 @@
 //! - ~96% success rate despite extreme fault injection
 //! - Protocol remains robust due to retry logic (3 retries, 1000-tick timeout)
 
+// Test-specific lint allowances - these are less critical in test code.
+#![allow(clippy::cast_precision_loss)] // f64 precision loss acceptable in test stats
+#![allow(clippy::cast_possible_truncation)] // u64 to usize safe on 64-bit test machines
+#![allow(clippy::too_many_lines)] // Test functions can be longer for clarity
+#![allow(clippy::too_many_arguments)] // Test setup functions may need many params
+#![allow(clippy::fn_params_excessive_bools)] // Test flags are often bools
+#![allow(clippy::doc_markdown)] // Backticks in docs not critical for tests
+#![allow(clippy::uninlined_format_args)] // Format string style not critical for tests
+#![allow(clippy::needless_pass_by_value)] // Pass by value can improve test clarity
+#![allow(clippy::type_complexity)] // Complex types acceptable in test utilities
+#![allow(clippy::needless_lifetimes)] // Explicit lifetimes can be clearer
+#![allow(clippy::deref_addrof)] // Ref/deref pattern may be intentional
+
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -144,7 +157,7 @@ fn encode_raft_message(msg: &Message) -> Vec<u8> {
             buf.extend(&resp.term.get().to_le_bytes());
             buf.extend(&resp.from.get().to_le_bytes());
             buf.extend(&resp.to.get().to_le_bytes());
-            buf.push(if resp.vote_granted { 1 } else { 0 });
+            buf.push(u8::from(resp.vote_granted));
         }
         Message::RequestVote(req) => {
             buf.push(2);
@@ -159,7 +172,7 @@ fn encode_raft_message(msg: &Message) -> Vec<u8> {
             buf.extend(&resp.term.get().to_le_bytes());
             buf.extend(&resp.from.get().to_le_bytes());
             buf.extend(&resp.to.get().to_le_bytes());
-            buf.push(if resp.vote_granted { 1 } else { 0 });
+            buf.push(u8::from(resp.vote_granted));
         }
         Message::AppendEntries(req) => {
             buf.push(4);
@@ -182,7 +195,7 @@ fn encode_raft_message(msg: &Message) -> Vec<u8> {
             buf.extend(&resp.term.get().to_le_bytes());
             buf.extend(&resp.from.get().to_le_bytes());
             buf.extend(&resp.to.get().to_le_bytes());
-            buf.push(if resp.success { 1 } else { 0 });
+            buf.push(u8::from(resp.success));
             buf.extend(&resp.match_index.get().to_le_bytes());
         }
         Message::TimeoutNow(req) => {
@@ -201,14 +214,14 @@ fn encode_raft_message(msg: &Message) -> Vec<u8> {
             buf.extend(&req.offset.to_le_bytes());
             buf.extend(&(req.data.len() as u64).to_le_bytes());
             buf.extend(&req.data);
-            buf.push(if req.done { 1 } else { 0 });
+            buf.push(u8::from(req.done));
         }
         Message::InstallSnapshotResponse(resp) => {
             buf.push(8);
             buf.extend(&resp.term.get().to_le_bytes());
             buf.extend(&resp.from.get().to_le_bytes());
             buf.extend(&resp.to.get().to_le_bytes());
-            buf.push(if resp.success { 1 } else { 0 });
+            buf.push(u8::from(resp.success));
             buf.extend(&resp.next_offset.to_le_bytes());
         }
     }
@@ -639,7 +652,7 @@ impl ShardNode {
         self.process_transfer_outputs(outputs, ctx);
     }
 
-    fn generate_transfer_response(&mut self, message: &TransferMessage) -> Option<TransferMessage> {
+    fn generate_transfer_response(&self, message: &TransferMessage) -> Option<TransferMessage> {
         match message {
             TransferMessage::PrepareRequest { transfer_id, shard_range } => {
                 // Use real MultiRaft snapshot creation.
@@ -699,7 +712,7 @@ impl SimulatedActor for ShardNode {
     }
 
     fn id(&self) -> ActorId { self.actor_id }
-    fn name(&self) -> &str { "shard-node" }
+    fn name(&self) -> &'static str { "shard-node" }
     fn checkpoint(&self) -> Box<dyn Any + Send> { Box::new(self.tick) }
     fn restore(&mut self, _: Box<dyn Any + Send>) {}
     fn on_start(&mut self, ctx: &mut SimulationContext) {
@@ -807,20 +820,20 @@ mod tests {
         }
 
         println!("\n=== 100 Seeds ===");
-        println!("Total Raft msgs: {}", total_raft);
-        println!("Total drops:     {}", total_drops);
-        println!("Total crashes:   {}", total_crashes);
-        println!("Initiated:       {}", total_initiated);
-        println!("Completed:       {}", total_completed);
+        println!("Total Raft msgs: {total_raft}");
+        println!("Total drops:     {total_drops}");
+        println!("Total crashes:   {total_crashes}");
+        println!("Initiated:       {total_initiated}");
+        println!("Completed:       {total_completed}");
 
         let success_rate = (total_completed as f64) / (total_initiated as f64) * 100.0;
-        println!("Success rate:    {:.1}%", success_rate);
+        println!("Success rate:    {success_rate:.1}%");
 
         assert!(total_raft > 10000, "Expected significant Raft activity");
         // With aggressive 3%/0.5% fault rates, expect >90% success
-        assert!(success_rate > 90.0, "Expected >90% success rate, got {:.1}%", success_rate);
+        assert!(success_rate > 90.0, "Expected >90% success rate, got {success_rate:.1}%");
         // Verify faults are actually being injected
-        assert!(total_crashes > 1000, "Expected >1000 crashes with 0.5% rate, got {}", total_crashes);
+        assert!(total_crashes > 1000, "Expected >1000 crashes with 0.5% rate, got {total_crashes}");
     }
 
     #[test]
@@ -833,7 +846,7 @@ mod tests {
             total_initiated += stats.transfers_initiated;
             total_completed += stats.transfers_completed;
 
-            assert!(stats.violations.is_empty(), "Seed {} violations: {:?}", seed, stats.violations);
+            assert!(stats.violations.is_empty(), "Seed {seed} violations: {:?}", stats.violations);
 
             if seed % 100 == 99 {
                 println!("Completed {} seeds...", seed + 1);
@@ -842,11 +855,11 @@ mod tests {
 
         let success_rate = (total_completed as f64) / (total_initiated as f64) * 100.0;
         println!("\n=== 500 Seeds Stress ===");
-        println!("Initiated: {}", total_initiated);
-        println!("Completed: {}", total_completed);
-        println!("Success rate: {:.1}%", success_rate);
+        println!("Initiated: {total_initiated}");
+        println!("Completed: {total_completed}");
+        println!("Success rate: {success_rate:.1}%");
 
         // With aggressive 3%/0.5% fault rates, expect >90% success
-        assert!(success_rate > 90.0, "Expected >90% success rate, got {:.1}%", success_rate);
+        assert!(success_rate > 90.0, "Expected >90% success rate, got {success_rate:.1}%");
     }
 }

@@ -1,15 +1,35 @@
 //! Multi-Raft property-verified simulation tests.
 //!
 //! These tests verify safety properties under fault injection for the Multi-Raft engine:
-//! - SingleLeaderPerTerm
-//! - LogMatching
-//! - StateMachineSafety
-//! - LeaderCompleteness
+//! - `SingleLeaderPerTerm`
+//! - `LogMatching`
+//! - `StateMachineSafety`
+//! - `LeaderCompleteness`
 //!
 //! Includes:
-//! - Mid-operation crash injection (during votes, AppendEntries, commits)
+//! - Mid-operation crash injection (during votes, `AppendEntries`, commits)
 //! - Extended duration stress tests (100k+ ticks)
 //! - Message chaos (duplication, reordering)
+
+// Test-specific lint allowances - these are less critical in test code.
+#![allow(clippy::cast_precision_loss)] // f64 precision loss acceptable in test stats
+#![allow(clippy::cast_possible_truncation)] // u64 to usize safe on 64-bit test machines
+#![allow(clippy::too_many_lines)] // Test functions can be longer for clarity
+#![allow(clippy::significant_drop_tightening)] // Test code clarity > drop optimization
+#![allow(clippy::needless_pass_by_ref_mut)] // Actor trait requires &mut self
+#![allow(clippy::doc_markdown)] // Backticks in docs not critical for tests
+#![allow(clippy::uninlined_format_args)] // Format string style not critical for tests
+#![allow(clippy::needless_pass_by_value)] // Pass by value can improve test clarity
+#![allow(clippy::type_complexity)] // Complex types acceptable in test utilities
+#![allow(clippy::format_push_string)] // String building style not critical
+#![allow(clippy::iter_over_hash_type)] // Iteration order doesn't matter in tests
+#![allow(clippy::explicit_iter_loop)] // Explicit iteration can be clearer
+#![allow(clippy::manual_let_else)] // Let-else style not critical
+#![allow(clippy::single_match_else)] // Match style not critical
+#![allow(clippy::map_unwrap_or)] // map/unwrap_or style not critical
+#![allow(clippy::needless_lifetimes)] // Explicit lifetimes can be clearer
+#![allow(clippy::for_kv_map)] // Iterate over keys may be intentional for clarity
+#![allow(clippy::deref_addrof)] // Ref/deref pattern may be intentional
 
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
@@ -228,18 +248,18 @@ impl PropertyCheckResult {
                 .iter()
                 .filter(|((g, _), _)| *g == *group)
                 .count();
-            println!("  Group {}: max_term={}, elections={}", group, term, elections);
+            println!("  Group {group}: max_term={term}, elections={elections}");
         }
         println!("Commit progress by node:");
         for ((node, group), commit) in &self.max_commit_by_node_group {
             if *commit > 0 {
-                println!("  Node {} Group {}: commit_index={}", node, group, commit);
+                println!("  Node {node} Group {group}: commit_index={commit}");
             }
         }
         if !self.violations.is_empty() {
             println!("VIOLATIONS ({}):", self.violations.len());
             for v in &self.violations {
-                println!("  {}", v);
+                println!("  {v}");
             }
         }
         println!("============================\n");
@@ -1597,7 +1617,7 @@ mod tests {
     // ------------------------------------------------------------------------
 
     #[test]
-    #[ignore] // Run with: cargo test test_extended_duration -- --ignored
+    #[ignore = "long-running stress test - run explicitly with --ignored"]
     fn test_extended_duration_100k_ticks() {
         // Run for extended duration (~100k ticks = 1000 seconds at 10ms tick).
         let config = VerifiedTestConfig {
@@ -1654,7 +1674,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "long-running multi-seed test - run explicitly with --ignored"]
     fn test_extended_many_seeds() {
         // Run many seeds for extended coverage.
         const SEED_COUNT: u64 = 50;
@@ -2132,7 +2152,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "long-running chaos test - run explicitly with --ignored"]
     fn test_chaos_many_seeds() {
         // Run chaos tests with many seeds.
         const SEED_COUNT: u64 = 30;
@@ -2183,7 +2203,7 @@ mod tests {
     // ------------------------------------------------------------------------
 
     #[test]
-    #[ignore]
+    #[ignore = "ultimate stress test - run explicitly with --ignored"]
     fn test_ultimate_stress() {
         // Ultimate stress test: many groups, chaos, crashes, partitions, long duration.
         let config = VerifiedTestConfig {

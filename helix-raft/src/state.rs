@@ -1502,6 +1502,6 @@ mod tests {
 
         // At least two should be different (with high probability).
         let unique: std::collections::HashSet<_> = timeouts.iter().collect();
-        assert!(unique.len() >= 2, "Expected different timeouts, got {:?}", timeouts);
+        assert!(unique.len() >= 2, "Expected different timeouts, got {timeouts:?}");
     }
 }

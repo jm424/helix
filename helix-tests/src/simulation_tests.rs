@@ -3,6 +3,20 @@
 //! These tests verify Raft safety properties under various fault conditions
 //! using Bloodhound's deterministic simulation framework.
 
+// Test-specific lint allowances - these are less critical in test code.
+#![allow(clippy::cast_precision_loss)] // f64 precision loss acceptable in test stats
+#![allow(clippy::cast_possible_truncation)] // u64 to usize safe on 64-bit test machines
+#![allow(clippy::too_many_lines)] // Test functions can be longer for clarity
+#![allow(clippy::significant_drop_tightening)] // Test code clarity > drop optimization
+#![allow(clippy::items_after_statements)] // Allow const definitions where needed
+#![allow(clippy::doc_markdown)] // Backticks in docs not critical for tests
+#![allow(clippy::uninlined_format_args)] // Format string style not critical for tests
+#![allow(clippy::needless_pass_by_value)] // Pass by value can improve test clarity
+#![allow(clippy::type_complexity)] // Complex types acceptable in test utilities
+#![allow(clippy::iter_over_hash_type)] // Iteration order doesn't matter in tests
+#![allow(clippy::explicit_iter_loop)] // Explicit iteration can be clearer
+#![allow(clippy::format_push_string)] // String building style not critical
+
 use std::collections::BTreeMap;
 use std::time::Duration;
 

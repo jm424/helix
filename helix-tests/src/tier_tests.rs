@@ -9,8 +9,36 @@
 //! 2. **Download Failures**: Verify fetch retries and corruption detection
 //! 3. **Metadata Consistency**: Segment state transitions remain consistent
 //! 4. **Multi-Seed Stress**: Same scenario with different seeds for coverage
-//! 5. **E2E with DurablePartition**: Full integration with WAL-backed storage
+//! 5. **E2E with `DurablePartition`**: Full integration with WAL-backed storage
 //! 6. **BUGGIFY Crash Tests**: Verify recovery from crashes at arbitrary points
+
+// Test-specific lint allowances - these are less critical in test code.
+#![allow(clippy::cast_precision_loss)] // f64 precision loss acceptable in test stats
+#![allow(clippy::cast_possible_truncation)] // u64 to usize safe on 64-bit test machines
+#![allow(clippy::too_many_lines)] // Test functions can be longer for clarity
+#![allow(clippy::items_after_statements)] // Allow const definitions where needed
+#![allow(clippy::significant_drop_tightening)] // Test code clarity > drop optimization
+#![allow(clippy::doc_markdown)] // Backticks in docs not critical for tests
+#![allow(clippy::uninlined_format_args)] // Format string style not critical for tests
+#![allow(clippy::needless_pass_by_value)] // Pass by value can improve test clarity
+#![allow(clippy::type_complexity)] // Complex types acceptable in test utilities
+#![allow(clippy::format_push_string)] // String building style not critical
+#![allow(clippy::iter_over_hash_type)] // Iteration order doesn't matter in tests
+#![allow(clippy::unused_async)] // Async functions for trait consistency
+#![allow(clippy::explicit_iter_loop)] // Explicit iteration can be clearer
+#![allow(clippy::if_then_some_else_none)] // If-else style not critical
+#![allow(clippy::option_if_let_else)] // Pattern style not critical
+#![allow(clippy::single_match_else)] // Match style not critical
+#![allow(clippy::manual_let_else)] // Let-else style not critical
+#![allow(clippy::map_unwrap_or)] // map/unwrap_or style not critical
+#![allow(clippy::only_used_in_recursion)] // False positives in test helpers
+#![allow(clippy::ref_as_ptr)] // Ref/ptr style not critical
+#![allow(clippy::panic_in_result_fn)] // Tests may intentionally panic
+#![allow(clippy::collection_is_never_read)] // Test setup may create unused collections
+#![allow(clippy::needless_lifetimes)] // Explicit lifetimes can be clearer
+#![allow(clippy::for_kv_map)] // Iterate over keys may be intentional for clarity
+#![allow(clippy::deref_addrof)] // Ref/deref pattern may be intentional
+#![allow(clippy::cast_sign_loss)] // Test data is always positive
 
 use bloodhound::buggify;
 use bytes::Bytes;
@@ -2861,7 +2889,7 @@ async fn test_randomized_operations_with_faults() {
 
 /// Extended randomized test with more seeds and longer sequences.
 #[tokio::test]
-#[ignore] // Run explicitly: cargo test test_randomized_extended -- --ignored
+#[ignore = "long-running randomized test - run explicitly with --ignored"]
 async fn test_randomized_extended() {
     const NUM_SEEDS: u64 = 100;
     const OPS_PER_SEED: usize = 200;
@@ -3229,7 +3257,7 @@ async fn test_recovery_with_exists_failures() {
 ///
 /// Run explicitly: cargo test test_comprehensive_stress -- --ignored --nocapture
 #[tokio::test]
-#[ignore]
+#[ignore = "comprehensive 500-seed stress test - run explicitly with --ignored"]
 async fn test_comprehensive_stress() {
     const NUM_SEEDS: u64 = 500;
     const OPS_PER_SEED: usize = 100;

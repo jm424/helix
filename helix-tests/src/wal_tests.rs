@@ -1,7 +1,7 @@
 //! WAL crash recovery and integrity simulation tests.
 //!
 //! These tests verify WAL correctness under crash conditions using
-//! SimulatedStorage with deterministic fault injection.
+//! `SimulatedStorage` with deterministic fault injection.
 //!
 //! # Test Categories
 //!
@@ -13,6 +13,23 @@
 //! 6. **Multi-Segment Corruption**: Multiple segments, last one corrupted
 //! 7. **Concurrent Access**: Reads while writes are happening
 //! 8. **Fsync Failures**: Disk full and I/O error handling
+
+// Test-specific lint allowances - these are less critical in test code.
+#![allow(clippy::cast_precision_loss)] // f64 precision loss acceptable in test stats
+#![allow(clippy::cast_possible_truncation)] // u64 to usize safe on 64-bit test machines
+#![allow(clippy::too_many_lines)] // Test functions can be longer for clarity
+#![allow(clippy::significant_drop_tightening)] // Test code clarity > drop optimization
+#![allow(clippy::unreadable_literal)] // Large seed numbers are fine without separators
+#![allow(clippy::doc_markdown)] // Backticks in docs not critical for tests
+#![allow(clippy::uninlined_format_args)] // Format string style not critical for tests
+#![allow(clippy::needless_pass_by_value)] // Pass by value can improve test clarity
+#![allow(clippy::type_complexity)] // Complex types acceptable in test utilities
+#![allow(clippy::explicit_iter_loop)] // Explicit iteration can be clearer
+#![allow(clippy::manual_let_else)] // Let-else style not critical
+#![allow(clippy::panic_in_result_fn)] // Tests may intentionally panic
+#![allow(clippy::cast_sign_loss)] // Test data is always positive
+#![allow(clippy::deref_addrof)] // Ref/deref pattern may be intentional
+#![allow(clippy::single_match)] // Single match for clarity
 
 use std::path::Path;
 
@@ -938,7 +955,7 @@ fn check_wal_invariants<S: Storage>(
 
         // INVARIANT 7: Content integrity - verify payload matches what was written
         if let Some(written) = written {
-            written.verify(i, &entry).map_err(|e| {
+            written.verify(i, entry).map_err(|e| {
                 format!("seed {seed}, op {op_num}: CONTENT CORRUPTION - {e}")
             })?;
         }
@@ -1454,13 +1471,13 @@ async fn test_repro_seed_135837() {
 
             // Print synced files for debugging
             let synced_paths = storage.synced_file_paths();
-            eprintln!("  synced_files: {:?}", synced_paths);
+            eprintln!("  synced_files: {synced_paths:?}");
 
             let recovered = Wal::open(storage.clone(), wal_config.clone()).await.unwrap();
             eprintln!("After crash: recovered={:?}", recovered.last_index());
 
             if let (Some(r), Some(d)) = (recovered.last_index(), durable_before) {
-                assert!(r <= d, "recovered {} > durable {}", r, d);
+                assert!(r <= d, "recovered {r} > durable {d}");
             }
             return;
         }
@@ -1513,7 +1530,7 @@ async fn test_repro_seed_135837() {
                 // Crash - skip for now, we want to run until op 64
                 let durable_before = wal.durable_index();
                 let last_before = wal.last_index();
-                eprintln!("  CRASH: durable={:?}, last={:?}", durable_before, last_before);
+                eprintln!("  CRASH: durable={durable_before:?}, last={last_before:?}");
                 drop(wal);
 
                 // Debug: print synced files before crash with sizes
@@ -1523,7 +1540,7 @@ async fn test_repro_seed_135837() {
                         eprintln!("    synced {}: {} bytes", p.display(), content.len());
                     }
                 }
-                eprintln!("  synced_files: {:?}", synced_paths);
+                eprintln!("  synced_files: {synced_paths:?}");
 
                 storage.simulate_crash();
 
@@ -1574,7 +1591,7 @@ async fn test_repro_seed_135837() {
 
                 // Check the invariant here too
                 if let (Some(r), Some(d)) = (w.last_index(), durable_before) {
-                    assert!(r <= d, "op {}: recovered {} > durable {}", op_num, r, d);
+                    assert!(r <= d, "op {op_num}: recovered {r} > durable {d}");
                 }
 
                 wal = w;

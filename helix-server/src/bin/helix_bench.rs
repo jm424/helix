@@ -28,6 +28,17 @@
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
+// Benchmark tool lint allowances - these are less critical for CLI tools.
+#![allow(clippy::cast_precision_loss)] // f64 precision loss acceptable in benchmark stats
+#![allow(clippy::cast_possible_truncation)] // Safe casts in benchmark context
+#![allow(clippy::uninlined_format_args)] // Format string style not critical
+#![allow(clippy::too_many_lines)] // Benchmark functions can be longer
+#![allow(clippy::doc_markdown)] // Backticks in docs not critical
+#![allow(clippy::significant_drop_tightening)] // Clarity over drop optimization
+#![allow(clippy::default_trait_access)] // HashMap::new() vs default() style not critical
+#![allow(clippy::cast_possible_wrap)] // Safe wrapping in benchmark context
+#![allow(clippy::cast_lossless)] // Safe casts, verbose From not needed
+#![allow(clippy::too_many_arguments)] // Benchmark runner needs many params
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

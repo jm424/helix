@@ -262,7 +262,7 @@ mod tests {
         let keys: &[&[u8]] = &[b"key1", b"key2", b"another_key", b"test"];
         for key in keys {
             let group = router.route_to_group(key);
-            assert!(group.is_some(), "key {:?} should route to a group", key);
+            assert!(group.is_some(), "key {key:?} should route to a group");
         }
     }
 
