@@ -556,7 +556,9 @@ mod tests {
         assert_eq!(wal.last_index().await, Some(100));
     }
 
-    #[tokio::test]
+    /// NOTE: Uses multi-threaded runtime to expose race conditions that would
+    /// be hidden by single-threaded Tokio's serialization of spawned tasks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_buffered_wal_concurrent_access() {
         let temp_dir = tempfile::tempdir().unwrap();
         let wal_config = WalConfig::new(temp_dir.path());
@@ -569,11 +571,11 @@ mod tests {
 
         // Spawn multiple tasks.
         let mut handles = vec![];
-        for task_id in 0..4 {
+        for task_id in 0u64..4 {
             let wal_clone = wal.clone();
             handles.push(tokio::spawn(async move {
-                for i in 0..25 {
-                    let index = (task_id * 25 + i + 1) as u64;
+                for i in 0u64..25 {
+                    let index = task_id * 25 + i + 1;
                     let entry = Entry::new(1, index, Bytes::from("data")).unwrap();
                     wal_clone.append(entry).await.unwrap();
                 }
@@ -590,7 +592,9 @@ mod tests {
         assert_eq!(wal.last_index().await, Some(100));
     }
 
-    #[tokio::test]
+    /// NOTE: Uses multi-threaded runtime to expose race conditions that would
+    /// be hidden by single-threaded Tokio's serialization of spawned tasks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_buffered_wal_concurrent_shared_counter_sync() {
         // Mimics the benchmark pattern: shared atomic counter for indices.
         let temp_dir = tempfile::tempdir().unwrap();
@@ -630,7 +634,9 @@ mod tests {
         assert_eq!(wal.last_index().await, Some(512)); // 64 tasks * 8 entries
     }
 
-    #[tokio::test]
+    /// NOTE: Uses multi-threaded runtime to expose race conditions that would
+    /// be hidden by single-threaded Tokio's serialization of spawned tasks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_buffered_wal_concurrent_shared_counter_buffered() {
         // Mimics the benchmark pattern with buffered mode.
         let temp_dir = tempfile::tempdir().unwrap();

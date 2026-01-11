@@ -543,7 +543,9 @@ async fn test_write_to_different_partitions() {
     );
 }
 
-#[tokio::test]
+/// NOTE: Uses multi-threaded runtime to expose race conditions that would
+/// be hidden by single-threaded Tokio's serialization of spawned tasks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_writes() {
     let (mut client, _addr) = start_test_server().await;
 
