@@ -59,7 +59,10 @@ mod storage;
 
 pub use error::{TierError, TierResult};
 pub use manager::{IntegratedTieringManager, TieringConfig, TieringManager};
-pub use metadata::{InMemoryMetadataStore, MetadataStore, SegmentLocation, SegmentMetadata};
+pub use metadata::{
+    InMemoryMetadataStore, MetadataStore, MetadataStoreFaultConfig, SegmentLocation,
+    SegmentMetadata,
+};
 pub use storage::{
     ObjectKey, ObjectStorage, ObjectStorageFaultConfig, SegmentReader, SimulatedObjectStorage,
 };

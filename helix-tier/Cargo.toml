@@ -15,6 +15,9 @@ workspace = true
 helix-core = { workspace = true }
 helix-wal = { workspace = true }
 
+# DST Framework.
+bloodhound = { workspace = true }
+
 # Async runtime.
 tokio = { workspace = true }
 async-trait = { workspace = true }

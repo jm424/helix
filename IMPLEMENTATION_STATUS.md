@@ -9,7 +9,7 @@ This document tracks progress against the [implementation plan](../helix-impleme
 | Phase 0: Foundations | Partial | ~80% |
 | Phase 1: Core Consensus | ✅ Complete | 100% (WAL + benchmarks done) |
 | Phase 2: Multi-Raft & Sharding | ⚠️ Partial | ~85% (missing shard movement) |
-| Phase 3: Storage Features | ⚠️ Partial | ~65% (helix-tier done + wired to DurablePartition) |
+| Phase 3: Storage Features | ⚠️ Partial | ~70% (helix-tier complete with real WAL tests) |
 | Phase 4: API & Flow Control | ⚠️ Partial | ~80% (multi-node networking done, flow control/kafka not started) |
 | Phase 5: Production Readiness | Not Started | 0% |
 
@@ -213,7 +213,7 @@ The plan requires:
 
 ### Phase 3: Storage Features
 
-**Status: ~65% (helix-tier done + wired to DurablePartition, helix-progress not started)**
+**Status: ~70% (helix-tier complete with real WAL integration tests, helix-progress not started)**
 
 #### 3.1 Tiered Storage (helix-tier)
 
@@ -246,10 +246,27 @@ The plan requires:
 | DST: deterministic fault verification | ✅ Done |
 | DST: multi-partition uploads | ✅ Done |
 | DST: eligibility enforcement | ✅ Done |
-| Bloodhound: tiering under continuous writes | ✅ Done (8 e2e tests) |
-| Bloodhound: S3 upload failures and retry | ✅ Done (component + e2e tests) |
-| Bloodhound: fetch for backfill | ⚠️ Partial (download tests, no full backfill scenario) |
+| DST: FaultingSegmentReader | ✅ Done (fault injection for WAL reads) |
+| DST: find_stuck_uploads fault injection | ✅ Done |
+| DST: try_claim_for_upload fault injection | ✅ Done |
+| DST: comprehensive stress (500 seeds × 100 ops) | ✅ Done (25% fault rates) |
+| DST: concurrent tier_same_segment test | ✅ Done |
+| DST invariants: ordering (sealed→committed→tiered) | ✅ Done |
+| DST invariants: referential integrity | ✅ Done |
+| DST invariants: orphaned data detection | ✅ Done |
+| DurablePartition e2e tests | ✅ Done (8 tests, tiering hooks) |
+| Real WAL integration tests | ✅ Done (4 tests with segment rotation) |
+| - test_real_segment_rotation_and_tiering | ✅ 12 entries, 5 entries/segment |
+| - test_real_tiering_with_upload_failures | ✅ Fault injection with retry |
+| - test_real_tiering_corruption_detection | ✅ Corruption on download |
+| - test_real_multi_segment_tiering | ✅ 15 entries, 3 entries/segment |
 | Integration test with real S3 (localstack) | ❌ Not Started |
+
+**Bugs Found Through DST:**
+| Bug | Seed/Op | Fix |
+|-----|---------|-----|
+| Orphaned data: `exists()` failure during recovery used `unwrap_or(false)`, causing incorrect abort | seed 197562, op 27 | Skip segment on exists() error, retry on next recovery |
+| Ordering violation: `mark_committed()` allowed uncommitted segments to be marked committed without being sealed first | seed 17, op 88 | Added precondition check: segment must be sealed before committing |
 
 **Integration Status:**
 - ✅ IntegratedTieringManager with SegmentReader trait (WAL abstraction)
@@ -385,11 +402,14 @@ Missing: `helix-kafka-proxy` crate.
    - `helix-wal` has segment access: `sealed_segment_ids()`, `read_segment_bytes()`, `segment_info()`
    - Fixed RNG bug: `(seed + counter) * M` formula (also fixed in helix-wal)
    - TigerStyle assertions added (improved from 0.9 to 1.04 per function)
-   - 13 component-level DST tests (forced failures, corruption, retries, eligibility)
    - `WalSegmentReader` implements `SegmentReader` for `DurablePartition`
    - `DurablePartitionConfig.with_tiering()` enables tiering
    - Hooks: `check_and_register_sealed_segments()`, `on_entries_committed()`, `tier_eligible_segments()`
    - 11 helix-server tests pass (including tiering integration test)
+   - **DST hardening**: FaultingSegmentReader, find_stuck_uploads/try_claim fault injection
+   - **Invariant checking**: ordering (sealed→committed→tiered), referential integrity, orphan detection
+   - **Comprehensive stress test**: 500 seeds × 100 ops with 25% fault rates
+   - **2 bugs found via DST**: orphaned data bug (seed 197562), ordering violation (seed 17)
 
 ### Optional Enhancements
 
@@ -404,8 +424,11 @@ Missing: `helix-kafka-proxy` crate.
 
 6. **Bloodhound e2e tests for tiering** ✅ Done
    - 8 new e2e tests: init, hooks, idempotent, no-tiering, concurrent, config, multi-partition, stress
-   - 13 component tests: upload/download failures, corruption, retry, eligibility
-   - Total: 21 tiering tests
+   - DST hardening: FaultingSegmentReader, find_stuck/try_claim fault injection
+   - Invariants: ordering, referential integrity, orphan detection
+   - 500-seed comprehensive stress test with 25% fault rates
+   - **2 bugs found via DST** (fixed): orphaned data, ordering violation
+   - Total: 43 tiering tests
 
 7. **S3ObjectStorage** - Real S3 implementation
    - Behind `s3` feature flag
@@ -433,10 +456,10 @@ Missing: `helix-kafka-proxy` crate.
 | `helix-raft` | ✅ Complete | Pre-vote, leadership transfer, tick-based timing, MultiRaft engine |
 | `helix-routing` | ✅ Exists | ShardMap, LeaderCache, ShardRouter |
 | `helix-runtime` | ⚠️ Partial | Tick-based server, missing io_uring |
-| `helix-tier` | ✅ Complete | Wired into DurablePartition with WalSegmentReader, tiering hooks, 11 tests |
+| `helix-tier` | ✅ Complete | Wired into DurablePartition, 500-seed stress DST found 2 bugs (fixed), 43 tests |
 | `helix-progress` | ❌ Missing | Need to create |
 | `helix-flow` | ❌ Missing | Need to create |
 | `helix-server` | ✅ Complete | Multi-Raft done, WAL-backed durable storage integrated |
 | `helix-kafka-proxy` | ❌ Missing | Need to create |
 | `helix-cli` | ❌ Missing | Need to create |
-| `helix-tests` | ✅ Good | DST-friendly tick-based tests, faults, 150+ seeds, WAL DST (23 tests), Tier tests (21 tests incl. 8 e2e) |
+| `helix-tests` | ✅ Good | DST-friendly tick-based tests, faults, 150+ seeds, WAL DST (23 tests), Tier tests (43 tests: 8 e2e + 500-seed stress + concurrent) |

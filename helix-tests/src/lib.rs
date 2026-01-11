@@ -6,6 +6,7 @@
 //! - `raft_actor`: Raft `SimulatedActor` for Bloodhound simulation
 //! - `raft_tests`: Raft consensus safety and liveness properties
 //! - `wal_tests`: Write-ahead log crash recovery and integrity
+//! - `tier_tests`: Tiered storage tests
 //! - `properties`: Property definitions (`SingleLeaderPerTerm`, `LogMatching`, etc.)
 //! - `scenarios`: Reusable test scenarios
 

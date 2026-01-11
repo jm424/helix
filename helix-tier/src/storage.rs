@@ -142,6 +142,8 @@ pub struct ObjectStorageFaultConfig {
     pub get_corruption_rate: f64,
     /// Probability of delete failing. Range: 0.0 - 1.0.
     pub delete_fail_rate: f64,
+    /// Probability of exists check failing. Range: 0.0 - 1.0.
+    pub exists_fail_rate: f64,
     /// If true, next put will fail (one-shot).
     pub force_put_fail: bool,
     /// If true, next get will fail (one-shot).
@@ -150,6 +152,8 @@ pub struct ObjectStorageFaultConfig {
     pub force_get_corruption: bool,
     /// If true, next delete will fail (one-shot).
     pub force_delete_fail: bool,
+    /// If true, next exists will fail (one-shot).
+    pub force_exists_fail: bool,
 }
 
 impl Default for ObjectStorageFaultConfig {
@@ -159,10 +163,12 @@ impl Default for ObjectStorageFaultConfig {
             get_fail_rate: 0.0,
             get_corruption_rate: 0.0,
             delete_fail_rate: 0.0,
+            exists_fail_rate: 0.0,
             force_put_fail: false,
             force_get_fail: false,
             force_get_corruption: false,
             force_delete_fail: false,
+            force_exists_fail: false,
         }
     }
 }
@@ -182,8 +188,21 @@ impl ObjectStorageFaultConfig {
             get_fail_rate: 0.01,
             get_corruption_rate: 0.001,
             delete_fail_rate: 0.001,
+            exists_fail_rate: 0.01,
             ..Default::default()
         }
+    }
+
+    /// Sets the exists failure rate.
+    ///
+    /// # Panics
+    ///
+    /// Panics if rate is not in range 0.0..=1.0.
+    #[must_use]
+    pub fn with_exists_fail_rate(mut self, rate: f64) -> Self {
+        assert!((0.0..=1.0).contains(&rate), "rate must be in 0.0..=1.0");
+        self.exists_fail_rate = rate;
+        self
     }
 
     /// Sets the put failure rate.
@@ -578,6 +597,27 @@ impl ObjectStorage for SimulatedObjectStorage {
     async fn exists(&self, key: &ObjectKey) -> TierResult<bool> {
         // TigerStyle: Assert precondition.
         assert!(!key.as_str().is_empty(), "object key must not be empty");
+
+        // Check for forced failure first.
+        let mut config = self.fault_config.lock().expect("fault config lock poisoned");
+        if config.force_exists_fail {
+            config.force_exists_fail = false;
+            drop(config);
+            return Err(TierError::Io {
+                operation: "exists",
+                message: "simulated exists failure (forced)".to_string(),
+            });
+        }
+        let exists_fail_rate = config.exists_fail_rate;
+        drop(config);
+
+        // Check for probabilistic failure.
+        if self.should_inject_fault(exists_fail_rate) {
+            return Err(TierError::Io {
+                operation: "exists",
+                message: "simulated exists failure (random)".to_string(),
+            });
+        }
 
         let objects = self.objects.lock().expect("objects lock poisoned");
         Ok(objects.contains_key(key))

@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use bloodhound::buggify;
 use bytes::Bytes;
 use helix_wal::SegmentId;
 use tracing::{debug, info, warn};
@@ -164,6 +165,14 @@ impl<S: ObjectStorage, M: MetadataStore> TieringManager<S, M> {
             return Ok(());
         }
 
+        // Precondition: segment must be sealed before it can be committed.
+        if !metadata.sealed {
+            return Err(TierError::NotEligible {
+                segment_id: segment_id.get(),
+                reason: "segment must be sealed before committing",
+            });
+        }
+
         metadata.mark_committed();
         self.metadata.set(metadata).await?;
 
@@ -189,16 +198,24 @@ impl<S: ObjectStorage, M: MetadataStore> TieringManager<S, M> {
         // Precondition: data must not be empty.
         assert!(!data.is_empty(), "segment data must not be empty");
 
+        // Get metadata to determine the key (before claiming).
         let metadata = self.get_metadata_or_error(segment_id).await?;
-
-        // Check eligibility.
-        self.check_upload_eligibility(&metadata)?;
 
         let key = ObjectKey::from_segment(
             metadata.topic_id.get(),
             metadata.partition_id.get(),
             segment_id.get(),
         );
+
+        // Atomically claim the segment for upload.
+        // This prevents race conditions with concurrent uploads.
+        let claimed = self.metadata.try_claim_for_upload(segment_id).await?;
+        if !claimed {
+            return Err(TierError::NotEligible {
+                segment_id: segment_id.get(),
+                reason: "segment already uploaded",
+            });
+        }
 
         info!(
             segment_id = segment_id.get(),
@@ -207,16 +224,69 @@ impl<S: ObjectStorage, M: MetadataStore> TieringManager<S, M> {
             "Uploading segment to S3"
         );
 
+        // BUGGIFY: Simulate crash after claiming but before upload.
+        // This leaves the segment stuck in Uploading state - a real bug that
+        // DST should find. When this triggers, we return an error WITHOUT
+        // calling abort_upload, simulating a process crash.
+        if buggify!("tiering_crash_after_claim", 0.1) {
+            warn!(
+                segment_id = segment_id.get(),
+                "BUGGIFY: Simulating crash after claim, segment left in Uploading state"
+            );
+            return Err(TierError::Io {
+                operation: "upload_segment",
+                message: "BUGGIFY: simulated crash after claim".into(),
+            });
+        }
+
         // Upload to S3.
-        self.storage.put(&key, data).await?;
+        let upload_result = self.storage.put(&key, data).await;
 
-        // Update metadata.
-        let mut updated = metadata;
-        updated.mark_uploaded(key);
-        self.metadata.set(updated).await?;
+        // Handle upload result.
+        match upload_result {
+            Ok(()) => {
+                // BUGGIFY: Simulate crash after upload succeeded but before metadata update.
+                // Data is in S3 but metadata still says Uploading.
+                if buggify!("tiering_crash_after_upload_before_complete", 0.1) {
+                    warn!(
+                        segment_id = segment_id.get(),
+                        "BUGGIFY: Crash after upload, before complete_upload"
+                    );
+                    return Err(TierError::Io {
+                        operation: "upload_segment",
+                        message: "BUGGIFY: simulated crash after upload".into(),
+                    });
+                }
 
-        info!(segment_id = segment_id.get(), "Segment uploaded successfully");
-        Ok(())
+                // Success: complete the upload.
+                self.metadata.complete_upload(segment_id, key).await?;
+                info!(segment_id = segment_id.get(), "Segment uploaded successfully");
+                Ok(())
+            }
+            Err(e) => {
+                // BUGGIFY: Simulate crash during error handling, before abort_upload.
+                // Upload failed but we don't get to revert the state.
+                if buggify!("tiering_crash_before_abort", 0.1) {
+                    warn!(
+                        segment_id = segment_id.get(),
+                        "BUGGIFY: Crash before abort_upload"
+                    );
+                    return Err(TierError::Io {
+                        operation: "upload_segment",
+                        message: "BUGGIFY: simulated crash before abort".into(),
+                    });
+                }
+
+                // Failure: abort the upload (revert to Local).
+                warn!(
+                    segment_id = segment_id.get(),
+                    error = %e,
+                    "Upload failed, reverting claim"
+                );
+                self.metadata.abort_upload(segment_id).await?;
+                Err(e)
+            }
+        }
     }
 
     /// Downloads a segment from S3.
@@ -281,6 +351,72 @@ impl<S: ObjectStorage, M: MetadataStore> TieringManager<S, M> {
         }
     }
 
+    /// Recovers segments stuck in `Uploading` state after a crash.
+    ///
+    /// This method should be called on startup to recover from incomplete uploads.
+    /// For each stuck segment:
+    /// - If data exists in S3 → complete the upload (Both)
+    /// - If data doesn't exist in S3 → abort the upload (Local)
+    ///
+    /// Returns the number of segments recovered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if recovery fails.
+    pub async fn recover_stuck_uploads(&self) -> TierResult<u32> {
+        let stuck = self.metadata.find_stuck_uploads().await?;
+        let mut recovered_count = 0u32;
+
+        for metadata in stuck {
+            let segment_id = metadata.segment_id;
+            let key = ObjectKey::from_segment(
+                metadata.topic_id.get(),
+                metadata.partition_id.get(),
+                segment_id.get(),
+            );
+
+            // Check if data actually made it to S3.
+            // IMPORTANT: If exists() fails, we skip this segment rather than
+            // assuming data is not in S3. Incorrectly aborting would create
+            // orphaned data in S3.
+            let exists_in_s3 = match self.storage.exists(&key).await {
+                Ok(exists) => exists,
+                Err(e) => {
+                    warn!(
+                        segment_id = segment_id.get(),
+                        error = %e,
+                        "Cannot determine if segment data exists in S3, skipping recovery"
+                    );
+                    continue; // Skip this segment, try again on next recovery
+                }
+            };
+
+            if exists_in_s3 {
+                // Data is in S3 - complete the upload.
+                info!(
+                    segment_id = segment_id.get(),
+                    "Recovering stuck upload: data exists in S3, completing"
+                );
+                self.metadata.complete_upload(segment_id, key).await?;
+            } else {
+                // Data is not in S3 - abort and allow retry.
+                info!(
+                    segment_id = segment_id.get(),
+                    "Recovering stuck upload: data not in S3, aborting"
+                );
+                self.metadata.abort_upload(segment_id).await?;
+            }
+
+            recovered_count += 1;
+        }
+
+        if recovered_count > 0 {
+            info!(recovered_count, "Recovered stuck uploads");
+        }
+
+        Ok(recovered_count)
+    }
+
     /// Finds and returns segments eligible for tiering.
     ///
     /// Segments are eligible if:
@@ -337,33 +473,6 @@ impl<S: ObjectStorage, M: MetadataStore> TieringManager<S, M> {
             .ok_or_else(|| TierError::NotFound {
                 key: format!("segment-{segment_id}"),
             })
-    }
-
-    /// Checks if a segment is eligible for upload.
-    #[allow(clippy::unused_self)]
-    fn check_upload_eligibility(&self, metadata: &SegmentMetadata) -> TierResult<()> {
-        if !metadata.sealed {
-            return Err(TierError::NotEligible {
-                segment_id: metadata.segment_id.get(),
-                reason: "segment not sealed",
-            });
-        }
-
-        if !metadata.committed {
-            return Err(TierError::NotEligible {
-                segment_id: metadata.segment_id.get(),
-                reason: "segment not committed",
-            });
-        }
-
-        if metadata.location != SegmentLocation::Local {
-            return Err(TierError::NotEligible {
-                segment_id: metadata.segment_id.get(),
-                reason: "segment already uploaded",
-            });
-        }
-
-        Ok(())
     }
 }
 
@@ -488,6 +597,17 @@ impl<S: ObjectStorage, M: MetadataStore, R: SegmentReader> IntegratedTieringMana
     /// Returns an error if metadata cannot be read.
     pub async fn find_eligible_segments(&self) -> TierResult<Vec<SegmentMetadata>> {
         self.inner.find_eligible_segments().await
+    }
+
+    /// Recovers segments stuck in `Uploading` state after a crash.
+    ///
+    /// This method should be called on startup to recover from incomplete uploads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if recovery fails.
+    pub async fn recover_stuck_uploads(&self) -> TierResult<u32> {
+        self.inner.recover_stuck_uploads().await
     }
 
     /// Returns a reference to the storage backend.
