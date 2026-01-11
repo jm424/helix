@@ -368,9 +368,17 @@ Missing: `helix-kafka-proxy` crate.
 
 ## Prioritized Next Steps
 
-### Priority 1: Complete Phase 3 (Storage Features)
+### Priority 1: Complete Phase 2 (Multi-Raft & Sharding)
 
-**1. helix-progress** - Consumer progress tracking ⭐ CRITICAL
+**1. Shard Movement** - Transfer shards between groups ⭐ CRITICAL
+   - Required for Phase 2 checkpoint: "Shard transfer works under faults"
+   - Snapshot + catchup transfer protocol
+   - DST testing with concurrent writes, failures, retries
+   - Estimated: 2-3 weeks
+
+### Priority 2: Complete Phase 3 (Storage Features)
+
+**2. helix-progress** - Consumer progress tracking
    - Required for Phase 3 checkpoint: "Complete data lifecycle (write→tier→read)"
    - Offset commits with leases
    - Consumer group coordination
@@ -378,19 +386,11 @@ Missing: `helix-kafka-proxy` crate.
    - DST testing with lease expiration, redelivery, node failures
    - Estimated: 2-3 weeks
 
-**2. S3ObjectStorage** - Real S3 implementation
+**3. S3ObjectStorage** - Real S3 implementation
    - Behind `s3` feature flag (aws-sdk-s3)
    - Integration test with localstack
    - Retry logic with exponential backoff
    - Estimated: 1 week
-
-### Priority 2: Complete Phase 2 (Multi-Raft)
-
-**3. Shard Movement** - Transfer shards between groups
-   - Required for Phase 2 checkpoint: "Shard transfer works under faults"
-   - Snapshot + catchup transfer protocol
-   - DST testing with concurrent writes, failures, retries
-   - Estimated: 2-3 weeks
 
 ### Priority 3: Phase 4 Completion
 
