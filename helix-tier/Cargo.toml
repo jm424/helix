@@ -1,0 +1,43 @@
+[package]
+name = "helix-tier"
+description = "Tiered storage to S3 for Helix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Internal crates.
+helix-core = { workspace = true }
+helix-wal = { workspace = true }
+
+# Async runtime.
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+# Serialization.
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = "1.0"
+
+# Error handling.
+thiserror = { workspace = true }
+
+# Tracing.
+tracing = { workspace = true }
+
+# S3 SDK (optional for production).
+aws-sdk-s3 = { version = "1.0", optional = true }
+aws-config = { version = "1.0", optional = true }
+
+[features]
+default = []
+s3 = ["aws-sdk-s3", "aws-config"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

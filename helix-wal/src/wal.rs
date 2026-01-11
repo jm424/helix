@@ -25,6 +25,26 @@ use crate::error::{WalError, WalResult};
 use crate::segment::{Segment, SegmentConfig, SegmentHeader, SegmentId, SEGMENT_HEADER_SIZE};
 use crate::storage::{Storage, StorageFile};
 
+/// Information about a segment for tiering decisions.
+///
+/// This provides metadata needed by `TieringManager` to determine
+/// whether a segment is eligible for tiering to S3.
+#[derive(Debug, Clone, Copy)]
+pub struct SegmentInfo {
+    /// Segment identifier.
+    pub segment_id: SegmentId,
+    /// First log index in this segment.
+    pub first_index: u64,
+    /// Last log index in this segment (None if empty).
+    pub last_index: Option<u64>,
+    /// Total size in bytes.
+    pub size_bytes: u64,
+    /// Number of entries.
+    pub entry_count: u64,
+    /// Whether the segment is sealed (no more writes).
+    pub is_sealed: bool,
+}
+
 /// WAL configuration.
 #[derive(Debug, Clone)]
 pub struct WalConfig {
@@ -428,6 +448,76 @@ impl<S: Storage> Wal<S> {
         self.config
             .dir
             .join(format!("segment-{:08x}.wal", segment_id.get()))
+    }
+
+    // -------------------------------------------------------------------------
+    // Tiering Support
+    // -------------------------------------------------------------------------
+    // These methods provide segment-level access for the TieringManager to
+    // upload sealed segments to S3.
+
+    /// Returns the IDs of all sealed segments.
+    ///
+    /// Sealed segments are immutable and eligible for tiering to S3.
+    /// The active segment (if any) is not included.
+    #[must_use]
+    pub fn sealed_segment_ids(&self) -> Vec<SegmentId> {
+        self.sealed_segments.keys().copied().collect()
+    }
+
+    /// Returns the number of sealed segments.
+    #[must_use]
+    pub fn sealed_segment_count(&self) -> u32 {
+        // TigerStyle: Use u32, not usize.
+        #[allow(clippy::cast_possible_truncation)]
+        let count = self.sealed_segments.len() as u32;
+        count
+    }
+
+    /// Returns information about a sealed segment.
+    ///
+    /// Returns `None` if the segment doesn't exist or is the active segment.
+    #[must_use]
+    pub fn segment_info(&self, segment_id: SegmentId) -> Option<SegmentInfo> {
+        self.sealed_segments.get(&segment_id).map(|sealed| {
+            let segment = &sealed.segment;
+            SegmentInfo {
+                segment_id,
+                first_index: segment.first_index(),
+                last_index: segment.last_index(),
+                size_bytes: segment.size_bytes(),
+                entry_count: segment.entry_count(),
+                is_sealed: segment.is_sealed(),
+            }
+        })
+    }
+
+    /// Reads the raw bytes of a sealed segment for tiering to S3.
+    ///
+    /// This encodes the entire segment (header + entries) as bytes that can
+    /// be uploaded to object storage and later decoded with `Segment::decode`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `WalError::SegmentNotFound` if the segment doesn't exist.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the segment exists but is not sealed (invariant violation).
+    pub fn read_segment_bytes(&self, segment_id: SegmentId) -> WalResult<bytes::Bytes> {
+        let sealed = self.sealed_segments.get(&segment_id).ok_or_else(|| {
+            WalError::SegmentNotFound {
+                segment_id: segment_id.get(),
+            }
+        })?;
+
+        // TigerStyle: Assert preconditions.
+        assert!(
+            sealed.segment.is_sealed(),
+            "segment must be sealed for tiering"
+        );
+
+        Ok(sealed.segment.encode())
     }
 }
 

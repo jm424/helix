@@ -32,3 +32,5 @@ mod simulation_tests;
 mod wal_tests;
 #[cfg(test)]
 mod multi_raft_verified_tests;
+#[cfg(test)]
+mod tier_tests;

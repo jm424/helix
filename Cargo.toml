@@ -5,6 +5,7 @@ members = [
     "helix-routing",
     "helix-runtime",
     "helix-server",
+    "helix-tier",
     "helix-wal",
     "helix-raft",
     "helix-tests",
@@ -26,6 +27,7 @@ helix-server = { path = "helix-server" }
 helix-wal = { path = "helix-wal" }
 helix-raft = { path = "helix-raft" }
 helix-tests = { path = "helix-tests" }
+helix-tier = { path = "helix-tier" }
 
 # DST Framework - Bloodhound provides deterministic simulation.
 bloodhound = { git = "https://github.com/nerdsane/bloodhound" }

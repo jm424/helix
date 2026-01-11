@@ -505,7 +505,7 @@ impl SimulatedFile {
         if rate >= 1.0 {
             return true;
         }
-        let hash = self.seed.wrapping_mul(0x5851_f42d_4c95_7f2d).wrapping_add(counter);
+        let hash = self.seed.wrapping_add(counter).wrapping_mul(0x5851_f42d_4c95_7f2d);
         let normalized = (hash as f64) / (u64::MAX as f64);
         normalized < rate
     }
@@ -540,7 +540,7 @@ impl StorageFile for SimulatedFile {
             Some(torn_offset)
         } else if self.should_inject_fault(config.torn_write_rate, counter) {
             // Random torn write position within the data.
-            let hash = self.seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(counter);
+            let hash = self.seed.wrapping_add(counter).wrapping_mul(0x9e37_79b9_7f4a_7c15);
             drop(config);
             Some(hash as usize % data.len().max(1))
         } else {
@@ -593,7 +593,7 @@ impl StorageFile for SimulatedFile {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.should_inject_fault(config.read_corruption_rate, counter) && !data.is_empty() {
             // Corrupt a random byte.
-            let hash = self.seed.wrapping_mul(0xc6a4_a793_5bd1_e995).wrapping_add(counter);
+            let hash = self.seed.wrapping_add(counter).wrapping_mul(0xc6a4_a793_5bd1_e995);
             let corrupt_idx = hash as usize % data.len();
             data[corrupt_idx] ^= 0xFF;
         }

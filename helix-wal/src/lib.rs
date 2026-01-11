@@ -48,7 +48,7 @@ pub use entry::{Entry, EntryHeader, ENTRY_HEADER_SIZE};
 pub use error::{WalError, WalResult};
 pub use segment::{Segment, SegmentConfig, SegmentHeader, SegmentId, SEGMENT_HEADER_SIZE};
 pub use storage::{FaultConfig, SimulatedStorage, Storage, StorageFile, TokioStorage};
-pub use wal::{Wal, WalConfig};
+pub use wal::{SegmentInfo, Wal, WalConfig};
 
 /// WAL configuration limits.
 pub mod limits {

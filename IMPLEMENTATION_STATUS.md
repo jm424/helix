@@ -8,8 +8,8 @@ This document tracks progress against the [implementation plan](../helix-impleme
 |-------|--------|------------|
 | Phase 0: Foundations | Partial | ~80% |
 | Phase 1: Core Consensus | ✅ Complete | 100% (WAL + benchmarks done) |
-| Phase 2: Multi-Raft & Sharding | ✅ Complete | ~90% |
-| Phase 3: Storage Features | Not Started | 0% |
+| Phase 2: Multi-Raft & Sharding | ⚠️ Partial | ~85% (missing shard movement) |
+| Phase 3: Storage Features | ⚠️ Partial | ~50% (helix-tier + WAL integration done, NOT wired to server) |
 | Phase 4: API & Flow Control | ⚠️ Partial | ~80% (multi-node networking done, flow control/kafka not started) |
 | Phase 5: Production Readiness | Not Started | 0% |
 
@@ -169,7 +169,7 @@ The plan requires:
 
 ### Phase 2: Multi-Raft & Sharding
 
-**Status: IN PROGRESS (~70%)**
+**Status: ~85% (missing shard movement)**
 
 #### 2.1 Multi-Raft Engine
 
@@ -213,11 +213,55 @@ The plan requires:
 
 ### Phase 3: Storage Features
 
+**Status: ~50% (helix-tier done, helix-progress not started)**
+
+#### 3.1 Tiered Storage (helix-tier)
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `helix-tier` crate | ✅ Done | New crate created |
+| TierError enum | ✅ Done | NotFound, UploadFailed, DownloadFailed, DataCorruption, NotEligible, Io |
+| ObjectStorage trait | ✅ Done | put, get, delete, list, exists |
+| ObjectKey type | ✅ Done | `{topic_id}/{partition_id}/segment-{segment_id:08x}.wal` format |
+| SimulatedObjectStorage | ✅ Done | In-memory storage with deterministic fault injection |
+| ObjectStorageFaultConfig | ✅ Done | put/get fail rates, corruption rate, force flags |
+| Deterministic RNG | ✅ Done | `(seed + counter) * M` formula for reproducible faults |
+| SegmentMetadata | ✅ Done | Tracks segment state (sealed, committed, location) |
+| SegmentLocation enum | ✅ Done | Local, Remote, Both |
+| MetadataStore trait | ✅ Done | get, set, find_eligible_for_tiering |
+| InMemoryMetadataStore | ✅ Done | HashMap-based implementation for testing |
+| TieringManager | ✅ Done | Orchestrates uploads/downloads with eligibility checks |
+| IntegratedTieringManager | ✅ Done | WAL-integrated tiering with SegmentReader trait |
+| SegmentReader trait | ✅ Done | Abstraction for reading segment bytes from WAL |
+| TieringConfig | ✅ Done | min_segment_age_secs configuration |
+| S3ObjectStorage | ❌ Not Started | Behind `s3` feature flag |
+
+**Testing Milestones:**
+| Item | Status |
+|------|--------|
+| Unit tests for SimulatedObjectStorage | ✅ Done (13 tests) |
+| DST: forced failure injection | ✅ Done |
+| DST: corruption detection | ✅ Done |
+| DST: retry logic with faults | ✅ Done |
+| DST: deterministic fault verification | ✅ Done |
+| DST: multi-partition uploads | ✅ Done |
+| DST: eligibility enforcement | ✅ Done |
+| Bloodhound: tiering under continuous writes | ❌ Requires WAL integration |
+| Bloodhound: S3 upload failures and retry | ❌ Requires WAL integration |
+| Bloodhound: fetch for backfill | ❌ Requires WAL integration |
+| Integration test with real S3 (localstack) | ❌ Not Started |
+
+**Integration Status:**
+- ✅ IntegratedTieringManager with SegmentReader trait (WAL abstraction)
+- ✅ helix-wal has segment access methods (sealed_segment_ids, read_segment_bytes, segment_info)
+- ❌ helix-tier not wired into helix-server/DurablePartition
+- ❌ Segment commit events from Raft should trigger tiering eligibility
+
+#### 3.2 Progress Tracking (helix-progress)
+
 **Status: NOT STARTED**
 
-Missing crates:
-- `helix-tier` - Tiered storage to S3
-- `helix-progress` - Consumer progress tracking with leases
+Missing crate: `helix-progress` - Consumer progress tracking with leases
 
 ---
 
@@ -327,6 +371,19 @@ Missing: `helix-kafka-proxy` crate.
    - Multi-node (3-node Docker, 4 clients):
      - Write: 129K records/sec, p99=8.7ms
 
+9. **helix-tier crate** ⚠️ Partial (types + WAL integration done)
+   - `ObjectStorage` trait for S3-like operations (put, get, delete, list, exists)
+   - `SimulatedObjectStorage` with deterministic fault injection
+   - `ObjectStorageFaultConfig` for configurable failure rates and corruption
+   - `SegmentMetadata` and `MetadataStore` for tracking segment locations
+   - `TieringManager` for orchestrating uploads/downloads
+   - `IntegratedTieringManager` with `SegmentReader` trait for WAL integration
+   - `helix-wal` has segment access: `sealed_segment_ids()`, `read_segment_bytes()`, `segment_info()`
+   - Fixed RNG bug: `(seed + counter) * M` formula (also fixed in helix-wal)
+   - TigerStyle assertions added (improved from 0.9 to 1.04 per function)
+   - 13 component-level DST tests (forced failures, corruption, retries, eligibility)
+   - **REMAINING**: Wire into helix-server/DurablePartition
+
 ### Optional Enhancements
 
 4. **Add hash-based routing**
@@ -338,11 +395,17 @@ Missing: `helix-kafka-proxy` crate.
 
 ### Next Phase: Storage Features (Phase 3)
 
-6. **helix-tier** - Tiered storage to S3
-   - Move cold data to object storage
-   - Transparent read-through
+6. **Wire helix-tier into DurablePartition**
+   - Add TieringManager to DurablePartition
+   - Segment sealed events trigger tiering eligibility
+   - Raft commit events mark segments as committed
+   - Then: Bloodhound e2e tests become possible
 
-7. **helix-progress** - Consumer progress tracking
+7. **S3ObjectStorage** - Real S3 implementation
+   - Behind `s3` feature flag
+   - Integration test with localstack
+
+8. **helix-progress** - Consumer progress tracking
    - Offset commits with leases
    - Consumer group coordination
 
@@ -364,10 +427,10 @@ Missing: `helix-kafka-proxy` crate.
 | `helix-raft` | ✅ Complete | Pre-vote, leadership transfer, tick-based timing, MultiRaft engine |
 | `helix-routing` | ✅ Exists | ShardMap, LeaderCache, ShardRouter |
 | `helix-runtime` | ⚠️ Partial | Tick-based server, missing io_uring |
-| `helix-tier` | ❌ Missing | Need to create |
+| `helix-tier` | ⚠️ Partial | Types + WAL integration done (IntegratedTieringManager, SegmentReader), NOT wired into helix-server |
 | `helix-progress` | ❌ Missing | Need to create |
 | `helix-flow` | ❌ Missing | Need to create |
 | `helix-server` | ✅ Complete | Multi-Raft done, WAL-backed durable storage integrated |
 | `helix-kafka-proxy` | ❌ Missing | Need to create |
 | `helix-cli` | ❌ Missing | Need to create |
-| `helix-tests` | ✅ Good | DST-friendly tick-based tests, faults, 150+ seeds, WAL DST (23 tests) |
+| `helix-tests` | ✅ Good | DST-friendly tick-based tests, faults, 150+ seeds, WAL DST (23 tests), Tier component tests (13 tests) |

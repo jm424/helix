@@ -15,6 +15,7 @@ helix-core = { workspace = true }
 helix-wal = { workspace = true }
 helix-raft = { workspace = true }
 helix-server = { workspace = true }
+helix-tier = { workspace = true }
 bloodhound = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
