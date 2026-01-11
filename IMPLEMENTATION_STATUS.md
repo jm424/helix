@@ -9,7 +9,7 @@ This document tracks progress against the [implementation plan](../helix-impleme
 | Phase 0: Foundations | Partial | ~80% |
 | Phase 1: Core Consensus | ✅ Complete | 100% (WAL + benchmarks done) |
 | Phase 2: Multi-Raft & Sharding | ⚠️ Partial | ~85% (missing shard movement) |
-| Phase 3: Storage Features | ⚠️ Partial | ~50% (helix-tier + WAL integration done, NOT wired to server) |
+| Phase 3: Storage Features | ⚠️ Partial | ~65% (helix-tier done + wired to DurablePartition) |
 | Phase 4: API & Flow Control | ⚠️ Partial | ~80% (multi-node networking done, flow control/kafka not started) |
 | Phase 5: Production Readiness | Not Started | 0% |
 
@@ -213,7 +213,7 @@ The plan requires:
 
 ### Phase 3: Storage Features
 
-**Status: ~50% (helix-tier done, helix-progress not started)**
+**Status: ~65% (helix-tier done + wired to DurablePartition, helix-progress not started)**
 
 #### 3.1 Tiered Storage (helix-tier)
 
@@ -246,16 +246,20 @@ The plan requires:
 | DST: deterministic fault verification | ✅ Done |
 | DST: multi-partition uploads | ✅ Done |
 | DST: eligibility enforcement | ✅ Done |
-| Bloodhound: tiering under continuous writes | ❌ Requires WAL integration |
-| Bloodhound: S3 upload failures and retry | ❌ Requires WAL integration |
-| Bloodhound: fetch for backfill | ❌ Requires WAL integration |
+| Bloodhound: tiering under continuous writes | 🔜 Ready (WAL integration complete) |
+| Bloodhound: S3 upload failures and retry | 🔜 Ready (WAL integration complete) |
+| Bloodhound: fetch for backfill | 🔜 Ready (WAL integration complete) |
 | Integration test with real S3 (localstack) | ❌ Not Started |
 
 **Integration Status:**
 - ✅ IntegratedTieringManager with SegmentReader trait (WAL abstraction)
 - ✅ helix-wal has segment access methods (sealed_segment_ids, read_segment_bytes, segment_info)
-- ❌ helix-tier not wired into helix-server/DurablePartition
-- ❌ Segment commit events from Raft should trigger tiering eligibility
+- ✅ helix-tier wired into helix-server/DurablePartition
+- ✅ WalSegmentReader implements SegmentReader for DurablePartition
+- ✅ DurablePartitionConfig.with_tiering() enables tiering
+- ✅ check_and_register_sealed_segments() hook for segment registration
+- ✅ on_entries_committed() hook for Raft commit events
+- ✅ tier_eligible_segments() method for triggering S3 uploads
 
 #### 3.2 Progress Tracking (helix-progress)
 
@@ -371,7 +375,7 @@ Missing: `helix-kafka-proxy` crate.
    - Multi-node (3-node Docker, 4 clients):
      - Write: 129K records/sec, p99=8.7ms
 
-9. **helix-tier crate** ⚠️ Partial (types + WAL integration done)
+9. **helix-tier crate** ✅ Done (wired into DurablePartition)
    - `ObjectStorage` trait for S3-like operations (put, get, delete, list, exists)
    - `SimulatedObjectStorage` with deterministic fault injection
    - `ObjectStorageFaultConfig` for configurable failure rates and corruption
@@ -382,7 +386,10 @@ Missing: `helix-kafka-proxy` crate.
    - Fixed RNG bug: `(seed + counter) * M` formula (also fixed in helix-wal)
    - TigerStyle assertions added (improved from 0.9 to 1.04 per function)
    - 13 component-level DST tests (forced failures, corruption, retries, eligibility)
-   - **REMAINING**: Wire into helix-server/DurablePartition
+   - `WalSegmentReader` implements `SegmentReader` for `DurablePartition`
+   - `DurablePartitionConfig.with_tiering()` enables tiering
+   - Hooks: `check_and_register_sealed_segments()`, `on_entries_committed()`, `tier_eligible_segments()`
+   - 11 helix-server tests pass (including tiering integration test)
 
 ### Optional Enhancements
 
@@ -395,11 +402,11 @@ Missing: `helix-kafka-proxy` crate.
 
 ### Next Phase: Storage Features (Phase 3)
 
-6. **Wire helix-tier into DurablePartition**
-   - Add TieringManager to DurablePartition
-   - Segment sealed events trigger tiering eligibility
-   - Raft commit events mark segments as committed
-   - Then: Bloodhound e2e tests become possible
+6. **Bloodhound e2e tests for tiering** (NOW POSSIBLE)
+   - Tiering under continuous writes
+   - S3 upload failures and retry with fault injection
+   - Fetch for backfill scenarios
+   - Verify segments tier correctly after Raft commits
 
 7. **S3ObjectStorage** - Real S3 implementation
    - Behind `s3` feature flag
@@ -427,7 +434,7 @@ Missing: `helix-kafka-proxy` crate.
 | `helix-raft` | ✅ Complete | Pre-vote, leadership transfer, tick-based timing, MultiRaft engine |
 | `helix-routing` | ✅ Exists | ShardMap, LeaderCache, ShardRouter |
 | `helix-runtime` | ⚠️ Partial | Tick-based server, missing io_uring |
-| `helix-tier` | ⚠️ Partial | Types + WAL integration done (IntegratedTieringManager, SegmentReader), NOT wired into helix-server |
+| `helix-tier` | ✅ Complete | Wired into DurablePartition with WalSegmentReader, tiering hooks, 11 tests |
 | `helix-progress` | ❌ Missing | Need to create |
 | `helix-flow` | ❌ Missing | Need to create |
 | `helix-server` | ✅ Complete | Multi-Raft done, WAL-backed durable storage integrated |

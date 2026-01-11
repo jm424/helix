@@ -1755,6 +1755,7 @@ dependencies = [
 name = "helix-server"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "clap",
  "criterion",
@@ -1762,6 +1763,7 @@ dependencies = [
  "helix-core",
  "helix-raft",
  "helix-runtime",
+ "helix-tier",
  "helix-wal",
  "proptest",
  "prost",

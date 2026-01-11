@@ -6,19 +6,95 @@
 //!
 //! Per the RFC design, data is stored in a tiered architecture:
 //! - **Tier 1 (Hot)**: In-memory + WAL on NVMe/EBS
-//! - **Tier 2 (Warm)**: S3 Standard (not yet implemented)
+//! - **Tier 2 (Warm)**: S3 Standard (via `helix-tier`)
 //! - **Tier 3 (Cold)**: S3 Glacier (not yet implemented)
 //!
 //! This module implements Tier 1 with:
 //! - [`Partition`]: In-memory storage (cache for fast reads)
 //! - [`DurablePartition`]: WAL-backed storage with in-memory cache
+//!
+//! # Tiered Storage Integration
+//!
+//! When tiering is enabled, sealed WAL segments can be uploaded to S3 via
+//! the [`helix_tier::IntegratedTieringManager`]. The `DurablePartition`
+//! tracks segment lifecycle and notifies the tiering manager when segments
+//! are sealed or committed.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use helix_core::{Offset, PartitionId, Record, TopicId};
-use helix_wal::{Entry, TokioStorage, Wal, WalConfig};
+use helix_tier::{
+    InMemoryMetadataStore, IntegratedTieringManager, SegmentMetadata, SegmentReader,
+    SimulatedObjectStorage, TierError, TierResult, TieringConfig,
+};
+use helix_wal::{Entry, SegmentId, TokioStorage, Wal, WalConfig};
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+
+// -----------------------------------------------------------------------------
+// WalSegmentReader
+// -----------------------------------------------------------------------------
+
+/// Wrapper that implements `SegmentReader` for a WAL reference.
+///
+/// This allows the `IntegratedTieringManager` to read segment bytes directly
+/// from the WAL when tiering to S3.
+///
+/// Uses `RwLock` to allow concurrent reads while writes are exclusive.
+pub struct WalSegmentReader {
+    /// Shared reference to the WAL (behind `RwLock` for concurrent access).
+    wal: Arc<RwLock<Wal<TokioStorage>>>,
+}
+
+impl WalSegmentReader {
+    /// Creates a new segment reader for the given WAL.
+    #[must_use]
+    pub const fn new(wal: Arc<RwLock<Wal<TokioStorage>>>) -> Self {
+        Self { wal }
+    }
+}
+
+#[async_trait]
+impl SegmentReader for WalSegmentReader {
+    async fn read_segment_bytes(&self, segment_id: SegmentId) -> TierResult<Bytes> {
+        let wal = self.wal.read().await;
+
+        // TigerStyle: Assert precondition.
+        assert!(
+            wal.segment_info(segment_id).is_some(),
+            "segment must exist before reading"
+        );
+
+        wal.read_segment_bytes(segment_id).map_err(|e| TierError::Io {
+            operation: "read_segment_bytes",
+            message: e.to_string(),
+        })
+    }
+
+    fn is_segment_sealed(&self, segment_id: SegmentId) -> bool {
+        // Use try_read to avoid blocking; if we can't get the lock, assume not sealed.
+        // This is safe because is_segment_sealed is only used as a precondition check.
+        self.wal
+            .try_read()
+            .map(|wal| wal.segment_info(segment_id).is_some_and(|info| info.is_sealed))
+            .unwrap_or(false)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tiering Type Aliases
+// -----------------------------------------------------------------------------
+
+/// Type alias for the tiering manager with simulated storage (for testing).
+pub type SimulatedTieringManager =
+    IntegratedTieringManager<SimulatedObjectStorage, InMemoryMetadataStore, WalSegmentReader>;
+
+// -----------------------------------------------------------------------------
+// PartitionCommand
+// -----------------------------------------------------------------------------
 
 /// Commands that can be applied to a partition.
 #[derive(Debug, Clone)]
@@ -332,6 +408,8 @@ pub struct DurablePartitionConfig {
     pub partition_id: PartitionId,
     /// Whether to sync after every write.
     pub sync_on_write: bool,
+    /// Optional tiering configuration. If `Some`, tiering is enabled.
+    pub tiering: Option<TieringConfig>,
 }
 
 #[allow(dead_code)] // Used in tests and will be used in service.rs integration.
@@ -344,6 +422,7 @@ impl DurablePartitionConfig {
             topic_id,
             partition_id,
             sync_on_write: false, // Default to batched syncs for performance.
+            tiering: None,
         }
     }
 
@@ -351,6 +430,13 @@ impl DurablePartitionConfig {
     #[must_use]
     pub const fn with_sync_on_write(mut self, sync: bool) -> Self {
         self.sync_on_write = sync;
+        self
+    }
+
+    /// Enables tiered storage with the given configuration.
+    #[must_use]
+    pub const fn with_tiering(mut self, config: TieringConfig) -> Self {
+        self.tiering = Some(config);
         self
     }
 
@@ -374,16 +460,26 @@ impl DurablePartitionConfig {
 /// - **Write path**: WAL append → sync (if configured) → update cache
 /// - **Read path**: Read from in-memory cache (fast)
 /// - **Recovery**: Replay WAL entries to rebuild cache
+///
+/// # Tiering Integration
+///
+/// When tiering is enabled, sealed segments can be uploaded to S3. The
+/// partition tracks the last committed index to determine when segments
+/// are safe to tier.
 #[allow(dead_code)] // Used in tests and will be used in service.rs integration.
 pub struct DurablePartition {
     /// Configuration.
     config: DurablePartitionConfig,
-    /// WAL for durable storage.
-    wal: Wal<TokioStorage>,
+    /// WAL for durable storage (shared with tiering manager via `RwLock`).
+    wal: Arc<RwLock<Wal<TokioStorage>>>,
     /// In-memory cache for fast reads.
     cache: Partition,
     /// Last applied WAL index.
     last_applied_index: u64,
+    /// Tiering manager for S3 uploads (optional).
+    tiering: Option<SimulatedTieringManager>,
+    /// Set of segment IDs that have been registered with tiering.
+    tiered_segments: std::collections::HashSet<u64>,
 }
 
 #[allow(dead_code)] // Used in tests and will be used in service.rs integration.
@@ -403,6 +499,7 @@ impl DurablePartition {
             topic = config.topic_id.get(),
             partition = config.partition_id.get(),
             dir = ?wal_dir,
+            tiering_enabled = config.tiering.is_some(),
             "Opening durable partition"
         );
 
@@ -446,11 +543,37 @@ impl DurablePartition {
             );
         }
 
+        // Wrap WAL in Arc<RwLock> for shared access with tiering.
+        let wal = Arc::new(RwLock::new(wal));
+
+        // Initialize tiering if configured.
+        let tiering = config.tiering.as_ref().map(|tiering_config| {
+            let segment_reader = WalSegmentReader::new(wal.clone());
+            // Use simulated storage for now - production would use S3.
+            let object_storage = SimulatedObjectStorage::new(42);
+            let metadata_store = InMemoryMetadataStore::new();
+
+            info!(
+                min_age_secs = tiering_config.min_age_secs,
+                max_concurrent = tiering_config.max_concurrent_uploads,
+                "Tiering enabled"
+            );
+
+            IntegratedTieringManager::new(
+                object_storage,
+                metadata_store,
+                segment_reader,
+                tiering_config.clone(),
+            )
+        });
+
         Ok(Self {
             config,
             wal,
             cache,
             last_applied_index,
+            tiering,
+            tiered_segments: std::collections::HashSet::new(),
         })
     }
 
@@ -502,11 +625,14 @@ impl DurablePartition {
         })?;
 
         // Write to WAL first (durability).
-        self.wal.append(entry).await.map_err(|e| {
-            DurablePartitionError::WalWrite {
+        self.wal
+            .write()
+            .await
+            .append(entry)
+            .await
+            .map_err(|e| DurablePartitionError::WalWrite {
                 message: e.to_string(),
-            }
-        })?;
+            })?;
 
         // Update in-memory cache.
         self.cache.append(records).map_err(|e| {
@@ -549,8 +675,9 @@ impl DurablePartition {
     ///
     /// # Errors
     /// Returns an error if the sync fails.
-    pub async fn sync(&mut self) -> Result<(), DurablePartitionError> {
-        self.wal.sync().await.map_err(|e| DurablePartitionError::WalSync {
+    pub async fn sync(&self) -> Result<(), DurablePartitionError> {
+        let mut wal = self.wal.write().await;
+        wal.sync().await.map_err(|e| DurablePartitionError::WalSync {
             message: e.to_string(),
         })
     }
@@ -582,6 +709,200 @@ impl DurablePartition {
         }
 
         Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Tiering Hooks
+    // -------------------------------------------------------------------------
+
+    /// Checks for newly sealed segments and registers them with the tiering manager.
+    ///
+    /// This should be called periodically or after writes that may have caused
+    /// segment rotation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if registration with the tiering manager fails.
+    pub async fn check_and_register_sealed_segments(&mut self) -> Result<u32, DurablePartitionError> {
+        let Some(tiering) = &self.tiering else {
+            return Ok(0);
+        };
+
+        // Read WAL state under lock.
+        let wal = self.wal.read().await;
+        let sealed_ids = wal.sealed_segment_ids();
+
+        // Collect segment info while holding the lock.
+        let mut segments_to_register = Vec::new();
+        for segment_id in sealed_ids.iter().take(100) {
+            let segment_id_raw = segment_id.get();
+
+            // Skip if already registered.
+            if self.tiered_segments.contains(&segment_id_raw) {
+                continue;
+            }
+
+            // Get segment info for metadata.
+            if let Some(info) = wal.segment_info(*segment_id) {
+                segments_to_register.push((*segment_id, segment_id_raw, info.first_index));
+            } else {
+                warn!(segment_id = segment_id_raw, "Segment info not found");
+            }
+        }
+        drop(wal); // Release lock before async operations.
+
+        let mut registered_count = 0u32;
+
+        // Register segments without holding the lock.
+        for (segment_id, segment_id_raw, first_index) in segments_to_register {
+            // Create and register metadata.
+            let metadata = SegmentMetadata::new(
+                segment_id,
+                self.config.topic_id,
+                self.config.partition_id,
+                first_index,
+            );
+
+            if let Err(e) = tiering.register_segment(metadata).await {
+                warn!(
+                    segment_id = segment_id_raw,
+                    error = %e,
+                    "Failed to register segment with tiering"
+                );
+                continue;
+            }
+
+            // Mark as sealed in tiering.
+            if let Err(e) = tiering.mark_sealed(segment_id).await {
+                warn!(
+                    segment_id = segment_id_raw,
+                    error = %e,
+                    "Failed to mark segment as sealed"
+                );
+                continue;
+            }
+
+            self.tiered_segments.insert(segment_id_raw);
+            registered_count += 1;
+
+            debug!(
+                segment_id = segment_id_raw,
+                first_index,
+                "Registered sealed segment with tiering"
+            );
+        }
+
+        // TigerStyle: Assert postcondition.
+        assert!(registered_count <= 100, "bounded registration count");
+
+        Ok(registered_count)
+    }
+
+    /// Marks segments as committed when their entries are committed through Raft.
+    ///
+    /// # Arguments
+    ///
+    /// * `committed_index` - The highest committed WAL index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if marking segments as committed fails.
+    pub async fn on_entries_committed(&self, committed_index: u64) -> Result<u32, DurablePartitionError> {
+        let Some(tiering) = &self.tiering else {
+            return Ok(0);
+        };
+
+        // Read WAL state under lock.
+        let wal = self.wal.read().await;
+        let sealed_ids = wal.sealed_segment_ids();
+
+        // Collect segments to commit while holding the lock.
+        let mut segments_to_commit = Vec::new();
+        for segment_id in sealed_ids.iter().take(100) {
+            if let Some(info) = wal.segment_info(*segment_id) {
+                // Check if all entries in this segment are committed.
+                let segment_last_index = info.last_index.unwrap_or(info.first_index);
+                if segment_last_index <= committed_index {
+                    segments_to_commit.push((*segment_id, segment_last_index));
+                }
+            }
+        }
+        drop(wal); // Release lock before async operations.
+
+        let mut committed_count = 0u32;
+
+        // Mark segments as committed without holding the lock.
+        for (segment_id, segment_last_index) in segments_to_commit {
+            if let Err(e) = tiering.mark_committed(segment_id).await {
+                warn!(
+                    segment_id = segment_id.get(),
+                    error = %e,
+                    "Failed to mark segment as committed"
+                );
+                continue;
+            }
+
+            committed_count += 1;
+
+            debug!(
+                segment_id = segment_id.get(),
+                segment_last_index,
+                committed_index,
+                "Segment marked as committed for tiering"
+            );
+        }
+
+        Ok(committed_count)
+    }
+
+    /// Tiers eligible segments to S3.
+    ///
+    /// Finds and uploads segments that are sealed, committed, and meet the
+    /// age requirement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if tiering fails.
+    pub async fn tier_eligible_segments(&self) -> Result<u32, DurablePartitionError> {
+        let Some(tiering) = &self.tiering else {
+            return Ok(0);
+        };
+
+        let eligible = tiering
+            .find_eligible_segments()
+            .await
+            .map_err(|e| DurablePartitionError::WalWrite {
+                message: format!("failed to find eligible segments: {e}"),
+            })?;
+
+        let mut tiered_count = 0u32;
+
+        // `TigerStyle`: bounded iteration.
+        for metadata in eligible.iter().take(10) {
+            if let Err(e) = tiering.tier_segment(metadata.segment_id).await {
+                warn!(
+                    segment_id = metadata.segment_id.get(),
+                    error = %e,
+                    "Failed to tier segment"
+                );
+                continue;
+            }
+
+            tiered_count += 1;
+
+            info!(
+                segment_id = metadata.segment_id.get(),
+                "Segment tiered to S3"
+            );
+        }
+
+        Ok(tiered_count)
+    }
+
+    /// Returns the tiering manager for testing purposes.
+    #[cfg(test)]
+    pub fn tiering_manager(&self) -> Option<&SimulatedTieringManager> {
+        self.tiering.as_ref()
     }
 }
 
@@ -736,5 +1057,40 @@ mod tests {
             let read_records = partition.read(Offset::new(0), 10).unwrap();
             assert_eq!(read_records.len(), 5);
         }
+    }
+
+    #[tokio::test]
+    async fn test_durable_partition_with_tiering() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create partition with tiering enabled.
+        let config = DurablePartitionConfig::new(
+            temp_dir.path(),
+            TopicId::new(1),
+            PartitionId::new(0),
+        )
+        .with_tiering(TieringConfig::for_testing());
+
+        let mut partition = DurablePartition::open(config).await.unwrap();
+
+        // Verify tiering is enabled.
+        assert!(partition.tiering_manager().is_some());
+
+        // Write some records.
+        let records = vec![
+            Record::new(Bytes::from("value1")),
+            Record::new(Bytes::from("value2")),
+        ];
+        partition.append(records).await.unwrap();
+
+        // Call tiering hooks (no sealed segments yet, so should return 0).
+        let registered = partition.check_and_register_sealed_segments().await.unwrap();
+        assert_eq!(registered, 0);
+
+        let committed = partition.on_entries_committed(10).await.unwrap();
+        assert_eq!(committed, 0);
+
+        let tiered = partition.tier_eligible_segments().await.unwrap();
+        assert_eq!(tiered, 0);
     }
 }
