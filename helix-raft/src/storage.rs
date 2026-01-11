@@ -18,6 +18,7 @@ use bytes::BytesMut;
 use helix_core::{LogIndex, NodeId, TermId};
 
 use crate::log::LogEntry;
+use crate::snapshot::Snapshot;
 
 /// Persistent Raft state that must survive crashes.
 ///
@@ -210,6 +211,34 @@ pub trait RaftStorage {
     /// # Errors
     /// Returns an error if sync fails.
     fn sync(&mut self) -> StorageResult<()>;
+
+    // Snapshot methods
+
+    /// Saves a snapshot to storage.
+    ///
+    /// After saving a snapshot, log entries before `snapshot.last_included_index`
+    /// can be safely compacted.
+    ///
+    /// # Errors
+    /// Returns an error if the snapshot cannot be saved.
+    fn save_snapshot(&mut self, snapshot: Snapshot) -> StorageResult<()>;
+
+    /// Loads the latest snapshot, if any.
+    ///
+    /// Returns `None` if no snapshot has been saved.
+    ///
+    /// # Errors
+    /// Returns an error if the snapshot cannot be loaded.
+    fn load_snapshot(&self) -> StorageResult<Option<Snapshot>>;
+
+    /// Returns true if a snapshot exists.
+    fn has_snapshot(&self) -> bool;
+
+    /// Returns the last included index from the latest snapshot, or 0 if none.
+    fn snapshot_index(&self) -> LogIndex;
+
+    /// Returns the last included term from the latest snapshot, or 0 if none.
+    fn snapshot_term(&self) -> TermId;
 }
 
 /// In-memory storage implementation for testing.
@@ -224,6 +253,8 @@ pub struct MemoryStorage {
     entries: Vec<LogEntry>,
     /// First index (1 if non-empty, 0 if empty).
     first_index: u64,
+    /// Latest snapshot.
+    snapshot: Option<Snapshot>,
 }
 
 impl MemoryStorage {
@@ -234,6 +265,7 @@ impl MemoryStorage {
             state: None,
             entries: Vec::new(),
             first_index: 0,
+            snapshot: None,
         }
     }
 }
@@ -361,6 +393,31 @@ impl RaftStorage for MemoryStorage {
         // No-op for memory storage.
         Ok(())
     }
+
+    fn save_snapshot(&mut self, snapshot: Snapshot) -> StorageResult<()> {
+        self.snapshot = Some(snapshot);
+        Ok(())
+    }
+
+    fn load_snapshot(&self) -> StorageResult<Option<Snapshot>> {
+        Ok(self.snapshot.clone())
+    }
+
+    fn has_snapshot(&self) -> bool {
+        self.snapshot.is_some()
+    }
+
+    fn snapshot_index(&self) -> LogIndex {
+        self.snapshot
+            .as_ref()
+            .map_or(LogIndex::new(0), |s| s.last_included_index)
+    }
+
+    fn snapshot_term(&self) -> TermId {
+        self.snapshot
+            .as_ref()
+            .map_or(TermId::new(0), |s| s.last_included_term)
+    }
 }
 
 #[cfg(test)]
@@ -450,5 +507,32 @@ mod tests {
 
         assert_eq!(storage.last_index().get(), 1);
         assert!(storage.get_entry(LogIndex::new(2)).is_err());
+    }
+
+    #[test]
+    fn test_memory_storage_snapshot() {
+        let mut storage = MemoryStorage::new();
+
+        // Initially no snapshot.
+        assert!(!storage.has_snapshot());
+        assert_eq!(storage.snapshot_index().get(), 0);
+        assert_eq!(storage.snapshot_term().get(), 0);
+        assert!(storage.load_snapshot().unwrap().is_none());
+
+        // Save a snapshot.
+        let snapshot = Snapshot::new(
+            LogIndex::new(100),
+            TermId::new(5),
+            Bytes::from("test snapshot data"),
+        );
+        storage.save_snapshot(snapshot.clone()).unwrap();
+
+        // Verify snapshot is saved.
+        assert!(storage.has_snapshot());
+        assert_eq!(storage.snapshot_index().get(), 100);
+        assert_eq!(storage.snapshot_term().get(), 5);
+
+        let loaded = storage.load_snapshot().unwrap().unwrap();
+        assert_eq!(loaded, snapshot);
     }
 }

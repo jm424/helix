@@ -219,6 +219,52 @@ impl ShardMap {
         groups.dedup();
         groups
     }
+
+    /// Atomically transfers a shard range from one group to another.
+    ///
+    /// This is used during the final switching phase of a shard transfer
+    /// to update the shard map to point to the new owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The shard doesn't exist
+    /// - The shard doesn't belong to `from_group`
+    pub fn transfer_shard(
+        &mut self,
+        range: ShardRange,
+        from_group: GroupId,
+        to_group: GroupId,
+    ) -> Result<(), ShardMapError> {
+        // Find the shard entry.
+        let entry = self
+            .shards
+            .get_mut(&range.start)
+            .ok_or(ShardMapError::ShardNotFound { start: range.start })?;
+
+        // Verify it belongs to the expected group.
+        if entry.group_id != from_group {
+            return Err(ShardMapError::WrongOwner {
+                start: range.start,
+                expected: from_group,
+                actual: entry.group_id,
+            });
+        }
+
+        // Verify the range matches exactly.
+        if entry.range != range {
+            return Err(ShardMapError::RangeMismatch {
+                expected: range,
+                actual: entry.range,
+            });
+        }
+
+        // Update the owner.
+        entry.group_id = to_group;
+        self.version += 1;
+
+        Ok(())
+    }
 }
 
 impl Default for ShardMap {
@@ -242,6 +288,22 @@ pub enum ShardMapError {
         /// The shard start that wasn't found.
         start: u32,
     },
+    /// Shard belongs to wrong owner.
+    WrongOwner {
+        /// The shard start.
+        start: u32,
+        /// Expected owner group.
+        expected: GroupId,
+        /// Actual owner group.
+        actual: GroupId,
+    },
+    /// Shard range doesn't match.
+    RangeMismatch {
+        /// Expected range.
+        expected: ShardRange,
+        /// Actual range.
+        actual: ShardRange,
+    },
 }
 
 impl std::fmt::Display for ShardMapError {
@@ -252,6 +314,25 @@ impl std::fmt::Display for ShardMapError {
             }
             Self::ShardNotFound { start } => {
                 write!(f, "shard not found: start={start}")
+            }
+            Self::WrongOwner {
+                start,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "shard {start} belongs to group {} but expected {}",
+                    actual.get(),
+                    expected.get()
+                )
+            }
+            Self::RangeMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "shard range mismatch: expected [{}, {}), got [{}, {})",
+                    expected.start, expected.end, actual.start, actual.end
+                )
             }
         }
     }
@@ -360,5 +441,48 @@ mod tests {
         let result = map.groups();
         // Should be sorted and deduplicated.
         assert_eq!(result, vec![GroupId::new(1), GroupId::new(2), GroupId::new(3)]);
+    }
+
+    #[test]
+    fn test_transfer_shard() {
+        let mut map = ShardMap::new();
+
+        let range = ShardRange::new(0, 1000);
+        map.assign(range, GroupId::new(1)).unwrap();
+
+        assert_eq!(map.lookup(500), Some(GroupId::new(1)));
+        let version_before = map.version();
+
+        // Transfer from group 1 to group 2.
+        map.transfer_shard(range, GroupId::new(1), GroupId::new(2))
+            .unwrap();
+
+        assert_eq!(map.lookup(500), Some(GroupId::new(2)));
+        assert_eq!(map.version(), version_before + 1);
+    }
+
+    #[test]
+    fn test_transfer_shard_wrong_owner() {
+        let mut map = ShardMap::new();
+
+        let range = ShardRange::new(0, 1000);
+        map.assign(range, GroupId::new(1)).unwrap();
+
+        // Try to transfer from wrong owner.
+        let result = map.transfer_shard(range, GroupId::new(3), GroupId::new(2));
+
+        assert!(matches!(result, Err(ShardMapError::WrongOwner { .. })));
+    }
+
+    #[test]
+    fn test_transfer_shard_not_found() {
+        let mut map = ShardMap::new();
+
+        let range = ShardRange::new(0, 1000);
+
+        // Try to transfer non-existent shard.
+        let result = map.transfer_shard(range, GroupId::new(1), GroupId::new(2));
+
+        assert!(matches!(result, Err(ShardMapError::ShardNotFound { .. })));
     }
 }

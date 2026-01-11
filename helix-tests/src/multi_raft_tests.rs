@@ -42,6 +42,8 @@ fn message_type(msg: &Message) -> &'static str {
         Message::AppendEntries(_) => "AppendEntries",
         Message::AppendEntriesResponse(_) => "AppendEntriesResponse",
         Message::TimeoutNow(_) => "TimeoutNow",
+        Message::InstallSnapshot(_) => "InstallSnapshot",
+        Message::InstallSnapshotResponse(_) => "InstallSnapshotResponse",
     }
 }
 
@@ -411,6 +413,10 @@ fn serialize_message_to(buf: &mut Vec<u8>, msg: &Message) {
             buf.extend_from_slice(&req.term.get().to_le_bytes());
             buf.extend_from_slice(&req.from.get().to_le_bytes());
             buf.extend_from_slice(&req.to.get().to_le_bytes());
+        }
+        // InstallSnapshot messages are not used in Multi-Raft simulation tests yet.
+        Message::InstallSnapshot(_) | Message::InstallSnapshotResponse(_) => {
+            panic!("InstallSnapshot messages not yet supported in simulation")
         }
     }
 }

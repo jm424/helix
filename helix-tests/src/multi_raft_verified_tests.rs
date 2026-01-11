@@ -1017,6 +1017,10 @@ fn serialize_message_to(buf: &mut Vec<u8>, msg: &Message) {
             buf.extend_from_slice(&req.from.get().to_le_bytes());
             buf.extend_from_slice(&req.to.get().to_le_bytes());
         }
+        // InstallSnapshot messages are not used in verified simulation tests yet.
+        Message::InstallSnapshot(_) | Message::InstallSnapshotResponse(_) => {
+            panic!("InstallSnapshot messages not yet supported in verified simulation")
+        }
     }
 }
 

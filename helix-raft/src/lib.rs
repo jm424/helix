@@ -21,6 +21,7 @@ mod config;
 mod log;
 mod message;
 pub mod multi;
+pub mod snapshot;
 mod state;
 mod storage;
 mod wal_storage;
@@ -32,10 +33,12 @@ pub use client::{
 pub use config::RaftConfig;
 pub use log::{LogEntry, RaftLog};
 pub use message::{
-    AppendEntriesRequest, AppendEntriesResponse, ClientRequest, Message, PreVoteRequest,
-    PreVoteResponse, RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
+    AppendEntriesRequest, AppendEntriesResponse, ClientRequest, InstallSnapshotRequest,
+    InstallSnapshotResponse, Message, PreVoteRequest, PreVoteResponse, RequestVoteRequest,
+    RequestVoteResponse, TimeoutNowRequest,
 };
 pub use state::{RaftNode, RaftOutput, RaftState};
+pub use snapshot::{Snapshot, SnapshotBuildError, SnapshotBuilder, SnapshotChunk, SnapshotMeta};
 pub use storage::{MemoryStorage, PersistentState, RaftStorage, StorageError, StorageResult};
 pub use wal_storage::WalStorage;
 

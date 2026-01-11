@@ -20,8 +20,9 @@ use helix_core::{LogIndex, NodeId, TermId};
 use crate::config::RaftConfig;
 use crate::log::{LogEntry, RaftLog};
 use crate::message::{
-    AppendEntriesRequest, AppendEntriesResponse, ClientRequest, Message, PreVoteRequest,
-    PreVoteResponse, RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
+    AppendEntriesRequest, AppendEntriesResponse, ClientRequest, InstallSnapshotRequest,
+    InstallSnapshotResponse, Message, PreVoteRequest, PreVoteResponse, RequestVoteRequest,
+    RequestVoteResponse, TimeoutNowRequest,
 };
 
 /// Raft node state (role).
@@ -457,6 +458,8 @@ impl RaftNode {
             Message::AppendEntries(req) => self.handle_append_entries(req),
             Message::AppendEntriesResponse(resp) => self.handle_append_entries_response(resp),
             Message::TimeoutNow(req) => self.handle_timeout_now(req),
+            Message::InstallSnapshot(ref req) => self.handle_install_snapshot(req),
+            Message::InstallSnapshotResponse(resp) => self.handle_install_snapshot_response(resp),
         }
     }
 
@@ -838,6 +841,81 @@ impl RaftNode {
         }
 
         outputs
+    }
+
+    /// Handles an `InstallSnapshot` RPC from the leader.
+    ///
+    /// This is called when a follower is too far behind to catch up via
+    /// `AppendEntries` and needs a snapshot to advance.
+    ///
+    /// Note: Full implementation requires snapshot storage integration.
+    /// This is a placeholder that acknowledges the snapshot.
+    fn handle_install_snapshot(
+        &mut self,
+        req: &InstallSnapshotRequest,
+    ) -> Vec<RaftOutput> {
+        let mut outputs = Vec::new();
+
+        // Check term.
+        if req.term < self.current_term {
+            // Stale term, reject.
+            let response = InstallSnapshotResponse::new(
+                self.current_term,
+                self.config.node_id,
+                req.leader_id,
+                false,
+                0,
+            );
+            outputs.push(RaftOutput::SendMessage(Message::InstallSnapshotResponse(
+                response,
+            )));
+            return outputs;
+        }
+
+        // Valid leader, update state.
+        self.leader_id = Some(req.leader_id);
+        self.reset_election_elapsed();
+
+        // For now, acknowledge receipt.
+        // Full implementation would:
+        // 1. Save snapshot chunks to storage
+        // 2. When complete, install snapshot and truncate log
+        // 3. Reset state machine state from snapshot
+        let response = if req.done {
+            InstallSnapshotResponse::complete(self.current_term, self.config.node_id, req.leader_id)
+        } else {
+            // Request next chunk.
+            InstallSnapshotResponse::new(
+                self.current_term,
+                self.config.node_id,
+                req.leader_id,
+                true,
+                req.offset + req.data.len() as u64,
+            )
+        };
+        outputs.push(RaftOutput::SendMessage(Message::InstallSnapshotResponse(
+            response,
+        )));
+
+        outputs
+    }
+
+    /// Handles an `InstallSnapshotResponse` from a follower.
+    ///
+    /// This is called when the leader receives acknowledgment of a snapshot chunk.
+    ///
+    /// Note: Full implementation requires snapshot chunking and sending logic.
+    /// This is a placeholder.
+    #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
+    fn handle_install_snapshot_response(
+        &self,
+        _resp: InstallSnapshotResponse,
+    ) -> Vec<RaftOutput> {
+        // Full implementation would:
+        // 1. Track progress per follower
+        // 2. Send next chunk if not complete
+        // 3. Update match_index when snapshot is fully installed
+        Vec::new()
     }
 
     /// Initiates leadership transfer to the specified target node.

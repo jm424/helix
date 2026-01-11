@@ -92,6 +92,9 @@ define_id!(TermId, "term", "Raft term number for leader election.");
 define_id!(LogIndex, "idx", "Index into the Raft log.");
 define_id!(GroupId, "group", "Unique identifier for a Raft group.");
 
+// Shard management.
+define_id!(TransferId, "xfer", "Unique identifier for a shard transfer operation.");
+
 #[cfg(test)]
 mod tests {
     use super::*;

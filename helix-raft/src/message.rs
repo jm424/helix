@@ -24,6 +24,10 @@ pub enum Message {
     AppendEntriesResponse(AppendEntriesResponse),
     /// Leadership transfer: tells target to start election immediately.
     TimeoutNow(TimeoutNowRequest),
+    /// Install snapshot from leader to follower.
+    InstallSnapshot(InstallSnapshotRequest),
+    /// Response to install snapshot.
+    InstallSnapshotResponse(InstallSnapshotResponse),
 }
 
 impl Message {
@@ -38,6 +42,8 @@ impl Message {
             Self::AppendEntries(r) => r.leader_id,
             Self::AppendEntriesResponse(r) => r.from,
             Self::TimeoutNow(r) => r.from,
+            Self::InstallSnapshot(r) => r.leader_id,
+            Self::InstallSnapshotResponse(r) => r.from,
         }
     }
 
@@ -52,6 +58,8 @@ impl Message {
             Self::AppendEntries(r) => r.to,
             Self::AppendEntriesResponse(r) => r.to,
             Self::TimeoutNow(r) => r.to,
+            Self::InstallSnapshot(r) => r.to,
+            Self::InstallSnapshotResponse(r) => r.to,
         }
     }
 
@@ -66,6 +74,8 @@ impl Message {
             Self::AppendEntries(r) => r.term,
             Self::AppendEntriesResponse(r) => r.term,
             Self::TimeoutNow(r) => r.term,
+            Self::InstallSnapshot(r) => r.term,
+            Self::InstallSnapshotResponse(r) => r.term,
         }
     }
 }
@@ -346,6 +356,117 @@ impl TimeoutNowRequest {
     #[must_use]
     pub const fn new(term: TermId, from: NodeId, to: NodeId) -> Self {
         Self { term, from, to }
+    }
+}
+
+/// `InstallSnapshot` RPC request.
+///
+/// Sent by leader to followers that are too far behind to catch up via
+/// `AppendEntries`. The snapshot contains all state machine data up to a
+/// certain point, allowing the follower to skip ahead.
+///
+/// Large snapshots are sent in chunks. The `offset` field tracks progress,
+/// and `done` indicates the final chunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallSnapshotRequest {
+    /// Leader's term.
+    pub term: TermId,
+    /// Leader sending this snapshot.
+    pub leader_id: NodeId,
+    /// Target follower.
+    pub to: NodeId,
+    /// Last log index included in the snapshot.
+    pub last_included_index: LogIndex,
+    /// Term of `last_included_index`.
+    pub last_included_term: TermId,
+    /// Byte offset where chunk is positioned in the snapshot file.
+    pub offset: u64,
+    /// Raw bytes of the snapshot chunk.
+    pub data: Bytes,
+    /// True if this is the last chunk.
+    pub done: bool,
+}
+
+impl InstallSnapshotRequest {
+    /// Creates a new `InstallSnapshot` request.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        term: TermId,
+        leader_id: NodeId,
+        to: NodeId,
+        last_included_index: LogIndex,
+        last_included_term: TermId,
+        offset: u64,
+        data: Bytes,
+        done: bool,
+    ) -> Self {
+        Self {
+            term,
+            leader_id,
+            to,
+            last_included_index,
+            last_included_term,
+            offset,
+            data,
+            done,
+        }
+    }
+
+    /// Returns true if this is the first chunk (offset == 0).
+    #[must_use]
+    pub const fn is_first_chunk(&self) -> bool {
+        self.offset == 0
+    }
+
+    /// Returns true if this is the last chunk.
+    #[must_use]
+    pub const fn is_last_chunk(&self) -> bool {
+        self.done
+    }
+}
+
+/// `InstallSnapshot` RPC response.
+///
+/// Sent by followers in response to `InstallSnapshot` requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstallSnapshotResponse {
+    /// Current term, for leader to update itself.
+    pub term: TermId,
+    /// Sender of this response.
+    pub from: NodeId,
+    /// Leader that sent the request.
+    pub to: NodeId,
+    /// True if the snapshot chunk was accepted.
+    pub success: bool,
+    /// The byte offset of the next expected chunk.
+    /// Used for resumption on failure.
+    pub next_offset: u64,
+}
+
+impl InstallSnapshotResponse {
+    /// Creates a new `InstallSnapshot` response.
+    #[must_use]
+    pub const fn new(term: TermId, from: NodeId, to: NodeId, success: bool, next_offset: u64) -> Self {
+        Self {
+            term,
+            from,
+            to,
+            success,
+            next_offset,
+        }
+    }
+
+    /// Creates a success response indicating the snapshot was fully received.
+    #[must_use]
+    pub const fn complete(term: TermId, from: NodeId, to: NodeId) -> Self {
+        Self {
+            term,
+            from,
+            to,
+            success: true,
+            next_offset: 0, // Not used for completed snapshots.
+        }
     }
 }
 

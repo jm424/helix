@@ -24,8 +24,9 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use helix_core::{GroupId, LogIndex, NodeId, TermId};
 use helix_raft::{
-    multi::GroupMessage, AppendEntriesRequest, AppendEntriesResponse, LogEntry, Message,
-    PreVoteRequest, PreVoteResponse, RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
+    multi::GroupMessage, AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
+    InstallSnapshotResponse, LogEntry, Message, PreVoteRequest, PreVoteResponse,
+    RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
 };
 use thiserror::Error;
 
@@ -41,6 +42,8 @@ const TAG_APPEND_ENTRIES: u8 = 4;
 const TAG_APPEND_ENTRIES_RESPONSE: u8 = 5;
 const TAG_TIMEOUT_NOW: u8 = 6;
 const TAG_GROUP_MESSAGE_BATCH: u8 = 7;
+const TAG_INSTALL_SNAPSHOT: u8 = 8;
+const TAG_INSTALL_SNAPSHOT_RESPONSE: u8 = 9;
 
 /// Codec errors.
 #[derive(Debug, Error)]
@@ -116,6 +119,14 @@ pub fn encode_message(message: &Message) -> CodecResult<Bytes> {
         Message::TimeoutNow(req) => {
             buf.put_u8(TAG_TIMEOUT_NOW);
             encode_timeout_now(&mut buf, req);
+        }
+        Message::InstallSnapshot(req) => {
+            buf.put_u8(TAG_INSTALL_SNAPSHOT);
+            encode_install_snapshot(&mut buf, req);
+        }
+        Message::InstallSnapshotResponse(resp) => {
+            buf.put_u8(TAG_INSTALL_SNAPSHOT_RESPONSE);
+            encode_install_snapshot_response(&mut buf, resp);
         }
     }
 
@@ -194,6 +205,10 @@ pub fn decode_message(data: &[u8]) -> CodecResult<(Message, usize)> {
             Message::AppendEntriesResponse(decode_append_entries_response(&mut buf)?)
         }
         TAG_TIMEOUT_NOW => Message::TimeoutNow(decode_timeout_now(&mut buf)?),
+        TAG_INSTALL_SNAPSHOT => Message::InstallSnapshot(decode_install_snapshot(&mut buf)?),
+        TAG_INSTALL_SNAPSHOT_RESPONSE => {
+            Message::InstallSnapshotResponse(decode_install_snapshot_response(&mut buf)?)
+        }
         _ => return Err(CodecError::UnknownMessageType { tag }),
     };
 
@@ -390,6 +405,73 @@ fn decode_timeout_now(buf: &mut &[u8]) -> CodecResult<TimeoutNowRequest> {
     Ok(TimeoutNowRequest::new(term, from, to))
 }
 
+/// Encodes an `InstallSnapshotRequest`.
+fn encode_install_snapshot(buf: &mut BytesMut, req: &InstallSnapshotRequest) {
+    buf.put_u64_le(req.term.get());
+    buf.put_u64_le(req.leader_id.get());
+    buf.put_u64_le(req.to.get());
+    buf.put_u64_le(req.last_included_index.get());
+    buf.put_u64_le(req.last_included_term.get());
+    buf.put_u64_le(req.offset);
+    // Safe cast: snapshot data size is bounded by message limits which fit in u32.
+    #[allow(clippy::cast_possible_truncation)]
+    let data_len = req.data.len() as u32;
+    buf.put_u32_le(data_len);
+    buf.put_slice(&req.data);
+    buf.put_u8(u8::from(req.done));
+}
+
+/// Decodes an `InstallSnapshotRequest`.
+fn decode_install_snapshot(buf: &mut &[u8]) -> CodecResult<InstallSnapshotRequest> {
+    ensure_remaining(buf, 52)?;
+
+    let term = TermId::new(buf.get_u64_le());
+    let leader_id = NodeId::new(buf.get_u64_le());
+    let to = NodeId::new(buf.get_u64_le());
+    let last_included_index = LogIndex::new(buf.get_u64_le());
+    let last_included_term = TermId::new(buf.get_u64_le());
+    let offset = buf.get_u64_le();
+    let data_len = buf.get_u32_le() as usize;
+
+    ensure_remaining(buf, data_len + 1)?;
+    let data = Bytes::copy_from_slice(&buf[..data_len]);
+    buf.advance(data_len);
+    let done = buf.get_u8() != 0;
+
+    Ok(InstallSnapshotRequest::new(
+        term,
+        leader_id,
+        to,
+        last_included_index,
+        last_included_term,
+        offset,
+        data,
+        done,
+    ))
+}
+
+/// Encodes an `InstallSnapshotResponse`.
+fn encode_install_snapshot_response(buf: &mut BytesMut, resp: &InstallSnapshotResponse) {
+    buf.put_u64_le(resp.term.get());
+    buf.put_u64_le(resp.from.get());
+    buf.put_u64_le(resp.to.get());
+    buf.put_u8(u8::from(resp.success));
+    buf.put_u64_le(resp.next_offset);
+}
+
+/// Decodes an `InstallSnapshotResponse`.
+fn decode_install_snapshot_response(buf: &mut &[u8]) -> CodecResult<InstallSnapshotResponse> {
+    ensure_remaining(buf, 33)?;
+
+    let term = TermId::new(buf.get_u64_le());
+    let from = NodeId::new(buf.get_u64_le());
+    let to = NodeId::new(buf.get_u64_le());
+    let success = buf.get_u8() != 0;
+    let next_offset = buf.get_u64_le();
+
+    Ok(InstallSnapshotResponse::new(term, from, to, success, next_offset))
+}
+
 /// Encodes a log entry.
 fn encode_log_entry(buf: &mut BytesMut, entry: &LogEntry) {
     buf.put_u64_le(entry.term.get());
@@ -508,6 +590,14 @@ fn encode_message_payload(buf: &mut BytesMut, message: &Message) {
         Message::TimeoutNow(req) => {
             buf.put_u8(TAG_TIMEOUT_NOW);
             encode_timeout_now(buf, req);
+        }
+        Message::InstallSnapshot(req) => {
+            buf.put_u8(TAG_INSTALL_SNAPSHOT);
+            encode_install_snapshot(buf, req);
+        }
+        Message::InstallSnapshotResponse(resp) => {
+            buf.put_u8(TAG_INSTALL_SNAPSHOT_RESPONSE);
+            encode_install_snapshot_response(buf, resp);
         }
     }
 }

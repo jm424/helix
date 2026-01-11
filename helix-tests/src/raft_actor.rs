@@ -272,6 +272,10 @@ fn serialize_message(msg: &Message) -> Vec<u8> {
             buf.extend_from_slice(&req.from.get().to_le_bytes());
             buf.extend_from_slice(&req.to.get().to_le_bytes());
         }
+        // InstallSnapshot messages are not used in basic Raft simulation tests yet.
+        Message::InstallSnapshot(_) | Message::InstallSnapshotResponse(_) => {
+            panic!("InstallSnapshot messages not yet supported in simulation")
+        }
     }
 
     buf

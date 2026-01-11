@@ -20,6 +20,7 @@ use helix_core::{LogIndex, TermId};
 use helix_wal::{Entry, Segment, SegmentConfig, SegmentId};
 
 use crate::log::LogEntry;
+use crate::snapshot::Snapshot;
 use crate::storage::{PersistentState, RaftStorage, StorageError, StorageResult};
 
 /// Magic term value used to identify metadata entries.
@@ -47,6 +48,8 @@ pub struct WalStorage {
     last_index: u64,
     /// Term of last entry.
     last_term: TermId,
+    /// Latest snapshot.
+    snapshot: Option<Snapshot>,
 }
 
 impl WalStorage {
@@ -64,6 +67,7 @@ impl WalStorage {
             first_index: 0,
             last_index: 0,
             last_term: TermId::new(0),
+            snapshot: None,
         }
     }
 
@@ -79,6 +83,7 @@ impl WalStorage {
             first_index: 0,
             last_index: 0,
             last_term: TermId::new(0),
+            snapshot: None,
         }
     }
 
@@ -98,6 +103,7 @@ impl WalStorage {
             first_index: 0,
             last_index: 0,
             last_term: TermId::new(0),
+            snapshot: None,
         };
 
         // Recover state and index information.
@@ -313,6 +319,33 @@ impl RaftStorage for WalStorage {
         // For in-memory segments, this is a no-op.
         // Production implementation would fsync here.
         Ok(())
+    }
+
+    fn save_snapshot(&mut self, snapshot: Snapshot) -> StorageResult<()> {
+        // For now, just store in memory.
+        // Production implementation would persist to a separate snapshot file.
+        self.snapshot = Some(snapshot);
+        Ok(())
+    }
+
+    fn load_snapshot(&self) -> StorageResult<Option<Snapshot>> {
+        Ok(self.snapshot.clone())
+    }
+
+    fn has_snapshot(&self) -> bool {
+        self.snapshot.is_some()
+    }
+
+    fn snapshot_index(&self) -> LogIndex {
+        self.snapshot
+            .as_ref()
+            .map_or(LogIndex::new(0), |s| s.last_included_index)
+    }
+
+    fn snapshot_term(&self) -> TermId {
+        self.snapshot
+            .as_ref()
+            .map_or(TermId::new(0), |s| s.last_included_term)
     }
 }
 
