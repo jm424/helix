@@ -28,7 +28,7 @@ helix-raft = { path = "helix-raft" }
 helix-tests = { path = "helix-tests" }
 
 # DST Framework - Bloodhound provides deterministic simulation.
-bloodhound = { path = "../bloodhound" }
+bloodhound = { git = "https://github.com/nerdsane/bloodhound" }
 
 # Async runtime.
 tokio = { version = "1.35", features = ["full"] }
@@ -69,6 +69,8 @@ clap = { version = "4.4", features = ["derive"] }
 # Testing.
 proptest = "1.4"
 criterion = "0.5"
+hdrhistogram = "7.5"
+tempfile = "3.10"
 
 [workspace.lints.rust]
 # Safety: All warnings are errors.

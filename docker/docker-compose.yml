@@ -1,0 +1,118 @@
+# Helix 3-node cluster for testing multi-node Raft consensus.
+#
+# Usage:
+#   cd docker
+#   docker-compose up --build -d
+#   docker-compose logs -f
+#
+# Client connections:
+#   - Node 1: localhost:9092 (gRPC)
+#   - Node 2: localhost:9093 (gRPC)
+#   - Node 3: localhost:9094 (gRPC)
+#
+# Raft peer connections (internal):
+#   - Node 1: helix-node1:9001
+#   - Node 2: helix-node2:9002
+#   - Node 3: helix-node3:9003
+
+services:
+  helix-node1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: helix-node1
+    hostname: helix-node1
+    ports:
+      - "9092:9092"  # gRPC client API
+      - "9001:9001"  # Raft peer (exposed for debugging)
+    volumes:
+      - helix-data-1:/var/lib/helix
+    command:
+      - --node-id=1
+      - --cluster-id=helix-docker-cluster
+      - --listen-addr=0.0.0.0:9092
+      - --raft-addr=0.0.0.0:9001
+      - --peer=2:helix-node2:9002
+      - --peer=3:helix-node3:9003
+      - --data-dir=/var/lib/helix
+      - --log-level=info
+    networks:
+      - helix-net
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9092 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  helix-node2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: helix-node2
+    hostname: helix-node2
+    ports:
+      - "9093:9092"  # gRPC client API (mapped to different host port)
+      - "9002:9002"  # Raft peer
+    volumes:
+      - helix-data-2:/var/lib/helix
+    command:
+      - --node-id=2
+      - --cluster-id=helix-docker-cluster
+      - --listen-addr=0.0.0.0:9092
+      - --raft-addr=0.0.0.0:9002
+      - --peer=1:helix-node1:9001
+      - --peer=3:helix-node3:9003
+      - --data-dir=/var/lib/helix
+      - --log-level=info
+    networks:
+      - helix-net
+    depends_on:
+      - helix-node1
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9092 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  helix-node3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: helix-node3
+    hostname: helix-node3
+    ports:
+      - "9094:9092"  # gRPC client API
+      - "9003:9003"  # Raft peer
+    volumes:
+      - helix-data-3:/var/lib/helix
+    command:
+      - --node-id=3
+      - --cluster-id=helix-docker-cluster
+      - --listen-addr=0.0.0.0:9092
+      - --raft-addr=0.0.0.0:9003
+      - --peer=1:helix-node1:9001
+      - --peer=2:helix-node2:9002
+      - --data-dir=/var/lib/helix
+      - --log-level=info
+    networks:
+      - helix-net
+    depends_on:
+      - helix-node1
+      - helix-node2
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9092 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  helix-net:
+    driver: bridge
+
+volumes:
+  helix-data-1:
+  helix-data-2:
+  helix-data-3:

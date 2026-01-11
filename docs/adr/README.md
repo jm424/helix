@@ -13,6 +13,7 @@ ADRs document significant architectural decisions along with their context and c
 | [0002](0002-synchronous-state-machines.md) | Synchronous State Machines in Core | Accepted |
 | [0003](0003-strongly-typed-identifiers.md) | Strongly-Typed Identifiers | Accepted |
 | [0004](0004-tick-based-raft-timing.md) | Tick-Based Raft Timing | Accepted |
+| [0005](0005-conservative-wal-corruption-recovery.md) | Conservative WAL Corruption Recovery | Accepted |
 
 ## When to Write an ADR
 

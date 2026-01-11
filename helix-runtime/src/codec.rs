@@ -19,12 +19,13 @@
 //! - 4: `AppendEntries`
 //! - 5: `AppendEntriesResponse`
 //! - 6: `TimeoutNow`
+//! - 7: `GroupMessageBatch` (for Multi-Raft batched messages)
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use helix_core::{LogIndex, NodeId, TermId};
+use helix_core::{GroupId, LogIndex, NodeId, TermId};
 use helix_raft::{
-    AppendEntriesRequest, AppendEntriesResponse, LogEntry, Message, PreVoteRequest,
-    PreVoteResponse, RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
+    multi::GroupMessage, AppendEntriesRequest, AppendEntriesResponse, LogEntry, Message,
+    PreVoteRequest, PreVoteResponse, RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
 };
 use thiserror::Error;
 
@@ -39,6 +40,7 @@ const TAG_REQUEST_VOTE_RESPONSE: u8 = 3;
 const TAG_APPEND_ENTRIES: u8 = 4;
 const TAG_APPEND_ENTRIES_RESPONSE: u8 = 5;
 const TAG_TIMEOUT_NOW: u8 = 6;
+const TAG_GROUP_MESSAGE_BATCH: u8 = 7;
 
 /// Codec errors.
 #[derive(Debug, Error)]
@@ -425,6 +427,199 @@ const fn ensure_remaining(buf: &[u8], need: usize) -> CodecResult<()> {
     Ok(())
 }
 
+/// Encodes a batch of `GroupMessage`s to bytes.
+///
+/// Wire format:
+/// - 4 bytes: total length (u32 little-endian, not including header)
+/// - 1 byte: tag (7 = `GroupMessageBatch`)
+/// - 4 bytes: message count (u32 little-endian)
+/// - For each message:
+///   - 8 bytes: `group_id` (u64 little-endian)
+///   - N bytes: encoded message (without length prefix)
+///
+/// # Errors
+/// Returns an error if the batch is too large.
+pub fn encode_group_batch(messages: &[GroupMessage]) -> CodecResult<Bytes> {
+    // Estimate initial capacity: 4 (length) + 1 (tag) + 4 (count) + messages.
+    let capacity = 9 + messages.len() * 64;
+    let mut buf = BytesMut::with_capacity(capacity);
+
+    // Reserve space for length prefix.
+    buf.put_u32_le(0);
+
+    // Tag for batch.
+    buf.put_u8(TAG_GROUP_MESSAGE_BATCH);
+
+    // Message count.
+    // Safe cast: count bounded by practical limits.
+    #[allow(clippy::cast_possible_truncation)]
+    let count = messages.len() as u32;
+    buf.put_u32_le(count);
+
+    // Encode each GroupMessage.
+    for group_msg in messages {
+        buf.put_u64_le(group_msg.group_id.get());
+        encode_message_payload(&mut buf, &group_msg.message);
+    }
+
+    // Fill in total length (excluding the 4-byte header).
+    // Safe cast: message size bounded by MAX_MESSAGE_SIZE.
+    #[allow(clippy::cast_possible_truncation)]
+    let len = (buf.len() - 4) as u32;
+    if len > MAX_MESSAGE_SIZE {
+        return Err(CodecError::MessageTooLarge {
+            size: len,
+            max: MAX_MESSAGE_SIZE,
+        });
+    }
+
+    buf[0..4].copy_from_slice(&len.to_le_bytes());
+
+    Ok(buf.freeze())
+}
+
+/// Encodes message payload (without length prefix).
+fn encode_message_payload(buf: &mut BytesMut, message: &Message) {
+    match message {
+        Message::PreVote(req) => {
+            buf.put_u8(TAG_PRE_VOTE);
+            encode_pre_vote(buf, req);
+        }
+        Message::PreVoteResponse(resp) => {
+            buf.put_u8(TAG_PRE_VOTE_RESPONSE);
+            encode_pre_vote_response(buf, resp);
+        }
+        Message::RequestVote(req) => {
+            buf.put_u8(TAG_REQUEST_VOTE);
+            encode_request_vote(buf, req);
+        }
+        Message::RequestVoteResponse(resp) => {
+            buf.put_u8(TAG_REQUEST_VOTE_RESPONSE);
+            encode_request_vote_response(buf, resp);
+        }
+        Message::AppendEntries(req) => {
+            buf.put_u8(TAG_APPEND_ENTRIES);
+            encode_append_entries(buf, req);
+        }
+        Message::AppendEntriesResponse(resp) => {
+            buf.put_u8(TAG_APPEND_ENTRIES_RESPONSE);
+            encode_append_entries_response(buf, resp);
+        }
+        Message::TimeoutNow(req) => {
+            buf.put_u8(TAG_TIMEOUT_NOW);
+            encode_timeout_now(buf, req);
+        }
+    }
+}
+
+/// Decodes a batch of `GroupMessage`s from bytes.
+///
+/// Expects the full framed batch including length prefix.
+///
+/// # Errors
+/// Returns an error if the data is malformed or incomplete.
+///
+/// # Panics
+/// Panics if the decoded message count doesn't match the expected count (indicates a bug).
+pub fn decode_group_batch(data: &[u8]) -> CodecResult<(Vec<GroupMessage>, usize)> {
+    if data.len() < 4 {
+        return Err(CodecError::InsufficientData {
+            need: 4,
+            have: data.len(),
+        });
+    }
+
+    let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+
+    // Safe cast: len bounded by MAX_MESSAGE_SIZE.
+    #[allow(clippy::cast_possible_truncation)]
+    let len_u32 = len as u32;
+    if len > MAX_MESSAGE_SIZE as usize {
+        return Err(CodecError::MessageTooLarge {
+            size: len_u32,
+            max: MAX_MESSAGE_SIZE,
+        });
+    }
+
+    let total_len = 4 + len;
+    if data.len() < total_len {
+        return Err(CodecError::InsufficientData {
+            need: total_len,
+            have: data.len(),
+        });
+    }
+
+    let payload = &data[4..total_len];
+    if payload.is_empty() {
+        return Err(CodecError::InsufficientData {
+            need: 1,
+            have: 0,
+        });
+    }
+
+    let tag = payload[0];
+    if tag != TAG_GROUP_MESSAGE_BATCH {
+        return Err(CodecError::UnknownMessageType { tag });
+    }
+
+    let body = &payload[1..];
+    if body.len() < 4 {
+        return Err(CodecError::InsufficientData {
+            need: 5,
+            have: payload.len(),
+        });
+    }
+
+    let count = u32::from_le_bytes([body[0], body[1], body[2], body[3]]) as usize;
+    let mut buf = &body[4..];
+    let mut messages = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        ensure_remaining(buf, 9)?; // 8 (group_id) + 1 (tag)
+
+        let group_id = GroupId::new((&mut buf).get_u64_le());
+        let message = decode_message_payload(&mut buf)?;
+
+        messages.push(GroupMessage::new(group_id, message));
+    }
+
+    assert_eq!(messages.len(), count);
+
+    Ok((messages, total_len))
+}
+
+/// Decodes message payload (without length prefix).
+fn decode_message_payload(buf: &mut &[u8]) -> CodecResult<Message> {
+    ensure_remaining(buf, 1)?;
+
+    let tag = buf[0];
+    *buf = &buf[1..];
+
+    let message = match tag {
+        TAG_PRE_VOTE => Message::PreVote(decode_pre_vote(buf)?),
+        TAG_PRE_VOTE_RESPONSE => Message::PreVoteResponse(decode_pre_vote_response(buf)?),
+        TAG_REQUEST_VOTE => Message::RequestVote(decode_request_vote(buf)?),
+        TAG_REQUEST_VOTE_RESPONSE => Message::RequestVoteResponse(decode_request_vote_response(buf)?),
+        TAG_APPEND_ENTRIES => Message::AppendEntries(decode_append_entries(buf)?),
+        TAG_APPEND_ENTRIES_RESPONSE => {
+            Message::AppendEntriesResponse(decode_append_entries_response(buf)?)
+        }
+        TAG_TIMEOUT_NOW => Message::TimeoutNow(decode_timeout_now(buf)?),
+        _ => return Err(CodecError::UnknownMessageType { tag }),
+    };
+
+    Ok(message)
+}
+
+/// Checks if the given data starts with a group message batch tag.
+///
+/// Used by the transport layer to determine which decoder to use.
+#[must_use]
+pub fn is_group_batch(data: &[u8]) -> bool {
+    // Need at least 5 bytes: 4 (length) + 1 (tag).
+    data.len() >= 5 && data[4] == TAG_GROUP_MESSAGE_BATCH
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,5 +743,98 @@ mod tests {
         let data = [1, 0, 0, 0, 255]; // length=1, tag=255
         let result = decode_message(&data);
         assert!(matches!(result, Err(CodecError::UnknownMessageType { tag: 255 })));
+    }
+
+    #[test]
+    fn test_encode_decode_group_batch_empty() {
+        let messages: Vec<GroupMessage> = vec![];
+        let encoded = encode_group_batch(&messages).unwrap();
+        let (decoded, consumed) = decode_group_batch(&encoded).unwrap();
+
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.len(), 0);
+    }
+
+    #[test]
+    fn test_encode_decode_group_batch_single() {
+        let messages = vec![GroupMessage::new(
+            GroupId::new(42),
+            make_request_vote(),
+        )];
+        let encoded = encode_group_batch(&messages).unwrap();
+        let (decoded, consumed) = decode_group_batch(&encoded).unwrap();
+
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].group_id.get(), 42);
+        assert_eq!(decoded[0].message, make_request_vote());
+    }
+
+    #[test]
+    fn test_encode_decode_group_batch_multiple() {
+        let messages = vec![
+            GroupMessage::new(GroupId::new(1), make_request_vote()),
+            GroupMessage::new(GroupId::new(2), make_request_vote_response()),
+            GroupMessage::new(GroupId::new(3), make_append_entries_heartbeat()),
+            GroupMessage::new(GroupId::new(1), make_append_entries_with_data()),
+            GroupMessage::new(GroupId::new(2), make_append_entries_response()),
+        ];
+        let encoded = encode_group_batch(&messages).unwrap();
+        let (decoded, consumed) = decode_group_batch(&encoded).unwrap();
+
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.len(), 5);
+
+        assert_eq!(decoded[0].group_id.get(), 1);
+        assert_eq!(decoded[0].message, make_request_vote());
+
+        assert_eq!(decoded[1].group_id.get(), 2);
+        assert_eq!(decoded[1].message, make_request_vote_response());
+
+        assert_eq!(decoded[2].group_id.get(), 3);
+        assert_eq!(decoded[2].message, make_append_entries_heartbeat());
+
+        assert_eq!(decoded[3].group_id.get(), 1);
+        assert_eq!(decoded[3].message, make_append_entries_with_data());
+
+        assert_eq!(decoded[4].group_id.get(), 2);
+        assert_eq!(decoded[4].message, make_append_entries_response());
+    }
+
+    #[test]
+    fn test_is_group_batch() {
+        // Regular message.
+        let regular = encode_message(&make_request_vote()).unwrap();
+        assert!(!is_group_batch(&regular));
+
+        // Group batch.
+        let batch = encode_group_batch(&[GroupMessage::new(
+            GroupId::new(1),
+            make_request_vote(),
+        )])
+        .unwrap();
+        assert!(is_group_batch(&batch));
+
+        // Empty batch.
+        let empty_batch = encode_group_batch(&[]).unwrap();
+        assert!(is_group_batch(&empty_batch));
+
+        // Too short to determine.
+        assert!(!is_group_batch(&[0, 1, 2, 3]));
+        assert!(!is_group_batch(&[]));
+    }
+
+    #[test]
+    fn test_decode_group_batch_insufficient_data() {
+        let result = decode_group_batch(&[0, 1]);
+        assert!(matches!(result, Err(CodecError::InsufficientData { .. })));
+    }
+
+    #[test]
+    fn test_decode_group_batch_wrong_tag() {
+        // Encode a regular message and try to decode as batch.
+        let regular = encode_message(&make_request_vote()).unwrap();
+        let result = decode_group_batch(&regular);
+        assert!(matches!(result, Err(CodecError::UnknownMessageType { .. })));
     }
 }

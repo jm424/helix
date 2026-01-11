@@ -22,4 +22,18 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
-tempfile = "3.10"
+criterion = { workspace = true }
+hdrhistogram = { workspace = true }
+tempfile = { workspace = true }
+
+[[bench]]
+name = "wal_write"
+harness = false
+
+[[bench]]
+name = "wal_read"
+harness = false
+
+[[bench]]
+name = "buffered_wal_bench"
+harness = false

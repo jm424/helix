@@ -22,8 +22,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use helix_core::NodeId;
+use helix_raft::multi::GroupMessage;
 use helix_raft::Message;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -31,7 +32,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
-use crate::codec::{decode_message, encode_message, CodecError};
+use crate::codec::{
+    decode_group_batch, decode_message, encode_group_batch, encode_message, is_group_batch,
+    CodecError,
+};
 
 /// Maximum read buffer size (1 MB).
 const READ_BUFFER_SIZE: usize = 1024 * 1024;
@@ -60,7 +64,7 @@ pub enum TransportError {
         /// The peer node ID.
         node_id: NodeId,
         /// The peer address.
-        addr: SocketAddr,
+        addr: String,
         /// The underlying error.
         source: std::io::Error,
     },
@@ -89,13 +93,33 @@ pub enum TransportError {
 /// Result type for transport operations.
 pub type TransportResult<T> = Result<T, TransportError>;
 
+/// Incoming message from a peer.
+///
+/// This enum distinguishes between single messages (backward compatible)
+/// and batches of `GroupMessage`s used by Multi-Raft.
+#[derive(Debug, Clone)]
+pub enum IncomingMessage {
+    /// A single Raft message.
+    Single(Message),
+    /// A batch of `GroupMessage`s from Multi-Raft.
+    Batch(Vec<GroupMessage>),
+}
+
+/// Internal type for outbound data.
+enum OutgoingData {
+    /// A single message to send.
+    Single(Message),
+    /// A batch of group messages to send.
+    Batch(Bytes),
+}
+
 /// Configuration for a peer node.
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
     /// The peer's node ID.
     pub node_id: NodeId,
-    /// The peer's address.
-    pub addr: SocketAddr,
+    /// The peer's address (hostname:port or ip:port, resolved at connect time).
+    pub addr: String,
 }
 
 /// Transport configuration.
@@ -121,21 +145,26 @@ impl TransportConfig {
     }
 
     /// Adds a peer to the configuration.
+    ///
+    /// The address can be either `ip:port` or `hostname:port`. DNS resolution
+    /// is deferred until connection time.
     #[must_use]
-    pub fn with_peer(mut self, node_id: NodeId, addr: SocketAddr) -> Self {
-        self.peers.push(PeerInfo { node_id, addr });
+    pub fn with_peer(mut self, node_id: NodeId, addr: impl Into<String>) -> Self {
+        self.peers.push(PeerInfo {
+            node_id,
+            addr: addr.into(),
+        });
         self
     }
 }
 
 /// State of a peer connection.
-#[derive(Debug)]
 struct PeerConnection {
     /// The peer's address (stored for reconnection).
     #[allow(dead_code)]
-    addr: SocketAddr,
-    /// Sender for outbound messages.
-    sender: mpsc::Sender<Message>,
+    addr: String,
+    /// Sender for outbound data.
+    sender: mpsc::Sender<OutgoingData>,
 }
 
 /// Handle to interact with the transport.
@@ -150,7 +179,7 @@ pub struct TransportHandle {
 }
 
 impl TransportHandle {
-    /// Sends a message to a peer.
+    /// Sends a single message to a peer.
     ///
     /// # Errors
     /// Returns an error if the peer is unknown or the send queue is full.
@@ -164,12 +193,46 @@ impl TransportHandle {
         }
 
         let peers = self.peers.read().await;
-        let conn = peers
-            .get(&to)
-            .ok_or(TransportError::UnknownPeer(to))?;
+        let conn = peers.get(&to).ok_or(TransportError::UnknownPeer(to))?;
 
         conn.sender
-            .try_send(message)
+            .try_send(OutgoingData::Single(message))
+            .map_err(|_| TransportError::QueueFull(to))
+    }
+
+    /// Sends a batch of `GroupMessage`s to a peer.
+    ///
+    /// This is the primary send method for Multi-Raft, which batches messages
+    /// by destination node for efficiency.
+    ///
+    /// # Errors
+    /// Returns an error if the peer is unknown, the send queue is full, or
+    /// encoding fails.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn send_batch(
+        &self,
+        to: NodeId,
+        messages: Vec<GroupMessage>,
+    ) -> TransportResult<()> {
+        // Precondition: can't send to self.
+        debug_assert!(to != self.node_id, "cannot send batch to self");
+
+        if messages.is_empty() {
+            return Ok(());
+        }
+
+        if *self.shutdown.lock().await {
+            return Err(TransportError::Shutdown);
+        }
+
+        // Encode the batch upfront to catch codec errors early.
+        let encoded = encode_group_batch(&messages)?;
+
+        let peers = self.peers.read().await;
+        let conn = peers.get(&to).ok_or(TransportError::UnknownPeer(to))?;
+
+        conn.sender
+            .try_send(OutgoingData::Batch(encoded))
             .map_err(|_| TransportError::QueueFull(to))
     }
 
@@ -186,7 +249,7 @@ pub struct Transport {
     /// Peer connections.
     peers: Arc<RwLock<HashMap<NodeId, PeerConnection>>>,
     /// Channel for received messages.
-    incoming_tx: mpsc::Sender<Message>,
+    incoming_tx: mpsc::Sender<IncomingMessage>,
     /// Shutdown signal.
     shutdown: Arc<Mutex<bool>>,
 }
@@ -196,7 +259,7 @@ impl Transport {
     ///
     /// Returns the transport and a receiver for incoming messages.
     #[must_use]
-    pub fn new(config: TransportConfig) -> (Self, mpsc::Receiver<Message>) {
+    pub fn new(config: TransportConfig) -> (Self, mpsc::Receiver<IncomingMessage>) {
         let (incoming_tx, incoming_rx) = mpsc::channel(1024);
 
         let transport = Self {
@@ -236,7 +299,7 @@ impl Transport {
 
         // Initialize peer connections.
         for peer in &self.config.peers {
-            self.init_peer_connection(peer.node_id, peer.addr).await;
+            self.init_peer_connection(peer.node_id, peer.addr.clone()).await;
         }
 
         // Spawn the accept loop.
@@ -252,12 +315,15 @@ impl Transport {
     }
 
     /// Initializes a connection to a peer.
-    async fn init_peer_connection(&self, peer_id: NodeId, addr: SocketAddr) {
+    async fn init_peer_connection(&self, peer_id: NodeId, addr: String) {
         let (tx, rx) = mpsc::channel(MAX_PENDING_MESSAGES);
 
         {
             let mut peers = self.peers.write().await;
-            peers.insert(peer_id, PeerConnection { addr, sender: tx });
+            peers.insert(peer_id, PeerConnection {
+                addr: addr.clone(),
+                sender: tx,
+            });
         }
 
         // Spawn the sender task.
@@ -272,7 +338,7 @@ impl Transport {
     /// Loop that accepts incoming connections.
     async fn accept_loop(
         listener: TcpListener,
-        incoming_tx: mpsc::Sender<Message>,
+        incoming_tx: mpsc::Sender<IncomingMessage>,
         shutdown: Arc<Mutex<bool>>,
         node_id: NodeId,
     ) {
@@ -311,8 +377,8 @@ impl Transport {
     async fn sender_loop(
         node_id: NodeId,
         peer_id: NodeId,
-        addr: SocketAddr,
-        mut rx: mpsc::Receiver<Message>,
+        addr: String,
+        mut rx: mpsc::Receiver<OutgoingData>,
         shutdown: Arc<Mutex<bool>>,
     ) {
         let mut stream: Option<TcpStream> = None;
@@ -329,14 +395,14 @@ impl Transport {
                 break;
             }
 
-            // Wait for a message.
-            let Some(message) = rx.recv().await else {
+            // Wait for data to send.
+            let Some(data) = rx.recv().await else {
                 break; // Channel closed.
             };
 
             // Ensure we have a connection.
             if stream.is_none() {
-                match Self::connect_to_peer(peer_id, addr).await {
+                match Self::connect_to_peer(peer_id, &addr).await {
                     Ok(s) => {
                         stream = Some(s);
                         reconnect_delay_ms = 100;
@@ -357,28 +423,40 @@ impl Transport {
                         // Exponential backoff.
                         tokio::time::sleep(tokio::time::Duration::from_millis(reconnect_delay_ms))
                             .await;
-                        reconnect_delay_ms =
-                            (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
+                        reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
                         continue;
                     }
                 }
             }
 
-            // Send the message.
+            // Send the data.
             if let Some(ref mut s) = stream {
-                match Self::send_message(s, &message).await {
+                let result = match &data {
+                    OutgoingData::Single(message) => {
+                        let encoded = encode_message(message);
+                        match encoded {
+                            Ok(bytes) => Self::send_bytes(s, &bytes).await,
+                            Err(e) => Err(e.into()),
+                        }
+                    }
+                    OutgoingData::Batch(bytes) => Self::send_bytes(s, bytes).await,
+                };
+
+                match result {
                     Ok(()) => {
-                        debug!(
-                            peer_id = peer_id.get(),
-                            msg_type = ?std::mem::discriminant(&message),
-                            "Sent message"
-                        );
+                        let msg_desc = match &data {
+                            OutgoingData::Single(m) => {
+                                format!("single:{:?}", std::mem::discriminant(m))
+                            }
+                            OutgoingData::Batch(b) => format!("batch:{} bytes", b.len()),
+                        };
+                        debug!(peer_id = peer_id.get(), msg = %msg_desc, "Sent data");
                     }
                     Err(e) => {
                         warn!(
                             peer_id = peer_id.get(),
                             error = %e,
-                            "Failed to send message, reconnecting"
+                            "Failed to send data, reconnecting"
                         );
                         stream = None;
                     }
@@ -388,10 +466,24 @@ impl Transport {
     }
 
     /// Connects to a peer with timeout.
-    async fn connect_to_peer(peer_id: NodeId, addr: SocketAddr) -> TransportResult<TcpStream> {
+    ///
+    /// The address is resolved at connection time to support hostnames.
+    async fn connect_to_peer(peer_id: NodeId, addr: &str) -> TransportResult<TcpStream> {
         let timeout = tokio::time::Duration::from_millis(CONNECT_TIMEOUT_MS);
 
-        match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+        // Resolve the address (supports both IP and hostname).
+        let connect_future = async {
+            let mut addrs = tokio::net::lookup_host(addr).await?;
+            let resolved = addrs.next().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("no addresses found for {addr}"),
+                )
+            })?;
+            TcpStream::connect(resolved).await
+        };
+
+        match tokio::time::timeout(timeout, connect_future).await {
             Ok(Ok(stream)) => {
                 // Disable Nagle's algorithm for lower latency.
                 stream.set_nodelay(true)?;
@@ -399,29 +491,30 @@ impl Transport {
             }
             Ok(Err(e)) => Err(TransportError::ConnectFailed {
                 node_id: peer_id,
-                addr,
+                addr: addr.to_string(),
                 source: e,
             }),
             Err(_) => Err(TransportError::ConnectFailed {
                 node_id: peer_id,
-                addr,
+                addr: addr.to_string(),
                 source: std::io::Error::new(std::io::ErrorKind::TimedOut, "connection timed out"),
             }),
         }
     }
 
-    /// Sends a single message over a TCP stream.
-    async fn send_message(stream: &mut TcpStream, message: &Message) -> TransportResult<()> {
-        let data = encode_message(message)?;
-        stream.write_all(&data).await?;
+    /// Sends raw bytes over a TCP stream.
+    async fn send_bytes(stream: &mut TcpStream, data: &[u8]) -> TransportResult<()> {
+        stream.write_all(data).await?;
         stream.flush().await?;
         Ok(())
     }
 
     /// Loop that receives messages from a connection.
+    ///
+    /// Handles both single messages and batched `GroupMessage`s.
     async fn receive_loop(
         mut stream: TcpStream,
-        incoming_tx: mpsc::Sender<Message>,
+        incoming_tx: mpsc::Sender<IncomingMessage>,
         shutdown: Arc<Mutex<bool>>,
     ) -> TransportResult<()> {
         let mut buffer = BytesMut::with_capacity(READ_BUFFER_SIZE);
@@ -441,30 +534,58 @@ impl Transport {
 
             // Try to decode messages from buffer.
             while !buffer.is_empty() {
-                match decode_message(&buffer) {
-                    Ok((message, consumed)) => {
-                        debug!(
-                            msg_type = ?std::mem::discriminant(&message),
-                            from = message.from().get(),
-                            "Received message"
-                        );
+                // Check if this is a batch or single message.
+                if is_group_batch(&buffer) {
+                    match decode_group_batch(&buffer) {
+                        Ok((messages, consumed)) => {
+                            debug!(count = messages.len(), "Received batch");
 
-                        // Forward to handler.
-                        if incoming_tx.send(message).await.is_err() {
-                            // Receiver dropped.
-                            return Ok(());
+                            // Forward to handler.
+                            let incoming = IncomingMessage::Batch(messages);
+                            if incoming_tx.send(incoming).await.is_err() {
+                                // Receiver dropped.
+                                return Ok(());
+                            }
+
+                            // Remove consumed bytes.
+                            let _ = buffer.split_to(consumed);
                         }
+                        Err(CodecError::InsufficientData { .. }) => {
+                            // Need more data.
+                            break;
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Failed to decode batch");
+                            return Err(e.into());
+                        }
+                    }
+                } else {
+                    match decode_message(&buffer) {
+                        Ok((message, consumed)) => {
+                            debug!(
+                                msg_type = ?std::mem::discriminant(&message),
+                                from = message.from().get(),
+                                "Received message"
+                            );
 
-                        // Remove consumed bytes.
-                        let _ = buffer.split_to(consumed);
-                    }
-                    Err(CodecError::InsufficientData { .. }) => {
-                        // Need more data.
-                        break;
-                    }
-                    Err(e) => {
-                        error!(error = %e, "Failed to decode message");
-                        return Err(e.into());
+                            // Forward to handler.
+                            let incoming = IncomingMessage::Single(message);
+                            if incoming_tx.send(incoming).await.is_err() {
+                                // Receiver dropped.
+                                return Ok(());
+                            }
+
+                            // Remove consumed bytes.
+                            let _ = buffer.split_to(consumed);
+                        }
+                        Err(CodecError::InsufficientData { .. }) => {
+                            // Need more data.
+                            break;
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Failed to decode message");
+                            return Err(e.into());
+                        }
                     }
                 }
             }
@@ -495,7 +616,7 @@ impl TransportBuilder {
 
     /// Adds a peer.
     #[must_use]
-    pub fn with_peer(mut self, node_id: NodeId, addr: SocketAddr) -> Self {
+    pub fn with_peer(mut self, node_id: NodeId, addr: impl Into<String>) -> Self {
         self.config = self.config.with_peer(node_id, addr);
         self
     }
@@ -504,7 +625,7 @@ impl TransportBuilder {
     ///
     /// # Errors
     /// Returns an error if binding fails.
-    pub async fn build(self) -> TransportResult<(TransportHandle, mpsc::Receiver<Message>)> {
+    pub async fn build(self) -> TransportResult<(TransportHandle, mpsc::Receiver<IncomingMessage>)> {
         let (transport, incoming_rx) = Transport::new(self.config);
         let handle = transport.start().await?;
         Ok((handle, incoming_rx))
@@ -540,7 +661,7 @@ mod tests {
     #[tokio::test]
     async fn test_transport_builder() {
         let (handle, _incoming_rx) = TransportBuilder::new(NodeId::new(1), "127.0.0.1:0".parse().unwrap())
-            .with_peer(NodeId::new(2), "127.0.0.1:9002".parse().unwrap())
+            .with_peer(NodeId::new(2), "127.0.0.1:9002")
             .build()
             .await
             .unwrap();
@@ -568,15 +689,14 @@ mod tests {
         let node1_addr: SocketAddr = "127.0.0.1:19101".parse().unwrap();
 
         // Start node 2 first (receiver).
-        let (transport2, mut incoming2) = Transport::new(
-            TransportConfig::new(NodeId::new(2), node2_addr)
-        );
+        let (transport2, mut incoming2) =
+            Transport::new(TransportConfig::new(NodeId::new(2), node2_addr));
         let _handle2 = transport2.start().await.unwrap();
 
         // Start node 1 with node 2 as a peer.
         let (transport1, _incoming1) = Transport::new(
             TransportConfig::new(NodeId::new(1), node1_addr)
-                .with_peer(NodeId::new(2), node2_addr)
+                .with_peer(NodeId::new(2), "127.0.0.1:19102"),
         );
         let handle1 = transport1.start().await.unwrap();
 
@@ -589,16 +709,82 @@ mod tests {
         assert!(result.is_ok(), "Failed to send: {result:?}");
 
         // Wait for the message to be received.
-        let received = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            incoming2.recv()
-        ).await;
+        let received = tokio::time::timeout(tokio::time::Duration::from_secs(2), incoming2.recv())
+            .await;
 
         assert!(received.is_ok(), "Timeout waiting for message");
         let received_message = received.unwrap();
         assert!(received_message.is_some(), "Channel closed");
 
-        let received_message = received_message.unwrap();
-        assert_eq!(received_message, message);
+        // Should be a single message.
+        match received_message.unwrap() {
+            IncomingMessage::Single(msg) => assert_eq!(msg, message),
+            IncomingMessage::Batch(_) => panic!("Expected single message, got batch"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_transport_batch_communication() {
+        use helix_core::GroupId;
+
+        // Use unique ports for this test.
+        let node2_addr: SocketAddr = "127.0.0.1:19202".parse().unwrap();
+        let node1_addr: SocketAddr = "127.0.0.1:19201".parse().unwrap();
+
+        // Start node 2 first (receiver).
+        let (transport2, mut incoming2) =
+            Transport::new(TransportConfig::new(NodeId::new(2), node2_addr));
+        let _handle2 = transport2.start().await.unwrap();
+
+        // Start node 1 with node 2 as a peer.
+        let (transport1, _incoming1) = Transport::new(
+            TransportConfig::new(NodeId::new(1), node1_addr)
+                .with_peer(NodeId::new(2), "127.0.0.1:19202"),
+        );
+        let handle1 = transport1.start().await.unwrap();
+
+        // Give transports time to connect.
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Send a batch of messages from node 1 to node 2.
+        let batch = vec![
+            GroupMessage::new(GroupId::new(1), make_test_message(1, 2)),
+            GroupMessage::new(GroupId::new(2), make_test_message(1, 2)),
+            GroupMessage::new(GroupId::new(1), make_test_message(1, 2)),
+        ];
+        let result = handle1.send_batch(NodeId::new(2), batch.clone()).await;
+        assert!(result.is_ok(), "Failed to send batch: {result:?}");
+
+        // Wait for the batch to be received.
+        let received = tokio::time::timeout(tokio::time::Duration::from_secs(2), incoming2.recv())
+            .await;
+
+        assert!(received.is_ok(), "Timeout waiting for batch");
+        let received_msg = received.unwrap();
+        assert!(received_msg.is_some(), "Channel closed");
+
+        // Should be a batch.
+        match received_msg.unwrap() {
+            IncomingMessage::Batch(msgs) => {
+                assert_eq!(msgs.len(), 3);
+                assert_eq!(msgs[0].group_id.get(), 1);
+                assert_eq!(msgs[1].group_id.get(), 2);
+                assert_eq!(msgs[2].group_id.get(), 1);
+            }
+            IncomingMessage::Single(_) => panic!("Expected batch, got single message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_send_batch_empty() {
+        let config = TransportConfig::new(NodeId::new(1), "127.0.0.1:0".parse().unwrap())
+            .with_peer(NodeId::new(2), "127.0.0.1:9999");
+
+        let (transport, _incoming_rx) = Transport::new(config);
+        let handle = transport.start().await.unwrap();
+
+        // Sending an empty batch should succeed immediately.
+        let result = handle.send_batch(NodeId::new(2), vec![]).await;
+        assert!(result.is_ok());
     }
 }

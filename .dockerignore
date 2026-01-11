@@ -1,0 +1,29 @@
+# Build artifacts - THIS IS THE BIG ONE
+target/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Rust
+*.rs.bk
+**/*.rs.bk
+
+# Test/temp files
+*.log
+*.tmp
+
+# TLA+ specs (not needed for runtime)
+specs/
+
+# Documentation (not needed for runtime)
+docs/
+*.md
+
+# Keep docker/ since Dockerfile is there

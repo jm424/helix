@@ -36,16 +36,18 @@
 #![warn(clippy::pedantic)]
 #![warn(clippy::nursery)]
 
+mod buffered;
 mod entry;
 mod error;
 mod segment;
 mod storage;
 mod wal;
 
+pub use buffered::{BufferedWal, BufferedWalConfig};
 pub use entry::{Entry, EntryHeader, ENTRY_HEADER_SIZE};
 pub use error::{WalError, WalResult};
 pub use segment::{Segment, SegmentConfig, SegmentHeader, SegmentId, SEGMENT_HEADER_SIZE};
-pub use storage::{Storage, StorageFile, TokioStorage};
+pub use storage::{FaultConfig, SimulatedStorage, Storage, StorageFile, TokioStorage};
 pub use wal::{Wal, WalConfig};
 
 /// WAL configuration limits.

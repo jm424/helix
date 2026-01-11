@@ -10,6 +10,7 @@
 //! storage should use `helix-wal` for durability. See storage.rs.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -17,9 +18,10 @@ use bytes::Bytes;
 use helix_core::{GroupId, LogIndex, NodeId, Offset, PartitionId, Record, TopicId};
 use helix_raft::multi::{MultiRaft, MultiRaftOutput};
 use helix_raft::RaftState;
+use helix_runtime::{IncomingMessage, PeerInfo, TransportConfig, TransportError, TransportHandle};
 use tokio::sync::{mpsc, RwLock};
 use tonic::{Request, Response, Status};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::storage::{
     DurablePartition, DurablePartitionConfig, DurablePartitionError, Partition, PartitionCommand,
@@ -347,6 +349,10 @@ pub struct HelixService {
     _shutdown_tx: mpsc::Sender<()>,
     /// Data directory for durable storage (None = in-memory only).
     data_dir: Option<PathBuf>,
+    /// Transport handle for sending Raft messages (multi-node only).
+    /// Kept to prevent the transport from being dropped (handle is cloned to tick task).
+    #[allow(dead_code)]
+    transport_handle: Option<TransportHandle>,
 }
 
 impl HelixService {
@@ -397,7 +403,82 @@ impl HelixService {
             cluster_nodes,
             _shutdown_tx: shutdown_tx,
             data_dir,
+            transport_handle: None,
         }
+    }
+
+    /// Creates a new Helix service with multi-node networking.
+    ///
+    /// This starts both the Raft tick task and the transport for peer
+    /// communication. Partition data is persisted to the specified directory.
+    ///
+    /// # Arguments
+    /// * `cluster_id` - Cluster identifier
+    /// * `node_id` - This node's numeric ID
+    /// * `listen_addr` - Address for Raft peer connections
+    /// * `peers` - List of other nodes in the cluster
+    /// * `data_dir` - Directory for persistent storage (optional for testing)
+    ///
+    /// # Errors
+    /// Returns an error if the transport cannot be started.
+    pub async fn new_multi_node(
+        cluster_id: String,
+        node_id: u64,
+        listen_addr: SocketAddr,
+        peers: Vec<PeerInfo>,
+        data_dir: Option<PathBuf>,
+    ) -> Result<Self, TransportError> {
+        let node_id = NodeId::new(node_id);
+
+        // Build cluster nodes list (self + peers).
+        let mut cluster_nodes = vec![node_id];
+        cluster_nodes.extend(peers.iter().map(|p| p.node_id));
+
+        // Create and start transport.
+        let mut transport_config = TransportConfig::new(node_id, listen_addr);
+        for peer in &peers {
+            transport_config = transport_config.with_peer(peer.node_id, peer.addr.clone());
+        }
+
+        let (transport, incoming_rx) = helix_runtime::Transport::new(transport_config);
+        let transport_handle = transport.start().await?;
+
+        let multi_raft = Arc::new(RwLock::new(MultiRaft::new(node_id)));
+        let partition_storage = Arc::new(RwLock::new(HashMap::new()));
+        let group_map = Arc::new(RwLock::new(GroupMap::new()));
+
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+
+        // Start background tick task with transport.
+        tokio::spawn(Self::tick_task_multi_node(
+            Arc::clone(&multi_raft),
+            Arc::clone(&partition_storage),
+            Arc::clone(&group_map),
+            transport_handle.clone(),
+            incoming_rx,
+            shutdown_rx,
+        ));
+
+        info!(
+            node_id = node_id.get(),
+            listen_addr = %listen_addr,
+            peer_count = peers.len(),
+            "Started multi-node Helix service"
+        );
+
+        Ok(Self {
+            cluster_id,
+            node_id,
+            multi_raft,
+            partition_storage,
+            group_map,
+            topics: Arc::new(RwLock::new(HashMap::new())),
+            next_topic_id: Arc::new(RwLock::new(1)),
+            cluster_nodes,
+            _shutdown_tx: shutdown_tx,
+            data_dir,
+            transport_handle: Some(transport_handle),
+        })
     }
 
     /// Background task to handle Raft ticks for all groups.
@@ -431,6 +512,155 @@ impl HelixService {
                         &partition_storage,
                         &group_map,
                     ).await;
+                }
+            }
+        }
+    }
+
+    /// Background task for multi-node operation.
+    ///
+    /// This handles both incoming Raft messages from peers and periodic ticks.
+    /// Messages are sent via the transport handle.
+    #[allow(clippy::significant_drop_tightening)]
+    async fn tick_task_multi_node(
+        multi_raft: Arc<RwLock<MultiRaft>>,
+        partition_storage: Arc<RwLock<HashMap<GroupId, PartitionStorage>>>,
+        group_map: Arc<RwLock<GroupMap>>,
+        transport_handle: TransportHandle,
+        mut incoming_rx: mpsc::Receiver<IncomingMessage>,
+        mut shutdown_rx: mpsc::Receiver<()>,
+    ) {
+        let mut tick_interval =
+            tokio::time::interval(tokio::time::Duration::from_millis(TICK_INTERVAL_MS));
+
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.recv() => {
+                    debug!("Multi-node tick task shutting down");
+                    break;
+                }
+                _ = tick_interval.tick() => {
+                    let outputs = {
+                        let mut mr = multi_raft.write().await;
+                        mr.tick()
+                    };
+                    Self::process_outputs_multi_node(
+                        &outputs,
+                        &partition_storage,
+                        &group_map,
+                        &transport_handle,
+                    ).await;
+                }
+                Some(incoming) = incoming_rx.recv() => {
+                    // Handle incoming messages from peers.
+                    let outputs = match incoming {
+                        IncomingMessage::Single(_message) => {
+                            // Single messages not expected in multi-node mode,
+                            // but handle them for backwards compatibility.
+                            warn!("Received single message in multi-node mode, expected batch");
+                            vec![]
+                        }
+                        IncomingMessage::Batch(group_messages) => {
+                            let mut mr = multi_raft.write().await;
+                            let mut all_outputs = Vec::new();
+                            for group_msg in group_messages {
+                                let outputs = mr.handle_message(
+                                    group_msg.group_id,
+                                    group_msg.message,
+                                );
+                                all_outputs.extend(outputs);
+                            }
+                            all_outputs
+                        }
+                    };
+                    Self::process_outputs_multi_node(
+                        &outputs,
+                        &partition_storage,
+                        &group_map,
+                        &transport_handle,
+                    ).await;
+                }
+            }
+        }
+    }
+
+    /// Processes Multi-Raft outputs with transport for sending messages.
+    async fn process_outputs_multi_node(
+        outputs: &[MultiRaftOutput],
+        partition_storage: &Arc<RwLock<HashMap<GroupId, PartitionStorage>>>,
+        group_map: &Arc<RwLock<GroupMap>>,
+        transport_handle: &TransportHandle,
+    ) {
+        for output in outputs {
+            match output {
+                MultiRaftOutput::CommitEntry {
+                    group_id,
+                    index,
+                    data,
+                } => {
+                    let key = {
+                        let gm = group_map.read().await;
+                        gm.get_key(*group_id)
+                    };
+
+                    if let Some((topic_id, partition_id)) = key {
+                        let mut storage = partition_storage.write().await;
+                        if let Some(ps) = storage.get_mut(group_id) {
+                            if let Err(e) = ps.apply_entry_async(*index, data).await {
+                                warn!(
+                                    topic = topic_id.get(),
+                                    partition = partition_id.get(),
+                                    error = %e,
+                                    "Failed to apply committed entry"
+                                );
+                            }
+                        }
+                    }
+                }
+                MultiRaftOutput::BecameLeader { group_id } => {
+                    let key = {
+                        let gm = group_map.read().await;
+                        gm.get_key(*group_id)
+                    };
+                    if let Some((topic_id, partition_id)) = key {
+                        info!(
+                            topic = topic_id.get(),
+                            partition = partition_id.get(),
+                            group = group_id.get(),
+                            "Became leader"
+                        );
+                    }
+                }
+                MultiRaftOutput::SteppedDown { group_id } => {
+                    let key = {
+                        let gm = group_map.read().await;
+                        gm.get_key(*group_id)
+                    };
+                    if let Some((topic_id, partition_id)) = key {
+                        info!(
+                            topic = topic_id.get(),
+                            partition = partition_id.get(),
+                            group = group_id.get(),
+                            "Stepped down from leader"
+                        );
+                    }
+                }
+                MultiRaftOutput::SendMessages { to, messages } => {
+                    // Send messages to peer via transport.
+                    if let Err(e) = transport_handle.send_batch(*to, messages.clone()).await {
+                        error!(
+                            to = to.get(),
+                            count = messages.len(),
+                            error = %e,
+                            "Failed to send messages to peer"
+                        );
+                    } else {
+                        debug!(
+                            to = to.get(),
+                            count = messages.len(),
+                            "Sent messages to peer"
+                        );
+                    }
                 }
             }
         }

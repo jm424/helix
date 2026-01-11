@@ -28,10 +28,22 @@ tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
+hdrhistogram = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
-tempfile = "3.10"
+criterion = { workspace = true }
+hdrhistogram = { workspace = true }
+tempfile = { workspace = true }
+tokio-stream = { workspace = true }
+
+[[bench]]
+name = "server_throughput"
+harness = false
+
+[[bin]]
+name = "helix-bench"
+path = "src/bin/helix_bench.rs"

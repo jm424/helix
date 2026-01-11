@@ -66,6 +66,13 @@ And verifying these properties ALWAYS hold:
 - Do NOT create new crates not in the plan without discussion
 - Do NOT mark phases complete without testing milestones
 
+### Benchmarking Rules
+
+- **NEVER run concurrent benchmarks** - results are unusable and will hang the machine
+- Run ONE benchmark at a time and wait for completion
+- Get user approval before running any benchmark
+- Present benchmark design for review before execution
+
 ### Deferred Items
 
 These items from the plan are intentionally deferred:

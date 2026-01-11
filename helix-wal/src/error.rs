@@ -92,6 +92,13 @@ pub enum WalError {
         /// Actual bytes found.
         found: u32,
     },
+
+    /// Invalid entry (e.g., empty batch).
+    #[error("invalid entry: {reason}")]
+    InvalidEntry {
+        /// Why the entry is invalid.
+        reason: &'static str,
+    },
 }
 
 impl WalError {

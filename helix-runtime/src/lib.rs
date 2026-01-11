@@ -40,10 +40,13 @@ mod config;
 mod server;
 mod transport;
 
-pub use codec::{decode_message, encode_message, CodecError, CodecResult};
+pub use codec::{
+    decode_group_batch, decode_message, encode_group_batch, encode_message, is_group_batch,
+    CodecError, CodecResult,
+};
 pub use config::{ConfigError, PeerConfig, ServerConfig, TimingConfig};
 pub use server::{OutgoingMessage, RaftServer, ServerCommand, ServerError, ServerEvent, ServerHandle};
 pub use transport::{
-    PeerInfo, Transport, TransportBuilder, TransportConfig, TransportError, TransportHandle,
-    TransportResult,
+    IncomingMessage, PeerInfo, Transport, TransportBuilder, TransportConfig, TransportError,
+    TransportHandle, TransportResult,
 };
