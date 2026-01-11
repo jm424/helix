@@ -7,9 +7,9 @@ This document tracks progress against the [implementation plan](../helix-impleme
 | Phase | Status | Completion |
 |-------|--------|------------|
 | Phase 0: Foundations | Partial | ~80% |
-| Phase 1: Core Consensus | ✅ Complete | 100% (WAL + benchmarks done) |
+| Phase 1: Core Consensus | ✅ Complete | 100% (WAL DST hardened, 500-seed stress test passing) |
 | Phase 2: Multi-Raft & Sharding | ⚠️ Partial | ~85% (missing shard movement) |
-| Phase 3: Storage Features | ⚠️ Partial | ~70% (helix-tier complete with real WAL tests) |
+| Phase 3: Storage Features | ⚠️ Partial | ~70% (helix-tier complete, helix-progress not started) |
 | Phase 4: API & Flow Control | ⚠️ Partial | ~80% (multi-node networking done, flow control/kafka not started) |
 | Phase 5: Production Readiness | Not Started | 0% |
 
@@ -109,25 +109,30 @@ The plan requires:
 | Item | Status |
 |------|--------|
 | Unit tests for segment format | ✅ Done |
-| DST: random write/read sequences | ✅ Done (27 tests with SimulatedStorage) |
+| DST: random write/read sequences | ✅ Done (29 tests with SimulatedStorage) |
 | DST: crash recovery with torn writes | ✅ Done (torn writes at various positions) |
 | DST: concurrent append + read | ✅ Done |
 | DST: corrupted segment/entry recovery | ✅ Done (conservative: skip segment on CRC mismatch) |
 | DST: fsync failure handling | ✅ Done |
 | DST: segment rotation crashes | ✅ Done |
 | DST: truncation across segments | ✅ Done (gap and overlap detection on recovery) |
-| DST: comprehensive stress test | ⚠️ Partial (1 failure due to SimulatedStorage limitations) |
+| DST: comprehensive stress test | ✅ Done (500 seeds × 100 ops, 25% fault rates) |
 
-**Recent Improvements:**
+**Recent Bug Fixes (via DST):**
+1. **In-memory truncation before on-disk sync** (seed 2074002)
+   - Bug: Sealed segment truncation modified in-memory state before disk sync. If sync failed, segment wouldn't be retried.
+   - Fix: Clone segment, truncate clone, sync, only modify original on success.
+
+2. **Recovery not rewriting overlapping segments** (seed 2074002)
+   - Bug: When recovery detected overlapping segments, in-memory was truncated but on-disk wasn't rewritten.
+   - Fix: Rewrite overlapping segments to disk during recovery.
+
+**Other Improvements:**
 - Fixed `truncate_after` to update `last_index` atomically before file operations
 - Added gap detection during recovery (handles failed truncation leaving deleted segment files)
 - Added overlap detection during recovery (handles failed truncation leaving stale segment data)
 - Best-effort file operations during truncation (won't fail if file ops fail)
-
-**Known Limitations:**
-- SimulatedStorage doesn't model crash semantics (un-synced data lost on crash)
-- Comprehensive stress test has 1 content corruption failure due to this limitation
-- For production use with real storage, fsync ensures proper durability
+- Added `Clone` derive to `Segment` struct for safe truncation operations
 
 #### 1.2 Raft State Machine
 
@@ -341,122 +346,73 @@ Missing: `helix-kafka-proxy` crate.
 
 ---
 
-## Recommended Next Steps
+## Recently Completed
 
-### Recently Completed
+| Component | Key Achievements |
+|-----------|------------------|
+| **Tick-based Raft** | DST-friendly timing, randomized elections, heartbeats |
+| **Bloodhound DST** | 150+ seeds, property checking, fault injection |
+| **Multi-Raft** | Message batching, tick-based timing, group lifecycle |
+| **helix-server** | Multi-Raft integration, GroupMap, 11 tests |
+| **helix-wal** | Disk persistence, crash recovery, 29 tests + 500-seed stress |
+| **DurablePartition** | WAL-backed storage, recovery, tiering hooks |
+| **Multi-node networking** | TCP transport, batch encoding, Docker 3-node cluster |
+| **Benchmarking** | 1.43M writes/sec (single), 129K writes/sec (3-node) |
+| **helix-tier** | S3 abstraction, DST (43 tests), 2 bugs found/fixed |
 
-1. **Tick-based timing** ✅ Done
-   - Refactored `RaftNode` to use internal tick counter
-   - `tick()` API drives both elections and heartbeats
-   - Randomized election timeout prevents thundering herd
-   - DST-friendly by design - just call `tick()` N times
+**Bugs Found via DST:**
+- helix-tier: orphaned data (seed 197562), ordering violation (seed 17)
+- helix-wal: in-memory truncation before sync (seed 2074002), recovery overlap bug (seed 2074002)
 
-2. **Bloodhound simulation tests** ✅ Done
-   - Network partition injection
-   - Node crash/restart scenarios
-   - Multiple random seeds (150+)
-   - Property checking (SingleLeaderPerTerm, LogMatching, LeaderCompleteness)
+---
 
-3. **Multi-Raft engine** ✅ Done
-   - Message batching to same node
-   - Tick-based timing for all groups
-   - Internal randomized election timeouts
+## Prioritized Next Steps
 
-4. **helix-server Multi-Raft integration** ✅ Done
-   - Replaced `ReplicationManager` with `MultiRaft` engine
-   - Added `GroupMap` for (TopicId, PartitionId) ↔ GroupId mapping
-   - Single tick task drives all groups efficiently
-   - All 10 server tests pass
+### Priority 1: Complete Phase 3 (Storage Features)
 
-5. **helix-wal disk persistence** ✅ Done
-   - Storage trait abstraction for future `io_uring` support
-   - TokioStorage implementation using `tokio::fs`
-   - Wal struct managing segments with disk I/O
-   - Group commit via `sync_on_write` config
-   - Crash recovery from segment files
-   - 20 tests passing
-
-6. **helix-wal integration into helix-server** ✅ Done
-   - `DurablePartition` wraps WAL for crash-safe storage
-   - In-memory cache (`Partition`) for fast reads
-   - Configurable: `HelixService::new()` for in-memory, `with_data_dir()` for durable
-   - Write path: WAL append → sync (if configured) → update cache
-   - Recovery: Replay WAL entries to rebuild cache on startup
-   - Per RFC: WAL is the source of truth for Tier 1 (Hot) data
-
-7. **Multi-node Raft networking** ✅ Done
-   - Extended `helix-runtime/codec.rs` with `GroupMessage` batch encoding (TAG=7)
-   - Added `send_batch()` to `TransportHandle` for Multi-Raft output
-   - Added `IncomingMessage` enum to handle both single messages and batches
-   - Added `HelixService::new_multi_node()` constructor with transport integration
-   - Added CLI args: `--raft-addr`, `--peer node_id:host:port`, `--data-dir`
-   - Created `docker/Dockerfile` and `docker/docker-compose.yml` for 3-node cluster
-   - 35 tests passing (25 helix-runtime + 10 helix-server)
-
-8. **Phase 1.4 Benchmarking** ✅ Done
-   - Created `helix-bench` standalone benchmark tool
-   - Created criterion benchmarks for WAL (write/read)
-   - Created criterion benchmarks for server throughput
-   - Documented results in `docs/BENCHMARKS.md`
-   - Key results (single-node, 4 clients):
-     - Write: 1.43M records/sec, p99=701us
-     - Read: 1.58M records/sec, p99=462us
-     - End-to-end: 6.8K ops/sec, p99=244us
-   - Multi-node (3-node Docker, 4 clients):
-     - Write: 129K records/sec, p99=8.7ms
-
-9. **helix-tier crate** ✅ Done (wired into DurablePartition)
-   - `ObjectStorage` trait for S3-like operations (put, get, delete, list, exists)
-   - `SimulatedObjectStorage` with deterministic fault injection
-   - `ObjectStorageFaultConfig` for configurable failure rates and corruption
-   - `SegmentMetadata` and `MetadataStore` for tracking segment locations
-   - `TieringManager` for orchestrating uploads/downloads
-   - `IntegratedTieringManager` with `SegmentReader` trait for WAL integration
-   - `helix-wal` has segment access: `sealed_segment_ids()`, `read_segment_bytes()`, `segment_info()`
-   - Fixed RNG bug: `(seed + counter) * M` formula (also fixed in helix-wal)
-   - TigerStyle assertions added (improved from 0.9 to 1.04 per function)
-   - `WalSegmentReader` implements `SegmentReader` for `DurablePartition`
-   - `DurablePartitionConfig.with_tiering()` enables tiering
-   - Hooks: `check_and_register_sealed_segments()`, `on_entries_committed()`, `tier_eligible_segments()`
-   - 11 helix-server tests pass (including tiering integration test)
-   - **DST hardening**: FaultingSegmentReader, find_stuck_uploads/try_claim fault injection
-   - **Invariant checking**: ordering (sealed→committed→tiered), referential integrity, orphan detection
-   - **Comprehensive stress test**: 500 seeds × 100 ops with 25% fault rates
-   - **2 bugs found via DST**: orphaned data bug (seed 197562), ordering violation (seed 17)
-
-### Optional Enhancements
-
-4. **Add hash-based routing**
-   - Wire `ShardRouter` for key-based routing
-   - Currently using explicit partition routing (Kafka-compatible)
-
-5. **Add TLA+ trace validation**
-   - Compare implementation traces against TLA+ spec
-
-### Next Phase: Storage Features (Phase 3)
-
-6. **Bloodhound e2e tests for tiering** ✅ Done
-   - 8 new e2e tests: init, hooks, idempotent, no-tiering, concurrent, config, multi-partition, stress
-   - DST hardening: FaultingSegmentReader, find_stuck/try_claim fault injection
-   - Invariants: ordering, referential integrity, orphan detection
-   - 500-seed comprehensive stress test with 25% fault rates
-   - **2 bugs found via DST** (fixed): orphaned data, ordering violation
-   - Total: 43 tiering tests
-
-7. **S3ObjectStorage** - Real S3 implementation
-   - Behind `s3` feature flag
-   - Integration test with localstack
-
-8. **helix-progress** - Consumer progress tracking
+**1. helix-progress** - Consumer progress tracking ⭐ CRITICAL
+   - Required for Phase 3 checkpoint: "Complete data lifecycle (write→tier→read)"
    - Offset commits with leases
    - Consumer group coordination
+   - Low watermark advancement
+   - DST testing with lease expiration, redelivery, node failures
+   - Estimated: 2-3 weeks
 
-### Deferred
+**2. S3ObjectStorage** - Real S3 implementation
+   - Behind `s3` feature flag (aws-sdk-s3)
+   - Integration test with localstack
+   - Retry logic with exponential backoff
+   - Estimated: 1 week
 
-- CI pipeline setup (run tests locally for now)
-- io_uring storage implementation
-- Kafka compatibility proxy
-- Configuration changes (joint consensus)
+### Priority 2: Complete Phase 2 (Multi-Raft)
+
+**3. Shard Movement** - Transfer shards between groups
+   - Required for Phase 2 checkpoint: "Shard transfer works under faults"
+   - Snapshot + catchup transfer protocol
+   - DST testing with concurrent writes, failures, retries
+   - Estimated: 2-3 weeks
+
+### Priority 3: Phase 4 Completion
+
+**4. helix-flow** - Flow control
+   - Token buckets for rate limiting
+   - Weighted fair queuing for IO classes
+   - AIMD controller for adaptive limits
+   - Estimated: 1-2 weeks
+
+**5. helix-kafka-proxy** - Kafka compatibility
+   - Protocol translation layer
+   - Topic/partition mapping
+   - Offset translation
+   - Estimated: 2-3 weeks
+
+### Optional / Deferred
+
+- **TLA+ trace validation** - Compare implementation traces against spec
+- **Hash-based routing** - Wire ShardRouter for key-based routing
+- **io_uring storage** - High-performance Linux I/O
+- **Configuration changes** - Joint consensus for membership changes
+- **CI pipeline** - Run tests locally for now
 
 ---
 
@@ -475,4 +431,4 @@ Missing: `helix-kafka-proxy` crate.
 | `helix-server` | ✅ Complete | Multi-Raft done, WAL-backed durable storage integrated |
 | `helix-kafka-proxy` | ❌ Missing | Need to create |
 | `helix-cli` | ❌ Missing | Need to create |
-| `helix-tests` | ✅ Good | DST-friendly tick-based tests, faults, 150+ seeds, WAL DST (23 tests), Tier tests (43 tests: 8 e2e + 500-seed stress + concurrent) |
+| `helix-tests` | ✅ Good | DST-friendly tick-based tests, faults, 150+ seeds, WAL DST (29 tests + 500-seed stress), Tier tests (43 tests) |
