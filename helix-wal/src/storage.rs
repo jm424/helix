@@ -270,6 +270,18 @@ pub struct FaultConfig {
     pub fsync_fail_rate: f64,
     /// Probability of read returning corrupted data. Range: 0.0 - 1.0.
     pub read_corruption_rate: f64,
+    /// Probability of read operation failing completely. Range: 0.0 - 1.0.
+    pub read_fail_rate: f64,
+    /// Probability of write operation failing. Range: 0.0 - 1.0.
+    pub write_fail_rate: f64,
+    /// Probability of exists check failing. Range: 0.0 - 1.0.
+    pub exists_fail_rate: f64,
+    /// Probability of `list_files` failing. Range: 0.0 - 1.0.
+    pub list_files_fail_rate: f64,
+    /// Probability of file open failing. Range: 0.0 - 1.0.
+    pub open_fail_rate: f64,
+    /// Probability of file remove failing. Range: 0.0 - 1.0.
+    pub remove_fail_rate: f64,
     /// If true, next write will be torn at the configured byte offset.
     pub force_torn_write_at: Option<usize>,
     /// If true, next fsync will fail.
@@ -284,6 +296,12 @@ impl Default for FaultConfig {
             torn_write_rate: 0.0,
             fsync_fail_rate: 0.0,
             read_corruption_rate: 0.0,
+            read_fail_rate: 0.0,
+            write_fail_rate: 0.0,
+            exists_fail_rate: 0.0,
+            list_files_fail_rate: 0.0,
+            open_fail_rate: 0.0,
+            remove_fail_rate: 0.0,
             force_torn_write_at: None,
             force_fsync_fail: false,
             force_disk_full: false,
@@ -305,8 +323,56 @@ impl FaultConfig {
             torn_write_rate: 0.01,
             fsync_fail_rate: 0.005,
             read_corruption_rate: 0.001,
+            read_fail_rate: 0.005,
+            write_fail_rate: 0.005,
+            exists_fail_rate: 0.002,
+            list_files_fail_rate: 0.002,
+            open_fail_rate: 0.002,
+            remove_fail_rate: 0.002,
             ..Default::default()
         }
+    }
+
+    /// Sets the read fail rate.
+    #[must_use]
+    pub const fn with_read_fail_rate(mut self, rate: f64) -> Self {
+        self.read_fail_rate = rate;
+        self
+    }
+
+    /// Sets the write fail rate.
+    #[must_use]
+    pub const fn with_write_fail_rate(mut self, rate: f64) -> Self {
+        self.write_fail_rate = rate;
+        self
+    }
+
+    /// Sets the exists check fail rate.
+    #[must_use]
+    pub const fn with_exists_fail_rate(mut self, rate: f64) -> Self {
+        self.exists_fail_rate = rate;
+        self
+    }
+
+    /// Sets the `list_files` fail rate.
+    #[must_use]
+    pub const fn with_list_files_fail_rate(mut self, rate: f64) -> Self {
+        self.list_files_fail_rate = rate;
+        self
+    }
+
+    /// Sets the open fail rate.
+    #[must_use]
+    pub const fn with_open_fail_rate(mut self, rate: f64) -> Self {
+        self.open_fail_rate = rate;
+        self
+    }
+
+    /// Sets the remove fail rate.
+    #[must_use]
+    pub const fn with_remove_fail_rate(mut self, rate: f64) -> Self {
+        self.remove_fail_rate = rate;
+        self
     }
 
     /// Sets the torn write rate.
@@ -357,12 +423,16 @@ impl FaultConfig {
 #[derive(Debug)]
 #[allow(clippy::significant_drop_tightening, clippy::missing_panics_doc)]
 pub struct SimulatedStorage {
-    /// In-memory file contents. Uses interior mutability for trait compliance.
+    /// In-memory file contents (dirty - may not be synced).
     files: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>>,
+    /// Synced file contents (durable - survives crash).
+    synced_files: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>>,
     /// Fault injection configuration.
     fault_config: std::sync::Arc<std::sync::Mutex<FaultConfig>>,
     /// RNG seed for deterministic fault injection.
     seed: u64,
+    /// Counter for deterministic fault injection on storage-level operations.
+    op_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[allow(clippy::missing_panics_doc)]
@@ -372,8 +442,10 @@ impl SimulatedStorage {
     pub fn new(seed: u64) -> Self {
         Self {
             files: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            synced_files: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             fault_config: std::sync::Arc::new(std::sync::Mutex::new(FaultConfig::default())),
             seed,
+            op_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -382,9 +454,36 @@ impl SimulatedStorage {
     pub fn with_faults(seed: u64, config: FaultConfig) -> Self {
         Self {
             files: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            synced_files: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             fault_config: std::sync::Arc::new(std::sync::Mutex::new(config)),
             seed,
+            op_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Simulates a crash by reverting all files to their last synced state.
+    /// Un-synced data is lost.
+    pub fn simulate_crash(&self) {
+        let synced = self.synced_files.lock().expect("synced_files lock poisoned");
+        let mut files = self.files.lock().expect("files lock poisoned");
+        files.clone_from(&synced);
+    }
+
+    /// Simple deterministic RNG for fault injection at storage level.
+    fn should_inject_fault(&self, rate: f64) -> bool {
+        if rate <= 0.0 {
+            return false;
+        }
+        if rate >= 1.0 {
+            return true;
+        }
+        let counter = self
+            .op_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let hash = self.seed.wrapping_add(counter).wrapping_mul(0x5851_f42d_4c95_7f2d);
+        #[allow(clippy::cast_precision_loss)]
+        let normalized = (hash as f64) / (u64::MAX as f64);
+        normalized < rate
     }
 
     /// Returns a reference to the fault configuration for modification.
@@ -397,6 +496,20 @@ impl SimulatedStorage {
     pub fn get_raw_content(&self, path: &Path) -> Option<Vec<u8>> {
         let files = self.files.lock().expect("files lock poisoned");
         files.get(path).cloned()
+    }
+
+    /// Gets the synced (durable) file content for inspection in tests.
+    #[must_use]
+    pub fn get_synced_content(&self, path: &Path) -> Option<Vec<u8>> {
+        let synced = self.synced_files.lock().expect("synced_files lock poisoned");
+        synced.get(path).cloned()
+    }
+
+    /// Returns all synced file paths for inspection in tests.
+    #[must_use]
+    pub fn synced_file_paths(&self) -> Vec<std::path::PathBuf> {
+        let synced = self.synced_files.lock().expect("synced_files lock poisoned");
+        synced.keys().cloned().collect()
     }
 
     /// Sets raw file content directly (for simulating corruption).
@@ -428,8 +541,10 @@ impl Clone for SimulatedStorage {
     fn clone(&self) -> Self {
         Self {
             files: self.files.clone(),
+            synced_files: self.synced_files.clone(),
             fault_config: self.fault_config.clone(),
             seed: self.seed,
+            op_counter: self.op_counter.clone(),
         }
     }
 }
@@ -438,6 +553,17 @@ impl Clone for SimulatedStorage {
 #[allow(clippy::significant_drop_tightening)]
 impl Storage for SimulatedStorage {
     async fn open(&self, path: &Path) -> WalResult<Box<dyn StorageFile>> {
+        // Check for open failure.
+        {
+            let config = self.fault_config.lock().expect("fault config lock poisoned");
+            if self.should_inject_fault(config.open_fail_rate) {
+                return Err(WalError::Io {
+                    operation: "open",
+                    message: "open failed (simulated)".to_string(),
+                });
+            }
+        }
+
         let mut files = self.files.lock().expect("files lock poisoned");
         files.entry(path.to_path_buf()).or_default();
         drop(files);
@@ -445,6 +571,7 @@ impl Storage for SimulatedStorage {
         Ok(Box::new(SimulatedFile {
             path: path.to_path_buf(),
             files: self.files.clone(),
+            synced_files: self.synced_files.clone(),
             fault_config: self.fault_config.clone(),
             seed: self.seed,
             write_counter: std::sync::atomic::AtomicU64::new(0),
@@ -452,11 +579,33 @@ impl Storage for SimulatedStorage {
     }
 
     async fn exists(&self, path: &Path) -> WalResult<bool> {
+        // Check for exists failure.
+        {
+            let config = self.fault_config.lock().expect("fault config lock poisoned");
+            if self.should_inject_fault(config.exists_fail_rate) {
+                return Err(WalError::Io {
+                    operation: "exists",
+                    message: "exists check failed (simulated)".to_string(),
+                });
+            }
+        }
+
         let files = self.files.lock().expect("files lock poisoned");
         Ok(files.contains_key(path))
     }
 
     async fn list_files(&self, dir: &Path, extension: &str) -> WalResult<Vec<std::path::PathBuf>> {
+        // Check for list_files failure.
+        {
+            let config = self.fault_config.lock().expect("fault config lock poisoned");
+            if self.should_inject_fault(config.list_files_fail_rate) {
+                return Err(WalError::Io {
+                    operation: "list_files",
+                    message: "list_files failed (simulated)".to_string(),
+                });
+            }
+        }
+
         let files = self.files.lock().expect("files lock poisoned");
         let mut result: Vec<_> = files
             .keys()
@@ -470,8 +619,25 @@ impl Storage for SimulatedStorage {
     }
 
     async fn remove(&self, path: &Path) -> WalResult<()> {
+        // Check for remove failure.
+        {
+            let config = self.fault_config.lock().expect("fault config lock poisoned");
+            if self.should_inject_fault(config.remove_fail_rate) {
+                return Err(WalError::Io {
+                    operation: "remove",
+                    message: "remove failed (simulated)".to_string(),
+                });
+            }
+        }
+
+        // Remove from both dirty and synced state (removal is atomic).
         let mut files = self.files.lock().expect("files lock poisoned");
         files.remove(path);
+        drop(files);
+
+        let mut synced = self.synced_files.lock().expect("synced_files lock poisoned");
+        synced.remove(path);
+
         Ok(())
     }
 
@@ -490,6 +656,7 @@ impl Storage for SimulatedStorage {
 struct SimulatedFile {
     path: std::path::PathBuf,
     files: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>>,
+    synced_files: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>>,
     fault_config: std::sync::Arc<std::sync::Mutex<FaultConfig>>,
     seed: u64,
     write_counter: std::sync::atomic::AtomicU64,
@@ -520,6 +687,14 @@ impl StorageFile for SimulatedFile {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let config = self.fault_config.lock().expect("fault config lock poisoned");
+
+        // Check for write failure.
+        if self.should_inject_fault(config.write_fail_rate, counter) {
+            return Err(WalError::Io {
+                operation: "write",
+                message: "write failed (simulated)".to_string(),
+            });
+        }
 
         // Check for disk full.
         if config.force_disk_full {
@@ -572,6 +747,20 @@ impl StorageFile for SimulatedFile {
     }
 
     async fn read_at(&self, offset: u64, len: usize) -> WalResult<Bytes> {
+        // Check for read failure first.
+        {
+            let config = self.fault_config.lock().expect("fault config lock poisoned");
+            let counter = self
+                .write_counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.should_inject_fault(config.read_fail_rate, counter) {
+                return Err(WalError::Io {
+                    operation: "read",
+                    message: "read failed (simulated)".to_string(),
+                });
+            }
+        }
+
         let files = self.files.lock().expect("files lock poisoned");
         let content = files.get(&self.path).ok_or_else(|| WalError::Io {
             operation: "read",
@@ -627,8 +816,15 @@ impl StorageFile for SimulatedFile {
                 message: "fsync failed (simulated)".to_string(),
             });
         }
+        drop(config);
 
-        // In simulated storage, sync is a no-op (data is already "durable").
+        // Copy current file content to synced state (makes it durable).
+        let files = self.files.lock().expect("files lock poisoned");
+        if let Some(content) = files.get(&self.path) {
+            let mut synced = self.synced_files.lock().expect("synced_files lock poisoned");
+            synced.insert(self.path.clone(), content.clone());
+        }
+
         Ok(())
     }
 

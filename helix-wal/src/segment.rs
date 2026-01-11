@@ -229,7 +229,7 @@ impl SegmentHeader {
 ///
 /// This is designed to work with Bloodhound's simulated storage for
 /// deterministic testing.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Segment {
     /// Segment header.
     header: SegmentHeader,
@@ -385,7 +385,19 @@ impl Segment {
     /// Currently infallible, but returns `Result` for future extensibility.
     pub fn truncate_after(&mut self, last_index_to_keep: u64) -> WalResult<()> {
         assert!(!self.sealed, "cannot truncate sealed segment");
+        self.truncate_entries_after(last_index_to_keep)
+    }
 
+    /// Truncates in-memory entries after the given index.
+    ///
+    /// This works on both sealed and unsealed segments. For sealed segments,
+    /// this only affects the in-memory representation - the on-disk file
+    /// is not modified. This is used during WAL truncation to remove stale
+    /// entries from sealed segments.
+    ///
+    /// # Errors
+    /// Currently infallible, but returns `Result` for future extensibility.
+    pub fn truncate_entries_after(&mut self, last_index_to_keep: u64) -> WalResult<()> {
         if self.entries.is_empty() {
             return Ok(());
         }

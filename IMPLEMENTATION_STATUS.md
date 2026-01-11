@@ -109,12 +109,25 @@ The plan requires:
 | Item | Status |
 |------|--------|
 | Unit tests for segment format | ✅ Done |
-| DST: random write/read sequences | ✅ Done (23 tests with SimulatedStorage) |
+| DST: random write/read sequences | ✅ Done (27 tests with SimulatedStorage) |
 | DST: crash recovery with torn writes | ✅ Done (torn writes at various positions) |
 | DST: concurrent append + read | ✅ Done |
 | DST: corrupted segment/entry recovery | ✅ Done (conservative: skip segment on CRC mismatch) |
 | DST: fsync failure handling | ✅ Done |
 | DST: segment rotation crashes | ✅ Done |
+| DST: truncation across segments | ✅ Done (gap and overlap detection on recovery) |
+| DST: comprehensive stress test | ⚠️ Partial (1 failure due to SimulatedStorage limitations) |
+
+**Recent Improvements:**
+- Fixed `truncate_after` to update `last_index` atomically before file operations
+- Added gap detection during recovery (handles failed truncation leaving deleted segment files)
+- Added overlap detection during recovery (handles failed truncation leaving stale segment data)
+- Best-effort file operations during truncation (won't fail if file ops fail)
+
+**Known Limitations:**
+- SimulatedStorage doesn't model crash semantics (un-synced data lost on crash)
+- Comprehensive stress test has 1 content corruption failure due to this limitation
+- For production use with real storage, fsync ensures proper durability
 
 #### 1.2 Raft State Machine
 

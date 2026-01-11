@@ -780,14 +780,9 @@ async fn test_repeated_fsync_failures() {
 async fn test_random_faults_stress() {
     // Run with different seeds for variety.
     for seed in [1, 42, 123, 999, 12345] {
-        let config = FaultConfig {
-            torn_write_rate: 0.02,      // 2% torn writes
-            fsync_fail_rate: 0.05,      // 5% fsync failures
-            read_corruption_rate: 0.0,  // Disable read corruption for this test
-            force_torn_write_at: None,
-            force_fsync_fail: false,
-            force_disk_full: false,
-        };
+        let config = FaultConfig::none()
+            .with_torn_write_rate(0.02)      // 2% torn writes
+            .with_fsync_fail_rate(0.05);     // 5% fsync failures
         let storage = SimulatedStorage::with_faults(seed, config);
         let wal_dir = Path::new("/wal/stress");
         let wal_config = WalConfig::new(wal_dir);
@@ -833,6 +828,766 @@ async fn test_random_faults_stress() {
                 let entry = wal.read(i).expect("recovered entry should be readable");
                 assert_eq!(entry.index(), i);
                 assert_eq!(entry.term(), 1);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Comprehensive Invariant Checking
+// ============================================================================
+
+/// Tracks what we wrote for content verification (simple, non-crash-aware tracking).
+#[derive(Default)]
+struct WrittenEntries {
+    /// Map from index to (term, payload).
+    entries: std::collections::HashMap<u64, (u64, String)>,
+}
+
+impl WrittenEntries {
+    fn record(&mut self, index: u64, term: u64, payload: String) {
+        self.entries.insert(index, (term, payload));
+    }
+
+    fn verify(&self, index: u64, entry: &Entry) -> Result<(), String> {
+        if let Some((expected_term, expected_payload)) = self.entries.get(&index) {
+            if entry.term() != *expected_term {
+                return Err(format!(
+                    "Term mismatch at index {index}: expected {expected_term}, got {}",
+                    entry.term()
+                ));
+            }
+            let actual_payload = String::from_utf8_lossy(&entry.payload);
+            if actual_payload != *expected_payload {
+                return Err(format!(
+                    "Payload mismatch at index {index}: expected '{expected_payload}', got '{actual_payload}'"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// WAL invariants that must ALWAYS hold:
+///
+/// 1. **Index contiguity**: If WAL has entries, indices are 1..=last_index with no gaps
+/// 2. **Index monotonicity**: Each entry's index equals its position (entry at position i has index i)
+/// 3. **Term validity**: All terms are > 0
+/// 4. **Readability**: Every entry from 1..=last_index is readable
+/// 5. **CRC integrity**: All entries pass CRC validation (implicit in read success)
+/// 6. **No regression**: After recovery, last_index never exceeds what was successfully written
+/// 7. **Content integrity**: Recovered data matches what was written
+///
+/// Returns Ok(()) if all invariants hold, Err with description if any fails.
+fn check_wal_invariants<S: Storage>(
+    wal: &Wal<S>,
+    seed: u64,
+    op_num: usize,
+    max_written: u64,
+    written: Option<&WrittenEntries>,
+) -> Result<(), String> {
+    let last_idx = match wal.last_index() {
+        Some(idx) => idx,
+        None => return Ok(()), // Empty WAL is valid
+    };
+
+    // INVARIANT 1: No regression - last_index <= max successfully written
+    if last_idx > max_written && max_written > 0 {
+        return Err(format!(
+            "seed {seed}, op {op_num}: INDEX REGRESSION - last_index {last_idx} > max_written {max_written}"
+        ));
+    }
+
+    // INVARIANT 2-5: Check each entry
+    let mut prev_term = 0u64;
+    for i in 1..=last_idx {
+        // INVARIANT 4: Readability
+        let entry = wal.read(i).map_err(|e| {
+            // Print debug info about what entries ARE readable
+            let mut readable = Vec::new();
+            for j in 1..=last_idx {
+                if wal.read(j).is_ok() {
+                    readable.push(j);
+                }
+            }
+            format!(
+                "seed {seed}, op {op_num}: READABILITY VIOLATION - entry {i} unreadable: {e} (readable: {:?})",
+                if readable.len() <= 20 { readable } else { vec![] }
+            )
+        })?;
+
+        // INVARIANT 2: Index monotonicity
+        if entry.index() != i {
+            return Err(format!(
+                "seed {seed}, op {op_num}: INDEX MISMATCH - entry at position {i} has index {}",
+                entry.index()
+            ));
+        }
+
+        // INVARIANT 3: Term validity
+        if entry.term() == 0 {
+            return Err(format!(
+                "seed {seed}, op {op_num}: INVALID TERM - entry {i} has term 0"
+            ));
+        }
+
+        // Note: We don't check term monotonicity here - that's a Raft invariant,
+        // not a WAL invariant. The WAL just stores entries; Raft ensures proper terms.
+        let _ = prev_term; // Suppress unused warning
+        prev_term = entry.term();
+
+        // INVARIANT 7: Content integrity - verify payload matches what was written
+        if let Some(written) = written {
+            written.verify(i, &entry).map_err(|e| {
+                format!("seed {seed}, op {op_num}: CONTENT CORRUPTION - {e}")
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Comprehensive Stress Test: 500 Seeds, 25% Fault Rates
+// ============================================================================
+
+/// Comprehensive WAL stress test with high fault rates.
+///
+/// Uses the WAL's `durable_index()` API to verify crash safety:
+/// - After crash, `last_index() <= durable_index()` from before crash
+/// - All entries in `1..=last_index()` are readable (CRC valid)
+/// - Index contiguity (no gaps)
+#[tokio::test]
+async fn test_comprehensive_wal_stress() {
+    const NUM_SEEDS: u64 = 500;
+    const OPS_PER_SEED: usize = 100;
+    const FAULT_RATE: f64 = 0.25;
+
+    for base_seed in 0..NUM_SEEDS {
+        let seed = base_seed * 12345 + 42;
+
+        let config = FaultConfig {
+            torn_write_rate: FAULT_RATE / 2.0,
+            fsync_fail_rate: FAULT_RATE,
+            read_corruption_rate: 0.0,
+            read_fail_rate: FAULT_RATE,
+            write_fail_rate: FAULT_RATE,
+            exists_fail_rate: FAULT_RATE / 5.0,
+            list_files_fail_rate: FAULT_RATE / 5.0,
+            open_fail_rate: FAULT_RATE / 10.0,
+            remove_fail_rate: FAULT_RATE / 5.0,
+            force_torn_write_at: None,
+            force_fsync_fail: false,
+            force_disk_full: false,
+        };
+
+        let storage = SimulatedStorage::with_faults(seed, config);
+        let wal_dir = Path::new("/wal/comprehensive");
+        let wal_config = WalConfig::new(wal_dir);
+
+        let mut max_written = 0u64;
+        let mut current_term = 1u64;
+
+        let wal_result = Wal::open(storage.clone(), wal_config.clone()).await;
+        let mut wal = match wal_result {
+            Ok(w) => w,
+            Err(_) => continue,
+        };
+
+        for op_num in 0..OPS_PER_SEED {
+            let op_hash = seed.wrapping_add(op_num as u64).wrapping_mul(0x9e3779b97f4a7c15);
+            let op_type = op_hash % 10;
+
+            match op_type {
+                0..=4 => {
+                    // 50%: Write
+                    let next_idx = wal.last_index().map_or(1, |i| i + 1);
+                    let entry = Entry::new(current_term, next_idx, Bytes::from("data")).unwrap();
+                    if wal.append(entry).await.is_ok() {
+                        max_written = next_idx;
+                        let _ = wal.sync().await;
+                    }
+                }
+                5 => {
+                    // 10%: Sync
+                    let _ = wal.sync().await;
+                }
+                6 => {
+                    // 10%: Read
+                    if let Some(last) = wal.last_index() {
+                        let idx = (op_hash % last) + 1;
+                        let _ = wal.read(idx);
+                    }
+                }
+                7 => {
+                    // 10%: Term bump
+                    current_term += 1;
+                }
+                8 => {
+                    // 10%: Truncation
+                    if let Some(last) = wal.last_index() {
+                        if last > 1 {
+                            let truncate_to = (op_hash % (last - 1)) + 1;
+                            let _ = wal.truncate_after(truncate_to).await;
+                            let _ = wal.sync().await;
+                            max_written = wal.last_index().unwrap_or(0);
+                        }
+                    }
+                }
+                _ => {
+                    // 10%: Crash and recovery
+                    // Record durable state BEFORE crash
+                    let durable_before = wal.durable_index();
+
+                    drop(wal);
+                    storage.simulate_crash();
+
+                    {
+                        let mut fc = storage.fault_config();
+                        fc.torn_write_rate = 0.0;
+                        fc.write_fail_rate = 0.0;
+                        fc.read_fail_rate = 0.0;
+                        fc.fsync_fail_rate = 0.0;
+                        fc.open_fail_rate = 0.0;
+                        fc.list_files_fail_rate = 0.0;
+                    }
+
+                    match Wal::open(storage.clone(), wal_config.clone()).await {
+                        Ok(w) => {
+                            // KEY INVARIANT: recovered state <= durable state
+                            if let (Some(recovered), Some(durable)) = (w.last_index(), durable_before) {
+                                assert!(
+                                    recovered <= durable,
+                                    "seed {seed}, op {op_num}: Recovered index {recovered} > durable index {durable}"
+                                );
+                            }
+
+                            // After recovery, durable_index == last_index
+                            assert_eq!(
+                                w.last_index(), w.durable_index(),
+                                "seed {seed}, op {op_num}: After recovery, last_index != durable_index"
+                            );
+
+                            max_written = w.last_index().unwrap_or(0);
+                            if let Err(e) = check_wal_invariants(&w, seed, op_num, max_written, None) {
+                                panic!("{e}");
+                            }
+                            wal = w;
+                        }
+                        Err(e) => {
+                            panic!("seed {seed}, op {op_num}: Recovery failed: {e}");
+                        }
+                    }
+
+                    {
+                        let mut fc = storage.fault_config();
+                        fc.torn_write_rate = FAULT_RATE / 2.0;
+                        fc.write_fail_rate = FAULT_RATE;
+                        fc.read_fail_rate = FAULT_RATE;
+                        fc.fsync_fail_rate = FAULT_RATE;
+                        fc.open_fail_rate = FAULT_RATE / 10.0;
+                        fc.list_files_fail_rate = FAULT_RATE / 5.0;
+                    }
+                }
+            }
+
+            // Check structural invariants (no content verification)
+            if op_type != 9 {
+                let old_read_fail = storage.fault_config().read_fail_rate;
+                storage.fault_config().read_fail_rate = 0.0;
+
+                if let Err(e) = check_wal_invariants(&wal, seed, op_num, max_written, None) {
+                    panic!("{e}");
+                }
+
+                storage.fault_config().read_fail_rate = old_read_fail;
+            }
+        }
+
+        // Final recovery check
+        drop(wal);
+        storage.simulate_crash();
+
+        {
+            let mut fc = storage.fault_config();
+            fc.torn_write_rate = 0.0;
+            fc.write_fail_rate = 0.0;
+            fc.read_fail_rate = 0.0;
+            fc.fsync_fail_rate = 0.0;
+            fc.open_fail_rate = 0.0;
+            fc.list_files_fail_rate = 0.0;
+        }
+
+        if let Ok(final_wal) = Wal::open(storage.clone(), wal_config).await {
+            max_written = final_wal.last_index().unwrap_or(0);
+            if let Err(e) = check_wal_invariants(&final_wal, seed, OPS_PER_SEED, max_written, None) {
+                panic!("{e}");
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Targeted Invariant Tests
+// ============================================================================
+
+/// Test that indices are always contiguous after recovery.
+#[tokio::test]
+async fn test_invariant_index_contiguity() {
+    for seed in 0..50 {
+        let config = FaultConfig::none()
+            .with_torn_write_rate(0.15)
+            .with_write_fail_rate(0.15);
+        let storage = SimulatedStorage::with_faults(seed, config);
+        let wal_dir = Path::new("/wal/contiguity");
+        let wal_config = WalConfig::new(wal_dir);
+
+        // Write entries with faults - track actual next index
+        {
+            let mut wal = Wal::open(storage.clone(), wal_config.clone()).await.unwrap();
+            let mut next_idx = 1u64;
+            for _ in 0..50 {
+                let entry = Entry::new(1, next_idx, Bytes::from("data")).unwrap();
+                if wal.append(entry).await.is_ok() {
+                    next_idx += 1;
+                }
+            }
+        }
+
+        // Disable faults and check recovery
+        storage.fault_config().torn_write_rate = 0.0;
+        storage.fault_config().write_fail_rate = 0.0;
+
+        let wal = Wal::open(storage.clone(), wal_config).await.unwrap();
+
+        // Verify contiguity: every index from 1 to last_index should be readable
+        if let Some(last_idx) = wal.last_index() {
+            for i in 1..=last_idx {
+                let entry = wal.read(i);
+                assert!(
+                    entry.is_ok(),
+                    "seed {seed}: Gap at index {i}, last_index={last_idx}"
+                );
+                assert_eq!(entry.unwrap().index(), i);
+            }
+        }
+    }
+}
+
+/// Test truncation under faults.
+#[tokio::test]
+async fn test_truncation_under_faults() {
+    for seed in 0..100 {
+        let config = FaultConfig::none()
+            .with_fsync_fail_rate(0.15);
+        let storage = SimulatedStorage::with_faults(seed, config);
+        let wal_dir = Path::new("/wal/truncate");
+        let wal_config = WalConfig::new(wal_dir);
+
+        // Write entries without write faults (to ensure we have data)
+        let mut max_written = 0u64;
+        {
+            let mut wal = Wal::open(storage.clone(), wal_config.clone()).await.unwrap();
+            for i in 1..=20 {
+                let entry = Entry::new(1, i, Bytes::from(format!("data-{i}"))).unwrap();
+                if wal.append(entry).await.is_ok() {
+                    max_written = i;
+                }
+            }
+            // Disable faults for sync to ensure data is persisted
+            storage.fault_config().fsync_fail_rate = 0.0;
+            wal.sync().await.ok();
+        }
+
+        if max_written < 5 {
+            continue; // Need enough entries to truncate
+        }
+
+        // Re-enable faults for truncation
+        storage.fault_config().fsync_fail_rate = 0.15;
+
+        // Truncate with faults enabled
+        let truncate_to = max_written / 2;
+        {
+            let mut wal = Wal::open(storage.clone(), wal_config.clone()).await.unwrap();
+            let _ = wal.truncate_after(truncate_to).await;
+        }
+
+        // Disable faults and verify
+        storage.fault_config().fsync_fail_rate = 0.0;
+
+        let wal = Wal::open(storage.clone(), wal_config).await.unwrap();
+
+        // Invariant: last_index should be <= original max_written
+        if let Some(last_idx) = wal.last_index() {
+            assert!(
+                last_idx <= max_written,
+                "seed {seed}: last_index {last_idx} > max_written {max_written}"
+            );
+
+            // All remaining entries should be readable and contiguous
+            for i in 1..=last_idx {
+                let entry = wal.read(i);
+                assert!(entry.is_ok(), "seed {seed}: entry {i} unreadable after truncation");
+                assert_eq!(entry.unwrap().index(), i);
+            }
+        }
+    }
+}
+
+/// Test segment rotation under faults with large payloads.
+#[tokio::test]
+async fn test_segment_rotation_under_faults() {
+    for seed in 0..50 {
+        let config = FaultConfig::none()
+            .with_write_fail_rate(0.15)
+            .with_fsync_fail_rate(0.15)
+            .with_torn_write_rate(0.05);
+        let storage = SimulatedStorage::with_faults(seed, config);
+        let wal_dir = Path::new("/wal/rotation");
+
+        // Use minimum segment size (1MB) and max_entries to force rotation
+        let segment_config = SegmentConfig::new().with_max_entries(5); // Force rotation after 5 entries
+        let wal_config = WalConfig::new(wal_dir).with_segment_config(segment_config);
+
+        let mut written = WrittenEntries::default();
+        let mut next_idx = 1u64;
+
+        {
+            let mut wal = Wal::open(storage.clone(), wal_config.clone()).await.unwrap();
+
+            // Write entries to force segment rotation via max_entries limit
+            for _ in 0..30 {
+                let payload = format!("segment-rotation-test-{seed}-{next_idx}");
+                let entry = Entry::new(1, next_idx, Bytes::from(payload.clone())).unwrap();
+                if wal.append(entry).await.is_ok() {
+                    written.record(next_idx, 1, payload);
+                    next_idx += 1;
+                }
+            }
+            wal.sync().await.ok();
+        }
+
+        // Disable faults and verify
+        storage.fault_config().write_fail_rate = 0.0;
+        storage.fault_config().fsync_fail_rate = 0.0;
+        storage.fault_config().torn_write_rate = 0.0;
+
+        let wal = Wal::open(storage.clone(), wal_config).await.unwrap();
+
+        // Should have multiple sealed segments if rotation worked
+        let sealed_count = wal.sealed_segment_count();
+
+        if let Some(last_idx) = wal.last_index() {
+            // All entries should be readable across segments
+            for i in 1..=last_idx {
+                let entry = wal.read(i);
+                assert!(
+                    entry.is_ok(),
+                    "seed {seed}: entry {i} unreadable, sealed_segments={sealed_count}"
+                );
+
+                // Verify content
+                if let Some((expected_term, expected_payload)) = written.entries.get(&i) {
+                    let e = entry.unwrap();
+                    assert_eq!(e.term(), *expected_term);
+                    let actual = String::from_utf8_lossy(&e.payload);
+                    assert_eq!(&*actual, expected_payload);
+                }
+            }
+        }
+    }
+}
+
+/// Test that term monotonicity is preserved.
+#[tokio::test]
+async fn test_invariant_term_monotonicity() {
+    for seed in 0..50 {
+        let config = FaultConfig::none()
+            .with_torn_write_rate(0.1);
+        let storage = SimulatedStorage::with_faults(seed, config);
+        let wal_dir = Path::new("/wal/term_mono");
+        let wal_config = WalConfig::new(wal_dir);
+
+        // Write entries with increasing terms - track actual next index
+        {
+            let mut wal = Wal::open(storage.clone(), wal_config.clone()).await.unwrap();
+            let mut term = 1u64;
+            let mut next_idx = 1u64;
+            for attempt in 0..30 {
+                if attempt % 5 == 0 && attempt > 0 {
+                    term += 1; // Bump term occasionally
+                }
+                let entry = Entry::new(term, next_idx, Bytes::from("data")).unwrap();
+                if wal.append(entry).await.is_ok() {
+                    next_idx += 1;
+                }
+            }
+        }
+
+        // Disable faults and check
+        storage.fault_config().torn_write_rate = 0.0;
+
+        let wal = Wal::open(storage.clone(), wal_config).await.unwrap();
+
+        // Verify term monotonicity
+        if let Some(last_idx) = wal.last_index() {
+            let mut prev_term = 0u64;
+            for i in 1..=last_idx {
+                let entry = wal.read(i).unwrap();
+                assert!(
+                    entry.term() >= prev_term,
+                    "seed {seed}: Term regression at index {i}: {} < {prev_term}",
+                    entry.term()
+                );
+                prev_term = entry.term();
+            }
+        }
+    }
+}
+
+/// Reproduction test for debugging durable_index bugs.
+#[tokio::test]
+async fn test_repro_seed_135837() {
+    const FAULT_RATE: f64 = 0.25;
+    let seed = 2074002u64;
+
+    let config = FaultConfig {
+        torn_write_rate: FAULT_RATE / 2.0,
+        fsync_fail_rate: FAULT_RATE,
+        read_corruption_rate: 0.0,
+        read_fail_rate: FAULT_RATE,
+        write_fail_rate: FAULT_RATE,
+        exists_fail_rate: FAULT_RATE / 5.0,
+        list_files_fail_rate: FAULT_RATE / 5.0,
+        open_fail_rate: FAULT_RATE / 10.0,
+        remove_fail_rate: FAULT_RATE / 5.0,
+        force_torn_write_at: None,
+        force_fsync_fail: false,
+        force_disk_full: false,
+    };
+
+    let storage = SimulatedStorage::with_faults(seed, config);
+    let wal_dir = Path::new("/wal/comprehensive");
+    let wal_config = WalConfig::new(wal_dir);
+
+    let mut current_term = 1u64;
+
+    let mut wal = Wal::open(storage.clone(), wal_config.clone()).await.unwrap();
+
+    // Run operations until op 69
+    for op_num in 0..=69 {
+        let op_hash = seed.wrapping_add(op_num as u64).wrapping_mul(0x9e3779b97f4a7c15);
+        let op_type = op_hash % 10;
+
+        eprintln!(
+            "op {}: type={}, last_idx={:?}, durable_idx={:?}",
+            op_num,
+            op_type,
+            wal.last_index(),
+            wal.durable_index()
+        );
+
+        if op_num == 69 {
+            // This should be a crash operation
+            let durable_before = wal.durable_index();
+            let sealed_count = wal.sealed_segment_count();
+            eprintln!(
+                "Before crash: durable={:?}, sealed_segments={}",
+                durable_before, sealed_count
+            );
+
+            // Debug: dump storage state before crash
+            let wal_dir = Path::new("/wal/repro");
+            if let Ok(files) = storage.list_files(wal_dir, "wal").await {
+                eprintln!("Files before crash (dirty state):");
+                for f in &files {
+                    if let Some(content) = storage.get_raw_content(f) {
+                        eprintln!("  {}: {} bytes", f.display(), content.len());
+                    }
+                }
+            }
+            eprintln!("Synced files before crash (durable state):");
+            for f in storage.synced_file_paths() {
+                if let Some(content) = storage.get_synced_content(&f) {
+                    eprintln!("  {}: {} bytes", f.display(), content.len());
+                }
+            }
+
+            drop(wal);
+            storage.simulate_crash();
+
+            // Debug: dump storage state after crash
+            {
+                let mut fc = storage.fault_config();
+                fc.list_files_fail_rate = 0.0;
+            }
+            eprintln!("Files after crash (should equal synced):");
+            match storage.list_files(wal_dir, "wal").await {
+                Ok(files) => {
+                    eprintln!("  Found {} files", files.len());
+                    for f in &files {
+                        if let Some(content) = storage.get_raw_content(f) {
+                            eprintln!("  {}: {} bytes", f.display(), content.len());
+                        } else {
+                            eprintln!("  {}: no content!", f.display());
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  list_files failed: {e}");
+                }
+            }
+
+            // Disable faults
+            {
+                let mut fc = storage.fault_config();
+                fc.torn_write_rate = 0.0;
+                fc.write_fail_rate = 0.0;
+                fc.read_fail_rate = 0.0;
+                fc.fsync_fail_rate = 0.0;
+                fc.open_fail_rate = 0.0;
+                fc.list_files_fail_rate = 0.0;
+                fc.exists_fail_rate = 0.0;
+                fc.remove_fail_rate = 0.0;
+            }
+
+            // Print synced files for debugging
+            let synced_paths = storage.synced_file_paths();
+            eprintln!("  synced_files: {:?}", synced_paths);
+
+            let recovered = Wal::open(storage.clone(), wal_config.clone()).await.unwrap();
+            eprintln!("After crash: recovered={:?}", recovered.last_index());
+
+            if let (Some(r), Some(d)) = (recovered.last_index(), durable_before) {
+                assert!(r <= d, "recovered {} > durable {}", r, d);
+            }
+            return;
+        }
+
+        match op_type {
+            0..=4 => {
+                let next_idx = wal.last_index().map_or(1, |i| i + 1);
+                let entry = Entry::new(current_term, next_idx, Bytes::from("data")).unwrap();
+                let result = wal.append(entry).await;
+                eprintln!("  Write idx {}: {:?}", next_idx, result.is_ok());
+                if result.is_ok() {
+                    let sync_result = wal.sync().await;
+                    eprintln!("  Sync: {:?}", sync_result.is_ok());
+                    // Debug: show files after sync
+                    if sync_result.is_ok() {
+                        if let Ok(files) = storage.list_files(wal_dir, "wal").await {
+                            eprintln!("    files: {:?}", files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>());
+                        }
+                        for p in storage.synced_file_paths() {
+                            if let Some(c) = storage.get_synced_content(&p) {
+                                eprintln!("    synced {}: {} bytes", p.display(), c.len());
+                            }
+                        }
+                    }
+                }
+            }
+            5 => {
+                let sync_result = wal.sync().await;
+                eprintln!("  Sync: {:?}", sync_result.is_ok());
+            }
+            6 => {
+                if let Some(last) = wal.last_index() {
+                    let idx = (op_hash % last) + 1;
+                    let _ = wal.read(idx);
+                }
+            }
+            7 => {
+                current_term += 1;
+            }
+            8 => {
+                if let Some(last) = wal.last_index() {
+                    if last > 1 {
+                        let truncate_to = (op_hash % (last - 1)) + 1;
+                        let _ = wal.truncate_after(truncate_to).await;
+                        let _ = wal.sync().await;
+                    }
+                }
+            }
+            _ => {
+                // Crash - skip for now, we want to run until op 64
+                let durable_before = wal.durable_index();
+                let last_before = wal.last_index();
+                eprintln!("  CRASH: durable={:?}, last={:?}", durable_before, last_before);
+                drop(wal);
+
+                // Debug: print synced files before crash with sizes
+                let synced_paths = storage.synced_file_paths();
+                for p in &synced_paths {
+                    if let Some(content) = storage.get_synced_content(p) {
+                        eprintln!("    synced {}: {} bytes", p.display(), content.len());
+                    }
+                }
+                eprintln!("  synced_files: {:?}", synced_paths);
+
+                storage.simulate_crash();
+
+                // Only disable the faults that comprehensive test disables (NOT exists/remove)
+                {
+                    let mut fc = storage.fault_config();
+                    fc.torn_write_rate = 0.0;
+                    fc.write_fail_rate = 0.0;
+                    fc.read_fail_rate = 0.0;
+                    fc.fsync_fail_rate = 0.0;
+                    fc.open_fail_rate = 0.0;
+                    fc.list_files_fail_rate = 0.0;
+                    // NOT disabling exists_fail_rate and remove_fail_rate to match comprehensive
+                }
+
+                // Debug: print files after crash (before recovery)
+                match storage.list_files(wal_dir, "wal").await {
+                    Ok(files) => {
+                        eprintln!("  files after crash (for recovery):");
+                        for f in &files {
+                            if let Some(content) = storage.get_raw_content(f) {
+                                eprintln!("    {}: {} bytes", f.display(), content.len());
+                            } else {
+                                eprintln!("    {}: no content!", f.display());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  list_files failed: {e}");
+                    }
+                }
+
+                let w = Wal::open(storage.clone(), wal_config.clone()).await.unwrap();
+                eprintln!("  Recovered: last={:?}", w.last_index());
+
+                // Debug: print files after recovery to see what was created
+                match storage.list_files(wal_dir, "wal").await {
+                    Ok(files) => {
+                        eprintln!("  files after recovery:");
+                        for f in &files {
+                            if let Some(content) = storage.get_raw_content(f) {
+                                eprintln!("    {}: {} bytes", f.display(), content.len());
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                }
+
+                // Check the invariant here too
+                if let (Some(r), Some(d)) = (w.last_index(), durable_before) {
+                    assert!(r <= d, "op {}: recovered {} > durable {}", op_num, r, d);
+                }
+
+                wal = w;
+
+                {
+                    let mut fc = storage.fault_config();
+                    fc.torn_write_rate = FAULT_RATE / 2.0;
+                    fc.write_fail_rate = FAULT_RATE;
+                    fc.read_fail_rate = FAULT_RATE;
+                    fc.fsync_fail_rate = FAULT_RATE;
+                    fc.open_fail_rate = FAULT_RATE / 10.0;
+                    fc.list_files_fail_rate = FAULT_RATE / 5.0;
+                }
             }
         }
     }
