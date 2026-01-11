@@ -17,12 +17,14 @@
 #![warn(clippy::nursery)]
 
 mod coordinator;
+mod handler;
 mod leader_cache;
 mod router;
 mod shard_map;
 mod transfer;
 
 pub use coordinator::TransferCoordinator;
+pub use handler::{HandlerError, SnapshotChunk, SnapshotId, SnapshotInfo, TransferHandler};
 pub use leader_cache::{LeaderCache, LeaderCacheConfig};
 pub use router::{RouteResult, RoutingError, ShardRouter, ShardRouterConfig};
 pub use shard_map::{ShardMap, ShardMapError, ShardRange};

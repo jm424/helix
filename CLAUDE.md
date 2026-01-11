@@ -304,6 +304,49 @@ Use Bloodhound for simulation tests:
 - Run thousands of iterations with different seeds
 - Verify invariants hold under all conditions
 
+### DST Skepticism - CRITICAL
+
+**Be deeply skeptical of DST tests that pass on the first attempt.** DST is only valuable if it actually exercises the code under test with high fidelity.
+
+**Red flags that tests are not actually testing anything:**
+- Tests complete in milliseconds (real DST takes seconds to minutes)
+- All tests pass immediately after writing them
+- No events are being processed (check `stats.events_processed`)
+- Zero transfers/operations reported in test output
+- Simulation runs but state never changes
+
+**Before declaring DST tests complete, verify:**
+
+1. **Fidelity check**: Is the simulation actually exercising the real implementation?
+   - Are messages being serialized/deserialized correctly?
+   - Is the state machine actually advancing through states?
+   - Are timers firing and being handled?
+
+2. **Fault injection check**: Are faults actually being injected?
+   - Add logging/counters for crash events, partition events
+   - Verify faults cause observable state changes
+   - Test that removing fault handling causes test failures
+
+3. **Property verification check**: Are properties actually being checked?
+   - Intentionally break an invariant and verify the test catches it
+   - Add assertions that would fail if the code path isn't exercised
+   - Check that violation counters are being incremented appropriately
+
+4. **Coverage check**: What code paths are actually being hit?
+   - Add counters/tracing to key code paths
+   - Verify the transfer state machine progresses through all states
+   - Ensure both success and failure paths are exercised
+
+**Iteration process for DST:**
+1. Write the test infrastructure
+2. Run tests and examine output carefully - don't just check pass/fail
+3. Add instrumentation to verify simulation fidelity
+4. Intentionally break things to verify tests catch failures
+5. Iterate until confident the tests are meaningful
+6. Only then increase seed count and run duration
+
+**A DST test that passes but doesn't actually test anything is worse than no test - it provides false confidence.**
+
 ### Test Naming
 
 ```rust

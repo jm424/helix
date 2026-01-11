@@ -46,6 +46,7 @@ use helix_core::{GroupId, LogIndex, NodeId, TermId};
 
 use crate::config::RaftConfig;
 use crate::message::{ClientRequest, Message};
+use crate::snapshot::{Snapshot, SnapshotMeta};
 use crate::state::{RaftNode, RaftOutput, RaftState};
 
 /// Maximum number of Raft groups per `MultiRaft` engine.
@@ -411,6 +412,45 @@ impl MultiRaft {
             .filter(|(_, info)| info.node.is_leader())
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    // ========================================================================
+    // Snapshot Operations
+    // ========================================================================
+
+    /// Creates a snapshot for the specified group.
+    ///
+    /// The `data` parameter contains the serialized state machine state.
+    ///
+    /// # Returns
+    ///
+    /// Returns `None` if the group doesn't exist or has nothing to snapshot.
+    pub fn create_group_snapshot(&self, group_id: GroupId, data: Bytes) -> Option<Snapshot> {
+        let info = self.groups.get(&group_id)?;
+        info.node.create_snapshot(data)
+    }
+
+    /// Installs a snapshot for the specified group.
+    ///
+    /// This is used during shard transfer to install state on the target group.
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` if installed successfully, `false` if group not found or
+    /// snapshot was stale.
+    pub fn install_group_snapshot(&mut self, group_id: GroupId, snapshot: &Snapshot) -> bool {
+        let Some(info) = self.groups.get_mut(&group_id) else {
+            return false;
+        };
+        info.node.install_snapshot(snapshot)
+    }
+
+    /// Returns snapshot metadata for the specified group.
+    #[must_use]
+    pub fn group_snapshot_meta(&self, group_id: GroupId) -> Option<SnapshotMeta> {
+        self.groups
+            .get(&group_id)
+            .and_then(|info| info.node.snapshot_meta().copied())
     }
 
     /// Processes outputs from a single Raft node and converts them to

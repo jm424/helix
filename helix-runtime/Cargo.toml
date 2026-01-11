@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 helix-core = { workspace = true }
 helix-raft = { workspace = true }
+helix-routing = { workspace = true }
 helix-wal = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }

@@ -28,6 +28,8 @@ mod raft_tests;
 #[cfg(test)]
 mod server_tests;
 #[cfg(test)]
+mod shard_transfer_tests;
+#[cfg(test)]
 mod simulation_tests;
 #[cfg(test)]
 mod wal_tests;

@@ -175,6 +175,37 @@ impl RaftLog {
         }
     }
 
+    /// Truncates the log prefix up to and including the given index.
+    ///
+    /// Removes entries with index <= `last_to_remove`. This is used during
+    /// snapshot installation to discard entries covered by the snapshot.
+    pub fn truncate_prefix(&mut self, last_to_remove: LogIndex) {
+        if self.entries.is_empty() {
+            return;
+        }
+
+        if last_to_remove.get() >= self.last_index().get() {
+            // Remove everything.
+            self.entries.clear();
+            self.first_index = last_to_remove.get() + 1;
+            return;
+        }
+
+        if last_to_remove.get() < self.first_index {
+            // Nothing to remove.
+            return;
+        }
+
+        // Calculate how many entries to remove.
+        // Safe cast: remove_count is bounded by entries.len() which fits in usize.
+        #[allow(clippy::cast_possible_truncation)]
+        let remove_count = (last_to_remove.get() - self.first_index + 1) as usize;
+
+        // Remove the prefix.
+        self.entries.drain(..remove_count);
+        self.first_index = last_to_remove.get() + 1;
+    }
+
     /// Returns entries from `start_index` to the end.
     #[must_use]
     pub fn entries_from(&self, start_index: LogIndex) -> Vec<LogEntry> {

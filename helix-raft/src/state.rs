@@ -24,6 +24,7 @@ use crate::message::{
     InstallSnapshotResponse, Message, PreVoteRequest, PreVoteResponse, RequestVoteRequest,
     RequestVoteResponse, TimeoutNowRequest,
 };
+use crate::snapshot::{Snapshot, SnapshotMeta};
 
 /// Raft node state (role).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -156,6 +157,10 @@ pub struct RaftNode {
     /// Target node for leadership transfer (if in progress).
     transfer_target: Option<NodeId>,
 
+    // Snapshot state.
+    /// Latest snapshot metadata (if any).
+    snapshot_meta: Option<SnapshotMeta>,
+
     // Tick-based timing state.
     /// Ticks since last election timeout reset.
     /// Incremented on each tick for followers/candidates.
@@ -206,6 +211,7 @@ impl RaftNode {
             votes_received: HashSet::new(),
             leader_id: None,
             transfer_target: None,
+            snapshot_meta: None,
             election_elapsed: 0,
             heartbeat_elapsed: 0,
             randomized_election_timeout: randomized_timeout,
@@ -972,6 +978,94 @@ impl RaftNode {
     #[must_use]
     pub const fn transfer_target(&self) -> Option<NodeId> {
         self.transfer_target
+    }
+
+    // ========================================================================
+    // Snapshot Operations
+    // ========================================================================
+
+    /// Creates a snapshot of the current state up to the commit index.
+    ///
+    /// The `data` parameter contains the serialized state machine state that
+    /// the application wants to include in the snapshot.
+    ///
+    /// # Returns
+    ///
+    /// Returns `None` if there's nothing to snapshot (`commit_index` is 0).
+    #[must_use]
+    pub fn create_snapshot(&self, data: Bytes) -> Option<Snapshot> {
+        // Nothing to snapshot if nothing committed.
+        if self.commit_index.get() == 0 {
+            return None;
+        }
+
+        // Get the term at commit_index.
+        let term = self.log.term_at(self.commit_index);
+
+        let snapshot = Snapshot::new(self.commit_index, term, data);
+
+        // Postcondition: snapshot covers committed entries.
+        debug_assert!(snapshot.last_included_index == self.commit_index);
+
+        Some(snapshot)
+    }
+
+    /// Installs a snapshot received from another node.
+    ///
+    /// This is called when a follower receives a complete snapshot from the
+    /// leader (or during shard transfer). It:
+    /// 1. Updates the snapshot metadata
+    /// 2. Truncates the log to remove entries covered by the snapshot
+    /// 3. Updates `commit_index` and `last_applied`
+    ///
+    /// The caller is responsible for updating the state machine with the
+    /// snapshot data.
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` if the snapshot was installed, `false` if it was stale.
+    pub fn install_snapshot(&mut self, snapshot: &Snapshot) -> bool {
+        // Reject stale snapshots.
+        if let Some(ref meta) = self.snapshot_meta {
+            if snapshot.last_included_index <= meta.last_included_index {
+                return false;
+            }
+        }
+
+        // Update snapshot metadata.
+        self.snapshot_meta = Some(SnapshotMeta::from_snapshot(snapshot));
+
+        // Truncate log - remove entries covered by snapshot.
+        // Keep entries after the snapshot's last_included_index.
+        self.log.truncate_prefix(snapshot.last_included_index);
+
+        // Update indices.
+        if snapshot.last_included_index > self.commit_index {
+            self.commit_index = snapshot.last_included_index;
+        }
+        if snapshot.last_included_index > self.last_applied {
+            self.last_applied = snapshot.last_included_index;
+        }
+
+        // Postcondition: indices are consistent with snapshot.
+        debug_assert!(self.commit_index >= snapshot.last_included_index);
+        debug_assert!(self.last_applied >= snapshot.last_included_index);
+
+        true
+    }
+
+    /// Returns the current snapshot metadata, if any.
+    #[must_use]
+    pub const fn snapshot_meta(&self) -> Option<&SnapshotMeta> {
+        self.snapshot_meta.as_ref()
+    }
+
+    /// Returns true if the given index is covered by a snapshot.
+    #[must_use]
+    pub fn is_index_compacted(&self, index: LogIndex) -> bool {
+        self.snapshot_meta
+            .as_ref()
+            .is_some_and(|meta| index <= meta.last_included_index)
     }
 
     /// Sends `AppendEntries` to a specific peer.

@@ -710,6 +710,294 @@ pub fn is_group_batch(data: &[u8]) -> bool {
     data.len() >= 5 && data[4] == TAG_GROUP_MESSAGE_BATCH
 }
 
+// =============================================================================
+// Transfer Message Codec
+// =============================================================================
+
+/// Transfer message type tags.
+const TAG_TRANSFER_PREPARE_REQUEST: u8 = 20;
+const TAG_TRANSFER_PREPARE_RESPONSE: u8 = 21;
+const TAG_TRANSFER_SNAPSHOT_CHUNK: u8 = 22;
+const TAG_TRANSFER_CATCHUP_ENTRIES: u8 = 23;
+const TAG_TRANSFER_SWITCH_REQUEST: u8 = 24;
+const TAG_TRANSFER_SWITCH_RESPONSE: u8 = 25;
+const TAG_TRANSFER_CANCEL_REQUEST: u8 = 26;
+
+use helix_core::TransferId;
+use helix_routing::{ShardRange, TransferMessage};
+
+/// Encodes a transfer message to bytes.
+///
+/// Wire format:
+/// - 4 bytes: message length (u32 little-endian, not including header)
+/// - 1 byte: message type tag (20-26)
+/// - 8 bytes: transfer ID
+/// - N bytes: type-specific payload
+///
+/// # Errors
+///
+/// Returns an error if the message is too large.
+pub fn encode_transfer_message(message: &TransferMessage) -> CodecResult<Bytes> {
+    let mut buf = BytesMut::with_capacity(256);
+
+    // Reserve space for length prefix.
+    buf.put_u32_le(0);
+
+    match message {
+        TransferMessage::PrepareRequest {
+            transfer_id,
+            shard_range,
+        } => {
+            buf.put_u8(TAG_TRANSFER_PREPARE_REQUEST);
+            buf.put_u64_le(transfer_id.get());
+            buf.put_u32_le(shard_range.start);
+            buf.put_u32_le(shard_range.end);
+        }
+        TransferMessage::PrepareResponse {
+            transfer_id,
+            snapshot_index,
+            snapshot_term,
+            snapshot_size,
+        } => {
+            buf.put_u8(TAG_TRANSFER_PREPARE_RESPONSE);
+            buf.put_u64_le(transfer_id.get());
+            buf.put_u64_le(snapshot_index.get());
+            buf.put_u64_le(snapshot_term.get());
+            buf.put_u64_le(*snapshot_size);
+        }
+        TransferMessage::SnapshotChunk {
+            transfer_id,
+            offset,
+            data,
+            done,
+        } => {
+            buf.put_u8(TAG_TRANSFER_SNAPSHOT_CHUNK);
+            buf.put_u64_le(transfer_id.get());
+            buf.put_u64_le(*offset);
+            // Safe cast: data size bounded by MAX_MESSAGE_SIZE.
+            #[allow(clippy::cast_possible_truncation)]
+            let data_len = data.len() as u32;
+            buf.put_u32_le(data_len);
+            buf.put_slice(data);
+            buf.put_u8(u8::from(*done));
+        }
+        TransferMessage::CatchupEntries {
+            transfer_id,
+            start_index,
+            entry_count,
+            entries_data,
+            done,
+        } => {
+            buf.put_u8(TAG_TRANSFER_CATCHUP_ENTRIES);
+            buf.put_u64_le(transfer_id.get());
+            buf.put_u64_le(start_index.get());
+            buf.put_u32_le(*entry_count);
+            // Safe cast: entries_data size bounded by MAX_MESSAGE_SIZE.
+            #[allow(clippy::cast_possible_truncation)]
+            let data_len = entries_data.len() as u32;
+            buf.put_u32_le(data_len);
+            buf.put_slice(entries_data);
+            buf.put_u8(u8::from(*done));
+        }
+        TransferMessage::SwitchRequest { transfer_id } => {
+            buf.put_u8(TAG_TRANSFER_SWITCH_REQUEST);
+            buf.put_u64_le(transfer_id.get());
+        }
+        TransferMessage::SwitchResponse {
+            transfer_id,
+            success,
+        } => {
+            buf.put_u8(TAG_TRANSFER_SWITCH_RESPONSE);
+            buf.put_u64_le(transfer_id.get());
+            buf.put_u8(u8::from(*success));
+        }
+        TransferMessage::CancelRequest {
+            transfer_id,
+            reason,
+        } => {
+            buf.put_u8(TAG_TRANSFER_CANCEL_REQUEST);
+            buf.put_u64_le(transfer_id.get());
+            let reason_bytes = reason.as_bytes();
+            // Safe cast: reason length bounded by practical limits.
+            #[allow(clippy::cast_possible_truncation)]
+            let reason_len = reason_bytes.len() as u32;
+            buf.put_u32_le(reason_len);
+            buf.put_slice(reason_bytes);
+        }
+    }
+
+    // Fill in length (excluding the 4-byte header).
+    #[allow(clippy::cast_possible_truncation)]
+    let len = (buf.len() - 4) as u32;
+    if len > MAX_MESSAGE_SIZE {
+        return Err(CodecError::MessageTooLarge {
+            size: len,
+            max: MAX_MESSAGE_SIZE,
+        });
+    }
+
+    buf[0..4].copy_from_slice(&len.to_le_bytes());
+    Ok(buf.freeze())
+}
+
+/// Decodes a transfer message from bytes.
+///
+/// Expects the full framed message including length prefix.
+///
+/// # Errors
+///
+/// Returns an error if the data is malformed or incomplete.
+pub fn decode_transfer_message(data: &[u8]) -> CodecResult<(TransferMessage, usize)> {
+    if data.len() < 4 {
+        return Err(CodecError::InsufficientData {
+            need: 4,
+            have: data.len(),
+        });
+    }
+
+    let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+
+    #[allow(clippy::cast_possible_truncation)]
+    let len_u32 = len as u32;
+    if len > MAX_MESSAGE_SIZE as usize {
+        return Err(CodecError::MessageTooLarge {
+            size: len_u32,
+            max: MAX_MESSAGE_SIZE,
+        });
+    }
+
+    let total_len = 4 + len;
+    if data.len() < total_len {
+        return Err(CodecError::InsufficientData {
+            need: total_len,
+            have: data.len(),
+        });
+    }
+
+    let payload = &data[4..total_len];
+    if payload.is_empty() {
+        return Err(CodecError::InsufficientData {
+            need: 1,
+            have: 0,
+        });
+    }
+
+    let tag = payload[0];
+    let mut buf = &payload[1..];
+    let message = decode_transfer_payload(tag, &mut buf)?;
+    Ok((message, total_len))
+}
+
+/// Decodes the payload portion of a transfer message.
+fn decode_transfer_payload(tag: u8, buf: &mut &[u8]) -> CodecResult<TransferMessage> {
+    match tag {
+        TAG_TRANSFER_PREPARE_REQUEST => decode_transfer_prepare_request(buf),
+        TAG_TRANSFER_PREPARE_RESPONSE => decode_transfer_prepare_response(buf),
+        TAG_TRANSFER_SNAPSHOT_CHUNK => decode_transfer_snapshot_chunk(buf),
+        TAG_TRANSFER_CATCHUP_ENTRIES => decode_transfer_catchup_entries(buf),
+        TAG_TRANSFER_SWITCH_REQUEST => decode_transfer_switch_request(buf),
+        TAG_TRANSFER_SWITCH_RESPONSE => decode_transfer_switch_response(buf),
+        TAG_TRANSFER_CANCEL_REQUEST => decode_transfer_cancel_request(buf),
+        _ => Err(CodecError::UnknownMessageType { tag }),
+    }
+}
+
+fn decode_transfer_prepare_request(buf: &mut &[u8]) -> CodecResult<TransferMessage> {
+    ensure_remaining(buf, 16)?;
+    let transfer_id = TransferId::new(buf.get_u64_le());
+    let start = buf.get_u32_le();
+    let end = buf.get_u32_le();
+    Ok(TransferMessage::PrepareRequest {
+        transfer_id,
+        shard_range: ShardRange::new(start, end),
+    })
+}
+
+fn decode_transfer_prepare_response(buf: &mut &[u8]) -> CodecResult<TransferMessage> {
+    ensure_remaining(buf, 32)?;
+    let transfer_id = TransferId::new(buf.get_u64_le());
+    let snapshot_index = LogIndex::new(buf.get_u64_le());
+    let snapshot_term = TermId::new(buf.get_u64_le());
+    let snapshot_size = buf.get_u64_le();
+    Ok(TransferMessage::PrepareResponse {
+        transfer_id,
+        snapshot_index,
+        snapshot_term,
+        snapshot_size,
+    })
+}
+
+fn decode_transfer_snapshot_chunk(buf: &mut &[u8]) -> CodecResult<TransferMessage> {
+    ensure_remaining(buf, 20)?;
+    let transfer_id = TransferId::new(buf.get_u64_le());
+    let offset = buf.get_u64_le();
+    let data_len = buf.get_u32_le() as usize;
+    ensure_remaining(buf, data_len + 1)?;
+    let data = Bytes::copy_from_slice(&buf[..data_len]);
+    buf.advance(data_len);
+    let done = buf.get_u8() != 0;
+    Ok(TransferMessage::SnapshotChunk {
+        transfer_id,
+        offset,
+        data,
+        done,
+    })
+}
+
+fn decode_transfer_catchup_entries(buf: &mut &[u8]) -> CodecResult<TransferMessage> {
+    ensure_remaining(buf, 24)?;
+    let transfer_id = TransferId::new(buf.get_u64_le());
+    let start_index = LogIndex::new(buf.get_u64_le());
+    let entry_count = buf.get_u32_le();
+    let data_len = buf.get_u32_le() as usize;
+    ensure_remaining(buf, data_len + 1)?;
+    let entries_data = Bytes::copy_from_slice(&buf[..data_len]);
+    buf.advance(data_len);
+    let done = buf.get_u8() != 0;
+    Ok(TransferMessage::CatchupEntries {
+        transfer_id,
+        start_index,
+        entry_count,
+        entries_data,
+        done,
+    })
+}
+
+fn decode_transfer_switch_request(buf: &mut &[u8]) -> CodecResult<TransferMessage> {
+    ensure_remaining(buf, 8)?;
+    let transfer_id = TransferId::new(buf.get_u64_le());
+    Ok(TransferMessage::SwitchRequest { transfer_id })
+}
+
+fn decode_transfer_switch_response(buf: &mut &[u8]) -> CodecResult<TransferMessage> {
+    ensure_remaining(buf, 9)?;
+    let transfer_id = TransferId::new(buf.get_u64_le());
+    let success = buf.get_u8() != 0;
+    Ok(TransferMessage::SwitchResponse {
+        transfer_id,
+        success,
+    })
+}
+
+fn decode_transfer_cancel_request(buf: &mut &[u8]) -> CodecResult<TransferMessage> {
+    ensure_remaining(buf, 12)?;
+    let transfer_id = TransferId::new(buf.get_u64_le());
+    let reason_len = buf.get_u32_le() as usize;
+    ensure_remaining(buf, reason_len)?;
+    let reason = String::from_utf8_lossy(&buf[..reason_len]).into_owned();
+    Ok(TransferMessage::CancelRequest {
+        transfer_id,
+        reason,
+    })
+}
+
+/// Checks if the given data starts with a transfer message tag.
+#[must_use]
+pub fn is_transfer_message(data: &[u8]) -> bool {
+    // Need at least 5 bytes: 4 (length) + 1 (tag).
+    data.len() >= 5 && (TAG_TRANSFER_PREPARE_REQUEST..=TAG_TRANSFER_CANCEL_REQUEST).contains(&data[4])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -926,5 +1214,139 @@ mod tests {
         let regular = encode_message(&make_request_vote()).unwrap();
         let result = decode_group_batch(&regular);
         assert!(matches!(result, Err(CodecError::UnknownMessageType { .. })));
+    }
+
+    // =========================================================================
+    // Transfer Message Codec Tests
+    // =========================================================================
+
+    #[test]
+    fn test_encode_decode_transfer_prepare_request() {
+        let original = TransferMessage::PrepareRequest {
+            transfer_id: TransferId::new(42),
+            shard_range: ShardRange::new(100, 500),
+        };
+        let encoded = encode_transfer_message(&original).unwrap();
+        let (decoded, consumed) = decode_transfer_message(&encoded).unwrap();
+
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_encode_decode_transfer_prepare_response() {
+        let original = TransferMessage::PrepareResponse {
+            transfer_id: TransferId::new(42),
+            snapshot_index: LogIndex::new(1000),
+            snapshot_term: TermId::new(5),
+            snapshot_size: 1024 * 1024,
+        };
+        let encoded = encode_transfer_message(&original).unwrap();
+        let (decoded, consumed) = decode_transfer_message(&encoded).unwrap();
+
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_encode_decode_transfer_snapshot_chunk() {
+        let original = TransferMessage::SnapshotChunk {
+            transfer_id: TransferId::new(42),
+            offset: 4096,
+            data: Bytes::from("snapshot data here"),
+            done: false,
+        };
+        let encoded = encode_transfer_message(&original).unwrap();
+        let (decoded, consumed) = decode_transfer_message(&encoded).unwrap();
+
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_encode_decode_transfer_snapshot_chunk_done() {
+        let original = TransferMessage::SnapshotChunk {
+            transfer_id: TransferId::new(42),
+            offset: 8192,
+            data: Bytes::from("final chunk"),
+            done: true,
+        };
+        let encoded = encode_transfer_message(&original).unwrap();
+        let (decoded, consumed) = decode_transfer_message(&encoded).unwrap();
+
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_encode_decode_transfer_catchup_entries() {
+        let original = TransferMessage::CatchupEntries {
+            transfer_id: TransferId::new(42),
+            start_index: LogIndex::new(1001),
+            entry_count: 50,
+            entries_data: Bytes::from("serialized entries"),
+            done: false,
+        };
+        let encoded = encode_transfer_message(&original).unwrap();
+        let (decoded, consumed) = decode_transfer_message(&encoded).unwrap();
+
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_encode_decode_transfer_switch_request() {
+        let original = TransferMessage::SwitchRequest {
+            transfer_id: TransferId::new(42),
+        };
+        let encoded = encode_transfer_message(&original).unwrap();
+        let (decoded, consumed) = decode_transfer_message(&encoded).unwrap();
+
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_encode_decode_transfer_switch_response() {
+        let original = TransferMessage::SwitchResponse {
+            transfer_id: TransferId::new(42),
+            success: true,
+        };
+        let encoded = encode_transfer_message(&original).unwrap();
+        let (decoded, consumed) = decode_transfer_message(&encoded).unwrap();
+
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_encode_decode_transfer_cancel_request() {
+        let original = TransferMessage::CancelRequest {
+            transfer_id: TransferId::new(42),
+            reason: "timeout exceeded".to_string(),
+        };
+        let encoded = encode_transfer_message(&original).unwrap();
+        let (decoded, consumed) = decode_transfer_message(&encoded).unwrap();
+
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_is_transfer_message() {
+        // Transfer message.
+        let transfer = encode_transfer_message(&TransferMessage::SwitchRequest {
+            transfer_id: TransferId::new(1),
+        })
+        .unwrap();
+        assert!(is_transfer_message(&transfer));
+
+        // Regular Raft message - not a transfer message.
+        let raft = encode_message(&make_request_vote()).unwrap();
+        assert!(!is_transfer_message(&raft));
+
+        // Too short.
+        assert!(!is_transfer_message(&[0, 1, 2, 3]));
+        assert!(!is_transfer_message(&[]));
     }
 }
