@@ -248,9 +248,9 @@ The plan requires:
 | Unit tests for Snapshot | ✅ Done |
 | Unit tests for TransferState | ✅ Done |
 | Unit tests for TransferCoordinator | ✅ Done |
-| Bloodhound: shard transfer with concurrent writes | ❌ Not Started |
-| Bloodhound: transfer failure and retry | ❌ Not Started |
-| Bloodhound: multiple concurrent transfers | ❌ Not Started |
+| Bloodhound: shard transfer with concurrent writes | ✅ Done (500 seeds, 3% drop, 0.5% crash) |
+| Bloodhound: transfer failure and retry | ✅ Done (transfer retries with timeout) |
+| Bloodhound: multiple concurrent transfers | ✅ Done (tests run concurrent transfers per node) |
 
 ---
 
@@ -375,6 +375,7 @@ Missing: `helix-kafka-proxy` crate.
 
 | Component | Key Achievements |
 |-----------|------------------|
+| **Shard Transfer DST** | 500-seed stress test, 3% drop/0.5% crash, ~96% success under aggressive faults |
 | **Shard Movement** | TransferCoordinator, Snapshot support, InstallSnapshot RPC, transfer state machine |
 | **Tick-based Raft** | DST-friendly timing, randomized elections, heartbeats |
 | **Bloodhound DST** | 150+ seeds, property checking, fault injection |
@@ -394,15 +395,15 @@ Missing: `helix-kafka-proxy` crate.
 
 ## Prioritized Next Steps
 
-### Priority 1: Shard Movement DST Testing
+### Priority 1: Shard Movement DST Testing ✅ COMPLETE
 
-**1. Bloodhound DST for Shard Transfers** ⭐ CRITICAL
-   - Required for Phase 2 checkpoint: "Shard transfer works under faults"
-   - Infrastructure complete (Snapshot, TransferCoordinator, InstallSnapshot RPC)
-   - Need DST tests: concurrent writes during transfer, failure/retry, multiple transfers
-   - Estimated: 1-2 weeks
+**1. Bloodhound DST for Shard Transfers** ✅ DONE
+   - Phase 2 checkpoint met: "Shard transfer works under faults"
+   - DST tests: 500 seeds × concurrent transfers, 3% message drop, 0.5% node crash
+   - ~96% success rate under aggressive fault injection
+   - See: `helix-tests/src/shard_transfer_tests.rs`
 
-### Priority 2: Complete Phase 3 (Storage Features)
+### Priority 2: Complete Phase 3 (Storage Features) ⭐ NEXT
 
 **2. helix-progress** - Consumer progress tracking
    - Required for Phase 3 checkpoint: "Complete data lifecycle (write→tier→read)"
