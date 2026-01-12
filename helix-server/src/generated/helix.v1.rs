@@ -101,6 +101,172 @@ pub struct RecordWithOffset {
     #[prost(message, optional, tag = "2")]
     pub record: ::core::option::Option<Record>,
 }
+/// Request to pull records for a consumer.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PullRequest {
+    /// Topic to pull from.
+    #[prost(string, tag = "1")]
+    pub topic: ::prost::alloc::string::String,
+    /// Partition to pull from.
+    #[prost(int32, tag = "2")]
+    pub partition: i32,
+    /// Consumer group ID.
+    #[prost(string, tag = "3")]
+    pub consumer_group_id: ::prost::alloc::string::String,
+    /// Consumer ID (unique within the group).
+    #[prost(string, tag = "4")]
+    pub consumer_id: ::prost::alloc::string::String,
+    /// Maximum number of records to return.
+    #[prost(uint32, tag = "5")]
+    pub max_records: u32,
+    /// Maximum bytes to return.
+    #[prost(uint32, tag = "6")]
+    pub max_bytes: u32,
+    /// Lease duration in milliseconds (how long consumer has to ack).
+    #[prost(uint32, tag = "7")]
+    pub lease_duration_ms: u32,
+}
+/// Response from pull operation.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PullResponse {
+    /// Records pulled (with lease).
+    #[prost(message, repeated, tag = "1")]
+    pub records: ::prost::alloc::vec::Vec<RecordWithOffset>,
+    /// Lease ID for these records (use in Ack request).
+    #[prost(uint64, tag = "2")]
+    pub lease_id: u64,
+    /// First offset in the lease range.
+    #[prost(uint64, tag = "3")]
+    pub from_offset: u64,
+    /// Last offset in the lease range (inclusive).
+    #[prost(uint64, tag = "4")]
+    pub to_offset: u64,
+    /// Lease expiration time in microseconds since epoch.
+    #[prost(uint64, tag = "5")]
+    pub lease_expires_at_us: u64,
+    /// Whether there are more records available.
+    #[prost(bool, tag = "6")]
+    pub has_more: bool,
+    /// Error code (0 = success).
+    #[prost(enumeration = "ErrorCode", tag = "7")]
+    pub error_code: i32,
+    /// Error message if any.
+    #[prost(string, optional, tag = "8")]
+    pub error_message: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Request to acknowledge, nack, or extend leased records.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AckRequest {
+    /// Topic.
+    #[prost(string, tag = "1")]
+    pub topic: ::prost::alloc::string::String,
+    /// Partition.
+    #[prost(int32, tag = "2")]
+    pub partition: i32,
+    /// Consumer group ID.
+    #[prost(string, tag = "3")]
+    pub consumer_group_id: ::prost::alloc::string::String,
+    /// Consumer ID.
+    #[prost(string, tag = "4")]
+    pub consumer_id: ::prost::alloc::string::String,
+    /// Lease IDs to acknowledge (mark as processed).
+    #[prost(uint64, repeated, tag = "5")]
+    pub ack_lease_ids: ::prost::alloc::vec::Vec<u64>,
+    /// Lease IDs to negative-acknowledge (release for redelivery).
+    #[prost(uint64, repeated, tag = "6")]
+    pub nack_lease_ids: ::prost::alloc::vec::Vec<u64>,
+    /// Lease IDs to extend (renew lease duration).
+    #[prost(uint64, repeated, tag = "7")]
+    pub extend_lease_ids: ::prost::alloc::vec::Vec<u64>,
+    /// Extension duration in milliseconds (for extend_lease_ids).
+    #[prost(uint32, tag = "8")]
+    pub extend_duration_ms: u32,
+}
+/// Response from ack operation.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AckResponse {
+    /// Number of leases successfully acknowledged.
+    #[prost(uint32, tag = "1")]
+    pub acked_count: u32,
+    /// Number of leases successfully nacked.
+    #[prost(uint32, tag = "2")]
+    pub nacked_count: u32,
+    /// Number of leases successfully extended.
+    #[prost(uint32, tag = "3")]
+    pub extended_count: u32,
+    /// New low watermark after acks (all offsets below are committed).
+    #[prost(uint64, tag = "4")]
+    pub low_watermark: u64,
+    /// Error code (0 = success).
+    #[prost(enumeration = "ErrorCode", tag = "5")]
+    pub error_code: i32,
+    /// Error message if any.
+    #[prost(string, optional, tag = "6")]
+    pub error_message: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Request to create a consumer group.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreateConsumerGroupRequest {
+    /// Consumer group ID (unique identifier).
+    #[prost(string, tag = "1")]
+    pub consumer_group_id: ::prost::alloc::string::String,
+    /// Acknowledgment mode for this group.
+    #[prost(enumeration = "AckMode", tag = "2")]
+    pub ack_mode: i32,
+    /// Topics this group will consume from.
+    #[prost(string, repeated, tag = "3")]
+    pub topics: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// Response from create consumer group.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CreateConsumerGroupResponse {
+    /// Whether the group was created (false if already exists).
+    #[prost(bool, tag = "1")]
+    pub created: bool,
+    /// Error code (0 = success).
+    #[prost(enumeration = "ErrorCode", tag = "2")]
+    pub error_code: i32,
+    /// Error message if any.
+    #[prost(string, optional, tag = "3")]
+    pub error_message: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Request to get committed offset for a consumer group.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetCommittedOffsetRequest {
+    /// Topic.
+    #[prost(string, tag = "1")]
+    pub topic: ::prost::alloc::string::String,
+    /// Partition.
+    #[prost(int32, tag = "2")]
+    pub partition: i32,
+    /// Consumer group ID.
+    #[prost(string, tag = "3")]
+    pub consumer_group_id: ::prost::alloc::string::String,
+}
+/// Response with committed offset.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetCommittedOffsetResponse {
+    /// Low watermark (all offsets below are committed).
+    #[prost(uint64, tag = "1")]
+    pub low_watermark: u64,
+    /// Whether the group has any committed offsets for this partition.
+    #[prost(bool, tag = "2")]
+    pub has_committed: bool,
+    /// Error code (0 = success).
+    #[prost(enumeration = "ErrorCode", tag = "3")]
+    pub error_code: i32,
+    /// Error message if any.
+    #[prost(string, optional, tag = "4")]
+    pub error_message: ::core::option::Option<::prost::alloc::string::String>,
+}
 /// Request for cluster metadata.
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -205,6 +371,35 @@ pub struct GetPartitionInfoResponse {
     #[prost(string, optional, tag = "6")]
     pub error_message: ::core::option::Option<::prost::alloc::string::String>,
 }
+/// Acknowledgment mode for consumer groups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum AckMode {
+    /// Kafka-style: commit offset N means everything up to N is processed.
+    Cumulative = 0,
+    /// Pulsar-style: acknowledge individual offsets, can have gaps.
+    Individual = 1,
+}
+impl AckMode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            AckMode::Cumulative => "ACK_MODE_CUMULATIVE",
+            AckMode::Individual => "ACK_MODE_INDIVIDUAL",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ACK_MODE_CUMULATIVE" => Some(Self::Cumulative),
+            "ACK_MODE_INDIVIDUAL" => Some(Self::Individual),
+            _ => None,
+        }
+    }
+}
 /// Error codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -227,6 +422,22 @@ pub enum ErrorCode {
     BrokerNotAvailable = 7,
     /// Record batch too large.
     RecordBatchTooLarge = 8,
+    /// Consumer group not found.
+    ConsumerGroupNotFound = 9,
+    /// Consumer not found in group.
+    ConsumerNotFound = 10,
+    /// Lease not found.
+    LeaseNotFound = 11,
+    /// Lease expired.
+    LeaseExpired = 12,
+    /// Offset already committed.
+    OffsetAlreadyCommitted = 13,
+    /// Offset not leased (trying to ack without lease).
+    OffsetNotLeased = 14,
+    /// Too many consumer groups.
+    TooManyGroups = 15,
+    /// Too many consumers in group.
+    TooManyConsumers = 16,
 }
 impl ErrorCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -244,6 +455,14 @@ impl ErrorCode {
             ErrorCode::RequestTimeout => "REQUEST_TIMEOUT",
             ErrorCode::BrokerNotAvailable => "BROKER_NOT_AVAILABLE",
             ErrorCode::RecordBatchTooLarge => "RECORD_BATCH_TOO_LARGE",
+            ErrorCode::ConsumerGroupNotFound => "CONSUMER_GROUP_NOT_FOUND",
+            ErrorCode::ConsumerNotFound => "CONSUMER_NOT_FOUND",
+            ErrorCode::LeaseNotFound => "LEASE_NOT_FOUND",
+            ErrorCode::LeaseExpired => "LEASE_EXPIRED",
+            ErrorCode::OffsetAlreadyCommitted => "OFFSET_ALREADY_COMMITTED",
+            ErrorCode::OffsetNotLeased => "OFFSET_NOT_LEASED",
+            ErrorCode::TooManyGroups => "TOO_MANY_GROUPS",
+            ErrorCode::TooManyConsumers => "TOO_MANY_CONSUMERS",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -258,6 +477,14 @@ impl ErrorCode {
             "REQUEST_TIMEOUT" => Some(Self::RequestTimeout),
             "BROKER_NOT_AVAILABLE" => Some(Self::BrokerNotAvailable),
             "RECORD_BATCH_TOO_LARGE" => Some(Self::RecordBatchTooLarge),
+            "CONSUMER_GROUP_NOT_FOUND" => Some(Self::ConsumerGroupNotFound),
+            "CONSUMER_NOT_FOUND" => Some(Self::ConsumerNotFound),
+            "LEASE_NOT_FOUND" => Some(Self::LeaseNotFound),
+            "LEASE_EXPIRED" => Some(Self::LeaseExpired),
+            "OFFSET_ALREADY_COMMITTED" => Some(Self::OffsetAlreadyCommitted),
+            "OFFSET_NOT_LEASED" => Some(Self::OffsetNotLeased),
+            "TOO_MANY_GROUPS" => Some(Self::TooManyGroups),
+            "TOO_MANY_CONSUMERS" => Some(Self::TooManyConsumers),
             _ => None,
         }
     }
@@ -368,7 +595,7 @@ pub mod helix_client {
             req.extensions_mut().insert(GrpcMethod::new("helix.v1.Helix", "Write"));
             self.inner.unary(req, path, codec).await
         }
-        /// Read records from a topic partition.
+        /// Read records from a topic partition (direct offset-based read).
         pub async fn read(
             &mut self,
             request: impl tonic::IntoRequest<super::ReadRequest>,
@@ -386,6 +613,98 @@ pub mod helix_client {
             let path = http::uri::PathAndQuery::from_static("/helix.v1.Helix/Read");
             let mut req = request.into_request();
             req.extensions_mut().insert(GrpcMethod::new("helix.v1.Helix", "Read"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Pull records for a consumer (lease-based delivery).
+        pub async fn pull(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PullRequest>,
+        ) -> std::result::Result<tonic::Response<super::PullResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/helix.v1.Helix/Pull");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("helix.v1.Helix", "Pull"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Acknowledge, nack, or extend leased records.
+        pub async fn ack(
+            &mut self,
+            request: impl tonic::IntoRequest<super::AckRequest>,
+        ) -> std::result::Result<tonic::Response<super::AckResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/helix.v1.Helix/Ack");
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new("helix.v1.Helix", "Ack"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Create a consumer group.
+        pub async fn create_consumer_group(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CreateConsumerGroupRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CreateConsumerGroupResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/helix.v1.Helix/CreateConsumerGroup",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("helix.v1.Helix", "CreateConsumerGroup"));
+            self.inner.unary(req, path, codec).await
+        }
+        /// Get committed offset for a consumer group.
+        pub async fn get_committed_offset(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetCommittedOffsetRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetCommittedOffsetResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/helix.v1.Helix/GetCommittedOffset",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("helix.v1.Helix", "GetCommittedOffset"));
             self.inner.unary(req, path, codec).await
         }
         /// Get cluster metadata.
@@ -454,11 +773,37 @@ pub mod helix_server {
             &self,
             request: tonic::Request<super::WriteRequest>,
         ) -> std::result::Result<tonic::Response<super::WriteResponse>, tonic::Status>;
-        /// Read records from a topic partition.
+        /// Read records from a topic partition (direct offset-based read).
         async fn read(
             &self,
             request: tonic::Request<super::ReadRequest>,
         ) -> std::result::Result<tonic::Response<super::ReadResponse>, tonic::Status>;
+        /// Pull records for a consumer (lease-based delivery).
+        async fn pull(
+            &self,
+            request: tonic::Request<super::PullRequest>,
+        ) -> std::result::Result<tonic::Response<super::PullResponse>, tonic::Status>;
+        /// Acknowledge, nack, or extend leased records.
+        async fn ack(
+            &self,
+            request: tonic::Request<super::AckRequest>,
+        ) -> std::result::Result<tonic::Response<super::AckResponse>, tonic::Status>;
+        /// Create a consumer group.
+        async fn create_consumer_group(
+            &self,
+            request: tonic::Request<super::CreateConsumerGroupRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::CreateConsumerGroupResponse>,
+            tonic::Status,
+        >;
+        /// Get committed offset for a consumer group.
+        async fn get_committed_offset(
+            &self,
+            request: tonic::Request<super::GetCommittedOffsetRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetCommittedOffsetResponse>,
+            tonic::Status,
+        >;
         /// Get cluster metadata.
         async fn get_metadata(
             &self,
@@ -629,6 +974,186 @@ pub mod helix_server {
                     let fut = async move {
                         let inner = inner.0;
                         let method = ReadSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/helix.v1.Helix/Pull" => {
+                    #[allow(non_camel_case_types)]
+                    struct PullSvc<T: Helix>(pub Arc<T>);
+                    impl<T: Helix> tonic::server::UnaryService<super::PullRequest>
+                    for PullSvc<T> {
+                        type Response = super::PullResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PullRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Helix>::pull(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = PullSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/helix.v1.Helix/Ack" => {
+                    #[allow(non_camel_case_types)]
+                    struct AckSvc<T: Helix>(pub Arc<T>);
+                    impl<T: Helix> tonic::server::UnaryService<super::AckRequest>
+                    for AckSvc<T> {
+                        type Response = super::AckResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::AckRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Helix>::ack(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = AckSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/helix.v1.Helix/CreateConsumerGroup" => {
+                    #[allow(non_camel_case_types)]
+                    struct CreateConsumerGroupSvc<T: Helix>(pub Arc<T>);
+                    impl<
+                        T: Helix,
+                    > tonic::server::UnaryService<super::CreateConsumerGroupRequest>
+                    for CreateConsumerGroupSvc<T> {
+                        type Response = super::CreateConsumerGroupResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::CreateConsumerGroupRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Helix>::create_consumer_group(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = CreateConsumerGroupSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/helix.v1.Helix/GetCommittedOffset" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetCommittedOffsetSvc<T: Helix>(pub Arc<T>);
+                    impl<
+                        T: Helix,
+                    > tonic::server::UnaryService<super::GetCommittedOffsetRequest>
+                    for GetCommittedOffsetSvc<T> {
+                        type Response = super::GetCommittedOffsetResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetCommittedOffsetRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Helix>::get_committed_offset(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = GetCommittedOffsetSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

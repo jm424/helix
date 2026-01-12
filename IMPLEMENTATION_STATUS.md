@@ -9,8 +9,8 @@ This document tracks progress against the [implementation plan](../helix-impleme
 | Phase 0: Foundations | Partial | ~80% |
 | Phase 1: Core Consensus | ✅ Complete | 100% (WAL DST hardened, 500-seed stress test passing) |
 | Phase 2: Multi-Raft & Sharding | ✅ Complete | 100% (shard movement infrastructure done) |
-| Phase 3: Storage Features | ⚠️ Partial | ~70% (helix-tier complete, helix-progress not started) |
-| Phase 4: API & Flow Control | ⚠️ Partial | ~80% (multi-node networking done, flow control/kafka not started) |
+| Phase 3: Storage Features | ✅ Complete | 100% (helix-tier + helix-progress + eviction coordination) |
+| Phase 4: API & Flow Control | ⚠️ Partial | ~85% (gRPC API complete, flow control/kafka not started) |
 | Phase 5: Production Readiness | Not Started | 0% |
 
 ## Deviations from Plan
@@ -256,7 +256,7 @@ The plan requires:
 
 ### Phase 3: Storage Features
 
-**Status: ~70% (helix-tier complete with real WAL integration tests, helix-progress not started)**
+**Status: ✅ COMPLETE (helix-tier + helix-progress + eviction coordination)**
 
 #### 3.1 Tiered Storage (helix-tier)
 
@@ -323,9 +323,58 @@ The plan requires:
 
 #### 3.2 Progress Tracking (helix-progress)
 
-**Status: NOT STARTED**
+**Status: ✅ COMPLETE**
 
-Missing crate: `helix-progress` - Consumer progress tracking with leases
+| Item | Status | Notes |
+|------|--------|-------|
+| `helix-progress` crate | ✅ Done | Consumer progress tracking with leases |
+| ProgressError enum | ✅ Done | GroupNotFound, ConsumerNotFound, LeaseExpired, etc. |
+| AckMode enum | ✅ Done | Cumulative (Kafka) + Individual (Pulsar) modes |
+| Lease struct | ✅ Done | LeaseId, consumer, partition, offset range, expiration |
+| PartitionProgress | ✅ Done | low_watermark, committed_bitmap (RoaringBitmap), active leases |
+| ConsumerGroupState | ✅ Done | Group-level state with partition progress map |
+| ProgressStore trait | ✅ Done | Async storage abstraction |
+| SimulatedProgressStore | ✅ Done | Deterministic fault injection for DST |
+| ProgressManager | ✅ Done | Orchestrates leases, commits, watermark advancement |
+| Bitmap utilities | ✅ Done | RoaringBitmap for sparse offset tracking |
+
+**Testing Milestones:**
+| Item | Status |
+|------|--------|
+| Unit tests for types | ✅ Done (32 tests) |
+| DST: lease expiration | ✅ Done |
+| DST: commit validation | ✅ Done |
+| DST: watermark advancement | ✅ Done |
+| DST: fault injection (all sites) | ✅ Done |
+| DST: determinism verification | ✅ Done |
+| DST: invariant checking | ✅ Done |
+| DST: comprehensive stress (100 seeds) | ✅ Done |
+| DST: 500-seed stress test | ✅ Done (ignored by default) |
+| Integration tests (16 tests) | ✅ Done |
+
+**Integration Status:**
+- ✅ ProgressManager integrated with DurablePartition
+- ✅ safe_eviction_offset() query for tiering coordination
+- ✅ Eviction respects consumer progress watermarks
+- ✅ 4 eviction coordination tests in helix-tier
+
+#### 3.3 Eviction Coordination
+
+**Status: ✅ COMPLETE**
+
+| Item | Status | Notes |
+|------|--------|-------|
+| Offset range tracking on segments | ✅ Done | set_offset_range() called on segment seal |
+| can_evict_with_progress() | ✅ Done | Checks safe eviction offset before evict |
+| evict_with_progress() | ✅ Done | Evicts only segments below safe offset |
+| Bug fixes | ✅ Done | 3 bugs found and fixed |
+
+**Bugs Found and Fixed:**
+| Bug | Fix |
+|-----|-----|
+| Offset range never populated | Added set_offset_range() call in check_and_register_sealed_segments() |
+| Segments without offset info evictable | Changed can_evict_with_progress() to return false when end_offset is None |
+| Off-by-one in eviction boundary | Changed `<=` to `<` in boundary comparison |
 
 ---
 
@@ -333,23 +382,38 @@ Missing crate: `helix-progress` - Consumer progress tracking with leases
 
 #### 4.1 gRPC API Layer
 
+**Status: ✅ COMPLETE**
+
 | Item | Status | Notes |
 |------|--------|-------|
 | HelixServer struct | ✅ Done | `helix-server` backed by Multi-Raft |
 | Write/Read/Metadata RPCs | ✅ Done | |
+| **Pull RPC** | ✅ Done | Consumer read with lease-based delivery |
+| **Ack RPC** | ✅ Done | Acknowledge/nack/extend leases |
+| **CreateConsumerGroup RPC** | ✅ Done | Create consumer groups with ack mode |
+| **GetCommittedOffset RPC** | ✅ Done | Query committed offset for consumer group |
 | Integration with Multi-Raft | ✅ Done | Replaced ReplicationManager with MultiRaft engine |
 | Integration with helix-wal | ✅ Done | DurablePartition for crash-safe storage |
+| Integration with helix-progress | ✅ Done | Consumer APIs use ProgressManager |
 | Integration with ShardRouter | ⚠️ Partial | GroupMap for partition→group, ShardRouter ready but not wired |
 | Multi-node Raft networking | ✅ Done | TCP transport, batch encoding, `new_multi_node()` constructor |
 | CLI args for clustering | ✅ Done | `--raft-addr`, `--peer`, `--data-dir` flags |
 | Docker multi-node setup | ✅ Done | 3-node cluster with docker-compose |
+| Consumer API unit tests | ✅ Done | 3 new tests (create group, pull/ack, get offset) |
 
 **Architecture:**
 - `MultiRaft` manages all Raft groups (one per partition)
 - `GroupMap` maps (TopicId, PartitionId) ↔ GroupId
 - `DurablePartition` wraps WAL + in-memory cache (Tier 1 storage per RFC)
+- `ProgressManager` tracks consumer group progress and leases
 - Single tick task drives all groups
 - TCP transport with batched `GroupMessage` encoding for peer communication
+
+**Consumer API Flow:**
+1. `CreateConsumerGroup` - Creates group with Cumulative or Individual ack mode
+2. `Pull` - Leases available offsets, returns records with lease_id
+3. `Ack` - Commits lease (ack), releases for redelivery (nack), or extends duration
+4. `GetCommittedOffset` - Queries low watermark for a consumer group
 
 #### 4.2 Flow Control
 
@@ -386,10 +450,14 @@ Missing: `helix-kafka-proxy` crate.
 | **Multi-node networking** | TCP transport, batch encoding, Docker 3-node cluster |
 | **Benchmarking** | 1.43M writes/sec (single), 129K writes/sec (3-node) |
 | **helix-tier** | S3 abstraction, DST (43 tests), 2 bugs found/fixed |
+| **helix-progress** | Consumer progress tracking, leases, watermarks, RoaringBitmap, 32+16 tests |
+| **Eviction Coordination** | Progress-aware eviction, 3 bugs found/fixed, 4 integration tests |
+| **Consumer gRPC API** | Pull/Ack/CreateConsumerGroup RPCs, integrated with helix-progress, 3 new tests |
 
 **Bugs Found via DST:**
 - helix-tier: orphaned data (seed 197562), ordering violation (seed 17)
 - helix-wal: in-memory truncation before sync (seed 2074002), recovery overlap bug (seed 2074002)
+- helix-tier/eviction: offset range never populated, segments without offset info evictable, off-by-one in boundary
 
 ---
 
@@ -403,15 +471,16 @@ Missing: `helix-kafka-proxy` crate.
    - ~96% success rate under aggressive fault injection
    - See: `helix-tests/src/shard_transfer_tests.rs`
 
-### Priority 2: Complete Phase 3 (Storage Features) ⭐ NEXT
+### Priority 2: Complete Phase 3 (Storage Features) ✅ COMPLETE
 
-**2. helix-progress** - Consumer progress tracking
-   - Required for Phase 3 checkpoint: "Complete data lifecycle (write→tier→read)"
-   - Offset commits with leases
-   - Consumer group coordination
-   - Low watermark advancement
-   - DST testing with lease expiration, redelivery, node failures
-   - Estimated: 2-3 weeks
+**2. helix-progress** ✅ DONE
+   - Phase 3 checkpoint met: "Complete data lifecycle (write→tier→read→consume)"
+   - Offset commits with leases (Cumulative + Individual ack modes)
+   - Consumer group coordination with ProgressManager
+   - Low watermark advancement with RoaringBitmap
+   - DST testing: 32 unit tests + 16 integration tests
+   - Eviction coordination: 3 bugs found and fixed
+   - See: `helix-progress/src/`, `helix-tests/src/progress_tests.rs`
 
 **3. S3ObjectStorage** - Real S3 implementation
    - Behind `s3` feature flag (aws-sdk-s3)
@@ -453,7 +522,7 @@ Missing: `helix-kafka-proxy` crate.
 | `helix-routing` | ✅ Exists | ShardMap, LeaderCache, ShardRouter |
 | `helix-runtime` | ⚠️ Partial | Tick-based server, missing io_uring |
 | `helix-tier` | ✅ Complete | Wired into DurablePartition, 500-seed stress DST found 2 bugs (fixed), 43 tests |
-| `helix-progress` | ❌ Missing | Need to create |
+| `helix-progress` | ✅ Complete | Consumer progress tracking, leases, watermarks, DST verified |
 | `helix-flow` | ❌ Missing | Need to create |
 | `helix-server` | ✅ Complete | Multi-Raft done, WAL-backed durable storage integrated |
 | `helix-kafka-proxy` | ❌ Missing | Need to create |

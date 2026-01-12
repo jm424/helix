@@ -640,6 +640,100 @@ impl<S: ProgressStore> ProgressManager<S> {
         Ok(())
     }
 
+    /// Commits all offsets in a lease and releases the lease.
+    ///
+    /// In Cumulative mode: advances watermark directly to `to_offset+1`.
+    /// In Individual mode: marks all offsets in the lease range as committed.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if lease not found, not owned by consumer, expired, or storage fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_lease(
+        &self,
+        group_id: ConsumerGroupId,
+        topic_id: TopicId,
+        partition_id: PartitionId,
+        consumer_id: ConsumerId,
+        lease_id: LeaseId,
+        current_time_us: u64,
+    ) -> ProgressResult<()> {
+        let mut group = self
+            .store
+            .get_group(group_id)
+            .await?
+            .ok_or(ProgressError::GroupNotFound { group_id })?;
+
+        let partition_key = PartitionKey::new(topic_id, partition_id);
+        let progress = group.partitions.get_mut(&partition_key).ok_or(
+            ProgressError::PartitionNotFound {
+                group_id,
+                topic_id,
+                partition_id,
+            },
+        )?;
+
+        // Find and validate the lease.
+        let lease = progress
+            .active_leases
+            .get(&lease_id)
+            .ok_or(ProgressError::LeaseNotFound { lease_id })?;
+
+        // Verify ownership.
+        if lease.consumer_id != consumer_id {
+            return Err(ProgressError::OffsetNotLeased {
+                consumer_id,
+                offset: lease.from_offset,
+            });
+        }
+
+        // Check expiration.
+        if lease.is_expired_at(current_time_us) {
+            return Err(ProgressError::LeaseExpired {
+                lease_id,
+                expired_at_us: lease.expires_at_us,
+            });
+        }
+
+        // Get the offset range from the lease.
+        let from_offset = lease.from_offset;
+        let to_offset = lease.to_offset;
+
+        // Commit all offsets in the lease range.
+        for offset_val in from_offset.get()..=to_offset.get() {
+            let offset = Offset::new(offset_val);
+            if !progress.is_committed(offset) {
+                progress.commit_offset(offset);
+            }
+        }
+
+        // Remove the lease.
+        progress.active_leases.remove(&lease_id);
+
+        // Remove from consumer's lease list.
+        if let Some(consumer) = group.consumers.get_mut(&consumer_id) {
+            consumer.lease_ids.retain(|&id| id != lease_id);
+        }
+
+        // Capture watermark before releasing borrow.
+        let new_watermark = progress.low_watermark;
+
+        // Clean up stale lease references from consumers.
+        group.cleanup_stale_consumer_leases();
+
+        self.store.save_group(&group).await?;
+
+        debug!(
+            lease_id = %lease_id,
+            from = from_offset.get(),
+            to = to_offset.get(),
+            new_watermark = new_watermark.get(),
+            "Committed lease"
+        );
+
+        Ok(())
+    }
+
     // -------------------------------------------------------------------------
     // Query Operations
     // -------------------------------------------------------------------------

@@ -7,8 +7,20 @@ service Helix {
     // Write records to a topic partition.
     rpc Write(WriteRequest) returns (WriteResponse);
 
-    // Read records from a topic partition.
+    // Read records from a topic partition (direct offset-based read).
     rpc Read(ReadRequest) returns (ReadResponse);
+
+    // Pull records for a consumer (lease-based delivery).
+    rpc Pull(PullRequest) returns (PullResponse);
+
+    // Acknowledge, nack, or extend leased records.
+    rpc Ack(AckRequest) returns (AckResponse);
+
+    // Create a consumer group.
+    rpc CreateConsumerGroup(CreateConsumerGroupRequest) returns (CreateConsumerGroupResponse);
+
+    // Get committed offset for a consumer group.
+    rpc GetCommittedOffset(GetCommittedOffsetRequest) returns (GetCommittedOffsetResponse);
 
     // Get cluster metadata.
     rpc GetMetadata(GetMetadataRequest) returns (GetMetadataResponse);
@@ -85,6 +97,134 @@ message RecordWithOffset {
     uint64 offset = 1;
     // The record data.
     Record record = 2;
+}
+
+// ============================================================================
+// Consumer Group APIs (Pull/Ack pattern with leases)
+// ============================================================================
+
+// Acknowledgment mode for consumer groups.
+enum AckMode {
+    // Kafka-style: commit offset N means everything up to N is processed.
+    ACK_MODE_CUMULATIVE = 0;
+    // Pulsar-style: acknowledge individual offsets, can have gaps.
+    ACK_MODE_INDIVIDUAL = 1;
+}
+
+// Request to pull records for a consumer.
+message PullRequest {
+    // Topic to pull from.
+    string topic = 1;
+    // Partition to pull from.
+    int32 partition = 2;
+    // Consumer group ID.
+    string consumer_group_id = 3;
+    // Consumer ID (unique within the group).
+    string consumer_id = 4;
+    // Maximum number of records to return.
+    uint32 max_records = 5;
+    // Maximum bytes to return.
+    uint32 max_bytes = 6;
+    // Lease duration in milliseconds (how long consumer has to ack).
+    uint32 lease_duration_ms = 7;
+}
+
+// Response from pull operation.
+message PullResponse {
+    // Records pulled (with lease).
+    repeated RecordWithOffset records = 1;
+    // Lease ID for these records (use in Ack request).
+    uint64 lease_id = 2;
+    // First offset in the lease range.
+    uint64 from_offset = 3;
+    // Last offset in the lease range (inclusive).
+    uint64 to_offset = 4;
+    // Lease expiration time in microseconds since epoch.
+    uint64 lease_expires_at_us = 5;
+    // Whether there are more records available.
+    bool has_more = 6;
+    // Error code (0 = success).
+    ErrorCode error_code = 7;
+    // Error message if any.
+    optional string error_message = 8;
+}
+
+// Request to acknowledge, nack, or extend leased records.
+message AckRequest {
+    // Topic.
+    string topic = 1;
+    // Partition.
+    int32 partition = 2;
+    // Consumer group ID.
+    string consumer_group_id = 3;
+    // Consumer ID.
+    string consumer_id = 4;
+    // Lease IDs to acknowledge (mark as processed).
+    repeated uint64 ack_lease_ids = 5;
+    // Lease IDs to negative-acknowledge (release for redelivery).
+    repeated uint64 nack_lease_ids = 6;
+    // Lease IDs to extend (renew lease duration).
+    repeated uint64 extend_lease_ids = 7;
+    // Extension duration in milliseconds (for extend_lease_ids).
+    uint32 extend_duration_ms = 8;
+}
+
+// Response from ack operation.
+message AckResponse {
+    // Number of leases successfully acknowledged.
+    uint32 acked_count = 1;
+    // Number of leases successfully nacked.
+    uint32 nacked_count = 2;
+    // Number of leases successfully extended.
+    uint32 extended_count = 3;
+    // New low watermark after acks (all offsets below are committed).
+    uint64 low_watermark = 4;
+    // Error code (0 = success).
+    ErrorCode error_code = 5;
+    // Error message if any.
+    optional string error_message = 6;
+}
+
+// Request to create a consumer group.
+message CreateConsumerGroupRequest {
+    // Consumer group ID (unique identifier).
+    string consumer_group_id = 1;
+    // Acknowledgment mode for this group.
+    AckMode ack_mode = 2;
+    // Topics this group will consume from.
+    repeated string topics = 3;
+}
+
+// Response from create consumer group.
+message CreateConsumerGroupResponse {
+    // Whether the group was created (false if already exists).
+    bool created = 1;
+    // Error code (0 = success).
+    ErrorCode error_code = 2;
+    // Error message if any.
+    optional string error_message = 3;
+}
+
+// Request to get committed offset for a consumer group.
+message GetCommittedOffsetRequest {
+    // Topic.
+    string topic = 1;
+    // Partition.
+    int32 partition = 2;
+    // Consumer group ID.
+    string consumer_group_id = 3;
+}
+
+// Response with committed offset.
+message GetCommittedOffsetResponse {
+    // Low watermark (all offsets below are committed).
+    uint64 low_watermark = 1;
+    // Whether the group has any committed offsets for this partition.
+    bool has_committed = 2;
+    // Error code (0 = success).
+    ErrorCode error_code = 3;
+    // Error message if any.
+    optional string error_message = 4;
 }
 
 // Request for cluster metadata.
@@ -181,4 +321,20 @@ enum ErrorCode {
     BROKER_NOT_AVAILABLE = 7;
     // Record batch too large.
     RECORD_BATCH_TOO_LARGE = 8;
+    // Consumer group not found.
+    CONSUMER_GROUP_NOT_FOUND = 9;
+    // Consumer not found in group.
+    CONSUMER_NOT_FOUND = 10;
+    // Lease not found.
+    LEASE_NOT_FOUND = 11;
+    // Lease expired.
+    LEASE_EXPIRED = 12;
+    // Offset already committed.
+    OFFSET_ALREADY_COMMITTED = 13;
+    // Offset not leased (trying to ack without lease).
+    OFFSET_NOT_LEASED = 14;
+    // Too many consumer groups.
+    TOO_MANY_GROUPS = 15;
+    // Too many consumers in group.
+    TOO_MANY_CONSUMERS = 16;
 }

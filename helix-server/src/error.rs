@@ -1,6 +1,7 @@
 //! Server error types.
 
 use crate::generated::ErrorCode;
+use helix_progress::ProgressError;
 
 /// Server error type.
 #[derive(Debug, thiserror::Error)]
@@ -52,6 +53,78 @@ pub enum ServerError {
         limit: usize,
     },
 
+    /// Consumer group not found.
+    #[error("consumer group not found: {group_id}")]
+    ConsumerGroupNotFound {
+        /// The consumer group ID.
+        group_id: String,
+    },
+
+    /// Consumer not found in group.
+    #[error("consumer {consumer_id} not found in group {group_id}")]
+    ConsumerNotFound {
+        /// The consumer group ID.
+        group_id: String,
+        /// The consumer ID.
+        consumer_id: String,
+    },
+
+    /// Lease not found.
+    #[error("lease {lease_id} not found")]
+    LeaseNotFound {
+        /// The lease ID.
+        lease_id: u64,
+    },
+
+    /// Lease expired.
+    #[error("lease {lease_id} expired")]
+    LeaseExpired {
+        /// The lease ID.
+        lease_id: u64,
+    },
+
+    /// Offset already committed.
+    #[error("offset {offset} already committed for partition {partition}")]
+    OffsetAlreadyCommitted {
+        /// The partition.
+        partition: i32,
+        /// The offset.
+        offset: u64,
+    },
+
+    /// Offset not leased.
+    #[error("offset {offset} not leased by consumer {consumer_id}")]
+    OffsetNotLeased {
+        /// The consumer ID.
+        consumer_id: String,
+        /// The offset.
+        offset: u64,
+    },
+
+    /// Too many consumer groups.
+    #[error("too many consumer groups: {count} (max {max})")]
+    TooManyGroups {
+        /// Current count.
+        count: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Too many consumers in group.
+    #[error("too many consumers in group {group_id}: {count} (max {max})")]
+    TooManyConsumers {
+        /// The consumer group ID.
+        group_id: String,
+        /// Current count.
+        count: usize,
+        /// Maximum allowed.
+        max: usize,
+    },
+
+    /// Progress tracking error.
+    #[error("progress error: {0}")]
+    Progress(#[from] ProgressError),
+
     /// Internal error.
     #[error("internal error: {message}")]
     Internal {
@@ -70,6 +143,15 @@ impl ServerError {
             Self::OffsetOutOfRange { .. } => ErrorCode::OffsetOutOfRange,
             Self::NotLeader { .. } => ErrorCode::NotLeader,
             Self::RecordBatchTooLarge { .. } => ErrorCode::RecordBatchTooLarge,
+            Self::ConsumerGroupNotFound { .. } => ErrorCode::ConsumerGroupNotFound,
+            Self::ConsumerNotFound { .. } => ErrorCode::ConsumerNotFound,
+            Self::LeaseNotFound { .. } => ErrorCode::LeaseNotFound,
+            Self::LeaseExpired { .. } => ErrorCode::LeaseExpired,
+            Self::OffsetAlreadyCommitted { .. } => ErrorCode::OffsetAlreadyCommitted,
+            Self::OffsetNotLeased { .. } => ErrorCode::OffsetNotLeased,
+            Self::TooManyGroups { .. } => ErrorCode::TooManyGroups,
+            Self::TooManyConsumers { .. } => ErrorCode::TooManyConsumers,
+            Self::Progress(e) => progress_error_to_code(e),
             Self::Internal { .. } => ErrorCode::Unknown,
         }
     }
@@ -78,6 +160,22 @@ impl ServerError {
     #[must_use]
     pub fn message(&self) -> String {
         self.to_string()
+    }
+}
+
+/// Maps a `ProgressError` to an `ErrorCode`.
+const fn progress_error_to_code(e: &ProgressError) -> ErrorCode {
+    match e {
+        ProgressError::GroupNotFound { .. } => ErrorCode::ConsumerGroupNotFound,
+        ProgressError::ConsumerNotFound { .. } => ErrorCode::ConsumerNotFound,
+        ProgressError::PartitionNotFound { .. } => ErrorCode::InvalidPartition,
+        ProgressError::LeaseNotFound { .. } => ErrorCode::LeaseNotFound,
+        ProgressError::LeaseExpired { .. } => ErrorCode::LeaseExpired,
+        ProgressError::OffsetAlreadyCommitted { .. } => ErrorCode::OffsetAlreadyCommitted,
+        ProgressError::OffsetNotLeased { .. } => ErrorCode::OffsetNotLeased,
+        ProgressError::TooManyGroups { .. } => ErrorCode::TooManyGroups,
+        ProgressError::TooManyConsumers { .. } => ErrorCode::TooManyConsumers,
+        ProgressError::LeaseDurationExceeded { .. } | ProgressError::Io { .. } => ErrorCode::Unknown,
     }
 }
 
