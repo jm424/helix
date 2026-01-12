@@ -1,0 +1,31 @@
+[package]
+name = "helix-progress"
+description = "Consumer progress tracking for Helix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Internal crates.
+helix-core = { workspace = true }
+
+# Async runtime.
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+# Data structures.
+roaring = { workspace = true }
+
+# Tracing.
+tracing = { workspace = true }
+
+# Error handling.
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
+
+[lints]
+workspace = true

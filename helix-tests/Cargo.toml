@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 helix-core = { workspace = true }
+helix-progress = { workspace = true }
 helix-raft = { workspace = true }
 helix-routing = { workspace = true }
 helix-runtime = { workspace = true }
