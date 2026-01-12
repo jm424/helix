@@ -10,7 +10,7 @@ This document tracks progress against the [implementation plan](../helix-impleme
 | Phase 1: Core Consensus | ✅ Complete | 100% (WAL DST hardened, 500-seed stress test passing) |
 | Phase 2: Multi-Raft & Sharding | ✅ Complete | 100% (shard movement infrastructure done) |
 | Phase 3: Storage Features | ✅ Complete | 100% (helix-tier + helix-progress + eviction coordination) |
-| Phase 4: API & Flow Control | ⚠️ Partial | ~85% (gRPC API complete, flow control/kafka not started) |
+| Phase 4: API & Flow Control | ⚠️ Partial | ~95% (gRPC API + Flow Control complete, Kafka proxy not started) |
 | Phase 5: Production Readiness | Not Started | 0% |
 
 ## Deviations from Plan
@@ -417,9 +417,25 @@ The plan requires:
 
 #### 4.2 Flow Control
 
-**Status: NOT STARTED**
+**Status: ✅ COMPLETE**
 
-Missing: `helix-flow` crate with token buckets, weighted fair queues.
+| Item | Status | Notes |
+|------|--------|-------|
+| `helix-flow` crate | ✅ Done | New crate created |
+| TokenBucket | ✅ Done | DST-compatible rate limiter with `current_time_us` parameter |
+| TokenBucketConfig | ✅ Done | Configurable capacity, refill rate, initial tokens |
+| WeightedFairQueue | ✅ Done | Virtual time-based fair scheduling |
+| IoClass enum | ✅ Done | Write, LiveRead, BackfillRead, Tiering |
+| FairQueueConfig | ✅ Done | Per-class weights, max queue depth |
+| AimdController | ✅ Done | Additive Increase Multiplicative Decrease congestion control |
+| AimdConfig | ✅ Done | Latency/error thresholds, adjustment intervals |
+| FlowController | ✅ Done | Orchestrates token buckets, fair queue, and AIMD |
+| Unit tests | ✅ Done | 36 tests covering all components |
+
+**DST Compatibility:**
+- All time-dependent operations take `current_time_us` parameter
+- No use of `Instant::now()` or system time
+- Deterministic behavior for simulation testing
 
 #### 4.3 Kafka Compatibility Proxy
 
@@ -453,6 +469,7 @@ Missing: `helix-kafka-proxy` crate.
 | **helix-progress** | Consumer progress tracking, leases, watermarks, RoaringBitmap, 32+16 tests |
 | **Eviction Coordination** | Progress-aware eviction, 3 bugs found/fixed, 4 integration tests |
 | **Consumer gRPC API** | Pull/Ack/CreateConsumerGroup RPCs, integrated with helix-progress, 3 new tests |
+| **helix-flow** | TokenBucket, WeightedFairQueue, AimdController, DST-compatible, 36 tests |
 
 **Bugs Found via DST:**
 - helix-tier: orphaned data (seed 197562), ordering violation (seed 17)
@@ -490,11 +507,11 @@ Missing: `helix-kafka-proxy` crate.
 
 ### Priority 3: Phase 4 Completion
 
-**4. helix-flow** - Flow control
+**4. helix-flow** ✅ DONE
    - Token buckets for rate limiting
    - Weighted fair queuing for IO classes
    - AIMD controller for adaptive limits
-   - Estimated: 1-2 weeks
+   - See: `helix-flow/src/`, 36 tests
 
 **5. helix-kafka-proxy** - Kafka compatibility
    - Protocol translation layer
@@ -523,7 +540,7 @@ Missing: `helix-kafka-proxy` crate.
 | `helix-runtime` | ⚠️ Partial | Tick-based server, missing io_uring |
 | `helix-tier` | ✅ Complete | Wired into DurablePartition, 500-seed stress DST found 2 bugs (fixed), 43 tests |
 | `helix-progress` | ✅ Complete | Consumer progress tracking, leases, watermarks, DST verified |
-| `helix-flow` | ❌ Missing | Need to create |
+| `helix-flow` | ✅ Complete | TokenBucket, WeightedFairQueue, AimdController, FlowController (36 tests) |
 | `helix-server` | ✅ Complete | Multi-Raft done, WAL-backed durable storage integrated |
 | `helix-kafka-proxy` | ❌ Missing | Need to create |
 | `helix-cli` | ❌ Missing | Need to create |

@@ -1717,6 +1717,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "helix-flow"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "helix-core",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "helix-progress"
 version = "0.1.0"
 dependencies = [

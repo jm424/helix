@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "helix-core",
+    "helix-flow",
     "helix-progress",
     "helix-routing",
     "helix-runtime",
@@ -22,6 +23,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 # Internal crates.
 helix-core = { path = "helix-core" }
+helix-flow = { path = "helix-flow" }
 helix-progress = { path = "helix-progress" }
 helix-routing = { path = "helix-routing" }
 helix-runtime = { path = "helix-runtime" }
