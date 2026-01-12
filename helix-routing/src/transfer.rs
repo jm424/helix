@@ -212,7 +212,7 @@ impl ShardTransfer {
     }
 
     /// Updates the catchup lag.
-    pub fn update_lag(&mut self, new_lag: u64) {
+    pub const fn update_lag(&mut self, new_lag: u64) {
         if let TransferState::CatchingUp { lag } = &mut self.state {
             *lag = new_lag;
         }

@@ -25,7 +25,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
-use helix_core::{Offset, PartitionId, Record, TopicId};
+use helix_core::{ConsumerGroupId, ConsumerId, Offset, PartitionId, Record, TopicId};
+use helix_progress::{
+    Lease, ProgressConfig, ProgressError, ProgressManager, SimulatedProgressStore,
+};
 use helix_tier::{
     InMemoryMetadataStore, IntegratedTieringManager, SegmentMetadata, SegmentReader,
     SimulatedObjectStorage, TierError, TierResult, TieringConfig,
@@ -91,6 +94,9 @@ impl SegmentReader for WalSegmentReader {
 /// Type alias for the tiering manager with simulated storage (for testing).
 pub type SimulatedTieringManager =
     IntegratedTieringManager<SimulatedObjectStorage, InMemoryMetadataStore, WalSegmentReader>;
+
+/// Type alias for the progress manager with simulated storage (for testing).
+pub type SimulatedProgressManager = ProgressManager<SimulatedProgressStore>;
 
 // -----------------------------------------------------------------------------
 // PartitionCommand
@@ -305,7 +311,7 @@ impl Partition {
     }
 
     /// Sets the high watermark.
-    pub fn set_high_watermark(&mut self, hwm: Offset) {
+    pub const fn set_high_watermark(&mut self, hwm: Offset) {
         self.high_watermark = hwm;
     }
 
@@ -410,6 +416,8 @@ pub struct DurablePartitionConfig {
     pub sync_on_write: bool,
     /// Optional tiering configuration. If `Some`, tiering is enabled.
     pub tiering: Option<TieringConfig>,
+    /// Optional progress tracking configuration. If `Some`, consumer progress is tracked.
+    pub progress: Option<ProgressConfig>,
 }
 
 #[allow(dead_code)] // Used in tests and will be used in service.rs integration.
@@ -423,6 +431,7 @@ impl DurablePartitionConfig {
             partition_id,
             sync_on_write: false, // Default to batched syncs for performance.
             tiering: None,
+            progress: None,
         }
     }
 
@@ -437,6 +446,13 @@ impl DurablePartitionConfig {
     #[must_use]
     pub const fn with_tiering(mut self, config: TieringConfig) -> Self {
         self.tiering = Some(config);
+        self
+    }
+
+    /// Enables consumer progress tracking with the given configuration.
+    #[must_use]
+    pub const fn with_progress(mut self, config: ProgressConfig) -> Self {
+        self.progress = Some(config);
         self
     }
 
@@ -480,6 +496,8 @@ pub struct DurablePartition {
     tiering: Option<SimulatedTieringManager>,
     /// Set of segment IDs that have been registered with tiering.
     tiered_segments: std::collections::HashSet<u64>,
+    /// Progress manager for consumer offset tracking (optional).
+    progress: Option<SimulatedProgressManager>,
 }
 
 #[allow(dead_code)] // Used in tests and will be used in service.rs integration.
@@ -567,6 +585,20 @@ impl DurablePartition {
             )
         });
 
+        // Initialize progress tracking if configured.
+        let progress = config.progress.as_ref().map(|progress_config| {
+            // Use simulated storage for now - production would use Raft-backed storage.
+            let store = SimulatedProgressStore::new(42);
+
+            info!(
+                max_lease_duration_us = progress_config.max_lease_duration_us,
+                max_consumers = progress_config.max_consumers_per_group,
+                "Progress tracking enabled"
+            );
+
+            ProgressManager::new(store, progress_config.clone())
+        });
+
         Ok(Self {
             config,
             wal,
@@ -574,6 +606,7 @@ impl DurablePartition {
             last_applied_index,
             tiering,
             tiered_segments: std::collections::HashSet::new(),
+            progress,
         })
     }
 
@@ -596,7 +629,7 @@ impl DurablePartition {
     }
 
     /// Sets the high watermark.
-    pub fn set_high_watermark(&mut self, hwm: Offset) {
+    pub const fn set_high_watermark(&mut self, hwm: Offset) {
         self.cache.set_high_watermark(hwm);
     }
 
@@ -914,6 +947,177 @@ impl DurablePartition {
     pub const fn tiering_manager(&self) -> Option<&SimulatedTieringManager> {
         self.tiering.as_ref()
     }
+
+    // -------------------------------------------------------------------------
+    // Consumer Progress Methods
+    // -------------------------------------------------------------------------
+
+    /// Returns true if consumer progress tracking is enabled.
+    #[must_use]
+    pub const fn has_progress(&self) -> bool {
+        self.progress.is_some()
+    }
+
+    /// Returns a reference to the progress manager for testing.
+    #[must_use]
+    pub const fn progress_manager(&self) -> Option<&SimulatedProgressManager> {
+        self.progress.as_ref()
+    }
+
+    /// Leases offsets for a consumer to process.
+    ///
+    /// The consumer must first be registered with the group via
+    /// `register_consumer`. The lease grants exclusive access to a range
+    /// of offsets for the specified duration.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if progress tracking is not enabled, consumer is not
+    /// registered, or storage operation fails.
+    pub async fn lease_for_consumer(
+        &self,
+        group_id: ConsumerGroupId,
+        consumer_id: ConsumerId,
+        max_count: u32,
+        duration_us: u64,
+        current_time_us: u64,
+    ) -> Result<Option<Lease>, DurablePartitionError> {
+        let progress = self.progress.as_ref().ok_or(DurablePartitionError::ProgressNotEnabled)?;
+
+        // Start leasing from the current log start offset.
+        let from_offset = self.cache.log_start_offset();
+
+        progress
+            .lease_offsets(
+                group_id,
+                self.config.topic_id,
+                self.config.partition_id,
+                consumer_id,
+                from_offset,
+                max_count,
+                duration_us,
+                current_time_us,
+            )
+            .await
+            .map_err(|e| DurablePartitionError::Progress { source: e })
+    }
+
+    /// Commits an offset for a consumer.
+    ///
+    /// The offset must be covered by an active lease held by this consumer.
+    /// In cumulative mode, committing offset N means all offsets up to N
+    /// are considered processed.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if progress tracking is not enabled, offset is not
+    /// leased by this consumer, or storage operation fails.
+    pub async fn commit_consumer_offset(
+        &self,
+        group_id: ConsumerGroupId,
+        consumer_id: ConsumerId,
+        offset: Offset,
+        current_time_us: u64,
+    ) -> Result<(), DurablePartitionError> {
+        let progress = self.progress.as_ref().ok_or(DurablePartitionError::ProgressNotEnabled)?;
+
+        progress
+            .commit_offset(
+                group_id,
+                self.config.topic_id,
+                self.config.partition_id,
+                consumer_id,
+                offset,
+                current_time_us,
+            )
+            .await
+            .map_err(|e| DurablePartitionError::Progress { source: e })
+    }
+
+    /// Registers a consumer with a consumer group.
+    ///
+    /// Must be called before leasing offsets or committing.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if progress tracking is not enabled or storage fails.
+    pub async fn register_consumer(
+        &self,
+        group_id: ConsumerGroupId,
+        consumer_id: ConsumerId,
+        current_time_us: u64,
+    ) -> Result<(), DurablePartitionError> {
+        let progress = self.progress.as_ref().ok_or(DurablePartitionError::ProgressNotEnabled)?;
+
+        progress
+            .register_consumer(group_id, consumer_id, current_time_us)
+            .await
+            .map_err(|e| DurablePartitionError::Progress { source: e })
+    }
+
+    /// Gets the safe eviction offset for this partition.
+    ///
+    /// Returns the minimum low watermark across all consumer groups tracking
+    /// this partition. Segments with end offset below this value can be
+    /// safely evicted from local storage.
+    ///
+    /// Returns `None` if no consumer groups are tracking this partition.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if progress tracking is not enabled or storage fails.
+    pub async fn get_safe_eviction_offset(&self) -> Result<Option<Offset>, DurablePartitionError> {
+        // If progress tracking is not enabled, return None (no restriction on eviction).
+        let Some(progress) = self.progress.as_ref() else {
+            return Ok(None);
+        };
+
+        progress
+            .get_safe_eviction_offset(self.config.topic_id, self.config.partition_id)
+            .await
+            .map_err(|e| DurablePartitionError::Progress { source: e })
+    }
+
+    /// Evicts eligible segments from local storage, respecting consumer progress.
+    ///
+    /// This method coordinates tiering and progress tracking:
+    /// 1. Gets the safe eviction offset from progress (if enabled)
+    /// 2. Only evicts segments whose `end_offset` is below the safe offset
+    ///
+    /// If progress tracking is not enabled, eviction proceeds based solely
+    /// on tiering eligibility (segment must be in both local and remote storage).
+    ///
+    /// # Returns
+    ///
+    /// The number of segments evicted, or 0 if tiering is not enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if eviction operation fails.
+    pub async fn evict_eligible_segments(&self) -> Result<u32, DurablePartitionError> {
+        let Some(tiering) = &self.tiering else {
+            return Ok(0);
+        };
+
+        // Get safe offset from progress (if enabled).
+        let safe_offset = if let Some(progress) = &self.progress {
+            progress
+                .get_safe_eviction_offset(self.config.topic_id, self.config.partition_id)
+                .await
+                .map_err(|e| DurablePartitionError::Progress { source: e })?
+        } else {
+            // No progress tracking - allow eviction of any eligible segment.
+            // Use max offset to indicate "no consumer constraints".
+            Some(Offset::new(u64::MAX))
+        };
+
+        tiering
+            .evict_with_progress(safe_offset)
+            .await
+            .map_err(|e| DurablePartitionError::Tiering {
+                message: e.to_string(),
+            })
+    }
 }
 
 /// Error type for durable partition operations.
@@ -944,6 +1148,18 @@ pub enum DurablePartitionError {
     },
     /// Partition is closed.
     Closed,
+    /// Progress tracking is not enabled.
+    ProgressNotEnabled,
+    /// Progress operation failed.
+    Progress {
+        /// The underlying progress error.
+        source: ProgressError,
+    },
+    /// Tiering operation failed.
+    Tiering {
+        /// Error message.
+        message: String,
+    },
 }
 
 impl std::fmt::Display for DurablePartitionError {
@@ -962,6 +1178,9 @@ impl std::fmt::Display for DurablePartitionError {
                 write!(f, "failed to update cache: {message}")
             }
             Self::Closed => write!(f, "partition is closed"),
+            Self::ProgressNotEnabled => write!(f, "progress tracking is not enabled"),
+            Self::Progress { source } => write!(f, "progress error: {source}"),
+            Self::Tiering { message } => write!(f, "tiering error: {message}"),
         }
     }
 }
@@ -971,6 +1190,7 @@ impl std::error::Error for DurablePartitionError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use helix_progress::ProgressStore;
 
     #[test]
     fn test_partition_append_and_read() {
@@ -1102,5 +1322,230 @@ mod tests {
 
         let tiered = partition.tier_eligible_segments().await.unwrap();
         assert_eq!(tiered, 0);
+    }
+
+    #[tokio::test]
+    async fn test_durable_partition_with_progress() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create partition with progress tracking enabled.
+        let config = DurablePartitionConfig::new(
+            temp_dir.path(),
+            TopicId::new(1),
+            PartitionId::new(0),
+        )
+        .with_progress(ProgressConfig::for_testing());
+
+        let partition = DurablePartition::open(config).await.unwrap();
+
+        // Verify progress is enabled.
+        assert!(partition.has_progress());
+        assert!(partition.progress_manager().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_durable_partition_consumer_registration() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let config = DurablePartitionConfig::new(
+            temp_dir.path(),
+            TopicId::new(1),
+            PartitionId::new(0),
+        )
+        .with_progress(ProgressConfig::for_testing());
+
+        let partition = DurablePartition::open(config).await.unwrap();
+
+        let group_id = ConsumerGroupId::new(1);
+        let consumer_id = ConsumerId::new(100);
+        let current_time = 1000;
+
+        // Register a consumer.
+        partition
+            .register_consumer(group_id, consumer_id, current_time)
+            .await
+            .unwrap();
+
+        // Verify the group exists via progress manager store.
+        let pm = partition.progress_manager().unwrap();
+        let group = pm.store().get_group(group_id).await.unwrap();
+        assert!(group.is_some());
+        assert!(group.unwrap().consumers.contains_key(&consumer_id));
+    }
+
+    #[tokio::test]
+    async fn test_durable_partition_lease_and_commit() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let config = DurablePartitionConfig::new(
+            temp_dir.path(),
+            TopicId::new(1),
+            PartitionId::new(0),
+        )
+        .with_progress(ProgressConfig::for_testing());
+
+        let mut partition = DurablePartition::open(config).await.unwrap();
+
+        // Write some records first.
+        let records = vec![
+            Record::new(Bytes::from("value1")),
+            Record::new(Bytes::from("value2")),
+            Record::new(Bytes::from("value3")),
+        ];
+        partition.append(records).await.unwrap();
+
+        let group_id = ConsumerGroupId::new(1);
+        let consumer_id = ConsumerId::new(100);
+        let current_time = 1000;
+        let lease_duration = 60_000_000; // 60 seconds in microseconds.
+
+        // Register consumer.
+        partition
+            .register_consumer(group_id, consumer_id, current_time)
+            .await
+            .unwrap();
+
+        // Lease offsets (max_count=3 to match our 3 records).
+        let lease = partition
+            .lease_for_consumer(group_id, consumer_id, 3, lease_duration, current_time)
+            .await
+            .unwrap();
+
+        assert!(lease.is_some());
+        let lease = lease.unwrap();
+        assert_eq!(lease.from_offset, Offset::new(0));
+        assert_eq!(lease.to_offset, Offset::new(2)); // 3 records: 0, 1, 2
+
+        // Commit the first offset.
+        partition
+            .commit_consumer_offset(group_id, consumer_id, Offset::new(0), current_time)
+            .await
+            .unwrap();
+
+        // Verify progress.
+        let pm = partition.progress_manager().unwrap();
+        let partition_key = helix_progress::PartitionKey::new(TopicId::new(1), PartitionId::new(0));
+        let progress = pm
+            .store()
+            .get_partition_progress(group_id, partition_key)
+            .await
+            .unwrap();
+        assert!(progress.is_some());
+        assert_eq!(progress.unwrap().low_watermark, Offset::new(1));
+    }
+
+    #[tokio::test]
+    async fn test_durable_partition_safe_eviction_offset() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let config = DurablePartitionConfig::new(
+            temp_dir.path(),
+            TopicId::new(1),
+            PartitionId::new(0),
+        )
+        .with_progress(ProgressConfig::for_testing());
+
+        let mut partition = DurablePartition::open(config).await.unwrap();
+
+        // Write records.
+        let records = vec![
+            Record::new(Bytes::from("value1")),
+            Record::new(Bytes::from("value2")),
+            Record::new(Bytes::from("value3")),
+            Record::new(Bytes::from("value4")),
+            Record::new(Bytes::from("value5")),
+        ];
+        partition.append(records).await.unwrap();
+
+        let group1 = ConsumerGroupId::new(1);
+        let group2 = ConsumerGroupId::new(2);
+        let consumer1 = ConsumerId::new(100);
+        let consumer2 = ConsumerId::new(200);
+        let current_time = 1000;
+        let lease_duration = 60_000_000; // 60 seconds in microseconds.
+
+        // Register two consumer groups.
+        partition
+            .register_consumer(group1, consumer1, current_time)
+            .await
+            .unwrap();
+        partition
+            .register_consumer(group2, consumer2, current_time)
+            .await
+            .unwrap();
+
+        // Group 1 leases and commits up to offset 3.
+        let _lease1 = partition
+            .lease_for_consumer(group1, consumer1, 10, lease_duration, current_time)
+            .await
+            .unwrap();
+        for offset in 0..=3 {
+            partition
+                .commit_consumer_offset(group1, consumer1, Offset::new(offset), current_time)
+                .await
+                .unwrap();
+        }
+
+        // Group 2 leases and commits only up to offset 1.
+        let _lease2 = partition
+            .lease_for_consumer(group2, consumer2, 10, lease_duration, current_time)
+            .await
+            .unwrap();
+        for offset in 0..=1 {
+            partition
+                .commit_consumer_offset(group2, consumer2, Offset::new(offset), current_time)
+                .await
+                .unwrap();
+        }
+
+        // Safe eviction offset should be min(group1_watermark, group2_watermark) = 2.
+        let safe_offset = partition.get_safe_eviction_offset().await.unwrap();
+        assert_eq!(safe_offset, Some(Offset::new(2)));
+    }
+
+    #[tokio::test]
+    async fn test_durable_partition_progress_not_enabled_error() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create partition WITHOUT progress tracking.
+        let config = DurablePartitionConfig::new(
+            temp_dir.path(),
+            TopicId::new(1),
+            PartitionId::new(0),
+        );
+
+        let partition = DurablePartition::open(config).await.unwrap();
+
+        // Attempting to use progress methods should fail.
+        let group_id = ConsumerGroupId::new(1);
+        let consumer_id = ConsumerId::new(100);
+
+        let result = partition
+            .register_consumer(group_id, consumer_id, 1000)
+            .await;
+        assert!(matches!(
+            result,
+            Err(DurablePartitionError::ProgressNotEnabled)
+        ));
+
+        let result = partition
+            .lease_for_consumer(group_id, consumer_id, 10, 60_000_000, 1000)
+            .await;
+        assert!(matches!(
+            result,
+            Err(DurablePartitionError::ProgressNotEnabled)
+        ));
+
+        let result = partition
+            .commit_consumer_offset(group_id, consumer_id, Offset::new(0), 1000)
+            .await;
+        assert!(matches!(
+            result,
+            Err(DurablePartitionError::ProgressNotEnabled)
+        ));
+
+        // get_safe_eviction_offset returns None when progress is not enabled.
+        let safe_offset = partition.get_safe_eviction_offset().await.unwrap();
+        assert_eq!(safe_offset, None);
     }
 }

@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 helix-core = { workspace = true }
+helix-progress = { workspace = true }
 helix-raft = { workspace = true }
 helix-runtime = { workspace = true }
 helix-tier = { workspace = true }

@@ -170,7 +170,7 @@ impl PropertyState {
     }
 
     /// Increments the event counter.
-    pub fn increment_events(&mut self) {
+    pub const fn increment_events(&mut self) {
         self.events_processed += 1;
     }
 }

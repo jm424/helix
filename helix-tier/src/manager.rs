@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use bloodhound::buggify;
 use bytes::Bytes;
+use helix_core::Offset;
 use helix_wal::SegmentId;
 use tracing::{debug, info, warn};
 
@@ -620,6 +621,50 @@ impl<S: ObjectStorage, M: MetadataStore, R: SegmentReader> IntegratedTieringMana
     #[must_use]
     pub fn metadata(&self) -> &M {
         self.inner.metadata()
+    }
+
+    /// Evicts eligible segments from local storage, respecting consumer progress.
+    ///
+    /// Only evicts segments where:
+    /// 1. The segment is in both local and remote storage
+    /// 2. The segment's `end_offset` is at or below the `safe_offset` (all records consumed)
+    ///
+    /// If `safe_offset` is `None`, no eviction is performed (consumers haven't
+    /// started tracking this partition yet).
+    ///
+    /// # Returns
+    ///
+    /// The number of segments evicted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if metadata operations fail.
+    pub async fn evict_with_progress(
+        &self,
+        safe_offset: Option<Offset>,
+    ) -> TierResult<u32> {
+        let Some(safe) = safe_offset else {
+            // No consumer tracking yet - don't evict anything.
+            return Ok(0);
+        };
+
+        let candidates = self.inner.metadata.find_eligible_for_eviction().await?;
+        let mut evicted = 0u32;
+
+        for metadata in candidates {
+            // Check if segment can be evicted with progress constraint.
+            if !metadata.can_evict_with_progress(safe) {
+                continue;
+            }
+
+            // Mark as evicted and persist.
+            let mut updated = metadata;
+            updated.mark_local_evicted();
+            self.inner.metadata.set(updated).await?;
+            evicted += 1;
+        }
+
+        Ok(evicted)
     }
 }
 

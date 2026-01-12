@@ -306,7 +306,7 @@ impl ClientSessions {
     ///
     /// In production, this would use timestamps to expire inactive sessions.
     /// For now, this is a placeholder.
-    pub fn expire_old_sessions(&mut self) {
+    pub const fn expire_old_sessions(&mut self) {
         // TODO: Implement session expiration based on activity timestamps
     }
 }
@@ -344,7 +344,7 @@ impl RaftClient {
 
     /// Creates a new command request.
     #[must_use]
-    pub fn create_command(&mut self, command: Bytes) -> ClientCommand {
+    pub const fn create_command(&mut self, command: Bytes) -> ClientCommand {
         let id = RequestId::new(self.client_id, self.next_sequence);
         self.next_sequence += 1;
         ClientCommand::new(id, command)
@@ -359,7 +359,7 @@ impl RaftClient {
     }
 
     /// Updates the known leader.
-    pub fn set_leader(&mut self, leader: Option<NodeId>) {
+    pub const fn set_leader(&mut self, leader: Option<NodeId>) {
         self.leader = leader;
     }
 
@@ -378,7 +378,7 @@ impl RaftClient {
     }
 
     /// Handles a response, updating leader information.
-    pub fn handle_response(&mut self, result: &ClientResult) {
+    pub const fn handle_response(&mut self, result: &ClientResult) {
         if let ClientResult::NotLeader { leader_hint } = result {
             self.leader = *leader_hint;
         }

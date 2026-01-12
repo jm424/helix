@@ -428,7 +428,7 @@ impl Segment {
     }
 
     /// Seals the segment, preventing further writes.
-    pub fn seal(&mut self) {
+    pub const fn seal(&mut self) {
         self.sealed = true;
     }
 

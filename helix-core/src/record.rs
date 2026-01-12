@@ -229,7 +229,7 @@ impl Record {
     }
 
     /// Sets the offset (typically done by the broker).
-    pub fn set_offset(&mut self, offset: Offset) {
+    pub const fn set_offset(&mut self, offset: Offset) {
         self.offset = offset;
     }
 

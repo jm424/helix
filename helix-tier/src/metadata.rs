@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use helix_core::{PartitionId, TopicId};
+use helix_core::{Offset, PartitionId, TopicId};
 use helix_wal::SegmentId;
 
 use crate::error::TierResult;
@@ -66,6 +66,12 @@ pub struct SegmentMetadata {
     pub sealed_at_secs: Option<u64>,
     /// Unix timestamp (seconds) when the segment was uploaded.
     pub uploaded_at_secs: Option<u64>,
+    /// First partition offset in this segment (if tracked).
+    /// Used for coordinating eviction with consumer progress.
+    pub start_offset: Option<Offset>,
+    /// End partition offset (exclusive) for this segment (if tracked).
+    /// All records in this segment have offsets in `[start_offset, end_offset)`.
+    pub end_offset: Option<Offset>,
 }
 
 impl SegmentMetadata {
@@ -91,6 +97,38 @@ impl SegmentMetadata {
             created_at_secs: current_timestamp_secs(),
             sealed_at_secs: None,
             uploaded_at_secs: None,
+            start_offset: None,
+            end_offset: None,
+        }
+    }
+
+    /// Sets the partition offset range for this segment.
+    ///
+    /// This is used to coordinate eviction with consumer progress tracking.
+    /// Only segments with `end_offset` below the safe eviction offset should
+    /// be evicted from local storage.
+    pub const fn set_offset_range(&mut self, start: Offset, end: Offset) {
+        self.start_offset = Some(start);
+        self.end_offset = Some(end);
+    }
+
+    /// Returns true if this segment can be safely evicted given the safe offset.
+    ///
+    /// A segment can be evicted if:
+    /// 1. It's in both local and remote storage (`can_evict_local`)
+    /// 2. Its `end_offset` is at or below the `safe_offset` (all records consumed)
+    ///
+    /// If offset tracking is not enabled (offsets are None), returns true
+    /// to allow eviction based solely on location.
+    #[must_use]
+    pub const fn can_evict_with_progress(&self, safe_offset: Offset) -> bool {
+        if !self.can_evict_local() {
+            return false;
+        }
+        // If offsets aren't tracked, allow eviction based on location alone.
+        match self.end_offset {
+            Some(end) => end.get() <= safe_offset.get(),
+            None => true,
         }
     }
 

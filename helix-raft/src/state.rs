@@ -74,7 +74,7 @@ impl SimpleRng {
     }
 
     /// Generates the next random u32.
-    fn next_u32(&mut self) -> u32 {
+    const fn next_u32(&mut self) -> u32 {
         // LCG constants from Numerical Recipes.
         self.state = self.state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
         (self.state >> 32) as u32
@@ -335,7 +335,7 @@ impl RaftNode {
     /// Resets the election elapsed counter.
     ///
     /// Called when receiving valid messages from the leader.
-    fn reset_election_elapsed(&mut self) {
+    const fn reset_election_elapsed(&mut self) {
         self.election_elapsed = 0;
     }
 
@@ -610,7 +610,7 @@ impl RaftNode {
         }
 
         // Check if we can vote for this candidate.
-        let can_vote = self.voted_for.map_or(true, |id| id == req.candidate_id);
+        let can_vote = self.voted_for.is_none_or(|id| id == req.candidate_id);
 
         if !can_vote {
             return false;
@@ -970,7 +970,7 @@ impl RaftNode {
     }
 
     /// Aborts an in-progress leadership transfer.
-    pub fn abort_transfer(&mut self) {
+    pub const fn abort_transfer(&mut self) {
         self.transfer_target = None;
     }
 
