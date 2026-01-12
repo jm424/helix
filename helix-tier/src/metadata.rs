@@ -118,17 +118,17 @@ impl SegmentMetadata {
     /// 1. It's in both local and remote storage (`can_evict_local`)
     /// 2. Its `end_offset` is at or below the `safe_offset` (all records consumed)
     ///
-    /// If offset tracking is not enabled (offsets are None), returns true
-    /// to allow eviction based solely on location.
+    /// If `end_offset` is None, returns false because we can't verify consumer
+    /// safety without knowing the offset range.
     #[must_use]
     pub const fn can_evict_with_progress(&self, safe_offset: Offset) -> bool {
         if !self.can_evict_local() {
             return false;
         }
-        // If offsets aren't tracked, allow eviction based on location alone.
+        // Can't evict if we don't know the offset range - safety cannot be verified.
         match self.end_offset {
-            Some(end) => end.get() <= safe_offset.get(),
-            None => true,
+            Some(end) => end.get() < safe_offset.get(),
+            None => false,
         }
     }
 

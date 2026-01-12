@@ -781,7 +781,12 @@ impl DurablePartition {
 
             // Get segment info for metadata.
             if let Some(info) = wal.segment_info(*segment_id) {
-                segments_to_register.push((*segment_id, segment_id_raw, info.first_index));
+                segments_to_register.push((
+                    *segment_id,
+                    segment_id_raw,
+                    info.first_index,
+                    info.last_index,
+                ));
             } else {
                 warn!(segment_id = segment_id_raw, "Segment info not found");
             }
@@ -791,14 +796,19 @@ impl DurablePartition {
         let mut registered_count = 0u32;
 
         // Register segments without holding the lock.
-        for (segment_id, segment_id_raw, first_index) in segments_to_register {
-            // Create and register metadata.
-            let metadata = SegmentMetadata::new(
+        for (segment_id, segment_id_raw, first_index, last_index) in segments_to_register {
+            // Create metadata with offset range for eviction coordination.
+            let mut metadata = SegmentMetadata::new(
                 segment_id,
                 self.config.topic_id,
                 self.config.partition_id,
                 first_index,
             );
+
+            // Set offset range if we know it (required for progress-aware eviction).
+            if let Some(last) = last_index {
+                metadata.set_offset_range(Offset::new(first_index), Offset::new(last));
+            }
 
             if let Err(e) = tiering.register_segment(metadata).await {
                 warn!(

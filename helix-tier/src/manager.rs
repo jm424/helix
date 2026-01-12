@@ -689,7 +689,7 @@ fn current_timestamp_secs() -> u64 {
 mod tests {
     use super::*;
     use crate::metadata::InMemoryMetadataStore;
-    use crate::storage::SimulatedObjectStorage;
+    use crate::storage::{SegmentReader, SimulatedObjectStorage};
     use helix_core::{PartitionId, TopicId};
 
     fn test_segment_id(id: u32) -> SegmentId {
@@ -703,6 +703,20 @@ mod tests {
             PartitionId::new(0),
             0,
         )
+    }
+
+    /// Stub segment reader for tests that don't need actual segment data.
+    struct StubSegmentReader;
+
+    #[async_trait::async_trait]
+    impl SegmentReader for StubSegmentReader {
+        async fn read_segment_bytes(&self, segment_id: SegmentId) -> TierResult<Bytes> {
+            Ok(Bytes::from(format!("segment-{}", segment_id.get())))
+        }
+
+        fn is_segment_sealed(&self, _segment_id: SegmentId) -> bool {
+            true // All segments are sealed in stub.
+        }
     }
 
     #[tokio::test]
@@ -816,5 +830,171 @@ mod tests {
         // Mark committed twice - should be idempotent.
         manager.mark_committed(test_segment_id(1)).await.unwrap();
         manager.mark_committed(test_segment_id(1)).await.unwrap(); // No panic.
+    }
+
+    fn test_metadata_with_offsets(segment_id: u32, start: u64, end: u64) -> SegmentMetadata {
+        let mut meta = SegmentMetadata::new(
+            test_segment_id(segment_id),
+            TopicId::new(1),
+            PartitionId::new(0),
+            start,
+        );
+        meta.set_offset_range(Offset::new(start), Offset::new(end));
+        meta
+    }
+
+    #[tokio::test]
+    async fn test_integrated_manager_evict_with_progress_respects_safe_offset() {
+        let storage = SimulatedObjectStorage::new(42);
+        let metadata_store = InMemoryMetadataStore::new();
+        let segment_reader = StubSegmentReader;
+        let manager = IntegratedTieringManager::new(
+            storage,
+            metadata_store,
+            segment_reader,
+            TieringConfig::for_testing(),
+        );
+
+        // Create three segments with different offset ranges:
+        // Segment 1: offsets 0-99
+        // Segment 2: offsets 100-199
+        // Segment 3: offsets 200-299
+        let meta1 = test_metadata_with_offsets(1, 0, 99);
+        let meta2 = test_metadata_with_offsets(2, 100, 199);
+        let meta3 = test_metadata_with_offsets(3, 200, 299);
+
+        // Register and make eligible for eviction (local + remote).
+        for meta in [meta1, meta2, meta3] {
+            let seg_id = meta.segment_id;
+            manager.register_segment(meta).await.unwrap();
+            manager.mark_sealed(seg_id).await.unwrap();
+            manager.mark_committed(seg_id).await.unwrap();
+            // Tier the segment (reads from stub reader, uploads to storage).
+            manager.tier_segment(seg_id).await.unwrap();
+        }
+
+        // After tiering, segments are in Both location and eviction-eligible.
+        // We verify eviction behavior below.
+
+        // Consumer has only consumed up to offset 150.
+        // Safe eviction offset = 150 means segments with end_offset < 150 can be evicted.
+        let safe_offset = Offset::new(150);
+
+        let evicted = manager.evict_with_progress(Some(safe_offset)).await.unwrap();
+
+        // Only segment 1 (end_offset=99 < 150) should be evicted.
+        // Segment 2 (end_offset=199 >= 150) should NOT be evicted.
+        // Segment 3 (end_offset=299 >= 150) should NOT be evicted.
+        assert_eq!(evicted, 1, "Only segment 1 should be evicted");
+
+        // Verify segment 1 is evicted, segments 2 and 3 are not.
+        let loc1 = manager.get_location(test_segment_id(1)).await.unwrap();
+        let loc2 = manager.get_location(test_segment_id(2)).await.unwrap();
+        let loc3 = manager.get_location(test_segment_id(3)).await.unwrap();
+
+        assert_eq!(loc1, Some(SegmentLocation::Remote), "Segment 1 should be remote-only");
+        assert_eq!(loc2, Some(SegmentLocation::Both), "Segment 2 should still be local+remote");
+        assert_eq!(loc3, Some(SegmentLocation::Both), "Segment 3 should still be local+remote");
+    }
+
+    #[tokio::test]
+    async fn test_integrated_manager_evict_with_progress_none_evicts_nothing() {
+        let storage = SimulatedObjectStorage::new(42);
+        let metadata_store = InMemoryMetadataStore::new();
+        let segment_reader = StubSegmentReader;
+        let manager = IntegratedTieringManager::new(
+            storage,
+            metadata_store,
+            segment_reader,
+            TieringConfig::for_testing(),
+        );
+
+        // Create a segment eligible for eviction.
+        let meta = test_metadata_with_offsets(1, 0, 99);
+        manager.register_segment(meta).await.unwrap();
+        manager.mark_sealed(test_segment_id(1)).await.unwrap();
+        manager.mark_committed(test_segment_id(1)).await.unwrap();
+        manager.tier_segment(test_segment_id(1)).await.unwrap();
+
+        // No safe offset (no consumers) - should not evict anything.
+        let evicted = manager.evict_with_progress(None).await.unwrap();
+        assert_eq!(evicted, 0, "Should not evict when safe_offset is None");
+
+        // Verify segment is still local.
+        let loc = manager.get_location(test_segment_id(1)).await.unwrap();
+        assert_eq!(loc, Some(SegmentLocation::Both));
+    }
+
+    #[tokio::test]
+    async fn test_integrated_manager_evict_with_progress_no_offset_range() {
+        let storage = SimulatedObjectStorage::new(42);
+        let metadata_store = InMemoryMetadataStore::new();
+        let segment_reader = StubSegmentReader;
+        let manager = IntegratedTieringManager::new(
+            storage,
+            metadata_store,
+            segment_reader,
+            TieringConfig::for_testing(),
+        );
+
+        // Create a segment WITHOUT offset range set.
+        let meta = test_metadata(1); // No offset range!
+        manager.register_segment(meta).await.unwrap();
+        manager.mark_sealed(test_segment_id(1)).await.unwrap();
+        manager.mark_committed(test_segment_id(1)).await.unwrap();
+        manager.tier_segment(test_segment_id(1)).await.unwrap();
+
+        // Try to evict with safe_offset = high value.
+        let evicted = manager
+            .evict_with_progress(Some(Offset::new(1000)))
+            .await
+            .unwrap();
+
+        // Should NOT evict because end_offset is None (can't determine safety).
+        assert_eq!(evicted, 0, "Should not evict segments without offset range");
+
+        // Verify segment is still local.
+        let loc = manager.get_location(test_segment_id(1)).await.unwrap();
+        assert_eq!(loc, Some(SegmentLocation::Both));
+    }
+
+    #[tokio::test]
+    async fn test_integrated_manager_evict_with_progress_high_safe_offset() {
+        let storage = SimulatedObjectStorage::new(42);
+        let metadata_store = InMemoryMetadataStore::new();
+        let segment_reader = StubSegmentReader;
+        let manager = IntegratedTieringManager::new(
+            storage,
+            metadata_store,
+            segment_reader,
+            TieringConfig::for_testing(),
+        );
+
+        // Create segments.
+        let meta1 = test_metadata_with_offsets(1, 0, 99);
+        let meta2 = test_metadata_with_offsets(2, 100, 199);
+
+        for meta in [meta1, meta2] {
+            let seg_id = meta.segment_id;
+            manager.register_segment(meta).await.unwrap();
+            manager.mark_sealed(seg_id).await.unwrap();
+            manager.mark_committed(seg_id).await.unwrap();
+            manager.tier_segment(seg_id).await.unwrap();
+        }
+
+        // Consumer has consumed everything (safe_offset = 1000).
+        let evicted = manager
+            .evict_with_progress(Some(Offset::new(1000)))
+            .await
+            .unwrap();
+
+        // Both segments should be evicted.
+        assert_eq!(evicted, 2, "Both segments should be evicted");
+
+        // Verify both are remote-only.
+        let loc1 = manager.get_location(test_segment_id(1)).await.unwrap();
+        let loc2 = manager.get_location(test_segment_id(2)).await.unwrap();
+        assert_eq!(loc1, Some(SegmentLocation::Remote));
+        assert_eq!(loc2, Some(SegmentLocation::Remote));
     }
 }
