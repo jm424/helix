@@ -1742,6 +1742,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "clap",
  "helix-core",
  "helix-progress",
  "helix-server",
@@ -1749,6 +1750,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1820,6 +1822,7 @@ dependencies = [
  "helix-runtime",
  "helix-tier",
  "helix-wal",
+ "kafka-protocol",
  "proptest",
  "prost",
  "serde",

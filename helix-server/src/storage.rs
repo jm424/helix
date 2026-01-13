@@ -510,8 +510,13 @@ impl Partition {
 
         let base_offset = self.blob_log_end_offset;
 
+        // Patch the baseOffset field in the RecordBatch header (bytes 0-7, big-endian i64).
+        // The producer sends baseOffset=0, but we need to update it to our assigned offset.
+        // This is safe because the Kafka RecordBatch CRC only covers bytes from offset 21.
+        let patched_blob = patch_record_batch_base_offset(blob, base_offset.get());
+
         // Store the blob with its metadata.
-        self.blobs.push(StoredBlob::new(base_offset, record_count, blob));
+        self.blobs.push(StoredBlob::new(base_offset, record_count, patched_blob));
 
         // Advance the log end offset.
         self.blob_log_end_offset = Offset::new(base_offset.get() + u64::from(record_count));
@@ -1464,6 +1469,36 @@ impl std::fmt::Display for DurablePartitionError {
 }
 
 impl std::error::Error for DurablePartitionError {}
+
+/// Patches the `baseOffset` field in a Kafka `RecordBatch` header.
+///
+/// The Kafka `RecordBatch` v2 format has `baseOffset` as a big-endian i64 at bytes 0-7.
+/// The CRC field only covers bytes from offset 21, so patching `baseOffset` is safe.
+///
+/// # Arguments
+/// * `blob` - The original `RecordBatch` bytes (consumed).
+/// * `new_base_offset` - The offset to write into the header.
+///
+/// # Returns
+/// A new `Bytes` with the patched `baseOffset`, or the original if too short.
+fn patch_record_batch_base_offset(blob: Bytes, new_base_offset: u64) -> Bytes {
+    const BASE_OFFSET_SIZE: usize = 8;
+
+    if blob.len() < BASE_OFFSET_SIZE {
+        // Blob too short to contain a valid RecordBatch header.
+        return blob;
+    }
+
+    // Safe cast: base_offset is u64 but Kafka uses i64 for wire format.
+    #[allow(clippy::cast_possible_wrap)]
+    let offset_bytes = (new_base_offset as i64).to_be_bytes();
+
+    // Create a new buffer with the patched offset.
+    let mut patched = bytes::BytesMut::with_capacity(blob.len());
+    patched.extend_from_slice(&offset_bytes);
+    patched.extend_from_slice(&blob[BASE_OFFSET_SIZE..]);
+    patched.freeze()
+}
 
 #[cfg(test)]
 mod tests {

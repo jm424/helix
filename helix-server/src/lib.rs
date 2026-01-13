@@ -2,11 +2,17 @@
 //!
 //! This crate provides the gRPC server implementation for Helix,
 //! exposing the Write, Read, and Metadata APIs to clients.
+//!
+//! Supports two protocols:
+//! - `--protocol grpc` (default): Native Helix gRPC API
+//! - `--protocol kafka`: Kafka wire protocol compatibility
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 mod error;
+/// Kafka wire protocol support.
+pub mod kafka;
 mod service;
 /// Partition storage implementations.
 pub mod storage;

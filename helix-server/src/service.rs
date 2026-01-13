@@ -383,6 +383,8 @@ pub struct HelixService {
     next_topic_id: Arc<RwLock<u64>>,
     /// All nodes in the cluster.
     cluster_nodes: Vec<NodeId>,
+    /// Peer addresses indexed by `NodeId` (for metadata responses).
+    peer_addrs: HashMap<NodeId, String>,
     /// Shutdown signal sender.
     _shutdown_tx: mpsc::Sender<()>,
     /// Data directory for durable storage (None = in-memory only).
@@ -446,6 +448,7 @@ impl HelixService {
             topics: Arc::new(RwLock::new(HashMap::new())),
             next_topic_id: Arc::new(RwLock::new(1)),
             cluster_nodes,
+            peer_addrs: HashMap::new(), // Empty for single-node
             _shutdown_tx: shutdown_tx,
             data_dir,
             transport_handle: None,
@@ -467,12 +470,18 @@ impl HelixService {
     ///
     /// # Errors
     /// Returns an error if the transport cannot be started.
+    ///
+    /// # Arguments
+    /// * `kafka_addr` - This node's Kafka address (for metadata responses)
+    /// * `kafka_peer_addrs` - Map of peer node IDs to their Kafka addresses
     pub async fn new_multi_node(
         cluster_id: String,
         node_id: u64,
         listen_addr: SocketAddr,
         peers: Vec<PeerInfo>,
         data_dir: Option<PathBuf>,
+        kafka_addr: String,
+        kafka_peer_addrs: HashMap<NodeId, String>,
     ) -> Result<Self, TransportError> {
         let node_id = NodeId::new(node_id);
 
@@ -517,6 +526,10 @@ impl HelixService {
             "Started multi-node Helix service"
         );
 
+        // Build Kafka peer addresses map (includes self).
+        let mut peer_addrs = kafka_peer_addrs;
+        peer_addrs.insert(node_id, kafka_addr);
+
         Ok(Self {
             cluster_id,
             node_id,
@@ -526,6 +539,7 @@ impl HelixService {
             topics: Arc::new(RwLock::new(HashMap::new())),
             next_topic_id: Arc::new(RwLock::new(1)),
             cluster_nodes,
+            peer_addrs,
             _shutdown_tx: shutdown_tx,
             data_dir,
             transport_handle: Some(transport_handle),
@@ -1754,6 +1768,387 @@ impl HelixService {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_micros() as u64)
+    }
+
+    // =========================================================================
+    // Cluster Info Methods (for Kafka protocol support)
+    // =========================================================================
+
+    /// Returns this node's ID.
+    #[must_use]
+    pub const fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    /// Returns all nodes in the cluster.
+    #[must_use]
+    pub fn cluster_nodes(&self) -> &[NodeId] {
+        &self.cluster_nodes
+    }
+
+    /// Returns the cluster ID.
+    #[must_use]
+    pub fn cluster_id(&self) -> &str {
+        &self.cluster_id
+    }
+
+    /// Returns the address for a node (for metadata responses).
+    ///
+    /// Returns `None` for single-node mode or if the node is not in the cluster.
+    #[must_use]
+    pub fn get_node_address(&self, node_id: NodeId) -> Option<&str> {
+        self.peer_addrs.get(&node_id).map(String::as_str)
+    }
+
+    /// Gets the leader for a topic/partition.
+    ///
+    /// Returns `None` if the topic or partition doesn't exist, or leader is unknown.
+    pub async fn get_leader(&self, topic: &str, partition: i32) -> Option<NodeId> {
+        // Get topic metadata.
+        let topic_meta = self.get_topic(topic).await?;
+
+        // Validate partition index.
+        if partition < 0 || partition >= topic_meta.partition_count {
+            return None;
+        }
+
+        // Safe cast: partition is validated to be non-negative.
+        #[allow(clippy::cast_sign_loss)]
+        let partition_id = PartitionId::new(partition as u64);
+
+        // Get group ID.
+        let group_id = {
+            let gm = self.group_map.read().await;
+            gm.get(topic_meta.topic_id, partition_id)?
+        };
+
+        // Get leader from MultiRaft.
+        let mr = self.multi_raft.read().await;
+        mr.group_state(group_id).and_then(|s| s.leader_id)
+    }
+
+    /// Checks if this node is the leader for a topic/partition.
+    pub async fn is_leader(&self, topic: &str, partition: i32) -> bool {
+        self.get_leader(topic, partition)
+            .await
+            .is_some_and(|leader| leader == self.node_id)
+    }
+
+    /// Gets all topics and their partition counts.
+    ///
+    /// Returns a list of (`topic_name`, `partition_count`) pairs.
+    pub async fn get_all_topics(&self) -> Vec<(String, i32)> {
+        let topics = self.topics.read().await;
+        topics
+            .iter()
+            .map(|(name, meta)| (name.clone(), meta.partition_count))
+            .collect()
+    }
+
+    /// Checks if a topic exists.
+    pub async fn topic_exists(&self, topic: &str) -> bool {
+        let topics = self.topics.read().await;
+        topics.contains_key(topic)
+    }
+
+    /// Gets partition info for a topic/partition.
+    ///
+    /// Returns (`log_start_offset`, `log_end_offset`, `high_watermark`) or `None` if not found.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn get_partition_offsets(
+        &self,
+        topic: &str,
+        partition: i32,
+    ) -> Option<(u64, u64, u64)> {
+        // Get topic metadata.
+        let topic_meta = self.get_topic(topic).await?;
+
+        // Validate partition index.
+        if partition < 0 || partition >= topic_meta.partition_count {
+            return None;
+        }
+
+        // Safe cast: partition is validated to be non-negative.
+        #[allow(clippy::cast_sign_loss)]
+        let partition_id = PartitionId::new(partition as u64);
+
+        // Get group ID.
+        let group_id = {
+            let gm = self.group_map.read().await;
+            gm.get(topic_meta.topic_id, partition_id)?
+        };
+
+        // Get offsets from storage.
+        let storage = self.partition_storage.read().await;
+        let ps = storage.get(&group_id)?;
+
+        Some((
+            ps.log_start_offset().get(),
+            ps.log_end_offset().get(),
+            ps.high_watermark().get(),
+        ))
+    }
+
+    // =========================================================================
+    // Blob Storage Methods (for Kafka zero-copy record batch support)
+    // =========================================================================
+
+    /// Appends a blob (Kafka `RecordBatch`) to a partition through Raft.
+    ///
+    /// Returns the base offset assigned to this batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the topic/partition doesn't exist or this node is not leader.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn append_blob(
+        &self,
+        topic: &str,
+        partition: i32,
+        record_count: u32,
+        data: Bytes,
+    ) -> ServerResult<u64> {
+        // Get topic metadata.
+        let topic_meta = self.get_topic(topic).await.ok_or_else(|| ServerError::TopicNotFound {
+            topic: topic.to_string(),
+        })?;
+
+        // Validate partition index.
+        if partition < 0 || partition >= topic_meta.partition_count {
+            return Err(ServerError::PartitionNotFound {
+                topic: topic.to_string(),
+                partition,
+            });
+        }
+
+        // Safe cast: partition is validated to be non-negative.
+        #[allow(clippy::cast_sign_loss)]
+        let partition_id = PartitionId::new(partition as u64);
+
+        // Get group ID.
+        let group_id = {
+            let gm = self.group_map.read().await;
+            gm.get(topic_meta.topic_id, partition_id).ok_or_else(|| ServerError::PartitionNotFound {
+                topic: topic.to_string(),
+                partition,
+            })?
+        };
+
+        // Check if we're the leader.
+        let (is_leader, leader_hint) = {
+            let mr = self.multi_raft.read().await;
+            let state = mr.group_state(group_id);
+            let is_leader = state.as_ref().is_some_and(|s| s.state == RaftState::Leader);
+            let leader = state.and_then(|s| s.leader_id);
+            (is_leader, leader)
+        };
+
+        if !is_leader {
+            return Err(ServerError::NotLeader {
+                topic: topic.to_string(),
+                partition,
+                leader_hint: leader_hint.map(NodeId::get),
+            });
+        }
+
+        // Get base offset before proposing.
+        let base_offset = {
+            let storage = self.partition_storage.read().await;
+            let ps = storage.get(&group_id).ok_or_else(|| ServerError::PartitionNotFound {
+                topic: topic.to_string(),
+                partition,
+            })?;
+            // Use blob_log_end_offset for blob storage.
+            match &ps.inner {
+                PartitionStorageInner::InMemory(p) => p.blob_log_end_offset(),
+                PartitionStorageInner::Durable(p) => p.blob_log_end_offset(),
+            }
+        };
+
+        // Encode blob command and propose to Raft.
+        let command = PartitionCommand::AppendBlob {
+            blob: data,
+            record_count,
+        };
+        let command_data = command.encode();
+
+        let outputs = {
+            let mut mr = self.multi_raft.write().await;
+            mr.propose(group_id, command_data)
+        };
+
+        // Apply any committed entries (single-node: immediate commit).
+        if let Some(outputs) = outputs {
+            for output in &outputs {
+                if let MultiRaftOutput::CommitEntry {
+                    group_id: gid,
+                    index,
+                    data: entry_data,
+                } = output
+                {
+                    if *gid == group_id {
+                        let mut storage = self.partition_storage.write().await;
+                        if let Some(ps) = storage.get_mut(&group_id) {
+                            ps.apply_entry_async(*index, entry_data)
+                                .await
+                                .map_err(|e| ServerError::Internal {
+                                    message: format!("failed to apply: {e}"),
+                                })?;
+                        }
+                    }
+                }
+            }
+        }
+
+        debug!(
+            topic = %topic,
+            partition,
+            base_offset = base_offset.get(),
+            record_count,
+            "Appended blob"
+        );
+
+        Ok(base_offset.get())
+    }
+
+    /// Reads blobs (Kafka `RecordBatches`) from a partition.
+    ///
+    /// Returns raw blob data that can be sent directly to Kafka clients.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the topic/partition doesn't exist.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn read_blobs(
+        &self,
+        topic: &str,
+        partition: i32,
+        start_offset: u64,
+        max_bytes: u32,
+    ) -> ServerResult<Vec<Bytes>> {
+        // Get topic metadata.
+        let topic_meta = self.get_topic(topic).await.ok_or_else(|| ServerError::TopicNotFound {
+            topic: topic.to_string(),
+        })?;
+
+        // Validate partition index.
+        if partition < 0 || partition >= topic_meta.partition_count {
+            return Err(ServerError::PartitionNotFound {
+                topic: topic.to_string(),
+                partition,
+            });
+        }
+
+        // Safe cast: partition is validated to be non-negative.
+        #[allow(clippy::cast_sign_loss)]
+        let partition_id = PartitionId::new(partition as u64);
+
+        // Get group ID.
+        let group_id = {
+            let gm = self.group_map.read().await;
+            gm.get(topic_meta.topic_id, partition_id).ok_or_else(|| ServerError::PartitionNotFound {
+                topic: topic.to_string(),
+                partition,
+            })?
+        };
+
+        // Read blobs from storage.
+        let storage = self.partition_storage.read().await;
+        let ps = storage.get(&group_id).ok_or_else(|| ServerError::PartitionNotFound {
+            topic: topic.to_string(),
+            partition,
+        })?;
+
+        let blobs = match &ps.inner {
+            PartitionStorageInner::InMemory(p) => {
+                p.read_blobs(Offset::new(start_offset), max_bytes)
+                    .into_iter()
+                    .map(|b| b.data)
+                    .collect()
+            }
+            PartitionStorageInner::Durable(p) => {
+                p.read_blobs(Offset::new(start_offset), max_bytes)
+                    .into_iter()
+                    .map(|b| b.data)
+                    .collect()
+            }
+        };
+
+        Ok(blobs)
+    }
+
+    /// Gets the blob log end offset for a partition.
+    ///
+    /// This is the high watermark for blob storage (Kafka `RecordBatches`).
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn blob_log_end_offset(&self, topic: &str, partition: i32) -> Option<u64> {
+        // Get topic metadata.
+        let topic_meta = self.get_topic(topic).await?;
+
+        // Validate partition index.
+        if partition < 0 || partition >= topic_meta.partition_count {
+            return None;
+        }
+
+        // Safe cast: partition is validated to be non-negative.
+        #[allow(clippy::cast_sign_loss)]
+        let partition_id = PartitionId::new(partition as u64);
+
+        // Get group ID.
+        let group_id = {
+            let gm = self.group_map.read().await;
+            gm.get(topic_meta.topic_id, partition_id)?
+        };
+
+        // Get blob log end offset from storage.
+        let storage = self.partition_storage.read().await;
+        let ps = storage.get(&group_id)?;
+
+        let offset = match &ps.inner {
+            PartitionStorageInner::InMemory(p) => p.blob_log_end_offset(),
+            PartitionStorageInner::Durable(p) => p.blob_log_end_offset(),
+        };
+
+        Some(offset.get())
+    }
+
+    /// Checks if a partition exists with blob storage.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn blob_partition_exists(&self, topic: &str, partition: i32) -> bool {
+        // Get topic metadata.
+        let Some(topic_meta) = self.get_topic(topic).await else {
+            return false;
+        };
+
+        // Validate partition index.
+        if partition < 0 || partition >= topic_meta.partition_count {
+            return false;
+        }
+
+        // Safe cast: partition is validated to be non-negative.
+        #[allow(clippy::cast_sign_loss)]
+        let partition_id = PartitionId::new(partition as u64);
+
+        // Get group ID.
+        let group_id = {
+            let gm = self.group_map.read().await;
+            match gm.get(topic_meta.topic_id, partition_id) {
+                Some(gid) => gid,
+                None => return false,
+            }
+        };
+
+        // Check storage.
+        let storage = self.partition_storage.read().await;
+        let Some(ps) = storage.get(&group_id) else {
+            return false;
+        };
+
+        match &ps.inner {
+            // Check if any blobs exist (offset 0 always valid if partition has data).
+            PartitionStorageInner::InMemory(p) => p.blob_partition_exists(Offset::new(0)),
+            PartitionStorageInner::Durable(p) => p.blob_partition_exists(),
+        }
     }
 }
 
