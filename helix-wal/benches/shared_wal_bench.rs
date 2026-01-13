@@ -325,7 +325,7 @@ fn bench_pool_scaling(c: &mut Criterion) {
     let partition_count = 64;
     let pool_sizes = vec![1, 2, 4, 8, 16];
     let entries_per_partition = 10;
-    let data_size = 256;
+    let data_size = 1024; // 1 KB payload
 
     let mut group = c.benchmark_group("pool_scaling");
     group.sample_size(10);

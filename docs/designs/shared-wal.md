@@ -499,6 +499,25 @@ Assumptions:
 | 1 shared WAL | 1,000 | ~100K+ |
 | 4 shared WALs | 4,000 | ~400K+ (parallel) |
 
+### Empirical Results: Optimal Pool Size
+
+Benchmark on NVMe SSD (64 partitions, 10 entries/partition, 1KB payload):
+
+| WALs (K) | Time | Throughput | vs K=1 |
+|----------|------|------------|--------|
+| 1 | 2.47 ms | 259 K/s | baseline |
+| 2 | 1.59 ms | 403 K/s | +56% |
+| 4 | 1.26 ms | 508 K/s | +96% |
+| **8** | **1.23 ms** | **518 K/s** | **+100%** |
+| 16 | 1.56 ms | 410 K/s | +58% |
+
+**Optimal: K=4-8 WALs** - ~2x faster than single shared WAL.
+
+The curve shows:
+- **K=1→4**: Parallelism wins - more concurrent fsyncs, reduced lock contention
+- **K=4-8**: Sweet spot - matches NVMe's optimal parallel queue depth
+- **K=16+**: Diminishing returns - coordinator overhead, smaller batches reduce amortization
+
 ## Implementation Plan
 
 ### Phase 1: WalEntry Trait
