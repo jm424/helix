@@ -1,0 +1,28 @@
+[package]
+name = "helix-kafka-compat"
+description = "Kafka wire protocol compatibility layer for Helix"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+helix-core = { workspace = true }
+helix-server = { workspace = true }
+
+# Kafka protocol encoding/decoding
+kafka-protocol = "0.17"
+
+# Async runtime
+tokio = { workspace = true, features = ["net", "io-util", "sync", "macros"] }
+
+# Byte handling
+bytes = "1"
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }

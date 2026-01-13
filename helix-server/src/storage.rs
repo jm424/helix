@@ -24,8 +24,54 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use helix_core::{ConsumerGroupId, ConsumerId, Offset, PartitionId, Record, TopicId};
+
+// -----------------------------------------------------------------------------
+// StoredBlob
+// -----------------------------------------------------------------------------
+
+/// A stored blob with metadata for protocol-agnostic storage.
+///
+/// Blobs are opaque byte sequences (e.g., Kafka `RecordBatch`) stored without
+/// parsing. Metadata enables offset tracking and efficient retrieval.
+#[derive(Debug, Clone)]
+pub struct StoredBlob {
+    /// Base offset of records in this blob.
+    pub base_offset: Offset,
+    /// Number of records in this blob.
+    pub record_count: u32,
+    /// Raw blob data (e.g., Kafka `RecordBatch` bytes).
+    pub data: Bytes,
+}
+
+impl StoredBlob {
+    /// Creates a new stored blob.
+    #[must_use]
+    pub const fn new(base_offset: Offset, record_count: u32, data: Bytes) -> Self {
+        Self {
+            base_offset,
+            record_count,
+            data,
+        }
+    }
+
+    /// Returns the last offset in this blob (inclusive).
+    #[must_use]
+    pub fn last_offset(&self) -> Offset {
+        if self.record_count == 0 {
+            self.base_offset
+        } else {
+            Offset::new(self.base_offset.get() + u64::from(self.record_count) - 1)
+        }
+    }
+
+    /// Returns the next offset after this blob.
+    #[must_use]
+    pub fn next_offset(&self) -> Offset {
+        Offset::new(self.base_offset.get() + u64::from(self.record_count))
+    }
+}
 use helix_progress::{
     Lease, ProgressConfig, ProgressError, ProgressManager, SimulatedProgressStore,
 };
@@ -105,10 +151,17 @@ pub type SimulatedProgressManager = ProgressManager<SimulatedProgressStore>;
 /// Commands that can be applied to a partition.
 #[derive(Debug, Clone)]
 pub enum PartitionCommand {
-    /// Append records to the partition.
+    /// Append records to the partition (typed records).
     Append {
         /// Records to append.
         records: Vec<Record>,
+    },
+    /// Append a blob to the partition (protocol-agnostic).
+    AppendBlob {
+        /// Raw blob data.
+        blob: Bytes,
+        /// Number of records in the blob.
+        record_count: u32,
     },
     /// Truncate the partition from a given offset.
     Truncate {
@@ -138,6 +191,15 @@ impl PartitionCommand {
                     record.encode(&mut buf);
                 }
             }
+            Self::AppendBlob { blob, record_count } => {
+                buf.put_u8(3); // Command type for blob.
+                buf.put_u32_le(*record_count);
+                // Safe cast: blob size bounded by protocol limits.
+                #[allow(clippy::cast_possible_truncation)]
+                let blob_len = blob.len() as u32;
+                buf.put_u32_le(blob_len);
+                buf.put_slice(blob);
+            }
             Self::Truncate { from_offset } => {
                 buf.put_u8(1);
                 buf.put_u64_le(from_offset.get());
@@ -153,8 +215,6 @@ impl PartitionCommand {
     /// Decodes a command from bytes.
     #[must_use]
     pub fn decode(data: &Bytes) -> Option<Self> {
-        use bytes::Buf;
-
         if data.is_empty() {
             return None;
         }
@@ -190,6 +250,19 @@ impl PartitionCommand {
                 }
                 let high_watermark = Offset::new(buf.get_u64_le());
                 Some(Self::UpdateHighWatermark { high_watermark })
+            }
+            3 => {
+                // AppendBlob: record_count (u32) + blob_len (u32) + blob bytes.
+                if buf.remaining() < 8 {
+                    return None;
+                }
+                let record_count = buf.get_u32_le();
+                let blob_len = buf.get_u32_le() as usize;
+                if buf.remaining() < blob_len {
+                    return None;
+                }
+                let blob = buf.copy_to_bytes(blob_len);
+                Some(Self::AppendBlob { blob, record_count })
             }
             _ => None,
         }
@@ -262,17 +335,24 @@ pub type PartitionResult<T> = Result<T, PartitionError>;
 
 /// In-memory partition storage.
 ///
-/// This is a temporary implementation. Per the RFC design, storage should
-/// use `helix-wal` for durability with in-memory caching for performance.
+/// Supports two storage modes:
+/// - **Typed records**: Individual `Record` structs (used by gRPC API).
+/// - **Blobs**: Opaque byte sequences (used by Kafka-compat for zero-copy).
+///
+/// Both modes can coexist but typically a partition uses one or the other.
 #[derive(Debug)]
 pub struct Partition {
     /// Configuration.
     #[allow(dead_code)]
     config: PartitionConfig,
-    /// Records stored in this partition.
+    /// Records stored in this partition (typed mode).
     records: Vec<Record>,
+    /// Blobs stored in this partition (protocol-agnostic mode).
+    blobs: Vec<StoredBlob>,
     /// Log start offset.
     log_start_offset: Offset,
+    /// Log end offset for blob storage (next offset to assign).
+    blob_log_end_offset: Offset,
     /// High watermark.
     high_watermark: Offset,
     /// Whether the partition is closed.
@@ -286,7 +366,9 @@ impl Partition {
         Self {
             config,
             records: Vec::new(),
+            blobs: Vec::new(),
             log_start_offset: Offset::new(0),
+            blob_log_end_offset: Offset::new(0),
             high_watermark: Offset::new(0),
             closed: false,
         }
@@ -399,6 +481,88 @@ impl Partition {
         }
 
         Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // Blob Storage Methods (Protocol-Agnostic)
+    // -------------------------------------------------------------------------
+
+    /// Returns the log end offset for blob storage.
+    #[must_use]
+    pub const fn blob_log_end_offset(&self) -> Offset {
+        self.blob_log_end_offset
+    }
+
+    /// Appends a blob to the partition.
+    ///
+    /// The blob is stored as-is without parsing. The `record_count` is used
+    /// for offset allocation.
+    ///
+    /// # Returns
+    /// The base offset assigned to this blob.
+    ///
+    /// # Errors
+    /// Returns an error if the partition is closed.
+    pub fn append_blob(&mut self, blob: Bytes, record_count: u32) -> PartitionResult<Offset> {
+        if self.closed {
+            return Err(PartitionError::Closed);
+        }
+
+        let base_offset = self.blob_log_end_offset;
+
+        // Store the blob with its metadata.
+        self.blobs.push(StoredBlob::new(base_offset, record_count, blob));
+
+        // Advance the log end offset.
+        self.blob_log_end_offset = Offset::new(base_offset.get() + u64::from(record_count));
+
+        Ok(base_offset)
+    }
+
+    /// Reads blobs starting at the given offset.
+    ///
+    /// Returns blobs that overlap with the requested offset range, up to
+    /// `max_bytes` total size. Always returns at least one blob if any
+    /// overlaps with the start offset.
+    ///
+    /// # Arguments
+    /// * `start_offset` - First offset to fetch.
+    /// * `max_bytes` - Maximum total bytes to return.
+    ///
+    /// # Returns
+    /// Vector of blobs overlapping with the requested range.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    pub fn read_blobs(&self, start_offset: Offset, max_bytes: u32) -> Vec<StoredBlob> {
+        let mut result = Vec::new();
+        let mut total_bytes = 0u32;
+
+        for blob in &self.blobs {
+            // Check if this blob overlaps with the requested offset.
+            let blob_end_offset = blob.next_offset();
+            if blob_end_offset.get() <= start_offset.get() {
+                // Blob is entirely before the requested offset.
+                continue;
+            }
+
+            // Check if we'd exceed max_bytes (but always include at least one blob).
+            let blob_size = blob.data.len() as u32;
+            if !result.is_empty() && total_bytes + blob_size > max_bytes {
+                break;
+            }
+
+            result.push(blob.clone());
+            total_bytes += blob_size;
+        }
+
+        result
+    }
+
+    /// Checks if a blob partition has any data at the given offset.
+    #[must_use]
+    pub fn blob_partition_exists(&self, start_offset: Offset) -> bool {
+        // If we have blobs and the offset is within range.
+        !self.blobs.is_empty() && start_offset.get() < self.blob_log_end_offset.get()
     }
 }
 
@@ -701,6 +865,107 @@ impl DurablePartition {
         self.cache.read(start_offset, max_records)
     }
 
+    // -------------------------------------------------------------------------
+    // Blob Storage Methods (Protocol-Agnostic)
+    // -------------------------------------------------------------------------
+
+    /// Returns the log end offset for blob storage.
+    #[must_use]
+    pub const fn blob_log_end_offset(&self) -> Offset {
+        self.cache.blob_log_end_offset()
+    }
+
+    /// Appends a blob to the partition.
+    ///
+    /// The blob is written to WAL for durability, then applied to the
+    /// in-memory cache. No parsing or conversion is performed.
+    ///
+    /// # Arguments
+    /// * `blob` - Raw blob data (e.g., Kafka `RecordBatch` bytes).
+    /// * `record_count` - Number of records in the blob (for offset allocation).
+    ///
+    /// # Returns
+    /// The base offset assigned to this blob.
+    ///
+    /// # Errors
+    /// Returns an error if the write fails.
+    pub async fn append_blob(
+        &mut self,
+        blob: Bytes,
+        record_count: u32,
+    ) -> Result<Offset, DurablePartitionError> {
+        let base_offset = self.cache.blob_log_end_offset();
+        let blob_size = blob.len();
+
+        // Create WAL entry with blob command.
+        let command = PartitionCommand::AppendBlob {
+            blob: blob.clone(),
+            record_count,
+        };
+        let data = command.encode();
+
+        let next_index = self.last_applied_index + 1;
+        let entry = Entry::new(0, next_index, data).map_err(|e| DurablePartitionError::WalWrite {
+            message: format!("failed to create WAL entry: {e}"),
+        })?;
+
+        // Write to WAL first (durability).
+        self.wal
+            .write()
+            .await
+            .append(entry)
+            .await
+            .map_err(|e| DurablePartitionError::WalWrite {
+                message: e.to_string(),
+            })?;
+
+        // Update in-memory cache.
+        self.cache.append_blob(blob, record_count).map_err(|e| {
+            DurablePartitionError::CacheUpdate {
+                message: e.to_string(),
+            }
+        })?;
+
+        self.last_applied_index = next_index;
+
+        // Update high watermark (entry is durable).
+        let new_hwm = self.cache.blob_log_end_offset();
+        self.cache.set_high_watermark(new_hwm);
+
+        debug!(
+            topic = self.config.topic_id.get(),
+            partition = self.config.partition_id.get(),
+            base_offset = base_offset.get(),
+            record_count,
+            blob_size,
+            wal_index = next_index,
+            "Appended blob to durable partition"
+        );
+
+        Ok(base_offset)
+    }
+
+    /// Reads blobs starting at the given offset.
+    ///
+    /// Returns raw blobs from the in-memory cache without parsing.
+    ///
+    /// # Arguments
+    /// * `start_offset` - First offset to fetch.
+    /// * `max_bytes` - Maximum total bytes to return.
+    ///
+    /// # Returns
+    /// Vector of stored blobs overlapping with the requested range.
+    #[must_use]
+    pub fn read_blobs(&self, start_offset: Offset, max_bytes: u32) -> Vec<StoredBlob> {
+        self.cache.read_blobs(start_offset, max_bytes)
+    }
+
+    /// Checks if the blob partition has data.
+    #[must_use]
+    pub const fn blob_partition_exists(&self) -> bool {
+        self.cache.blob_log_end_offset().get() > 0
+    }
+
     /// Syncs the WAL to disk.
     ///
     /// Call this periodically for group commit, or rely on `sync_on_write`
@@ -732,6 +997,9 @@ impl DurablePartition {
         match command {
             PartitionCommand::Append { records } => {
                 cache.append(records)?;
+            }
+            PartitionCommand::AppendBlob { blob, record_count } => {
+                cache.append_blob(blob, record_count)?;
             }
             PartitionCommand::Truncate { from_offset } => {
                 cache.truncate(from_offset)?;
@@ -1557,5 +1825,173 @@ mod tests {
         // get_safe_eviction_offset returns None when progress is not enabled.
         let safe_offset = partition.get_safe_eviction_offset().await.unwrap();
         assert_eq!(safe_offset, None);
+    }
+
+    // -------------------------------------------------------------------------
+    // Blob Storage Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_partition_blob_append_and_read() {
+        let config = PartitionConfig::new(TopicId::new(1), PartitionId::new(0));
+        let mut partition = Partition::new(config);
+
+        // Append first blob (3 records).
+        let blob1 = Bytes::from("kafka-batch-1-data");
+        let base_offset1 = partition.append_blob(blob1.clone(), 3).unwrap();
+        assert_eq!(base_offset1, Offset::new(0));
+        assert_eq!(partition.blob_log_end_offset(), Offset::new(3));
+
+        // Append second blob (2 records).
+        let blob2 = Bytes::from("kafka-batch-2-data");
+        let base_offset2 = partition.append_blob(blob2.clone(), 2).unwrap();
+        assert_eq!(base_offset2, Offset::new(3));
+        assert_eq!(partition.blob_log_end_offset(), Offset::new(5));
+
+        // Read blobs from offset 0.
+        let read_blobs = partition.read_blobs(Offset::new(0), 1000);
+        assert_eq!(read_blobs.len(), 2);
+        assert_eq!(read_blobs[0].data, blob1);
+        assert_eq!(read_blobs[0].base_offset, Offset::new(0));
+        assert_eq!(read_blobs[0].record_count, 3);
+        assert_eq!(read_blobs[1].data, blob2);
+        assert_eq!(read_blobs[1].base_offset, Offset::new(3));
+        assert_eq!(read_blobs[1].record_count, 2);
+
+        // Read blobs from offset 3 (should get second blob only).
+        let read_blobs = partition.read_blobs(Offset::new(3), 1000);
+        assert_eq!(read_blobs.len(), 1);
+        assert_eq!(read_blobs[0].data, blob2);
+    }
+
+    #[test]
+    fn test_partition_blob_max_bytes_limit() {
+        let config = PartitionConfig::new(TopicId::new(1), PartitionId::new(0));
+        let mut partition = Partition::new(config);
+
+        // Append several blobs.
+        for i in 0..5 {
+            let blob = Bytes::from(format!("blob-{i}-with-some-data"));
+            partition.append_blob(blob, 1).unwrap();
+        }
+
+        // Read with small max_bytes - should get at least one blob.
+        let read_blobs = partition.read_blobs(Offset::new(0), 10);
+        assert_eq!(read_blobs.len(), 1); // First blob is always included.
+
+        // Read with larger max_bytes - should get more.
+        let read_blobs = partition.read_blobs(Offset::new(0), 100);
+        assert!(read_blobs.len() > 1);
+    }
+
+    #[test]
+    fn test_partition_command_blob_roundtrip() {
+        let blob = Bytes::from("test-kafka-batch-data");
+        let cmd = PartitionCommand::AppendBlob {
+            blob: blob.clone(),
+            record_count: 5,
+        };
+        let encoded = cmd.encode();
+        let decoded = PartitionCommand::decode(&encoded).unwrap();
+
+        match decoded {
+            PartitionCommand::AppendBlob {
+                blob: decoded_blob,
+                record_count,
+            } => {
+                assert_eq!(decoded_blob, blob);
+                assert_eq!(record_count, 5);
+            }
+            _ => panic!("wrong command type"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_durable_partition_blob_append_and_read() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = DurablePartitionConfig::new(
+            temp_dir.path(),
+            TopicId::new(1),
+            PartitionId::new(0),
+        );
+
+        let mut partition = DurablePartition::open(config).await.unwrap();
+
+        // Append blobs.
+        let blob1 = Bytes::from("kafka-batch-1");
+        let blob2 = Bytes::from("kafka-batch-2");
+
+        let base_offset1 = partition.append_blob(blob1.clone(), 3).await.unwrap();
+        assert_eq!(base_offset1, Offset::new(0));
+
+        let base_offset2 = partition.append_blob(blob2.clone(), 2).await.unwrap();
+        assert_eq!(base_offset2, Offset::new(3));
+
+        assert_eq!(partition.blob_log_end_offset(), Offset::new(5));
+
+        // Read blobs.
+        let read_blobs = partition.read_blobs(Offset::new(0), 1000);
+        assert_eq!(read_blobs.len(), 2);
+        assert_eq!(read_blobs[0].data, blob1);
+        assert_eq!(read_blobs[1].data, blob2);
+    }
+
+    #[tokio::test]
+    async fn test_durable_partition_blob_recovery() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Write some blobs.
+        {
+            let config = DurablePartitionConfig::new(
+                temp_dir.path(),
+                TopicId::new(1),
+                PartitionId::new(0),
+            );
+
+            let mut partition = DurablePartition::open(config).await.unwrap();
+
+            for i in 0..5 {
+                let blob = Bytes::from(format!("kafka-batch-{i}"));
+                partition.append_blob(blob, 2).await.unwrap();
+            }
+
+            partition.sync().await.unwrap();
+        }
+
+        // Reopen and verify recovery.
+        {
+            let config = DurablePartitionConfig::new(
+                temp_dir.path(),
+                TopicId::new(1),
+                PartitionId::new(0),
+            );
+
+            let partition = DurablePartition::open(config).await.unwrap();
+
+            // 5 blobs * 2 records each = 10 total offset advancement.
+            assert_eq!(partition.blob_log_end_offset(), Offset::new(10));
+
+            let read_blobs = partition.read_blobs(Offset::new(0), 10000);
+            assert_eq!(read_blobs.len(), 5);
+
+            // Verify blob contents.
+            for (i, blob) in read_blobs.iter().enumerate() {
+                assert_eq!(blob.data, Bytes::from(format!("kafka-batch-{i}")));
+                assert_eq!(blob.record_count, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn test_stored_blob_offsets() {
+        let blob = StoredBlob::new(Offset::new(10), 5, Bytes::from("data"));
+        assert_eq!(blob.base_offset, Offset::new(10));
+        assert_eq!(blob.last_offset(), Offset::new(14)); // 10 + 5 - 1
+        assert_eq!(blob.next_offset(), Offset::new(15)); // 10 + 5
+
+        // Empty blob edge case.
+        let empty_blob = StoredBlob::new(Offset::new(10), 0, Bytes::new());
+        assert_eq!(empty_blob.last_offset(), Offset::new(10));
+        assert_eq!(empty_blob.next_offset(), Offset::new(10));
     }
 }

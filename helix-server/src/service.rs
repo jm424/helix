@@ -186,6 +186,19 @@ impl PartitionStorage {
 
                     Some(offset)
                 }
+                PartitionCommand::AppendBlob { blob, record_count } => {
+                    // Blob storage for in-memory partition.
+                    let offset = partition.append_blob(blob, record_count).map_err(|e| {
+                        ServerError::Internal {
+                            message: format!("failed to append blob: {e}"),
+                        }
+                    })?;
+
+                    let new_hwm = partition.blob_log_end_offset();
+                    partition.set_high_watermark(new_hwm);
+
+                    Some(offset)
+                }
                 PartitionCommand::Truncate { from_offset } => {
                     partition.truncate(from_offset).map_err(|e| ServerError::Internal {
                         message: format!("failed to truncate: {e}"),
@@ -242,6 +255,18 @@ impl PartitionStorage {
 
                     Some(offset)
                 }
+                PartitionCommand::AppendBlob { blob, record_count } => {
+                    let offset = partition.append_blob(blob, record_count).map_err(|e| {
+                        ServerError::Internal {
+                            message: format!("failed to append blob: {e}"),
+                        }
+                    })?;
+
+                    let new_hwm = partition.blob_log_end_offset();
+                    partition.set_high_watermark(new_hwm);
+
+                    Some(offset)
+                }
                 PartitionCommand::Truncate { from_offset } => {
                     partition.truncate(from_offset).map_err(|e| ServerError::Internal {
                         message: format!("failed to truncate: {e}"),
@@ -258,6 +283,14 @@ impl PartitionStorage {
                     let offset = partition.append(records).await.map_err(|e| {
                         ServerError::Internal {
                             message: format!("failed to append: {e}"),
+                        }
+                    })?;
+                    Some(offset)
+                }
+                PartitionCommand::AppendBlob { blob, record_count } => {
+                    let offset = partition.append_blob(blob, record_count).await.map_err(|e| {
+                        ServerError::Internal {
+                            message: format!("failed to append blob: {e}"),
                         }
                     })?;
                     Some(offset)
