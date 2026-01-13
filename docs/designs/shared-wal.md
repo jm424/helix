@@ -565,6 +565,7 @@ SharedWal needs additional features:
 | `test_dst_comprehensive_stress` | 1000 | fsync 10% + torn 10% | ✅ |
 | `test_dst_stress_with_truncation` | 100 | None | ✅ |
 | `test_dst_multi_crash_recovery_cycles` | 100 | None | ✅ |
+| `test_dst_high_fidelity_stress` | 1000 | fsync/read/open/remove 25%, torn 12.5% | ✅ |
 | Coordinator unit tests | N/A | N/A | ✅ (8 tests) |
 
 **Phase 3 Coordination Layer: ✅ Complete**
@@ -952,7 +953,8 @@ pub struct CrashEvent {
 ```rust
 /// Seeds that previously found bugs or edge cases.
 pub const SHARED_WAL_REGRESSION_SEEDS: &[u64] = &[
-    42,           // Basic
+    42,           // Partition-local index recovery bug (WAL incorrectly applied
+                  // gap/overlap detection to partition-local indices)
     0xDEAD_BEEF,  // Boundary conditions
     0xCAFE_BABE,  // Multi-partition interleaving
     // Add seeds as bugs are found
