@@ -1,10 +1,16 @@
-//! `SharedWal` fsync amortization benchmarks.
+//! `SharedWalPool` fsync amortization benchmarks.
 //!
 //! Compares fsync cost between:
 //! - Per-partition WALs: N partitions, N WALs, N fsyncs per batch
-//! - `SharedWal`: N partitions, K shared WALs, K fsyncs per batch (K << N)
+//! - `SharedWalPool`: N partitions, K shared WALs, K fsyncs per batch (K << N)
 //!
-//! This demonstrates the fsync amortization benefit of sharing a WAL.
+//! This demonstrates the fsync amortization benefit of sharing WALs via
+//! the coordinator-backed pool which batches writes before fsync.
+//!
+//! Run with io_uring support:
+//! ```bash
+//! cargo bench --bench shared_wal_bench --features io-uring
+//! ```
 
 #![allow(missing_docs)]
 #![allow(clippy::doc_markdown)]
@@ -15,7 +21,6 @@
 #![allow(clippy::cast_sign_loss)]
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -23,24 +28,24 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use helix_core::PartitionId;
 use tempfile::TempDir;
 use tokio::runtime::Builder;
-use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use helix_wal::{
-    Entry, PoolConfig, SharedWal, SharedWalConfig, SharedWalPool, TokioStorage, Wal, WalConfig,
-};
+use helix_wal::{Entry, PoolConfig, SharedWalPool, Storage, TokioStorage, Wal, WalConfig};
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+use helix_wal::IoUringWorkerStorage;
 
 /// Benchmark configuration.
 #[derive(Clone, Debug)]
 struct BenchConfig {
     /// Total number of partitions.
     partition_count: usize,
-    /// Number of shared WALs (for SharedWal model).
+    /// Number of shared WALs (for SharedWalPool).
     shared_wal_count: usize,
     /// Entries per partition per batch.
     entries_per_partition: usize,
-    /// Size of each entry payload in bytes (optional, defaults to 0 if not used).
+    /// Size of each entry payload in bytes.
     #[allow(dead_code)]
     data_size: usize,
 }
@@ -74,7 +79,7 @@ fn create_temp_dir() -> TempDir {
 ///
 /// Each partition has its own WAL. Writers run concurrently.
 /// Total fsyncs = N (one per partition).
-async fn bench_separate_wals_concurrent(config: &BenchConfig, data: &Bytes) -> Duration {
+async fn bench_separate_wals(config: &BenchConfig, data: &Bytes) -> Duration {
     let tempdir = create_temp_dir();
     let start = Instant::now();
 
@@ -93,8 +98,8 @@ async fn bench_separate_wals_concurrent(config: &BenchConfig, data: &Bytes) -> D
                 .expect("failed to open WAL");
 
             for i in 0..entries {
-                let entry = Entry::new(1, (i + 1) as u64, data.clone())
-                    .expect("entry creation failed");
+                let entry =
+                    Entry::new(1, (i + 1) as u64, data.clone()).expect("entry creation failed");
                 wal.append(entry).await.expect("append failed");
             }
 
@@ -110,113 +115,108 @@ async fn bench_separate_wals_concurrent(config: &BenchConfig, data: &Bytes) -> D
 }
 
 // ============================================================================
-// SharedWal model (amortized fsync)
+// SharedWalPool model (amortized fsync via coordinator batching)
 // ============================================================================
 
-/// Benchmark K shared WALs with N partitions distributed across them.
+/// Benchmark SharedWalPool with K WALs serving N partitions.
 ///
-/// Partitions are distributed round-robin across shared WALs.
-/// Each shared WAL is protected by a mutex for concurrent access.
-/// Total fsyncs = K (one per shared WAL).
-async fn bench_shared_wals_concurrent(config: &BenchConfig, data: &Bytes) -> Duration {
+/// Uses the coordinator-backed pool which batches writes and fsyncs.
+/// Total fsyncs = K (one per shared WAL, amortized across partitions).
+///
+/// Pattern: submit all entries with `append_async`, then `flush()` to sync,
+/// then await durability acks. This matches the intended usage for fsync
+/// amortization.
+async fn bench_shared_wal_pool_with_storage<S>(
+    storage: S,
+    config: &BenchConfig,
+    data: &Bytes,
+) -> Duration
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
     let tempdir = create_temp_dir();
 
-    // Create K shared WALs.
-    let mut shared_wals: Vec<Arc<Mutex<SharedWal<TokioStorage>>>> =
-        Vec::with_capacity(config.shared_wal_count);
+    // Use long flush interval since we'll trigger explicit flush.
+    let pool_config = PoolConfig::new(tempdir.path(), config.shared_wal_count as u32)
+        .with_flush_interval(Duration::from_secs(60));
 
-    for k in 0..config.shared_wal_count {
-        let wal_path = tempdir.path().join(format!("shared-{k}"));
-        std::fs::create_dir_all(&wal_path).expect("failed to create shared wal dir");
-        let wal_config = SharedWalConfig::new(&wal_path);
-        let wal = SharedWal::open(TokioStorage::new(), wal_config)
+    let pool = Arc::new(
+        SharedWalPool::open(storage, pool_config)
             .await
-            .expect("failed to open SharedWal");
-        shared_wals.push(Arc::new(Mutex::new(wal)));
-    }
+            .expect("failed to open pool"),
+    );
 
     let start = Instant::now();
 
+    // Barrier to synchronize all writers before flush.
+    let barrier = Arc::new(Barrier::new(config.partition_count + 1));
     let mut join_set = JoinSet::new();
 
     // Spawn a writer task per partition.
     for p in 0..config.partition_count {
-        // Round-robin assignment to shared WALs.
-        let shared_wal_idx = p % config.shared_wal_count;
-        let shared_wal = shared_wals[shared_wal_idx].clone();
         let partition_id = PartitionId::new(p as u64 + 1);
+        let handle = pool.handle(partition_id);
         let entries = config.entries_per_partition;
         let data = data.clone();
+        let barrier = barrier.clone();
 
         join_set.spawn(async move {
+            // Submit all entries without waiting (append_async).
+            let mut receivers = Vec::with_capacity(entries);
             for i in 0..entries {
-                let mut wal = shared_wal.lock().await;
-                wal.append(partition_id, 1, (i + 1) as u64, data.clone())
+                let rx = handle
+                    .append_async(1, (i + 1) as u64, data.clone())
                     .await
-                    .expect("append failed");
-                // Note: We release the lock between appends to allow interleaving.
+                    .expect("append_async failed");
+                receivers.push(rx);
+            }
+
+            // Signal that all entries are submitted.
+            barrier.wait().await;
+
+            // Wait for all entries to be durable.
+            for rx in receivers {
+                rx.await
+                    .expect("durable ack channel closed")
+                    .expect("durable ack failed");
             }
         });
     }
 
-    // Wait for all writers to finish appending.
+    // Wait for all partitions to submit entries.
+    barrier.wait().await;
+
+    // Trigger immediate flush (K fsyncs for K WALs).
+    pool.flush().await.expect("flush failed");
+
+    // Wait for all writers to confirm durability.
     while join_set.join_next().await.is_some() {}
 
-    // Sync each shared WAL (K fsyncs total).
-    for shared_wal in &shared_wals {
-        let mut wal = shared_wal.lock().await;
-        wal.sync().await.expect("sync failed");
-    }
+    pool.shutdown().await.expect("shutdown failed");
 
     start.elapsed()
 }
 
-/// Alternative: batch all appends then sync once per shared WAL.
-/// This maximizes fsync amortization.
-async fn bench_shared_wals_batched(config: &BenchConfig, data: &Bytes) -> Duration {
-    let tempdir = create_temp_dir();
+/// Benchmark SharedWalPool with TokioStorage.
+async fn bench_shared_wal_pool(config: &BenchConfig, data: &Bytes) -> Duration {
+    bench_shared_wal_pool_with_storage(TokioStorage::new(), config, data).await
+}
 
-    // Create K shared WALs.
-    let mut shared_wals: Vec<SharedWal<TokioStorage>> = Vec::with_capacity(config.shared_wal_count);
-
-    for k in 0..config.shared_wal_count {
-        let wal_path = tempdir.path().join(format!("shared-{k}"));
-        std::fs::create_dir_all(&wal_path).expect("failed to create shared wal dir");
-        let wal_config = SharedWalConfig::new(&wal_path);
-        let wal = SharedWal::open(TokioStorage::new(), wal_config)
-            .await
-            .expect("failed to open SharedWal");
-        shared_wals.push(wal);
-    }
-
-    let start = Instant::now();
-
-    // Append all entries sequentially (batched per shared WAL).
-    for p in 0..config.partition_count {
-        let shared_wal_idx = p % config.shared_wal_count;
-        let partition_id = PartitionId::new(p as u64 + 1);
-
-        for i in 0..config.entries_per_partition {
-            shared_wals[shared_wal_idx]
-                .append(partition_id, 1, (i + 1) as u64, data.clone())
-                .await
-                .expect("append failed");
-        }
-    }
-
-    // Sync each shared WAL (K fsyncs total).
-    for wal in &mut shared_wals {
-        wal.sync().await.expect("sync failed");
-    }
-
-    start.elapsed()
+/// Benchmark SharedWalPool with IoUringWorkerStorage.
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+async fn bench_shared_wal_pool_io_uring(config: &BenchConfig, data: &Bytes) -> Duration {
+    let storage = IoUringWorkerStorage::try_new().expect("failed to create io_uring storage");
+    bench_shared_wal_pool_with_storage(storage, config, data).await
 }
 
 // ============================================================================
 // Benchmarks
 // ============================================================================
 
-/// Compare per-partition WALs vs SharedWal with varying partition counts.
+/// Compare per-partition WALs vs SharedWalPool with varying partition counts.
 ///
 /// Shows fsync amortization benefit as partition count increases.
 fn bench_fsync_amortization(c: &mut Criterion) {
@@ -226,10 +226,10 @@ fn bench_fsync_amortization(c: &mut Criterion) {
         .build()
         .expect("failed to build runtime");
 
-    // Test: N partitions, comparing N separate WALs vs 1 shared WAL.
+    // Test: N partitions, comparing N separate WALs vs 1 shared WAL pool.
     let partition_counts = vec![4, 16, 64];
     let entries_per_partition = 10;
-    let data_size = 256;
+    let data_size = 1024; // 1 KB payload
 
     let mut group = c.benchmark_group("fsync_amortization");
     group.sample_size(10);
@@ -264,7 +264,7 @@ fn bench_fsync_amortization(c: &mut Criterion) {
                     rt.block_on(async {
                         let mut total = Duration::ZERO;
                         for _ in 0..iters {
-                            total += bench_separate_wals_concurrent(&config_separate, &data).await;
+                            total += bench_separate_wals(&config_separate, &data).await;
                         }
                         total
                     })
@@ -272,16 +272,16 @@ fn bench_fsync_amortization(c: &mut Criterion) {
             },
         );
 
-        // SharedWal with concurrent writers (1 fsync).
+        // SharedWalPool with Tokio storage (1 fsync).
         group.bench_with_input(
-            BenchmarkId::new("shared_concurrent", format!("p{partition_count}")),
+            BenchmarkId::new("pool_tokio", format!("p{partition_count}")),
             &config_shared,
             |b, _cfg| {
                 b.iter_custom(|iters| {
                     rt.block_on(async {
                         let mut total = Duration::ZERO;
                         for _ in 0..iters {
-                            total += bench_shared_wals_concurrent(&config_shared, &data).await;
+                            total += bench_shared_wal_pool(&config_shared, &data).await;
                         }
                         total
                     })
@@ -289,16 +289,17 @@ fn bench_fsync_amortization(c: &mut Criterion) {
             },
         );
 
-        // SharedWal with batched writes (1 fsync, no lock contention).
+        // SharedWalPool with io_uring storage (1 fsync).
+        #[cfg(all(target_os = "linux", feature = "io-uring"))]
         group.bench_with_input(
-            BenchmarkId::new("shared_batched", format!("p{partition_count}")),
+            BenchmarkId::new("pool_uring", format!("p{partition_count}")),
             &config_shared,
             |b, _cfg| {
                 b.iter_custom(|iters| {
                     rt.block_on(async {
                         let mut total = Duration::ZERO;
                         for _ in 0..iters {
-                            total += bench_shared_wals_batched(&config_shared, &data).await;
+                            total += bench_shared_wal_pool_io_uring(&config_shared, &data).await;
                         }
                         total
                     })
@@ -313,154 +314,7 @@ fn bench_fsync_amortization(c: &mut Criterion) {
 /// Vary the number of shared WALs (K) for a fixed partition count.
 ///
 /// Shows the trade-off between fsync amortization (fewer WALs) and
-/// lock contention (more WALs = less contention).
-fn bench_shared_wal_count(c: &mut Criterion) {
-    let rt = Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(4)
-        .build()
-        .expect("failed to build runtime");
-
-    let partition_count = 64;
-    let shared_wal_counts = vec![1, 2, 4, 8, 16, 64]; // 64 = same as separate
-    let entries_per_partition = 10;
-    let data_size = 256;
-
-    let mut group = c.benchmark_group("shared_wal_count");
-    group.sample_size(10);
-    group.measurement_time(Duration::from_secs(20));
-
-    let data = Bytes::from(vec![0u8; data_size]);
-    let total_entries = partition_count * entries_per_partition;
-
-    group.throughput(Throughput::Elements(total_entries as u64));
-
-    for &shared_wal_count in &shared_wal_counts {
-        let config = BenchConfig {
-            partition_count,
-            shared_wal_count,
-            entries_per_partition,
-            data_size,
-        };
-
-        group.bench_with_input(
-            BenchmarkId::new("k", shared_wal_count),
-            &config,
-            |b, cfg| {
-                b.iter_custom(|iters| {
-                    rt.block_on(async {
-                        let mut total = Duration::ZERO;
-                        for _ in 0..iters {
-                            total += bench_shared_wals_concurrent(cfg, &data).await;
-                        }
-                        total
-                    })
-                });
-            },
-        );
-    }
-
-    group.finish();
-}
-
-/// Benchmark with larger data sizes to stress I/O more.
-fn bench_shared_wal_data_sizes(c: &mut Criterion) {
-    let rt = Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(4)
-        .build()
-        .expect("failed to build runtime");
-
-    let partition_count = 16;
-    let shared_wal_count = 1;
-    let entries_per_partition = 100;
-    let data_sizes = vec![64, 256, 1024, 4096];
-
-    let mut group = c.benchmark_group("shared_wal_data_size");
-    group.sample_size(10);
-    group.measurement_time(Duration::from_secs(15));
-
-    for &data_size in &data_sizes {
-        let config = BenchConfig {
-            partition_count,
-            shared_wal_count,
-            entries_per_partition,
-            data_size,
-        };
-
-        let data = Bytes::from(vec![0u8; data_size]);
-        let total_bytes = config.total_entries() * data_size;
-
-        group.throughput(Throughput::Bytes(total_bytes as u64));
-
-        group.bench_with_input(
-            BenchmarkId::new("size", data_size),
-            &config,
-            |b, cfg| {
-                b.iter_custom(|iters| {
-                    rt.block_on(async {
-                        let mut total = Duration::ZERO;
-                        for _ in 0..iters {
-                            total += bench_shared_wals_batched(cfg, &data).await;
-                        }
-                        total
-                    })
-                });
-            },
-        );
-    }
-
-    group.finish();
-}
-
-// ============================================================================
-// SharedWalPool benchmarks (using the new pool API)
-// ============================================================================
-
-/// Benchmark SharedWalPool with varying pool sizes.
-///
-/// Uses the high-level SharedWalPool API which handles partition distribution
-/// automatically via partition_id % wal_count.
-async fn bench_shared_wal_pool(config: &BenchConfig, data: &Bytes) -> Duration {
-    let tempdir = create_temp_dir();
-
-    let pool_config = PoolConfig::new(tempdir.path(), config.shared_wal_count as u32)
-        .with_flush_interval(Duration::from_millis(1));
-
-    let pool = SharedWalPool::open(TokioStorage::new(), pool_config)
-        .await
-        .expect("failed to open pool");
-
-    let start = Instant::now();
-
-    let mut join_set = JoinSet::new();
-
-    // Spawn a writer task per partition.
-    for p in 0..config.partition_count {
-        let partition_id = PartitionId::new(p as u64 + 1);
-        let handle = pool.handle(partition_id);
-        let entries = config.entries_per_partition;
-        let data = data.clone();
-
-        join_set.spawn(async move {
-            for i in 0..entries {
-                handle
-                    .append(1, (i + 1) as u64, data.clone())
-                    .await
-                    .expect("append failed");
-            }
-        });
-    }
-
-    // Wait for all writers.
-    while join_set.join_next().await.is_some() {}
-
-    pool.shutdown().await.expect("shutdown failed");
-
-    start.elapsed()
-}
-
-/// Compare SharedWalPool performance with varying pool sizes.
+/// parallelism (more WALs = more concurrent flushes).
 fn bench_pool_scaling(c: &mut Criterion) {
     let rt = Builder::new_multi_thread()
         .enable_all()
@@ -469,7 +323,7 @@ fn bench_pool_scaling(c: &mut Criterion) {
         .expect("failed to build runtime");
 
     let partition_count = 64;
-    let pool_sizes = vec![1, 2, 4, 8];
+    let pool_sizes = vec![1, 2, 4, 8, 16];
     let entries_per_partition = 10;
     let data_size = 256;
 
@@ -491,7 +345,7 @@ fn bench_pool_scaling(c: &mut Criterion) {
         };
 
         group.bench_with_input(
-            BenchmarkId::new("pool", pool_size),
+            BenchmarkId::new("k", pool_size),
             &config,
             |b, cfg| {
                 b.iter_custom(|iters| {
@@ -510,11 +364,56 @@ fn bench_pool_scaling(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark with larger data sizes to stress I/O more.
+fn bench_pool_data_sizes(c: &mut Criterion) {
+    let rt = Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(4)
+        .build()
+        .expect("failed to build runtime");
+
+    let partition_count = 16;
+    let shared_wal_count = 1;
+    let entries_per_partition = 100;
+    let data_sizes = vec![64, 256, 1024, 4096];
+
+    let mut group = c.benchmark_group("pool_data_size");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(15));
+
+    for &data_size in &data_sizes {
+        let config = BenchConfig {
+            partition_count,
+            shared_wal_count,
+            entries_per_partition,
+            data_size,
+        };
+
+        let data = Bytes::from(vec![0u8; data_size]);
+        let total_bytes = config.total_entries() * data_size;
+
+        group.throughput(Throughput::Bytes(total_bytes as u64));
+
+        group.bench_with_input(BenchmarkId::new("size", data_size), &config, |b, cfg| {
+            b.iter_custom(|iters| {
+                rt.block_on(async {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        total += bench_shared_wal_pool(cfg, &data).await;
+                    }
+                    total
+                })
+            });
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_fsync_amortization,
-    bench_shared_wal_count,
-    bench_shared_wal_data_sizes,
     bench_pool_scaling,
+    bench_pool_data_sizes,
 );
 criterion_main!(benches);

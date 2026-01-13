@@ -203,6 +203,67 @@ impl<S: Storage> SharedWal<S> {
         Ok(())
     }
 
+    /// Appends multiple entries in a single batched I/O operation.
+    ///
+    /// This is significantly faster than calling `append` in a loop because
+    /// all entries are written in a single syscall.
+    ///
+    /// Each entry must satisfy the same `TigerStyle` invariants as `append`:
+    /// - Per-partition indices must be sequential
+    /// - Terms must be monotonically non-decreasing per partition
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the batch write fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any entry violates sequentiality or term constraints.
+    pub async fn append_batch(&mut self, entries: &[SharedEntry]) -> WalResult<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        // Validate all entries before writing.
+        for entry in entries {
+            let partition_id = entry.partition_id();
+            let index = entry.index();
+            let term = entry.term();
+
+            if let Some(state) = self.partition_state.get(&partition_id) {
+                assert_eq!(
+                    index,
+                    state.last_index + 1,
+                    "partition {} index must be sequential: expected {}, got {}",
+                    partition_id,
+                    state.last_index + 1,
+                    index
+                );
+                assert!(
+                    term >= state.last_term,
+                    "partition {} term must be non-decreasing: last {}, got {}",
+                    partition_id,
+                    state.last_term,
+                    term
+                );
+            }
+
+            // Update partition state for subsequent entries in this batch.
+            self.partition_state.insert(
+                partition_id,
+                PartitionState {
+                    last_index: index,
+                    last_term: term,
+                },
+            );
+        }
+
+        // Single batched write.
+        self.wal.append_batch(entries).await?;
+
+        Ok(())
+    }
+
     /// Syncs all pending entries to disk.
     ///
     /// After this call returns, all previously appended entries are durable.
@@ -843,34 +904,33 @@ async fn flush_loop<S: Storage + Clone + Send + Sync + 'static>(inner: Arc<Coord
             buffer.drain()
         };
 
-        // Write all entries to WAL.
+        // Extract entries and response channels.
+        let entries: Vec<SharedEntry> = pending.iter().map(|pw| pw.entry.clone()).collect();
+        let channels: Vec<(oneshot::Sender<WalResult<DurableAck>>, DurableAck)> = pending
+            .into_iter()
+            .map(|pw| {
+                let ack = DurableAck {
+                    partition_id: pw.entry.partition_id(),
+                    index: pw.entry.index(),
+                    term: pw.entry.term(),
+                };
+                (pw.durable_tx, ack)
+            })
+            .collect();
+
+        // Single batched write for all entries.
         let mut wal = inner.wal.lock().await;
-        let mut results: Vec<(oneshot::Sender<WalResult<DurableAck>>, WalResult<DurableAck>)> =
-            Vec::with_capacity(pending.len());
+        let write_result = wal.append_batch(&entries).await;
 
-        for pw in pending {
-            let partition_id = pw.entry.partition_id();
-            let index = pw.entry.index();
-            let term = pw.entry.term();
-
-            match wal
-                .append(partition_id, term, index, pw.entry.payload.clone())
-                .await
-            {
-                Ok(()) => {
-                    results.push((
-                        pw.durable_tx,
-                        Ok(DurableAck {
-                            partition_id,
-                            index,
-                            term,
-                        }),
-                    ));
-                }
-                Err(e) => {
-                    results.push((pw.durable_tx, Err(e)));
-                }
+        if let Err(e) = write_result {
+            // Batch write failed - notify all waiters with error.
+            for (tx, _) in channels {
+                let _ = tx.send(Err(e.clone()));
             }
+            if shutting_down {
+                break;
+            }
+            continue;
         }
 
         // Single fsync for entire batch.
@@ -882,21 +942,19 @@ async fn flush_loop<S: Storage + Clone + Send + Sync + 'static>(inner: Arc<Coord
                 // Update partition_last_index for successful writes.
                 {
                     let mut last_index = inner.partition_last_index.write().await;
-                    for (_, result) in &results {
-                        if let Ok(ack) = result {
-                            last_index.insert(ack.partition_id, ack.index);
-                        }
+                    for (_, ack) in &channels {
+                        last_index.insert(ack.partition_id, ack.index);
                     }
                 }
 
                 // Send success notifications.
-                for (tx, result) in results {
-                    let _ = tx.send(result);
+                for (tx, ack) in channels {
+                    let _ = tx.send(Ok(ack));
                 }
             }
             Err(e) => {
-                // Send failure notifications to all.
-                for (tx, _) in results {
+                // Sync failed - notify all waiters with error.
+                for (tx, _) in channels {
                     let _ = tx.send(Err(e.clone()));
                 }
             }
@@ -1122,6 +1180,22 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalPool<S> {
         }
 
         Ok(all_entries)
+    }
+
+    /// Flushes all pending writes across all WALs in the pool.
+    ///
+    /// This triggers an immediate fsync on each WAL, making all buffered
+    /// entries durable. Use this when you need to ensure durability without
+    /// waiting for the automatic flush interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any WAL fails to flush.
+    pub async fn flush(&self) -> WalResult<()> {
+        for coordinator in &self.coordinators {
+            coordinator.flush().await?;
+        }
+        Ok(())
     }
 
     /// Shuts down all WALs in the pool.

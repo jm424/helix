@@ -541,6 +541,86 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
         Ok(index)
     }
 
+    /// Appends multiple entries in a single batched I/O operation.
+    ///
+    /// This is significantly faster than calling `append` in a loop because:
+    /// - All entries are encoded into a single buffer
+    /// - Only one write syscall is made
+    /// - Internal state is updated once at the end
+    ///
+    /// The batch must fit within the current segment's remaining capacity.
+    /// If it doesn't fit, this method will return an error and you should
+    /// either use smaller batches or call `append` individually (which
+    /// handles segment rollover automatically).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails or the batch is too large for
+    /// the current segment.
+    ///
+    /// # Panics
+    ///
+    /// Panics if entries is empty.
+    pub async fn append_batch(&mut self, entries: &[E]) -> WalResult<u64> {
+        assert!(!entries.is_empty(), "append_batch requires at least one entry");
+
+        // Calculate total size needed.
+        let total_payload: u32 = entries.iter().map(E::payload_len).sum();
+        let total_size: u64 = entries.iter().map(E::total_size).sum();
+
+        // Ensure we have an active segment with space for the entire batch.
+        self.ensure_active_segment(total_payload).await?;
+
+        let active = self
+            .active_segment
+            .as_mut()
+            .expect("active segment should exist after ensure_active_segment");
+
+        // Check if batch fits in remaining segment space.
+        let remaining = self.config.segment_config.max_size_bytes - active.write_offset;
+        if total_size > remaining {
+            return Err(crate::WalError::SegmentFull {
+                reason: "batch too large for remaining segment space",
+            });
+        }
+
+        // Encode all entries into a single buffer.
+        #[allow(clippy::cast_possible_truncation)]
+        let mut buf = bytes::BytesMut::with_capacity(total_size as usize);
+        for entry in entries {
+            entry.encode(&mut buf);
+        }
+        let data = buf.freeze();
+
+        // Single write for entire batch.
+        active.file.write_at(active.write_offset, &data).await?;
+        active.write_offset += total_size;
+
+        // Update in-memory segment for all entries.
+        let mut last_index = 0u64;
+        for entry in entries {
+            active.segment.append(entry.clone())?;
+            last_index = entry.index();
+        }
+
+        // Update WAL state.
+        self.last_index = Some(last_index);
+        self.bytes_since_sync += total_size;
+
+        // Sync if configured.
+        if self.config.sync_on_write {
+            self.sync().await?;
+        }
+
+        debug!(
+            count = entries.len(),
+            bytes = total_size,
+            last_index,
+            "Appended batch"
+        );
+        Ok(last_index)
+    }
+
     /// Syncs all buffered writes to disk.
     ///
     /// Call this periodically for group commit, or rely on `sync_on_write`

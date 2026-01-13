@@ -77,7 +77,6 @@ And verifying these properties ALWAYS hold:
 
 These items from the plan are intentionally deferred:
 - CI pipeline setup (run tests locally for now)
-- io_uring storage implementation (use standard file I/O)
 
 ## TLA+ Model Checking
 
