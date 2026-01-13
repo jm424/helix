@@ -989,7 +989,7 @@ fn check_wal_invariants<S: Storage>(
 }
 
 // ============================================================================
-// Comprehensive Stress Test: 500 Seeds, 25% Fault Rates
+// Comprehensive Stress Test: 1000 Seeds, 25% Fault Rates
 // ============================================================================
 
 /// Comprehensive WAL stress test with high fault rates.
@@ -1000,7 +1000,7 @@ fn check_wal_invariants<S: Storage>(
 /// - Index contiguity (no gaps)
 #[tokio::test]
 async fn test_comprehensive_wal_stress() {
-    const NUM_SEEDS: u64 = 500;
+    const NUM_SEEDS: u64 = 1000;
     const OPS_PER_SEED: usize = 100;
     const FAULT_RATE: f64 = 0.25;
 
@@ -1053,7 +1053,7 @@ async fn test_comprehensive_wal_stress() {
             let op_type = op_hash % 10;
 
             // Debug output for failing seed (disabled after fix)
-            let debug = false && seed == 530877 && op_num >= 75 && op_num <= 90;
+            let debug = false;
 
             match op_type {
                 0..=4 => {

@@ -240,6 +240,10 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
         let mut gap_detected = false;
         let mut segments_to_remove: Vec<SegmentId> = Vec::new(); // Segments after gap
         let mut overlaps_to_fix: Vec<(SegmentId, u64)> = Vec::new(); // (segment_id, truncate_to)
+        // Track the max segment ID that contributed to valid_last_index.
+        // This prevents older segments (lower ID) from overriding newer segments
+        // (higher ID) that were processed earlier due to lower first_index.
+        let mut max_contributing_id: Option<SegmentId> = None;
 
         // Sort segments by first_index, then by segment_id as tiebreaker.
         let mut segments_by_first_index: Vec<_> = sealed_segments.iter().collect();
@@ -275,54 +279,72 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
                 segments_to_remove.push(*id);
                 // Don't update valid_last_index for segments after the gap
             } else if seg_first < expected_next && !gap_detected {
-                // Overlap detected! This newer segment starts before the previous one ended.
-                // This happens when truncation failed to rewrite/remove the older segment.
-                // The newer segment has correct data, so we'll truncate or remove older segments.
-                warn!(
-                    segment_id = id.get(),
-                    seg_first,
-                    expected_next,
-                    "Overlap detected - newer segment overlaps with older"
-                );
-                // Mark all older segments that overlap for truncation.
-                // Also mark older segments that come AFTER this segment's range as stale
-                // (they're from a previous "timeline" before this segment was created).
-                let truncate_to = seg_first.saturating_sub(1);
-                let seg_last_val = seg_last.unwrap_or(seg_first);
-                for (old_id, old_sealed) in &sealed_segments {
-                    if *old_id < *id {
-                        if let Some(old_last) = old_sealed.segment.last_index() {
-                            if old_last >= seg_first {
-                                // Older segment overlaps - truncate it.
-                                overlaps_to_fix.push((*old_id, truncate_to));
+                // Overlap detected! This segment starts before the previous one ended.
+                // This happens when truncation failed to rewrite/remove older segments.
+                //
+                // IMPORTANT: Only let this segment contribute if it has a HIGHER id than
+                // any segment that already contributed. Lower id = older = stale data.
+                // A segment with lower first_index but higher id was already processed
+                // and its data should take precedence.
+                let dominated_by_newer = max_contributing_id
+                    .is_some_and(|max_id| *id < max_id);
+
+                if dominated_by_newer {
+                    // This segment is older (lower id) than one we've already used.
+                    // Mark it for truncation so it doesn't contain conflicting entries.
+                    warn!(
+                        segment_id = id.get(),
+                        seg_first,
+                        max_contributing_id = ?max_contributing_id,
+                        "Stale segment (lower ID than already-processed newer segment)"
+                    );
+                    // Truncate to before its first index (effectively removing all entries).
+                    overlaps_to_fix.push((*id, seg_first.saturating_sub(1)));
+                } else {
+                    // This segment is newer, so it's authoritative for its index range.
+                    warn!(
+                        segment_id = id.get(),
+                        seg_first,
+                        expected_next,
+                        "Overlap detected - newer segment overlaps with older"
+                    );
+                    // Mark all older segments that overlap for truncation.
+                    // Also mark older segments that come AFTER this segment's range as stale.
+                    let truncate_to = seg_first.saturating_sub(1);
+                    let seg_last_val = seg_last.unwrap_or(seg_first);
+                    for (old_id, old_sealed) in &sealed_segments {
+                        if *old_id < *id {
+                            if let Some(old_last) = old_sealed.segment.last_index() {
+                                if old_last >= seg_first {
+                                    overlaps_to_fix.push((*old_id, truncate_to));
+                                }
+                            }
+                            let old_first = old_sealed.segment.first_index();
+                            if old_first > seg_last_val {
+                                warn!(
+                                    stale_segment_id = old_id.get(),
+                                    stale_first = old_first,
+                                    newer_segment_id = id.get(),
+                                    newer_last = seg_last_val,
+                                    "Marking stale segment for removal"
+                                );
+                                segments_to_remove.push(*old_id);
                             }
                         }
-                        // Also check if older segment comes entirely AFTER the current segment.
-                        // This indicates it's stale (from before the truncation that created
-                        // the current segment). Mark it for removal.
-                        let old_first = old_sealed.segment.first_index();
-                        if old_first > seg_last_val {
-                            warn!(
-                                stale_segment_id = old_id.get(),
-                                stale_first = old_first,
-                                newer_segment_id = id.get(),
-                                newer_last = seg_last_val,
-                                "Marking stale segment for removal"
-                            );
-                            segments_to_remove.push(*old_id);
-                        }
                     }
-                }
-                // Update tracking with this segment's data.
-                if let Some(last) = seg_last {
-                    valid_last_index = Some(last);
-                    expected_next = last + 1;
+                    // Update tracking with this segment's data.
+                    if let Some(last) = seg_last {
+                        valid_last_index = Some(last);
+                        expected_next = last + 1;
+                        max_contributing_id = Some(*id);
+                    }
                 }
             } else if !gap_detected {
                 // Normal case: segment continues from expected_next
                 if let Some(last) = seg_last {
                     valid_last_index = Some(last);
                     expected_next = last + 1;
+                    max_contributing_id = Some(*id);
                 }
             }
         }

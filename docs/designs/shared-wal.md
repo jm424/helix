@@ -535,7 +535,7 @@ Assumptions:
 - **Gate**: 100 seeds with aggressive faults, zero violations
 
 ### Phase 5.5: Feature Parity for Full DST (NEW)
-To achieve comprehensive stress testing matching the per-partition WAL DST (500 seeds × 100 ops, 25% faults),
+To achieve comprehensive stress testing matching the per-partition WAL DST (1000 seeds × 100 ops, 25% faults),
 SharedWal needs additional features:
 
 **Missing Features:**
@@ -562,7 +562,7 @@ SharedWal needs additional features:
 | `test_dst_multi_seed_fsync_failures` | 100 | fsync 30% | ✅ |
 | `test_dst_multi_seed_torn_writes` | 100 | torn 20% | ✅ |
 | Unit tests for truncation | N/A | N/A | ✅ (4 tests) |
-| `test_dst_comprehensive_stress` | 500 | fsync 10% + torn 10% | ✅ |
+| `test_dst_comprehensive_stress` | 1000 | fsync 10% + torn 10% | ✅ |
 | `test_dst_stress_with_truncation` | 100 | None | ✅ |
 | `test_dst_multi_crash_recovery_cycles` | 100 | None | ✅ |
 | Coordinator unit tests | N/A | N/A | ✅ (8 tests) |

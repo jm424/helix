@@ -1183,7 +1183,7 @@ async fn test_dst_shared_wal_multi_seed_torn_writes() {
 }
 
 // ========================================================================
-// Comprehensive DST (500 seeds, 25% combined faults)
+// Comprehensive DST (1000 seeds, 25% combined faults)
 // ========================================================================
 
 /// Comprehensive stress test with combined faults.
@@ -1196,7 +1196,7 @@ async fn test_dst_shared_wal_multi_seed_torn_writes() {
 /// - Property verification (durability, ordering, no-phantoms, content)
 #[tokio::test]
 async fn test_dst_shared_wal_comprehensive_stress() {
-    const SEED_COUNT: u64 = 500;
+    const SEED_COUNT: u64 = 1000;
     const PARTITION_COUNT: u64 = 10;
     const ENTRIES_PER_PARTITION: u64 = 20;
 
