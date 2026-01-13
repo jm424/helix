@@ -225,6 +225,11 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
         }
 
         // Validate segment contiguity, fix gaps, and handle overlaps.
+        // This is ONLY done for entry types with global sequential indices (Entry).
+        // For entry types with partition-local indices (SharedEntry), gap/overlap
+        // detection is meaningless because indices are per-partition, not global.
+        // SharedWal handles deduplication at the coordination layer.
+        //
         // Gaps can occur after a failed truncation leaves some segment files deleted.
         // Overlaps can occur after a failed truncation leaves old segment data on disk.
         // We resolve gaps by keeping only the first contiguous run of entries.
@@ -244,6 +249,40 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
         // This prevents older segments (lower ID) from overriding newer segments
         // (higher ID) that were processed earlier due to lower first_index.
         let mut max_contributing_id: Option<SegmentId> = None;
+
+        // Skip gap/overlap detection for non-global-index entry types (e.g., SharedEntry).
+        // Their indices are partition-local and segment first_index is meaningless.
+        if !E::uses_global_index() {
+            // For SharedEntry, just compute last_index from entries across all segments.
+            // Deduplication is handled by SharedWal::recover() using last-write-wins.
+            for sealed in sealed_segments.values() {
+                if let Some(seg_last) = sealed.segment.last_index() {
+                    valid_last_index =
+                        Some(valid_last_index.map_or(seg_last, |v: u64| v.max(seg_last)));
+                }
+            }
+            last_index = valid_last_index;
+
+            info!(
+                segments = sealed_segments.len(),
+                ?first_index,
+                ?last_index,
+                "WAL recovery complete (non-global-index entries)"
+            );
+
+            return Ok(Self {
+                storage,
+                config,
+                sealed_segments,
+                active_segment: None,
+                next_segment_id,
+                first_index,
+                last_index,
+                durable_index: last_index, // Recovered state is durable (survived crash)
+                bytes_since_sync: 0,
+                sealed_segments_pending_sync: Vec::new(),
+            });
+        }
 
         // Sort segments by first_index, then by segment_id as tiebreaker.
         let mut segments_by_first_index: Vec<_> = sealed_segments.iter().collect();

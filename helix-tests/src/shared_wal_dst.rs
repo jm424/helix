@@ -2039,3 +2039,287 @@ async fn test_dst_shared_wal_segment_rollover_with_faults() {
         "At least some rollover tests should succeed"
     );
 }
+
+// ========================================================================
+// High-Fidelity Stress Test: 1000 Seeds, Truncations + Faults + Crashes
+// ========================================================================
+
+/// High-fidelity stress test matching the per-partition WAL test structure.
+///
+/// This test exercises the same bug-finding scenarios as the per-partition WAL:
+/// - Truncations that leave stale segment data
+/// - Fault injection during sync/remove operations
+/// - Multiple crash/recovery cycles
+/// - Property verification after each recovery
+///
+/// The key insight is that bugs occur when:
+/// 1. Truncation happens (creates stale segment data)
+/// 2. sync() or remove() fails (stale data persists)
+/// 3. Crash occurs
+/// 4. Recovery sees both old (stale) and new segments
+#[tokio::test]
+async fn test_dst_shared_wal_high_fidelity_stress() {
+    const SEED_COUNT: u64 = 1000;
+    const OPS_PER_SEED: usize = 100;
+    const FAULT_RATE: f64 = 0.25;
+
+    let mut seeds_completed = 0u64;
+    let mut seeds_skipped = 0u64;
+    let mut total_ops = 0u64;
+    let mut total_writes = 0u64;
+    let mut total_syncs = 0u64;
+    let mut total_truncations = 0u64;
+    let mut total_crashes = 0u64;
+    let mut total_reads = 0u64;
+
+    for base_seed in 0..SEED_COUNT {
+        let seed = base_seed * 12345 + 42;
+
+        let fault_config = FaultConfig::default()
+            .with_torn_write_rate(FAULT_RATE / 2.0)
+            .with_fsync_fail_rate(FAULT_RATE)
+            .with_read_fail_rate(FAULT_RATE)
+            .with_open_fail_rate(FAULT_RATE / 10.0)
+            .with_list_files_fail_rate(FAULT_RATE / 5.0)
+            .with_exists_fail_rate(FAULT_RATE / 10.0)
+            .with_remove_fail_rate(FAULT_RATE / 5.0);
+
+        let storage = SimulatedStorage::with_faults(seed, fault_config);
+        let config = SharedWalConfig::new(format!("/wal/hifi-{seed}"));
+
+        let p1 = PartitionId::new(1);
+        let p2 = PartitionId::new(2);
+
+        let wal_result = SharedWal::open(storage.clone(), config.clone()).await;
+        let mut wal = match wal_result {
+            Ok(w) => w,
+            Err(_) => {
+                seeds_skipped += 1;
+                continue;
+            }
+        };
+
+        // Track per-partition state: (next_index, current_term)
+        // Durable indices are queried from WAL directly before crashes.
+        let mut p1_next_idx = 1u64;
+        let mut p1_term = 1u64;
+        let mut p2_next_idx = 1u64;
+        let mut p2_term = 1u64;
+
+        for op_num in 0..OPS_PER_SEED {
+            let op_hash = seed.wrapping_add(op_num as u64).wrapping_mul(0x9e3779b97f4a7c15);
+            let op_type = op_hash % 10;
+
+            match op_type {
+                0..=3 => {
+                    // 40%: Write to partition 1 or 2
+                    total_writes += 1;
+                    let (pid, next_idx, term) = if op_hash % 2 == 0 {
+                        (p1, &mut p1_next_idx, p1_term)
+                    } else {
+                        (p2, &mut p2_next_idx, p2_term)
+                    };
+
+                    let payload = Bytes::from(format!("s{seed}-o{op_num}-i{}", *next_idx));
+                    if wal.append(pid, term, *next_idx, payload).await.is_ok() {
+                        *next_idx += 1;
+                    }
+                }
+                4 => {
+                    // 10%: Sync
+                    total_syncs += 1;
+                    let _ = wal.sync().await;
+                }
+                5 => {
+                    // 10%: Truncation on partition 1
+                    total_truncations += 1;
+                    if p1_next_idx > 2 {
+                        let truncate_to = (op_hash % (p1_next_idx - 1)).max(1);
+                        wal.truncate_after(p1, truncate_to);
+                        p1_next_idx = truncate_to + 1;
+                        p1_term += 1; // Bump term after truncation (Raft semantics)
+                        let _ = wal.sync().await;
+                    }
+                }
+                6 => {
+                    // 10%: Truncation on partition 2
+                    total_truncations += 1;
+                    if p2_next_idx > 2 {
+                        let truncate_to = (op_hash % (p2_next_idx - 1)).max(1);
+                        wal.truncate_after(p2, truncate_to);
+                        p2_next_idx = truncate_to + 1;
+                        p2_term += 1;
+                        let _ = wal.sync().await;
+                    }
+                }
+                7 => {
+                    // 10%: Read verification
+                    total_reads += 1;
+                    if p1_next_idx > 1 {
+                        let idx = (op_hash % (p1_next_idx - 1)) + 1;
+                        let _ = wal.read(p1, idx);
+                    }
+                }
+                _ => {
+                    // 20%: Crash and recovery
+                    total_crashes += 1;
+
+                    // Capture durable state before crash
+                    let p1_durable_before = wal.partition_durable_index(p1);
+                    let p2_durable_before = wal.partition_durable_index(p2);
+
+                    drop(wal);
+                    storage.simulate_crash();
+
+                    // Disable faults for recovery
+                    {
+                        let mut fc = storage.fault_config();
+                        fc.torn_write_rate = 0.0;
+                        fc.write_fail_rate = 0.0;
+                        fc.read_fail_rate = 0.0;
+                        fc.fsync_fail_rate = 0.0;
+                        fc.open_fail_rate = 0.0;
+                        fc.list_files_fail_rate = 0.0;
+                    }
+
+                    match SharedWal::open(storage.clone(), config.clone()).await {
+                        Ok(mut w) => {
+                            // Verify durability: recovered >= durable_before for each partition
+                            let recovered = w.recover().unwrap_or_default();
+
+                            if let Some(durable) = p1_durable_before {
+                                let recovered_count =
+                                    recovered.get(&p1).map(|e| e.len()).unwrap_or(0) as u64;
+                                if recovered_count < durable {
+                                    panic!(
+                                        "seed {seed}, op {op_num}: P1 DURABILITY VIOLATION - \
+                                         recovered {recovered_count} < durable {durable}"
+                                    );
+                                }
+                            }
+
+                            if let Some(durable) = p2_durable_before {
+                                let recovered_count =
+                                    recovered.get(&p2).map(|e| e.len()).unwrap_or(0) as u64;
+                                if recovered_count < durable {
+                                    panic!(
+                                        "seed {seed}, op {op_num}: P2 DURABILITY VIOLATION - \
+                                         recovered {recovered_count} < durable {durable}"
+                                    );
+                                }
+                            }
+
+                            // Verify ordering and no duplicates
+                            let ordering_violations = verify_ordering(&recovered);
+                            if !ordering_violations.is_empty() {
+                                panic!(
+                                    "seed {seed}, op {op_num}: ORDERING VIOLATION - {:?}",
+                                    ordering_violations
+                                );
+                            }
+
+                            let dup_violations = verify_no_duplicates(&recovered);
+                            if !dup_violations.is_empty() {
+                                panic!(
+                                    "seed {seed}, op {op_num}: DUPLICATE VIOLATION - {:?}",
+                                    dup_violations
+                                );
+                            }
+
+                            // Reset state based on recovery
+                            p1_next_idx = recovered
+                                .get(&p1)
+                                .and_then(|e| e.last())
+                                .map(|e| e.index() + 1)
+                                .unwrap_or(1);
+                            p2_next_idx = recovered
+                                .get(&p2)
+                                .and_then(|e| e.last())
+                                .map(|e| e.index() + 1)
+                                .unwrap_or(1);
+
+                            wal = w;
+                        }
+                        Err(e) => {
+                            panic!("seed {seed}, op {op_num}: Recovery failed: {e}");
+                        }
+                    }
+
+                    // Re-enable faults
+                    {
+                        let mut fc = storage.fault_config();
+                        fc.torn_write_rate = FAULT_RATE / 2.0;
+                        fc.write_fail_rate = FAULT_RATE;
+                        fc.read_fail_rate = FAULT_RATE;
+                        fc.fsync_fail_rate = FAULT_RATE;
+                        fc.open_fail_rate = FAULT_RATE / 10.0;
+                        fc.list_files_fail_rate = FAULT_RATE / 5.0;
+                    }
+                }
+            }
+
+            total_ops += 1;
+        }
+
+        seeds_completed += 1;
+
+        // Final crash/recovery check
+        let p1_final_durable = wal.partition_durable_index(p1);
+        let p2_final_durable = wal.partition_durable_index(p2);
+        drop(wal);
+        storage.simulate_crash();
+
+        {
+            let mut fc = storage.fault_config();
+            fc.torn_write_rate = 0.0;
+            fc.read_fail_rate = 0.0;
+            fc.fsync_fail_rate = 0.0;
+            fc.open_fail_rate = 0.0;
+            fc.list_files_fail_rate = 0.0;
+        }
+
+        if let Ok(mut final_wal) = SharedWal::open(storage.clone(), config).await {
+            let recovered = final_wal.recover().unwrap_or_default();
+
+            if let Some(durable) = p1_final_durable {
+                let recovered_count = recovered.get(&p1).map(|e| e.len()).unwrap_or(0) as u64;
+                if recovered_count < durable {
+                    panic!(
+                        "seed {seed}: FINAL P1 DURABILITY VIOLATION - recovered {recovered_count} < durable {durable}"
+                    );
+                }
+            }
+
+            if let Some(durable) = p2_final_durable {
+                let recovered_count = recovered.get(&p2).map(|e| e.len()).unwrap_or(0) as u64;
+                if recovered_count < durable {
+                    panic!(
+                        "seed {seed}: FINAL P2 DURABILITY VIOLATION - recovered {recovered_count} < durable {durable}"
+                    );
+                }
+            }
+        }
+    }
+
+    eprintln!("\n=== SharedWal High-Fidelity Stress Test Statistics ===");
+    eprintln!("Seeds: {seeds_completed} completed, {seeds_skipped} skipped");
+    eprintln!("Total ops: {total_ops}");
+    eprintln!(
+        "Operations: {total_writes} writes, {total_syncs} syncs, {total_reads} reads, \
+         {total_truncations} truncations, {total_crashes} crashes"
+    );
+    eprintln!("======================================================\n");
+
+    assert!(
+        seeds_completed > 900,
+        "At least 900 seeds should complete successfully"
+    );
+    assert!(
+        total_truncations > 10000,
+        "Should have significant truncation coverage"
+    );
+    assert!(
+        total_crashes > 10000,
+        "Should have significant crash coverage"
+    );
+}
