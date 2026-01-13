@@ -273,7 +273,22 @@ Enable all warnings and treat them as errors:
 cargo clippy --workspace
 ```
 
-Common fixes:
+**Auto-fixing clippy warnings**: Rust can auto-fix many clippy warnings. Use this before manual fixes:
+
+```bash
+cargo clippy --fix -p <crate-name> --allow-dirty --allow-staged
+```
+
+This automatically fixes issues like:
+- Missing `const fn`
+- Redundant closures
+- Using `map_or` instead of `is_none() || unwrap()`
+- Doc comment formatting
+- Single-match-else patterns
+
+Run this first, then manually fix the remaining warnings that require human judgment (e.g., `cast_possible_truncation`).
+
+Common manual fixes:
 - Add `const fn` where clippy suggests
 - Use inline format args: `"{var}"` instead of `"{}", var`
 - Add `# Errors` and `# Panics` doc sections for fallible functions
