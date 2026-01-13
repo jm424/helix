@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "helix-core",
     "helix-flow",
-    "helix-kafka-compat",
     "helix-progress",
     "helix-routing",
     "helix-runtime",
@@ -26,7 +25,6 @@ rust-version = "1.85"
 # Internal crates.
 helix-core = { path = "helix-core" }
 helix-flow = { path = "helix-flow" }
-helix-kafka-compat = { path = "helix-kafka-compat" }
 helix-progress = { path = "helix-progress" }
 helix-routing = { path = "helix-routing" }
 helix-runtime = { path = "helix-runtime" }

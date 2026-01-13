@@ -1737,23 +1737,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "helix-kafka-compat"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "clap",
- "helix-core",
- "helix-progress",
- "helix-server",
- "kafka-protocol",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "helix-progress"
 version = "0.1.0"
 dependencies = [
