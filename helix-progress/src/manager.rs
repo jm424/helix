@@ -865,6 +865,114 @@ impl<S: ProgressStore> ProgressManager<S> {
         }
         Ok(total)
     }
+
+    // -------------------------------------------------------------------------
+    // Kafka-Compatible Operations
+    // -------------------------------------------------------------------------
+    //
+    // These methods support Kafka protocol semantics where:
+    // - Groups are auto-created on first commit
+    // - Commits don't require leases (cumulative semantics)
+    // - Fetch returns None for non-existent partitions (not error)
+
+    /// Commits an offset using Kafka-style cumulative semantics.
+    ///
+    /// Unlike the standard `commit_offset`, this method:
+    /// - Auto-creates the consumer group if it doesn't exist
+    /// - Auto-creates the partition progress if it doesn't exist
+    /// - Does NOT require a lease (direct commit)
+    /// - Uses cumulative mode (watermark advances directly)
+    ///
+    /// This is designed for Kafka protocol compatibility where clients
+    /// don't use the lease mechanism.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if storage operation fails.
+    pub async fn commit_offset_kafka(
+        &self,
+        group_id: ConsumerGroupId,
+        topic_id: TopicId,
+        partition_id: PartitionId,
+        offset: Offset,
+        current_time_us: u64,
+    ) -> ProgressResult<()> {
+        // Get or create group with cumulative mode.
+        let mut group = if let Some(g) = self.store.get_group(group_id).await? {
+            g
+        } else {
+            let g = ConsumerGroupState::new(group_id, current_time_us, AckMode::Cumulative);
+            self.store.save_group(&g).await?;
+            debug!(group_id = %group_id, "Created consumer group for Kafka commit");
+            g
+        };
+
+        let partition_key = PartitionKey::new(topic_id, partition_id);
+
+        // Get or create partition progress.
+        let progress = group
+            .partitions
+            .entry(partition_key)
+            .or_insert_with(|| PartitionProgress::new(partition_key, Offset::new(0), AckMode::Cumulative));
+
+        // Cumulative commit: advance watermark directly to offset + 1.
+        // This means "I've processed everything up to and including this offset".
+        let new_watermark = Offset::new(offset.get().saturating_add(1));
+        if new_watermark > progress.low_watermark {
+            progress.low_watermark = new_watermark;
+            progress.next_lease_offset = progress.next_lease_offset.max(new_watermark);
+        }
+
+        // Save updated group.
+        self.store.save_group(&group).await?;
+
+        debug!(
+            group_id = %group_id,
+            topic_id = %topic_id,
+            partition_id = %partition_id,
+            offset = %offset,
+            new_watermark = %new_watermark,
+            "Kafka-style offset commit"
+        );
+
+        Ok(())
+    }
+
+    /// Fetches the committed offset using Kafka-style semantics.
+    ///
+    /// Unlike the standard `fetch_committed`, this method:
+    /// - Returns `None` if the group doesn't exist (not an error)
+    /// - Returns `None` if the partition doesn't exist (not an error)
+    ///
+    /// The returned offset is the last committed offset (watermark - 1).
+    /// Returns `None` if no offset has been committed.
+    ///
+    /// # Errors
+    ///
+    /// Returns error only if storage operation fails.
+    pub async fn fetch_committed_kafka(
+        &self,
+        group_id: ConsumerGroupId,
+        topic_id: TopicId,
+        partition_id: PartitionId,
+    ) -> ProgressResult<Option<Offset>> {
+        let Some(group) = self.store.get_group(group_id).await? else {
+            return Ok(None);
+        };
+
+        let partition_key = PartitionKey::new(topic_id, partition_id);
+        let Some(progress) = group.partitions.get(&partition_key) else {
+            return Ok(None);
+        };
+
+        // Watermark is "next offset to be committed", so committed = watermark - 1.
+        // If watermark is 0, nothing has been committed.
+        if progress.low_watermark.get() == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(Offset::new(progress.low_watermark.get() - 1)))
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------

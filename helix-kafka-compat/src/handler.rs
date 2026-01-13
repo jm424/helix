@@ -13,7 +13,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use bytes::{Bytes, BytesMut};
-use helix_core::{PartitionId, TopicId};
+use helix_core::{ConsumerGroupId, PartitionId, TopicId};
+use helix_progress::{ProgressConfig, ProgressManager, SimulatedProgressStore};
 use helix_server::storage::{DurablePartition, DurablePartitionConfig};
 use tokio::sync::RwLock;
 use kafka_protocol::{
@@ -63,21 +64,17 @@ struct PartitionKey {
     partition: i32,
 }
 
-/// Key for consumer group committed offset tracking.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ConsumerGroupPartitionKey {
-    group_id: String,
-    topic: String,
-    partition: i32,
-}
-
 /// Topic ID counter for generating unique topic IDs.
 static NEXT_TOPIC_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Consumer group ID counter for generating unique group IDs.
+static NEXT_GROUP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Handler context containing Helix storage and configuration.
 ///
 /// Uses protocol-agnostic blob storage for Kafka `RecordBatch` data.
-/// Data is persisted to WAL via `DurablePartition`.
+/// Data is persisted to WAL via `DurablePartition`. Consumer group progress
+/// is tracked via `ProgressManager`.
 pub struct HandlerContext {
     /// Node ID of this Helix node.
     pub node_id: i32,
@@ -91,16 +88,22 @@ pub struct HandlerContext {
     data_dir: PathBuf,
     /// Topic name to ID mapping.
     topic_ids: std::sync::RwLock<HashMap<String, TopicId>>,
+    /// Consumer group name to ID mapping.
+    group_ids: std::sync::RwLock<HashMap<String, ConsumerGroupId>>,
     /// Partition storage (topic+partition -> `DurablePartition` with blob storage).
     partitions: RwLock<HashMap<PartitionKey, DurablePartition>>,
-    /// Consumer group committed offsets (group+topic+partition -> offset).
-    committed_offsets: std::sync::RwLock<HashMap<ConsumerGroupPartitionKey, i64>>,
+    /// Consumer group progress tracking via helix-progress.
+    progress: ProgressManager<SimulatedProgressStore>,
 }
 
 impl HandlerContext {
     /// Create a new handler context.
     #[must_use]
     pub fn new(node_id: i32, host: String, port: i32, data_dir: PathBuf) -> Self {
+        // Create progress store and manager for consumer group tracking.
+        let store = SimulatedProgressStore::new(0);
+        let progress = ProgressManager::new(store, ProgressConfig::for_testing());
+
         Self {
             node_id,
             host,
@@ -108,8 +111,9 @@ impl HandlerContext {
             cluster_id: "helix-cluster".to_string(),
             data_dir,
             topic_ids: std::sync::RwLock::new(HashMap::new()),
+            group_ids: std::sync::RwLock::new(HashMap::new()),
             partitions: RwLock::new(HashMap::new()),
-            committed_offsets: std::sync::RwLock::new(HashMap::new()),
+            progress,
         }
     }
 
@@ -127,6 +131,23 @@ impl HandlerContext {
         let mut topic_ids = self.topic_ids.write().unwrap();
         *topic_ids.entry(topic.to_string()).or_insert_with(|| {
             TopicId::new(NEXT_TOPIC_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+        })
+    }
+
+    /// Gets or creates a consumer group ID for the given group name.
+    fn get_or_create_group_id(&self, group: &str) -> ConsumerGroupId {
+        // Try read lock first.
+        {
+            let group_ids = self.group_ids.read().unwrap();
+            if let Some(&id) = group_ids.get(group) {
+                return id;
+            }
+        }
+
+        // Need write lock to create.
+        let mut group_ids = self.group_ids.write().unwrap();
+        *group_ids.entry(group.to_string()).or_insert_with(|| {
+            ConsumerGroupId::new(NEXT_GROUP_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
         })
     }
 
@@ -241,29 +262,63 @@ impl HandlerContext {
     }
 
     /// Commit an offset for a consumer group.
-    fn commit_offset(&self, group_id: &str, topic: &str, partition: i32, offset: i64) {
-        let key = ConsumerGroupPartitionKey {
-            group_id: group_id.to_string(),
-            topic: topic.to_string(),
-            partition,
-        };
+    ///
+    /// Uses the helix-progress `ProgressManager` for durable offset tracking.
+    async fn commit_offset(&self, group_id: &str, topic: &str, partition: i32, offset: i64) {
+        let topic_id = self.get_or_create_topic_id(topic);
+        // Safe cast: partition ID fits in u32.
+        #[allow(clippy::cast_sign_loss)]
+        let partition_id = PartitionId::new(u64::from(partition as u32));
+        let group_id = self.get_or_create_group_id(group_id);
+        // Safe cast: offset is i64 but should be non-negative.
+        #[allow(clippy::cast_sign_loss)]
+        let offset_u64 = helix_core::Offset::new(offset.max(0) as u64);
+        // Safe: u128 microseconds won't overflow u64 until year ~586,000.
+        #[allow(clippy::cast_possible_truncation)]
+        let current_time_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
 
-        let mut offsets = self.committed_offsets.write().unwrap();
-        offsets.insert(key, offset);
+        // Use Kafka-style cumulative commit (no lease required).
+        if let Err(e) = self
+            .progress
+            .commit_offset_kafka(group_id, topic_id, partition_id, offset_u64, current_time_us)
+            .await
+        {
+            warn!(error = %e, "Failed to commit offset via ProgressManager");
+        }
     }
 
     /// Fetch the committed offset for a consumer group.
     ///
+    /// Uses the helix-progress `ProgressManager` for offset retrieval.
     /// Returns -1 if no offset has been committed.
-    fn fetch_committed_offset(&self, group_id: &str, topic: &str, partition: i32) -> i64 {
-        let key = ConsumerGroupPartitionKey {
-            group_id: group_id.to_string(),
-            topic: topic.to_string(),
-            partition,
-        };
+    async fn fetch_committed_offset(&self, group_id: &str, topic: &str, partition: i32) -> i64 {
+        let topic_id = self.get_or_create_topic_id(topic);
+        // Safe cast: partition ID fits in u32.
+        #[allow(clippy::cast_sign_loss)]
+        let partition_id = PartitionId::new(u64::from(partition as u32));
+        let group_id = self.get_or_create_group_id(group_id);
 
-        let offsets = self.committed_offsets.read().unwrap();
-        offsets.get(&key).copied().unwrap_or(-1)
+        match self
+            .progress
+            .fetch_committed_kafka(group_id, topic_id, partition_id)
+            .await
+        {
+            Ok(Some(offset)) => {
+                // Safe cast: offset fits in i64.
+                #[allow(clippy::cast_possible_wrap)]
+                {
+                    offset.get() as i64
+                }
+            }
+            Ok(None) => -1,
+            Err(e) => {
+                warn!(error = %e, "Failed to fetch committed offset via ProgressManager");
+                -1
+            }
+        }
     }
 
     /// Check if a partition exists (has been written to).
@@ -324,8 +379,8 @@ pub async fn handle_request(
         x if x == ApiKey::Fetch as i16 => handle_fetch(ctx, request).await,
         x if x == ApiKey::ListOffsets as i16 => handle_list_offsets(ctx, request).await,
         x if x == ApiKey::FindCoordinator as i16 => handle_find_coordinator(ctx, request),
-        x if x == ApiKey::OffsetCommit as i16 => handle_offset_commit(ctx, request),
-        x if x == ApiKey::OffsetFetch as i16 => handle_offset_fetch(ctx, request),
+        x if x == ApiKey::OffsetCommit as i16 => handle_offset_commit(ctx, request).await,
+        x if x == ApiKey::OffsetFetch as i16 => handle_offset_fetch(ctx, request).await,
         _ => {
             warn!(api_key = request.api_key, "Unsupported API");
             Err(KafkaCompatError::UnsupportedApi {
@@ -863,7 +918,7 @@ fn handle_find_coordinator(
 /// Handle `OffsetCommit` request.
 ///
 /// Commits consumer group offsets.
-fn handle_offset_commit(
+async fn handle_offset_commit(
     ctx: &HandlerContext,
     request: &DecodedRequest,
 ) -> KafkaCompatResult<BytesMut> {
@@ -893,8 +948,9 @@ fn handle_offset_commit(
             let partition_id = partition_data.partition_index;
             let offset = partition_data.committed_offset;
 
-            // Commit the offset.
-            ctx.commit_offset(&group_id, &topic_name, partition_id, offset);
+            // Commit the offset via ProgressManager.
+            ctx.commit_offset(&group_id, &topic_name, partition_id, offset)
+                .await;
 
             info!(
                 group_id = %group_id,
@@ -925,7 +981,7 @@ fn handle_offset_commit(
 /// Handle `OffsetFetch` request.
 ///
 /// Fetches committed consumer group offsets.
-fn handle_offset_fetch(
+async fn handle_offset_fetch(
     ctx: &HandlerContext,
     request: &DecodedRequest,
 ) -> KafkaCompatResult<BytesMut> {
@@ -956,8 +1012,10 @@ fn handle_offset_fetch(
             for partition_data in &topic_data.partition_indexes {
                 let partition_id = *partition_data;
 
-                // Fetch the committed offset.
-                let offset = ctx.fetch_committed_offset(&group_id, &topic_name, partition_id);
+                // Fetch the committed offset via ProgressManager.
+                let offset = ctx
+                    .fetch_committed_offset(&group_id, &topic_name, partition_id)
+                    .await;
 
                 debug!(
                     group_id = %group_id,

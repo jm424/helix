@@ -7,6 +7,7 @@ edition.workspace = true
 [dependencies]
 helix-core = { workspace = true }
 helix-server = { workspace = true }
+helix-progress = { workspace = true }
 
 # Kafka protocol encoding/decoding
 kafka-protocol = "0.17"

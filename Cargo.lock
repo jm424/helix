@@ -1743,6 +1743,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "helix-core",
+ "helix-progress",
  "helix-server",
  "kafka-protocol",
  "thiserror 1.0.69",
