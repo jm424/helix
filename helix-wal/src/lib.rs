@@ -51,8 +51,8 @@ pub use error::{WalError, WalResult};
 pub use segment::{Segment, SegmentConfig, SegmentHeader, SegmentId, SEGMENT_HEADER_SIZE};
 pub use shared_entry::{SharedEntry, SharedEntryHeader, SHARED_ENTRY_HEADER_SIZE};
 pub use shared_wal::{
-    CoordinatorConfig, DurableAck, SharedWal, SharedWalConfig, SharedWalCoordinator,
-    SharedWalHandle,
+    CoordinatorConfig, DurableAck, PoolConfig, SharedWal, SharedWalConfig, SharedWalCoordinator,
+    SharedWalHandle, SharedWalPool, POOL_WAL_COUNT_MAX,
 };
 pub use storage::{create_storage, FaultConfig, SimulatedStorage, Storage, StorageFile, TokioStorage};
 

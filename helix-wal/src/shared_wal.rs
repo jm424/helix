@@ -909,6 +909,242 @@ async fn flush_loop<S: Storage + Clone + Send + Sync + 'static>(inner: Arc<Coord
 }
 
 // ----------------------------------------------------------------------------
+// SharedWalPool - Multiple Shared WALs
+// ----------------------------------------------------------------------------
+
+/// Maximum number of WALs in a pool.
+///
+/// Why this limit: A pool distributes partitions across WALs to parallelize fsyncs.
+/// Beyond 16 WALs, the benefit diminishes (`NVMe` can handle ~4-8 parallel fsyncs well)
+/// and complexity increases. For NUMA systems, 1 WAL per NUMA node (typically 2-8)
+/// is optimal.
+pub const POOL_WAL_COUNT_MAX: u32 = 16;
+
+/// Configuration for a pool of shared WALs.
+///
+/// Use a pool when you need more than one fsync stream, typically:
+/// - 1 WAL per NUMA node for memory locality
+/// - Multiple WALs to parallelize fsyncs on high-core systems
+#[derive(Debug, Clone)]
+pub struct PoolConfig {
+    /// Base directory for all WALs. Each WAL gets a subdirectory.
+    pub base_dir: PathBuf,
+    /// Number of WALs in the pool.
+    pub wal_count: u32,
+    /// Configuration for each WAL's coordinator.
+    pub coordinator_config: CoordinatorConfig,
+}
+
+impl PoolConfig {
+    /// Creates a new pool configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `wal_count` is 0 or exceeds `POOL_WAL_COUNT_MAX`.
+    #[must_use]
+    pub fn new(base_dir: impl Into<PathBuf>, wal_count: u32) -> Self {
+        // TigerStyle: Assert preconditions.
+        assert!(wal_count > 0, "wal_count must be at least 1");
+        assert!(
+            wal_count <= POOL_WAL_COUNT_MAX,
+            "wal_count {wal_count} exceeds max {POOL_WAL_COUNT_MAX}"
+        );
+
+        let base_dir = base_dir.into();
+        // Create a default coordinator config; the WAL directory will be set per-WAL.
+        let coordinator_config = CoordinatorConfig::new(&base_dir);
+
+        Self {
+            base_dir,
+            wal_count,
+            coordinator_config,
+        }
+    }
+
+    /// Sets the flush interval for all WALs.
+    #[must_use]
+    pub const fn with_flush_interval(mut self, interval: Duration) -> Self {
+        self.coordinator_config.flush_interval = interval;
+        self
+    }
+
+    /// Sets the maximum buffer entries for all WALs.
+    #[must_use]
+    pub const fn with_max_buffer_entries(mut self, max: usize) -> Self {
+        self.coordinator_config.max_buffer_entries = max;
+        self
+    }
+}
+
+/// A pool of shared WALs for distributing partitions across multiple fsync streams.
+///
+/// # Why Use a Pool?
+///
+/// A single shared WAL amortizes fsync cost (N partitions → 1 fsync), but serializes
+/// all writes through one file. A pool distributes partitions across K WALs, enabling:
+/// - K parallel fsyncs (better `NVMe` utilization)
+/// - K parallel write streams (reduced lock contention)
+/// - NUMA-aware placement (1 WAL per NUMA node)
+///
+/// # Partition Assignment
+///
+/// Partitions are assigned to WALs by hashing: `partition_id % wal_count`. This ensures:
+/// - Deterministic assignment (same partition always goes to same WAL)
+/// - Even distribution (assuming partition IDs are well-distributed)
+/// - No coordination needed (each partition knows its WAL)
+pub struct SharedWalPool<S: Storage> {
+    /// The WALs in this pool, indexed by `partition_id % wal_count`.
+    coordinators: Vec<SharedWalCoordinator<S>>,
+    /// Number of WALs (stored separately to avoid Vec length lookup in hot path).
+    wal_count: u32,
+}
+
+impl<S: Storage + Clone + Send + Sync + 'static> SharedWalPool<S> {
+    /// Opens or creates a pool of shared WALs.
+    ///
+    /// Creates `config.wal_count` subdirectories under `config.base_dir`, each
+    /// containing one shared WAL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any WAL fails to open.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.wal_count` is 0 or exceeds `POOL_WAL_COUNT_MAX`.
+    pub async fn open(storage: S, config: PoolConfig) -> WalResult<Self> {
+        // TigerStyle: Assert preconditions (also checked in PoolConfig::new).
+        assert!(config.wal_count > 0);
+        assert!(config.wal_count <= POOL_WAL_COUNT_MAX);
+
+        let mut coordinators = Vec::with_capacity(config.wal_count as usize);
+
+        for i in 0..config.wal_count {
+            // Each WAL gets its own subdirectory: base_dir/wal-00, wal-01, etc.
+            let wal_dir = config.base_dir.join(format!("wal-{i:02}"));
+            let mut wal_config = config.coordinator_config.clone();
+            wal_config.wal_config = SharedWalConfig::new(&wal_dir);
+
+            let coordinator = SharedWalCoordinator::open(storage.clone(), wal_config).await?;
+            coordinators.push(coordinator);
+        }
+
+        // TigerStyle: Assert postcondition.
+        assert_eq!(coordinators.len(), config.wal_count as usize);
+
+        Ok(Self {
+            coordinators,
+            wal_count: config.wal_count,
+        })
+    }
+
+    /// Gets a handle for a partition.
+    ///
+    /// The partition is assigned to a WAL by hashing: `partition_id % wal_count`.
+    /// This assignment is deterministic and stable.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal state is inconsistent (should never happen).
+    #[must_use]
+    pub fn handle(&self, partition_id: PartitionId) -> SharedWalHandle<S> {
+        // TigerStyle: Explicit cast with bounds check via assert.
+        // Safe: wal_count <= POOL_WAL_COUNT_MAX (16), so result fits in usize on any platform.
+        #[allow(clippy::cast_possible_truncation)]
+        let wal_index = (partition_id.get() % u64::from(self.wal_count)) as usize;
+        assert!(wal_index < self.coordinators.len());
+
+        self.coordinators[wal_index].handle(partition_id)
+    }
+
+    /// Returns which WAL index a partition is assigned to.
+    ///
+    /// Useful for debugging and metrics.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal state is inconsistent (should never happen).
+    #[must_use]
+    pub fn wal_index_for_partition(&self, partition_id: PartitionId) -> u32 {
+        #[allow(clippy::cast_possible_truncation)] // Bounded by wal_count.
+        let index = (partition_id.get() % u64::from(self.wal_count)) as u32;
+        assert!(index < self.wal_count);
+        index
+    }
+
+    /// Returns the number of WALs in the pool.
+    #[must_use]
+    pub const fn wal_count(&self) -> u32 {
+        self.wal_count
+    }
+
+    /// Recovers entries from all WALs, grouped by partition.
+    ///
+    /// Merges recovery results from all WALs in the pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any WAL fails to recover.
+    ///
+    /// # Panics
+    ///
+    /// Panics if recovered entries are not sorted by index (indicates WAL corruption).
+    pub async fn recover(&self) -> WalResult<HashMap<PartitionId, Vec<SharedEntry>>> {
+        let mut all_entries: HashMap<PartitionId, Vec<SharedEntry>> = HashMap::new();
+
+        for coordinator in &self.coordinators {
+            let wal_entries = coordinator.recover().await?;
+            for (partition_id, entries) in wal_entries {
+                all_entries.entry(partition_id).or_default().extend(entries);
+            }
+        }
+
+        // TigerStyle: Assert postcondition - entries should be sorted per partition.
+        for entries in all_entries.values() {
+            for window in entries.windows(2) {
+                assert!(
+                    window[0].index() < window[1].index(),
+                    "recovered entries must be sorted by index"
+                );
+            }
+        }
+
+        Ok(all_entries)
+    }
+
+    /// Shuts down all WALs in the pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any WAL fails to shut down.
+    pub async fn shutdown(&self) -> WalResult<()> {
+        for coordinator in &self.coordinators {
+            coordinator.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    /// Returns true if all WALs in the pool are empty.
+    pub async fn is_empty(&self) -> bool {
+        for coordinator in &self.coordinators {
+            if !coordinator.is_empty().await {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Returns the total entry count across all WALs.
+    pub async fn entry_count(&self) -> u64 {
+        let mut total = 0u64;
+        for coordinator in &self.coordinators {
+            total += coordinator.entry_count().await;
+        }
+        total
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Tests
 // ----------------------------------------------------------------------------
 
@@ -1525,5 +1761,144 @@ mod coordinator_tests {
         assert_eq!(coordinator.partition_durable_index(p1).await, Some(2));
 
         coordinator.shutdown().await.unwrap();
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Pool Tests
+// ----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+    use crate::storage::TokioStorage;
+
+    #[tokio::test]
+    async fn test_pool_basic() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig::new(temp_dir.path(), 2)
+            .with_flush_interval(Duration::from_millis(10));
+
+        let pool = SharedWalPool::open(TokioStorage::new(), config)
+            .await
+            .unwrap();
+
+        // Verify pool has correct count.
+        assert_eq!(pool.wal_count(), 2);
+        assert!(pool.is_empty().await);
+
+        // Partitions should be distributed across WALs.
+        let p1 = PartitionId::new(1);
+        let p2 = PartitionId::new(2);
+        let p3 = PartitionId::new(3);
+
+        // With 2 WALs: p1 -> wal 1, p2 -> wal 0, p3 -> wal 1.
+        assert_eq!(pool.wal_index_for_partition(p1), 1);
+        assert_eq!(pool.wal_index_for_partition(p2), 0);
+        assert_eq!(pool.wal_index_for_partition(p3), 1);
+
+        // Get handles and write.
+        let h1 = pool.handle(p1);
+        let h2 = pool.handle(p2);
+
+        h1.append(1, 1, Bytes::from("p1-entry-1")).await.unwrap();
+        h2.append(1, 1, Bytes::from("p2-entry-1")).await.unwrap();
+
+        // Verify entry count.
+        assert_eq!(pool.entry_count().await, 2);
+
+        pool.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_pool_recovery() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_path = temp_dir.path().to_path_buf();
+
+        let p1 = PartitionId::new(10);
+        let p2 = PartitionId::new(11);
+
+        // Write entries.
+        {
+            let config = PoolConfig::new(&base_path, 4)
+                .with_flush_interval(Duration::from_millis(5));
+
+            let pool = SharedWalPool::open(TokioStorage::new(), config)
+                .await
+                .unwrap();
+
+            let h1 = pool.handle(p1);
+            let h2 = pool.handle(p2);
+
+            h1.append(1, 1, Bytes::from("p1-1")).await.unwrap();
+            h1.append(1, 2, Bytes::from("p1-2")).await.unwrap();
+            h2.append(1, 1, Bytes::from("p2-1")).await.unwrap();
+
+            pool.shutdown().await.unwrap();
+        }
+
+        // Recover entries.
+        {
+            let config = PoolConfig::new(&base_path, 4)
+                .with_flush_interval(Duration::from_millis(5));
+
+            let pool = SharedWalPool::open(TokioStorage::new(), config)
+                .await
+                .unwrap();
+
+            let recovered = pool.recover().await.unwrap();
+
+            // Verify p1 entries.
+            let p1_entries = recovered.get(&p1).unwrap();
+            assert_eq!(p1_entries.len(), 2);
+            assert_eq!(p1_entries[0].index(), 1);
+            assert_eq!(p1_entries[1].index(), 2);
+
+            // Verify p2 entries.
+            let p2_entries = recovered.get(&p2).unwrap();
+            assert_eq!(p2_entries.len(), 1);
+            assert_eq!(p2_entries[0].index(), 1);
+
+            pool.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pool_partition_distribution() {
+        // Test that partitions are evenly distributed.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = PoolConfig::new(temp_dir.path(), 4);
+
+        let pool = SharedWalPool::open(TokioStorage::new(), config)
+            .await
+            .unwrap();
+
+        // Track which WAL each partition goes to.
+        let mut wal_counts = [0u32; 4];
+        for i in 0..100 {
+            let partition = PartitionId::new(i);
+            let wal_idx = pool.wal_index_for_partition(partition);
+            wal_counts[wal_idx as usize] += 1;
+        }
+
+        // With sequential partition IDs mod 4, distribution should be exact.
+        assert_eq!(wal_counts[0], 25);
+        assert_eq!(wal_counts[1], 25);
+        assert_eq!(wal_counts[2], 25);
+        assert_eq!(wal_counts[3], 25);
+
+        pool.shutdown().await.unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "wal_count must be at least 1")]
+    fn test_pool_config_zero_wals() {
+        let _config = PoolConfig::new("/tmp/test", 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds max")]
+    fn test_pool_config_too_many_wals() {
+        let _config = PoolConfig::new("/tmp/test", POOL_WAL_COUNT_MAX + 1);
     }
 }
