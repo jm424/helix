@@ -27,7 +27,9 @@ use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use helix_wal::{Entry, SharedWal, SharedWalConfig, TokioStorage, Wal, WalConfig};
+use helix_wal::{
+    Entry, PoolConfig, SharedWal, SharedWalConfig, SharedWalPool, TokioStorage, Wal, WalConfig,
+};
 
 /// Benchmark configuration.
 #[derive(Clone, Debug)]
@@ -411,10 +413,108 @@ fn bench_shared_wal_data_sizes(c: &mut Criterion) {
     group.finish();
 }
 
+// ============================================================================
+// SharedWalPool benchmarks (using the new pool API)
+// ============================================================================
+
+/// Benchmark SharedWalPool with varying pool sizes.
+///
+/// Uses the high-level SharedWalPool API which handles partition distribution
+/// automatically via partition_id % wal_count.
+async fn bench_shared_wal_pool(config: &BenchConfig, data: &Bytes) -> Duration {
+    let tempdir = create_temp_dir();
+
+    let pool_config = PoolConfig::new(tempdir.path(), config.shared_wal_count as u32)
+        .with_flush_interval(Duration::from_millis(1));
+
+    let pool = SharedWalPool::open(TokioStorage::new(), pool_config)
+        .await
+        .expect("failed to open pool");
+
+    let start = Instant::now();
+
+    let mut join_set = JoinSet::new();
+
+    // Spawn a writer task per partition.
+    for p in 0..config.partition_count {
+        let partition_id = PartitionId::new(p as u64 + 1);
+        let handle = pool.handle(partition_id);
+        let entries = config.entries_per_partition;
+        let data = data.clone();
+
+        join_set.spawn(async move {
+            for i in 0..entries {
+                handle
+                    .append(1, (i + 1) as u64, data.clone())
+                    .await
+                    .expect("append failed");
+            }
+        });
+    }
+
+    // Wait for all writers.
+    while join_set.join_next().await.is_some() {}
+
+    pool.shutdown().await.expect("shutdown failed");
+
+    start.elapsed()
+}
+
+/// Compare SharedWalPool performance with varying pool sizes.
+fn bench_pool_scaling(c: &mut Criterion) {
+    let rt = Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(4)
+        .build()
+        .expect("failed to build runtime");
+
+    let partition_count = 64;
+    let pool_sizes = vec![1, 2, 4, 8];
+    let entries_per_partition = 10;
+    let data_size = 256;
+
+    let mut group = c.benchmark_group("pool_scaling");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(20));
+
+    let data = Bytes::from(vec![0u8; data_size]);
+    let total_entries = partition_count * entries_per_partition;
+
+    group.throughput(Throughput::Elements(total_entries as u64));
+
+    for &pool_size in &pool_sizes {
+        let config = BenchConfig {
+            partition_count,
+            shared_wal_count: pool_size,
+            entries_per_partition,
+            data_size,
+        };
+
+        group.bench_with_input(
+            BenchmarkId::new("pool", pool_size),
+            &config,
+            |b, cfg| {
+                b.iter_custom(|iters| {
+                    rt.block_on(async {
+                        let mut total = Duration::ZERO;
+                        for _ in 0..iters {
+                            total += bench_shared_wal_pool(cfg, &data).await;
+                        }
+                        total
+                    })
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_fsync_amortization,
     bench_shared_wal_count,
     bench_shared_wal_data_sizes,
+    bench_pool_scaling,
 );
 criterion_main!(benches);
