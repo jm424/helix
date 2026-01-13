@@ -10,6 +10,10 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+io-uring = ["dep:tokio-uring"]
+
 [dependencies]
 helix-core = { workspace = true }
 bloodhound = { workspace = true }
@@ -19,6 +23,11 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+futures = { workspace = true }
+
+# io_uring support (Linux only).
+[target.'cfg(target_os = "linux")'.dependencies]
+tokio-uring = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -36,4 +45,12 @@ harness = false
 
 [[bench]]
 name = "buffered_wal_bench"
+harness = false
+
+[[bench]]
+name = "storage_comparison"
+harness = false
+
+[[bench]]
+name = "shared_wal_bench"
 harness = false

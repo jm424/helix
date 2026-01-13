@@ -3,7 +3,14 @@
 //! Measures WAL read throughput and latency from pre-populated data.
 
 #![allow(missing_docs)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::unreadable_literal)]
+#![allow(clippy::option_if_let_else)]
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::unnecessary_cast)]
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,12 +25,21 @@ use tokio::time::Instant;
 
 use helix_wal::{Entry, TokioStorage, Wal, WalConfig};
 
+/// Returns the benchmark base directory from HELIX_BENCH_DIR env var, or None for system temp.
+fn bench_base_dir() -> Option<PathBuf> {
+    std::env::var("HELIX_BENCH_DIR").ok().map(PathBuf::from)
+}
+
 /// Pre-populates a WAL with entries and returns it along with the valid index range.
+/// Uses HELIX_BENCH_DIR env var if set, otherwise system temp directory.
 async fn setup_populated_wal(
     entry_count: usize,
     data_size: usize,
 ) -> (Wal<TokioStorage>, TempDir, u64, u64) {
-    let tempdir = tempfile::tempdir().expect("failed to create temp dir");
+    let tempdir = match bench_base_dir() {
+        Some(base) => tempfile::tempdir_in(base).expect("failed to create temp dir in HELIX_BENCH_DIR"),
+        None => tempfile::tempdir().expect("failed to create temp dir"),
+    };
     let config = WalConfig::new(tempdir.path());
     let mut wal = Wal::open(TokioStorage::new(), config)
         .await
@@ -261,7 +277,10 @@ fn bench_wal_read_after_write(c: &mut Criterion) {
                     let total_start = Instant::now();
 
                     for _ in 0..iters {
-                        let tempdir = tempfile::tempdir().expect("tempdir");
+                        let tempdir = match bench_base_dir() {
+                            Some(base) => tempfile::tempdir_in(base).expect("tempdir in HELIX_BENCH_DIR"),
+                            None => tempfile::tempdir().expect("tempdir"),
+                        };
                         let config = WalConfig::new(tempdir.path());
                         let mut wal = Wal::open(TokioStorage::new(), config)
                             .await

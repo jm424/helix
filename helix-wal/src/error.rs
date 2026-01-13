@@ -8,7 +8,7 @@ use thiserror::Error;
 pub type WalResult<T> = Result<T, WalError>;
 
 /// Errors that can occur during WAL operations.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum WalError {
     /// Entry payload exceeds maximum size.
     #[error("entry too large: {size} bytes exceeds max {max} bytes")]
@@ -66,6 +66,15 @@ pub enum WalError {
         last: u64,
     },
 
+    /// Position out of bounds (for shared WAL entries).
+    #[error("position {position} out of bounds (segment has {count} entries)")]
+    PositionOutOfBounds {
+        /// Requested position.
+        position: usize,
+        /// Total entry count.
+        count: usize,
+    },
+
     /// I/O error from underlying storage.
     #[error("I/O error: {operation}: {message}")]
     Io {
@@ -99,6 +108,10 @@ pub enum WalError {
         /// Why the entry is invalid.
         reason: &'static str,
     },
+
+    /// Coordinator has been shut down.
+    #[error("WAL coordinator has been shut down")]
+    Shutdown,
 }
 
 impl WalError {

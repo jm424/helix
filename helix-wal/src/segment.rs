@@ -26,7 +26,7 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::entry::{Entry, ENTRY_HEADER_SIZE};
+use crate::entry::{Entry, WalEntry};
 use crate::error::{WalError, WalResult};
 use crate::limits::{ENTRIES_PER_SEGMENT_MAX, SEGMENT_SIZE_BYTES_MAX, SEGMENT_SIZE_BYTES_MIN};
 
@@ -229,21 +229,26 @@ impl SegmentHeader {
 ///
 /// This is designed to work with Bloodhound's simulated storage for
 /// deterministic testing.
+///
+/// # Type Parameters
+///
+/// - `E`: The entry type, defaults to [`Entry`]. Use [`SharedEntry`](crate::SharedEntry)
+///   for multi-partition shared WALs.
 #[derive(Debug, Clone)]
-pub struct Segment {
+pub struct Segment<E: WalEntry = Entry> {
     /// Segment header.
     header: SegmentHeader,
     /// Configuration.
     config: SegmentConfig,
     /// Entries in this segment.
-    entries: Vec<Entry>,
+    entries: Vec<E>,
     /// Current size in bytes (header + entries).
     size_bytes: u64,
     /// Whether the segment is sealed (no more writes).
     sealed: bool,
 }
 
-impl Segment {
+impl<E: WalEntry> Segment<E> {
     /// Creates a new empty segment.
     #[must_use]
     pub const fn new(segment_id: SegmentId, first_index: u64, config: SegmentConfig) -> Self {
@@ -271,7 +276,7 @@ impl Segment {
     /// Returns the last index in this segment, or None if empty.
     #[must_use]
     pub fn last_index(&self) -> Option<u64> {
-        self.entries.last().map(Entry::index)
+        self.entries.last().map(WalEntry::index)
     }
 
     /// Returns the number of entries in this segment.
@@ -299,7 +304,7 @@ impl Segment {
             return false;
         }
 
-        let entry_size = ENTRY_HEADER_SIZE as u64 + u64::from(payload_size);
+        let entry_size = E::HEADER_SIZE as u64 + u64::from(payload_size);
         let new_size = self.size_bytes + entry_size;
         let new_count = self.entries.len() as u64 + 1;
 
@@ -313,7 +318,7 @@ impl Segment {
     ///
     /// # Errors
     /// Returns an error if the segment is full.
-    pub fn append(&mut self, entry: Entry) -> WalResult<()> {
+    pub fn append(&mut self, entry: E) -> WalResult<()> {
         // TigerStyle: Check preconditions.
         assert!(!self.sealed, "cannot append to sealed segment");
 
@@ -331,17 +336,21 @@ impl Segment {
             });
         }
 
-        // Verify index is sequential.
-        let expected_index = self
-            .entries
-            .last()
-            .map_or(self.header.first_index, |e| e.index() + 1);
+        // Verify index is sequential for entry types that use global indexing.
+        // For shared entries (uses_global_index=false), indices are partition-local
+        // and sequentiality is enforced by the coordination layer.
+        if E::uses_global_index() {
+            let expected_index = self
+                .entries
+                .last()
+                .map_or(self.header.first_index, |e| e.index() + 1);
 
-        assert_eq!(
-            entry.index(),
-            expected_index,
-            "entry index must be sequential"
-        );
+            assert_eq!(
+                entry.index(),
+                expected_index,
+                "entry index must be sequential"
+            );
+        }
 
         self.size_bytes += entry_size;
         self.entries.push(entry);
@@ -351,9 +360,13 @@ impl Segment {
 
     /// Reads an entry by index.
     ///
+    /// This method is for entry types with global sequential indices ([`Entry`]).
+    /// For entry types with partition-local indices ([`SharedEntry`](crate::SharedEntry)),
+    /// use [`read_at_position`](Self::read_at_position) or [`entries`](Self::entries).
+    ///
     /// # Errors
     /// Returns an error if the index is out of bounds.
-    pub fn read(&self, index: u64) -> WalResult<&Entry> {
+    pub fn read(&self, index: u64) -> WalResult<&E> {
         if self.entries.is_empty() {
             return Err(WalError::IndexOutOfBounds {
                 index,
@@ -363,7 +376,7 @@ impl Segment {
         }
 
         let first = self.header.first_index;
-        let last = self.entries.last().map_or(first, Entry::index);
+        let last = self.entries.last().map_or(first, WalEntry::index);
 
         if index < first || index > last {
             return Err(WalError::IndexOutOfBounds { index, first, last });
@@ -372,6 +385,27 @@ impl Segment {
         #[allow(clippy::cast_possible_truncation)] // Entry count bounded by config.
         let offset = (index - first) as usize;
         Ok(&self.entries[offset])
+    }
+
+    /// Reads an entry by array position.
+    ///
+    /// This method is for entry types with partition-local indices
+    /// ([`SharedEntry`](crate::SharedEntry)) where index-based lookup doesn't apply.
+    ///
+    /// # Errors
+    /// Returns an error if the position is out of bounds.
+    pub fn read_at_position(&self, position: usize) -> WalResult<&E> {
+        self.entries.get(position).ok_or(WalError::PositionOutOfBounds {
+            position,
+            count: self.entries.len(),
+        })
+    }
+
+    /// Returns an iterator over all entries in the segment.
+    ///
+    /// Useful for recovery and for entry types with partition-local indices.
+    pub fn entries(&self) -> impl Iterator<Item = &E> {
+        self.entries.iter()
     }
 
     /// Truncates entries after the given index.
@@ -406,7 +440,7 @@ impl Segment {
 
         // If truncating before our first index, remove all entries.
         if last_index_to_keep < first {
-            let removed_size: u64 = self.entries.iter().map(Entry::total_size).sum();
+            let removed_size: u64 = self.entries.iter().map(WalEntry::total_size).sum();
             self.size_bytes -= removed_size;
             self.entries.clear();
             return Ok(());
@@ -419,7 +453,10 @@ impl Segment {
         }
 
         // Calculate size of removed entries.
-        let removed_size: u64 = self.entries[keep_count..].iter().map(Entry::total_size).sum();
+        let removed_size: u64 = self.entries[keep_count..]
+            .iter()
+            .map(WalEntry::total_size)
+            .sum();
 
         self.entries.truncate(keep_count);
         self.size_bytes -= removed_size;
@@ -461,12 +498,12 @@ impl Segment {
 
         while data.has_remaining() {
             // Check if we have at least a header's worth of data.
-            if data.remaining() < ENTRY_HEADER_SIZE {
+            if data.remaining() < E::HEADER_SIZE {
                 // Partial header at end - treat as truncated write.
                 break;
             }
 
-            match Entry::decode(&mut data, offset) {
+            match E::decode(&mut data, offset) {
                 Ok(entry) => {
                     offset += entry.total_size();
                     entries.push(entry);
@@ -480,7 +517,7 @@ impl Segment {
         }
 
         let size_bytes =
-            SEGMENT_HEADER_SIZE as u64 + entries.iter().map(Entry::total_size).sum::<u64>();
+            SEGMENT_HEADER_SIZE as u64 + entries.iter().map(WalEntry::total_size).sum::<u64>();
 
         Ok(Self {
             header,

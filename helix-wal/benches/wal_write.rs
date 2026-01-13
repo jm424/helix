@@ -3,7 +3,15 @@
 //! Measures WAL append throughput and latency under various configurations.
 
 #![allow(missing_docs)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::option_if_let_else)]
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::significant_drop_tightening)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::len_zero)]
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -37,9 +45,18 @@ impl BenchConfig {
     }
 }
 
+/// Returns the benchmark base directory from HELIX_BENCH_DIR env var, or None for system temp.
+fn bench_base_dir() -> Option<PathBuf> {
+    std::env::var("HELIX_BENCH_DIR").ok().map(PathBuf::from)
+}
+
 /// Creates a temporary WAL for benchmarking.
+/// Uses HELIX_BENCH_DIR env var if set, otherwise system temp directory.
 async fn setup_wal(sync_on_write: bool) -> (Wal<TokioStorage>, TempDir) {
-    let tempdir = tempfile::tempdir().expect("failed to create temp dir");
+    let tempdir = match bench_base_dir() {
+        Some(base) => tempfile::tempdir_in(base).expect("failed to create temp dir in HELIX_BENCH_DIR"),
+        None => tempfile::tempdir().expect("failed to create temp dir"),
+    };
     let config = WalConfig::new(tempdir.path()).with_sync_on_write(sync_on_write);
     let wal = Wal::open(TokioStorage::new(), config)
         .await

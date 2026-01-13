@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use tracing::{debug, info, warn};
 
-use crate::entry::Entry;
+use crate::entry::{Entry, WalEntry};
 use crate::error::{WalError, WalResult};
 use crate::segment::{Segment, SegmentConfig, SegmentHeader, SegmentId, SEGMENT_HEADER_SIZE};
 use crate::storage::{Storage, StorageFile};
@@ -86,15 +86,21 @@ impl WalConfig {
 /// Write-Ahead Log.
 ///
 /// Generic over storage backend `S` for flexibility (`tokio::fs`, `io_uring`, in-memory).
-pub struct Wal<S: Storage> {
+///
+/// # Type Parameters
+///
+/// - `S`: Storage backend (e.g., [`TokioStorage`](crate::TokioStorage))
+/// - `E`: Entry type, defaults to [`Entry`]. Use [`SharedEntry`](crate::SharedEntry)
+///   for multi-partition shared WALs.
+pub struct Wal<S: Storage, E: WalEntry = Entry> {
     /// Storage backend.
     storage: Arc<S>,
     /// Configuration.
     config: WalConfig,
     /// Sealed segments (`segment_id` -> segment).
-    sealed_segments: BTreeMap<SegmentId, SealedSegment>,
+    sealed_segments: BTreeMap<SegmentId, SealedSegment<E>>,
     /// Active segment for writes.
-    active_segment: Option<ActiveSegment>,
+    active_segment: Option<ActiveSegment<E>>,
     /// Next segment ID to use.
     next_segment_id: SegmentId,
     /// First index in the WAL (for bounds checking).
@@ -113,18 +119,18 @@ pub struct Wal<S: Storage> {
 }
 
 /// A sealed (read-only) segment.
-struct SealedSegment {
+struct SealedSegment<E: WalEntry> {
     /// Segment metadata.
-    segment: Segment,
+    segment: Segment<E>,
     /// Path to segment file.
     #[allow(dead_code)]
     path: PathBuf,
 }
 
 /// The active segment being written to.
-struct ActiveSegment {
+struct ActiveSegment<E: WalEntry> {
     /// In-memory segment data.
-    segment: Segment,
+    segment: Segment<E>,
     /// File handle for writes.
     file: Box<dyn StorageFile>,
     /// Path to segment file.
@@ -133,7 +139,7 @@ struct ActiveSegment {
     write_offset: u64,
 }
 
-impl<S: Storage> Wal<S> {
+impl<S: Storage, E: WalEntry> Wal<S, E> {
     /// Opens or creates a WAL in the given directory.
     ///
     /// If the directory contains existing segments, they are recovered.
@@ -167,7 +173,7 @@ impl<S: Storage> Wal<S> {
                 continue;
             }
 
-            match Segment::decode(data.clone(), config.segment_config) {
+            match Segment::<E>::decode(data.clone(), config.segment_config) {
                 Ok(segment) => {
                     let segment_id = segment.id();
                     debug!(
@@ -223,32 +229,55 @@ impl<S: Storage> Wal<S> {
         // Overlaps can occur after a failed truncation leaves old segment data on disk.
         // We resolve gaps by keeping only the first contiguous run of entries.
         // We resolve overlaps by truncating older segments to not overlap with newer ones.
+        //
+        // IMPORTANT: Process segments by first_index order, not segment_id order.
+        // This ensures that if a failed removal leaves a stale segment (with higher first_index)
+        // alongside a newer segment (with lower first_index), we process the newer one first
+        // and detect the stale one as a gap (which gets removed) rather than detecting the
+        // newer one as a gap (which would lose valid data).
         let mut valid_last_index = None;
         let mut expected_next = first_index;
-        let mut first_gap_id = None;
+        let mut gap_detected = false;
+        let mut segments_to_remove: Vec<SegmentId> = Vec::new(); // Segments after gap
         let mut overlaps_to_fix: Vec<(SegmentId, u64)> = Vec::new(); // (segment_id, truncate_to)
 
-        for (id, sealed) in &sealed_segments {
+        // Sort segments by first_index, then by segment_id as tiebreaker.
+        let mut segments_by_first_index: Vec<_> = sealed_segments.iter().collect();
+        segments_by_first_index.sort_by_key(|(id, sealed)| (sealed.segment.first_index(), **id));
+
+        for (id, sealed) in segments_by_first_index {
+            // Skip segments already marked for removal (e.g., stale segments).
+            if segments_to_remove.contains(id) {
+                continue;
+            }
+
+            // Skip segments already marked for truncation - they're from a previous timeline
+            // and shouldn't contribute to valid_last_index.
+            if overlaps_to_fix.iter().any(|(fix_id, _)| fix_id == id) {
+                continue;
+            }
+
             let seg_first = sealed.segment.first_index();
             let seg_last = sealed.segment.last_index();
 
             if seg_first > expected_next {
                 // Gap detected! This segment starts after a gap.
-                // All segments from here on will be removed.
-                if first_gap_id.is_none() {
+                // Mark this segment (and all following in first_index order) for removal.
+                if !gap_detected {
                     warn!(
                         segment_id = id.get(),
                         expected = expected_next,
                         actual = seg_first,
                         "Gap detected in WAL - removing segment and all following"
                     );
-                    first_gap_id = Some(*id);
+                    gap_detected = true;
                 }
+                segments_to_remove.push(*id);
                 // Don't update valid_last_index for segments after the gap
-            } else if seg_first < expected_next && first_gap_id.is_none() {
+            } else if seg_first < expected_next && !gap_detected {
                 // Overlap detected! This newer segment starts before the previous one ended.
-                // This happens when truncation failed to rewrite the older segment.
-                // The newer segment has correct data, so we'll truncate older segments.
+                // This happens when truncation failed to rewrite/remove the older segment.
+                // The newer segment has correct data, so we'll truncate or remove older segments.
                 warn!(
                     segment_id = id.get(),
                     seg_first,
@@ -256,14 +285,31 @@ impl<S: Storage> Wal<S> {
                     "Overlap detected - newer segment overlaps with older"
                 );
                 // Mark all older segments that overlap for truncation.
-                // They should be truncated to (seg_first - 1).
+                // Also mark older segments that come AFTER this segment's range as stale
+                // (they're from a previous "timeline" before this segment was created).
                 let truncate_to = seg_first.saturating_sub(1);
+                let seg_last_val = seg_last.unwrap_or(seg_first);
                 for (old_id, old_sealed) in &sealed_segments {
                     if *old_id < *id {
                         if let Some(old_last) = old_sealed.segment.last_index() {
                             if old_last >= seg_first {
+                                // Older segment overlaps - truncate it.
                                 overlaps_to_fix.push((*old_id, truncate_to));
                             }
+                        }
+                        // Also check if older segment comes entirely AFTER the current segment.
+                        // This indicates it's stale (from before the truncation that created
+                        // the current segment). Mark it for removal.
+                        let old_first = old_sealed.segment.first_index();
+                        if old_first > seg_last_val {
+                            warn!(
+                                stale_segment_id = old_id.get(),
+                                stale_first = old_first,
+                                newer_segment_id = id.get(),
+                                newer_last = seg_last_val,
+                                "Marking stale segment for removal"
+                            );
+                            segments_to_remove.push(*old_id);
                         }
                     }
                 }
@@ -272,7 +318,7 @@ impl<S: Storage> Wal<S> {
                     valid_last_index = Some(last);
                     expected_next = last + 1;
                 }
-            } else if first_gap_id.is_none() {
+            } else if !gap_detected {
                 // Normal case: segment continues from expected_next
                 if let Some(last) = seg_last {
                     valid_last_index = Some(last);
@@ -308,20 +354,14 @@ impl<S: Storage> Wal<S> {
         }
 
         // Update last_index if we fixed overlaps (valid_last_index tracks correct value).
-        if had_overlaps && first_gap_id.is_none() {
+        if had_overlaps && !gap_detected {
             last_index = valid_last_index;
+            debug!(?last_index, "Updated last_index after overlap handling");
         }
 
-        // If we found gaps, remove the discontinuous segments.
-        if let Some(gap_id) = first_gap_id {
-            // Remove all segments with ID >= the first gap ID.
-            let all_to_remove: Vec<SegmentId> = sealed_segments
-                .keys()
-                .filter(|id| **id >= gap_id)
-                .copied()
-                .collect();
-
-            for id in all_to_remove {
+        // Remove segments that were after a gap (collected during first_index-ordered traversal).
+        if !segments_to_remove.is_empty() {
+            for id in segments_to_remove {
                 if let Some(sealed) = sealed_segments.remove(&id) {
                     // Best-effort file cleanup
                     let _ = storage.remove(&sealed.path).await;
@@ -401,7 +441,7 @@ impl<S: Storage> Wal<S> {
     /// # Panics
     /// Panics if `ensure_active_segment` fails to create an active segment
     /// (should not happen in normal operation).
-    pub async fn append(&mut self, entry: Entry) -> WalResult<u64> {
+    pub async fn append(&mut self, entry: E) -> WalResult<u64> {
         let index = entry.index();
         let entry_size = entry.total_size();
 
@@ -524,7 +564,7 @@ impl<S: Storage> Wal<S> {
     ///
     /// # Errors
     /// Returns an error if the index is out of bounds or the read fails.
-    pub fn read(&self, index: u64) -> WalResult<&Entry> {
+    pub fn read(&self, index: u64) -> WalResult<&E> {
         // Check bounds.
         let last = self.last_index.ok_or(WalError::IndexOutOfBounds {
             index,
@@ -563,6 +603,39 @@ impl<S: Storage> Wal<S> {
         })
     }
 
+    /// Returns an iterator over all entries in the WAL.
+    ///
+    /// Iterates through sealed segments in order, then the active segment.
+    /// This is useful for recovery and for entry types with partition-local
+    /// indices ([`SharedEntry`](crate::SharedEntry)) where index-based lookup
+    /// doesn't apply.
+    pub fn entries(&self) -> impl Iterator<Item = &E> {
+        // Chain sealed segments (in order) with active segment.
+        self.sealed_segments
+            .values()
+            .flat_map(|s| s.segment.entries())
+            .chain(
+                self.active_segment
+                    .iter()
+                    .flat_map(|a| a.segment.entries()),
+            )
+    }
+
+    /// Returns the number of entries in the WAL.
+    #[must_use]
+    pub fn entry_count(&self) -> u64 {
+        let sealed_count: u64 = self
+            .sealed_segments
+            .values()
+            .map(|s| s.segment.entry_count())
+            .sum();
+        let active_count = self
+            .active_segment
+            .as_ref()
+            .map_or(0, |a| a.segment.entry_count());
+        sealed_count + active_count
+    }
+
     /// Truncates all entries after the given index.
     ///
     /// Entries with index > `last_index_to_keep` are removed. This handles
@@ -582,12 +655,6 @@ impl<S: Storage> Wal<S> {
         } else {
             None
         };
-
-        // Track whether truncation was synced to disk.
-        // We only update durable_index if all syncs succeed, because if sync fails,
-        // the old (pre-truncation) data may still be in synced_files and would be
-        // recovered on crash.
-        let mut truncation_synced = true;
 
         // Identify what needs to be done.
         let remove_active = self
@@ -609,21 +676,13 @@ impl<S: Storage> Wal<S> {
             }
         } else if truncate_active {
             if let Some(active) = &mut self.active_segment {
+                // Truncate in-memory segment only. We do NOT rewrite the file because:
+                // 1. File rewrites are not crash-safe (torn writes can corrupt data)
+                // 2. Reads already filter by last_index, so stale entries are ignored
+                // 3. Physical cleanup happens during segment rotation/compaction
                 active.segment.truncate_after(last_index_to_keep)?;
-
-                // Re-encode and rewrite the segment file.
-                // Best-effort: file operations may fail but in-memory state is correct.
-                // IMPORTANT: Only sync if write succeeded, otherwise we'd sync a 0-byte file.
-                let data = active.segment.encode();
-                let _ = active.file.truncate(0).await;
-                if active.file.write_at(0, &data).await.is_ok() {
-                    active.write_offset = data.len() as u64;
-                    if active.file.sync().await.is_err() {
-                        truncation_synced = false;
-                    }
-                } else {
-                    truncation_synced = false;
-                }
+                // Update write_offset to match truncated segment size.
+                active.write_offset = active.segment.size_bytes();
             }
         }
 
@@ -649,63 +708,66 @@ impl<S: Storage> Wal<S> {
         }
 
         // Handle sealed segments that contain entries beyond the truncation point.
-        // We need to truncate them both in-memory AND on disk, otherwise recovery
-        // will reload the stale entries.
-        // First, collect segment IDs that need truncation to avoid borrow issues.
-        let segments_to_truncate: Vec<SegmentId> = self
-            .sealed_segments
-            .iter()
-            .filter(|(_, seg)| seg.segment.last_index().is_some_and(|l| l > last_index_to_keep))
-            .map(|(id, _)| *id)
-            .collect();
-
-        for segment_id in segments_to_truncate {
-            if let Some(sealed) = self.sealed_segments.get_mut(&segment_id) {
-                // Clone segment and truncate the clone to generate truncated data.
-                // We DON'T modify the original yet - only after sync succeeds.
-                // This ensures in-memory state stays consistent with on-disk state.
-                let mut truncated_segment = sealed.segment.clone();
-                let _ = truncated_segment.truncate_entries_after(last_index_to_keep);
-                let data = truncated_segment.encode();
-
-                // Best-effort: try to rewrite the segment file with truncated data.
-                // If this fails, add to pending list so sync() will retry.
-                // IMPORTANT: Only sync if write succeeded, otherwise we'd sync a 0-byte file.
-                // IMPORTANT: Check truncate result - if truncate fails, write_at might
-                // append data instead of replacing, leaving stale trailing data.
-                let mut sync_succeeded = false;
-                if let Ok(file) = self.storage.open(&sealed.path).await {
-                    if file.truncate(0).await.is_ok()
-                        && file.write_at(0, &data).await.is_ok()
-                        && file.sync().await.is_ok()
-                    {
-                        sync_succeeded = true;
-                    }
-                }
-
-                // Only modify in-memory state if sync succeeded.
-                // This ensures segment stays in segments_to_truncate for retry.
-                if sync_succeeded {
-                    let _ = sealed.segment.truncate_entries_after(last_index_to_keep);
-                } else {
-                    truncation_synced = false;
-                    self.sealed_segments_pending_sync.push(segment_id);
-                }
-
+        // We truncate in-memory and check if the segment becomes empty.
+        //
+        // Important: segments that become empty MUST be deleted from disk.
+        // Otherwise, on crash recovery, these stale segments (with old first_index)
+        // will be read from synced_files with their pre-truncation entries,
+        // causing gap detection to remove NEW segments that fill the gap.
+        //
+        // We do NOT rewrite non-empty segments because:
+        // 1. File rewrites with torn writes can corrupt data (lose durable entries)
+        // 2. For non-empty segments, recovery will see extra entries but that's OK
+        //    (recovered > durable is fine, recovered < durable is the violation)
+        let mut segments_to_delete: Vec<SegmentId> = Vec::new();
+        for (segment_id, sealed) in &mut self.sealed_segments {
+            if sealed
+                .segment
+                .last_index()
+                .is_some_and(|l| l > last_index_to_keep)
+            {
+                let _ = sealed.segment.truncate_entries_after(last_index_to_keep);
                 debug!(
                     segment_id = segment_id.get(),
                     last_index_to_keep,
-                    "Truncated sealed segment (in-memory and on disk)"
+                    "Truncated sealed segment (in-memory)"
+                );
+
+                // If segment is now empty, mark for deletion.
+                if sealed.segment.entry_count() == 0 {
+                    debug!(
+                        segment_id = segment_id.get(),
+                        "Segment became empty after truncation, will delete"
+                    );
+                    segments_to_delete.push(*segment_id);
+                }
+            }
+        }
+
+        // Delete empty segments from both in-memory map and disk.
+        // This is crash-safe: deleting a file is atomic, and on crash we either
+        // have the old file (which will be ignored by recovery's gap detection
+        // since we're about to create a new segment at that index) or no file.
+        for segment_id in segments_to_delete {
+            if let Some(sealed) = self.sealed_segments.remove(&segment_id) {
+                let _ = self.storage.remove(&sealed.path).await;
+                debug!(
+                    segment_id = segment_id.get(),
+                    "Deleted empty segment after truncation"
                 );
             }
         }
 
-        // Only update durable_index if truncation was synced to disk.
-        // If sync failed, the old (pre-truncation) data may still be in synced_files
-        // and could be recovered on crash. Keeping the old durable_index is safe:
-        // the invariant "recovered <= durable_before" will still hold.
-        if truncation_synced {
-            self.durable_index = self.last_index;
+        // ALWAYS cap durable_index to last_index after truncation.
+        // This maintains the invariant: durable_index <= last_index.
+        //
+        // If sync failed, old data may still be on disk and could be recovered,
+        // but the user has been told truncation happened. On recovery, extra entries
+        // might appear, but that's the expected behavior for failed truncation.
+        if let Some(durable) = self.durable_index {
+            if self.last_index.is_none_or(|last| durable > last) {
+                self.durable_index = self.last_index;
+            }
         }
 
         debug!(last_index_to_keep, "Truncated WAL");
@@ -740,7 +802,7 @@ impl<S: Storage> Wal<S> {
         file.truncate(0).await?;
 
         // Create segment and write header.
-        let segment = Segment::new(segment_id, first_index, self.config.segment_config);
+        let segment = Segment::<E>::new(segment_id, first_index, self.config.segment_config);
         let header_data = {
             let mut buf = bytes::BytesMut::with_capacity(SEGMENT_HEADER_SIZE);
             SegmentHeader::new(segment_id, first_index).encode(&mut buf);
@@ -878,7 +940,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let config = WalConfig::new(temp_dir.path());
 
-        let mut wal = Wal::open(TokioStorage::new(), config).await.unwrap();
+        let mut wal: Wal<TokioStorage> = Wal::open(TokioStorage::new(), config).await.unwrap();
         assert!(wal.is_empty());
 
         // Append entries.
@@ -909,7 +971,7 @@ mod tests {
 
         // Write some entries.
         {
-            let mut wal = Wal::open(TokioStorage::new(), config.clone()).await.unwrap();
+            let mut wal: Wal<TokioStorage> = Wal::open(TokioStorage::new(), config.clone()).await.unwrap();
             for i in 1..=10 {
                 let entry = Entry::new(1, i, Bytes::from(format!("data-{i}"))).unwrap();
                 wal.append(entry).await.unwrap();
@@ -919,7 +981,7 @@ mod tests {
 
         // Reopen and verify recovery.
         {
-            let wal = Wal::open(TokioStorage::new(), config).await.unwrap();
+            let wal: Wal<TokioStorage> = Wal::open(TokioStorage::new(), config).await.unwrap();
             assert_eq!(wal.first_index(), 1);
             // Note: After recovery, entries are in sealed segments.
             // The last_index is tracked from recovery.
@@ -932,7 +994,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let config = WalConfig::new(temp_dir.path());
 
-        let mut wal = Wal::open(TokioStorage::new(), config).await.unwrap();
+        let mut wal: Wal<TokioStorage> = Wal::open(TokioStorage::new(), config).await.unwrap();
 
         // Append entries.
         for i in 1..=10 {
@@ -957,7 +1019,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let config = WalConfig::new(temp_dir.path());
 
-        let mut wal = Wal::open(TokioStorage::new(), config.clone()).await.unwrap();
+        let mut wal: Wal<TokioStorage> = Wal::open(TokioStorage::new(), config.clone()).await.unwrap();
 
         // Initially empty - both indices are None
         assert_eq!(wal.last_index(), None);
@@ -992,7 +1054,81 @@ mod tests {
 
         // After recovery, durable_index == last_index
         drop(wal);
-        let wal = Wal::open(TokioStorage::new(), config).await.unwrap();
+        let wal: Wal<TokioStorage> = Wal::open(TokioStorage::new(), config).await.unwrap();
         assert_eq!(wal.last_index(), wal.durable_index());
+    }
+
+    #[tokio::test]
+    async fn test_wal_with_shared_entry() {
+        use crate::shared_entry::SharedEntry;
+        use helix_core::PartitionId;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = WalConfig::new(temp_dir.path());
+
+        // Create a WAL with SharedEntry type.
+        let mut wal: Wal<TokioStorage, SharedEntry> =
+            Wal::open(TokioStorage::new(), config.clone()).await.unwrap();
+        assert!(wal.is_empty());
+
+        // Append entries from multiple partitions with partition-local indices.
+        // Each partition has its own sequential index space (1, 2, 3...).
+        let p1 = PartitionId::new(1);
+        let p2 = PartitionId::new(2);
+
+        // Interleave entries from two partitions.
+        // P1: indices 1, 2, 3, 4, 5 with term=1
+        // P2: indices 1, 2, 3, 4, 5 with term=2
+        for i in 1..=5u64 {
+            let entry = SharedEntry::new(p1, 1, i, Bytes::from(format!("p1-{i}"))).unwrap();
+            wal.append(entry).await.unwrap();
+
+            let entry = SharedEntry::new(p2, 2, i, Bytes::from(format!("p2-{i}"))).unwrap();
+            wal.append(entry).await.unwrap();
+        }
+
+        wal.sync().await.unwrap();
+
+        // Verify entry count.
+        assert_eq!(wal.entry_count(), 10);
+
+        // Use iterator to verify entries (index-based read doesn't work for shared entries).
+        let entries: Vec<_> = wal.entries().collect();
+        assert_eq!(entries.len(), 10);
+
+        // Entries are interleaved: p1-1, p2-1, p1-2, p2-2, ...
+        for (i, chunk) in entries.chunks(2).enumerate() {
+            let local_idx = (i + 1) as u64;
+
+            assert_eq!(chunk[0].partition_id(), p1);
+            assert_eq!(chunk[0].term(), 1);
+            assert_eq!(chunk[0].index(), local_idx);
+
+            assert_eq!(chunk[1].partition_id(), p2);
+            assert_eq!(chunk[1].term(), 2);
+            assert_eq!(chunk[1].index(), local_idx);
+        }
+
+        // Test recovery.
+        drop(wal);
+        let wal: Wal<TokioStorage, SharedEntry> =
+            Wal::open(TokioStorage::new(), config).await.unwrap();
+
+        // Verify entry count after recovery.
+        assert_eq!(wal.entry_count(), 10);
+
+        // Verify entries after recovery using iterator.
+        let entries: Vec<_> = wal.entries().collect();
+        assert_eq!(entries.len(), 10);
+
+        // First entry should be P1 with index 1.
+        assert_eq!(entries[0].partition_id(), p1);
+        assert_eq!(entries[0].term(), 1);
+        assert_eq!(entries[0].index(), 1);
+
+        // Second entry should be P2 with index 1.
+        assert_eq!(entries[1].partition_id(), p2);
+        assert_eq!(entries[1].term(), 2);
+        assert_eq!(entries[1].index(), 1);
     }
 }

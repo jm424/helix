@@ -1,265 +1,18 @@
-//! Storage abstraction for WAL.
+//! Simulated Storage for Deterministic Simulation Testing (DST).
 //!
-//! This module provides a trait-based storage abstraction allowing different
-//! backends (`tokio::fs`, `io_uring`, in-memory for testing).
-//!
-//! # Design
-//!
-//! The storage trait is intentionally simple - it handles raw bytes at offsets.
-//! Higher-level concerns (segments, entries, checksums) are handled by the WAL.
+//! This module provides an in-memory storage implementation with configurable
+//! fault injection for testing crash recovery scenarios.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 
+use super::{Storage, StorageFile};
 use crate::error::{WalError, WalResult};
-
-/// Storage backend trait for WAL segment files.
-///
-/// Implementations must be `Send + Sync` for use across async tasks.
-/// All operations are fallible and return [`WalResult`].
-#[async_trait]
-pub trait Storage: Send + Sync {
-    /// Opens or creates a file at the given path.
-    ///
-    /// If the file exists, it is opened for read/write.
-    /// If the file does not exist, it is created.
-    ///
-    /// # Errors
-    /// Returns an error if the file cannot be opened or created.
-    async fn open(&self, path: &Path) -> WalResult<Box<dyn StorageFile>>;
-
-    /// Checks if a file exists at the given path.
-    async fn exists(&self, path: &Path) -> WalResult<bool>;
-
-    /// Lists files in a directory matching a pattern.
-    ///
-    /// # Errors
-    /// Returns an error if the directory cannot be read.
-    async fn list_files(&self, dir: &Path, extension: &str) -> WalResult<Vec<std::path::PathBuf>>;
-
-    /// Removes a file at the given path.
-    ///
-    /// # Errors
-    /// Returns an error if the file cannot be removed.
-    async fn remove(&self, path: &Path) -> WalResult<()>;
-
-    /// Creates a directory and all parent directories.
-    ///
-    /// # Errors
-    /// Returns an error if the directory cannot be created.
-    async fn create_dir_all(&self, path: &Path) -> WalResult<()>;
-}
-
-/// A handle to an open file for reading and writing.
-#[async_trait]
-pub trait StorageFile: Send + Sync {
-    /// Writes data at the specified offset.
-    ///
-    /// # Errors
-    /// Returns an error if the write fails.
-    async fn write_at(&self, offset: u64, data: &[u8]) -> WalResult<()>;
-
-    /// Reads data from the specified offset.
-    ///
-    /// Returns the bytes read. May return fewer bytes than requested if EOF.
-    ///
-    /// # Errors
-    /// Returns an error if the read fails.
-    async fn read_at(&self, offset: u64, len: usize) -> WalResult<Bytes>;
-
-    /// Reads the entire file contents.
-    ///
-    /// # Errors
-    /// Returns an error if the read fails.
-    async fn read_all(&self) -> WalResult<Bytes>;
-
-    /// Syncs all buffered data to disk (fsync).
-    ///
-    /// This ensures durability - data written before `sync()` will survive crashes.
-    ///
-    /// # Errors
-    /// Returns an error if the sync fails.
-    async fn sync(&self) -> WalResult<()>;
-
-    /// Returns the current file size in bytes.
-    ///
-    /// # Errors
-    /// Returns an error if the size cannot be determined.
-    async fn size(&self) -> WalResult<u64>;
-
-    /// Truncates the file to the specified length.
-    ///
-    /// # Errors
-    /// Returns an error if the truncation fails.
-    async fn truncate(&self, len: u64) -> WalResult<()>;
-}
-
-/// Tokio-based file storage implementation.
-///
-/// Uses `tokio::fs` for async file operations. Note that `tokio::fs` uses
-/// a thread pool under the hood (`spawn_blocking`), so it's not true async I/O,
-/// but it provides a good async API and works on all platforms.
-#[derive(Debug, Clone)]
-pub struct TokioStorage;
-
-impl TokioStorage {
-    /// Creates a new Tokio storage instance.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for TokioStorage {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl Storage for TokioStorage {
-    async fn open(&self, path: &Path) -> WalResult<Box<dyn StorageFile>> {
-        use tokio::fs::OpenOptions;
-
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .await
-            .map_err(|e| WalError::io("open", e))?;
-
-        Ok(Box::new(TokioFile {
-            file: tokio::sync::Mutex::new(file),
-        }))
-    }
-
-    async fn exists(&self, path: &Path) -> WalResult<bool> {
-        Ok(tokio::fs::try_exists(path)
-            .await
-            .map_err(|e| WalError::io("exists", e))?)
-    }
-
-    async fn list_files(&self, dir: &Path, extension: &str) -> WalResult<Vec<std::path::PathBuf>> {
-        let mut entries = tokio::fs::read_dir(dir)
-            .await
-            .map_err(|e| WalError::io("read_dir", e))?;
-
-        let mut files = Vec::new();
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|e| WalError::io("read_dir_entry", e))?
-        {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == extension) {
-                files.push(path);
-            }
-        }
-
-        // Sort by filename for deterministic ordering.
-        files.sort();
-        Ok(files)
-    }
-
-    async fn remove(&self, path: &Path) -> WalResult<()> {
-        tokio::fs::remove_file(path)
-            .await
-            .map_err(|e| WalError::io("remove", e))
-    }
-
-    async fn create_dir_all(&self, path: &Path) -> WalResult<()> {
-        tokio::fs::create_dir_all(path)
-            .await
-            .map_err(|e| WalError::io("create_dir_all", e))
-    }
-}
-
-/// A file handle using `tokio::fs`.
-struct TokioFile {
-    file: tokio::sync::Mutex<tokio::fs::File>,
-}
-
-// Allow significant_drop_tightening - holding the lock for the full operation is correct here.
-#[allow(clippy::significant_drop_tightening)]
-
-#[async_trait]
-impl StorageFile for TokioFile {
-    async fn write_at(&self, offset: u64, data: &[u8]) -> WalResult<()> {
-        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-
-        let mut file = self.file.lock().await;
-        file.seek(std::io::SeekFrom::Start(offset))
-            .await
-            .map_err(|e| WalError::io("seek", e))?;
-        file.write_all(data)
-            .await
-            .map_err(|e| WalError::io("write", e))?;
-        Ok(())
-    }
-
-    async fn read_at(&self, offset: u64, len: usize) -> WalResult<Bytes> {
-        use tokio::io::{AsyncReadExt, AsyncSeekExt};
-
-        let mut file = self.file.lock().await;
-        file.seek(std::io::SeekFrom::Start(offset))
-            .await
-            .map_err(|e| WalError::io("seek", e))?;
-
-        let mut buf = vec![0u8; len];
-        let n = file
-            .read(&mut buf)
-            .await
-            .map_err(|e| WalError::io("read", e))?;
-        buf.truncate(n);
-        Ok(Bytes::from(buf))
-    }
-
-    async fn read_all(&self) -> WalResult<Bytes> {
-        use tokio::io::{AsyncReadExt, AsyncSeekExt};
-
-        let mut file = self.file.lock().await;
-        file.seek(std::io::SeekFrom::Start(0))
-            .await
-            .map_err(|e| WalError::io("seek", e))?;
-
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf)
-            .await
-            .map_err(|e| WalError::io("read", e))?;
-        Ok(Bytes::from(buf))
-    }
-
-    async fn sync(&self) -> WalResult<()> {
-        let file = self.file.lock().await;
-        file.sync_all()
-            .await
-            .map_err(|e| WalError::io("sync", e))
-    }
-
-    async fn size(&self) -> WalResult<u64> {
-        let file = self.file.lock().await;
-        let metadata = file
-            .metadata()
-            .await
-            .map_err(|e| WalError::io("metadata", e))?;
-        Ok(metadata.len())
-    }
-
-    async fn truncate(&self, len: u64) -> WalResult<()> {
-        let file = self.file.lock().await;
-        file.set_len(len)
-            .await
-            .map_err(|e| WalError::io("truncate", e))
-    }
-}
-
-// ----------------------------------------------------------------------------
-// Simulated Storage for Deterministic Simulation Testing (DST)
-// ----------------------------------------------------------------------------
 
 /// Configuration for fault injection in simulated storage.
 #[derive(Debug, Clone)]
@@ -424,15 +177,15 @@ impl FaultConfig {
 #[allow(clippy::significant_drop_tightening, clippy::missing_panics_doc)]
 pub struct SimulatedStorage {
     /// In-memory file contents (dirty - may not be synced).
-    files: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>>,
+    files: Arc<Mutex<HashMap<PathBuf, Vec<u8>>>>,
     /// Synced file contents (durable - survives crash).
-    synced_files: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>>,
+    synced_files: Arc<Mutex<HashMap<PathBuf, Vec<u8>>>>,
     /// Fault injection configuration.
-    fault_config: std::sync::Arc<std::sync::Mutex<FaultConfig>>,
+    fault_config: Arc<Mutex<FaultConfig>>,
     /// RNG seed for deterministic fault injection.
     seed: u64,
     /// Counter for deterministic fault injection on storage-level operations.
-    op_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    op_counter: Arc<AtomicU64>,
 }
 
 #[allow(clippy::missing_panics_doc)]
@@ -441,11 +194,11 @@ impl SimulatedStorage {
     #[must_use]
     pub fn new(seed: u64) -> Self {
         Self {
-            files: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            synced_files: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            fault_config: std::sync::Arc::new(std::sync::Mutex::new(FaultConfig::default())),
+            files: Arc::new(Mutex::new(HashMap::new())),
+            synced_files: Arc::new(Mutex::new(HashMap::new())),
+            fault_config: Arc::new(Mutex::new(FaultConfig::default())),
             seed,
-            op_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            op_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -453,11 +206,11 @@ impl SimulatedStorage {
     #[must_use]
     pub fn with_faults(seed: u64, config: FaultConfig) -> Self {
         Self {
-            files: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            synced_files: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            fault_config: std::sync::Arc::new(std::sync::Mutex::new(config)),
+            files: Arc::new(Mutex::new(HashMap::new())),
+            synced_files: Arc::new(Mutex::new(HashMap::new())),
+            fault_config: Arc::new(Mutex::new(config)),
             seed,
-            op_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            op_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -477,17 +230,18 @@ impl SimulatedStorage {
         if rate >= 1.0 {
             return true;
         }
-        let counter = self
-            .op_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let hash = self.seed.wrapping_add(counter).wrapping_mul(0x5851_f42d_4c95_7f2d);
+        let counter = self.op_counter.fetch_add(1, Ordering::Relaxed);
+        let hash = self
+            .seed
+            .wrapping_add(counter)
+            .wrapping_mul(0x5851_f42d_4c95_7f2d);
         #[allow(clippy::cast_precision_loss)]
         let normalized = (hash as f64) / (u64::MAX as f64);
         normalized < rate
     }
 
     /// Returns a reference to the fault configuration for modification.
-    pub fn fault_config(&self) -> std::sync::MutexGuard<'_, FaultConfig> {
+    pub fn fault_config(&self) -> MutexGuard<'_, FaultConfig> {
         self.fault_config.lock().expect("fault config lock poisoned")
     }
 
@@ -507,9 +261,16 @@ impl SimulatedStorage {
 
     /// Returns all synced file paths for inspection in tests.
     #[must_use]
-    pub fn synced_file_paths(&self) -> Vec<std::path::PathBuf> {
+    pub fn synced_file_paths(&self) -> Vec<PathBuf> {
         let synced = self.synced_files.lock().expect("synced_files lock poisoned");
         synced.keys().cloned().collect()
+    }
+
+    /// Returns a snapshot of all synced files with their contents for debugging.
+    #[must_use]
+    pub fn synced_snapshot(&self) -> HashMap<PathBuf, Vec<u8>> {
+        let synced = self.synced_files.lock().expect("synced_files lock poisoned");
+        synced.clone()
     }
 
     /// Sets raw file content directly (for simulating corruption).
@@ -574,7 +335,9 @@ impl Storage for SimulatedStorage {
             synced_files: self.synced_files.clone(),
             fault_config: self.fault_config.clone(),
             seed: self.seed,
-            write_counter: std::sync::atomic::AtomicU64::new(0),
+            write_counter: AtomicU64::new(0),
+            sync_counter: AtomicU64::new(0),
+            read_counter: AtomicU64::new(0),
         }))
     }
 
@@ -594,7 +357,7 @@ impl Storage for SimulatedStorage {
         Ok(files.contains_key(path))
     }
 
-    async fn list_files(&self, dir: &Path, extension: &str) -> WalResult<Vec<std::path::PathBuf>> {
+    async fn list_files(&self, dir: &Path, extension: &str) -> WalResult<Vec<PathBuf>> {
         // Check for list_files failure.
         {
             let config = self.fault_config.lock().expect("fault config lock poisoned");
@@ -648,31 +411,51 @@ impl Storage for SimulatedStorage {
 }
 
 /// A simulated file handle with fault injection.
+///
+/// Uses separate counters for different fault types to ensure independence.
+/// This is critical for DST: enabling torn writes shouldn't affect fsync failure rate.
 #[allow(
     clippy::significant_drop_tightening,
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss
 )]
 struct SimulatedFile {
-    path: std::path::PathBuf,
-    files: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>>,
-    synced_files: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>>,
-    fault_config: std::sync::Arc<std::sync::Mutex<FaultConfig>>,
+    path: PathBuf,
+    files: Arc<Mutex<HashMap<PathBuf, Vec<u8>>>>,
+    synced_files: Arc<Mutex<HashMap<PathBuf, Vec<u8>>>>,
+    fault_config: Arc<Mutex<FaultConfig>>,
     seed: u64,
-    write_counter: std::sync::atomic::AtomicU64,
+    /// Counter for write/torn write fault injection.
+    write_counter: AtomicU64,
+    /// Separate counter for fsync fault injection.
+    sync_counter: AtomicU64,
+    /// Separate counter for read fault injection.
+    read_counter: AtomicU64,
 }
 
 #[allow(clippy::cast_precision_loss)]
 impl SimulatedFile {
     /// Simple deterministic RNG based on seed and counter.
     fn should_inject_fault(&self, rate: f64, counter: u64) -> bool {
+        Self::should_inject_fault_with_salt(self.seed, rate, counter, 0)
+    }
+
+    /// Deterministic RNG with additional salt to decorrelate fault types.
+    fn should_inject_fault_with_salt(seed: u64, rate: f64, counter: u64, salt: u64) -> bool {
         if rate <= 0.0 {
             return false;
         }
         if rate >= 1.0 {
             return true;
         }
-        let hash = self.seed.wrapping_add(counter).wrapping_mul(0x5851_f42d_4c95_7f2d);
+        // Use different multipliers for different salts to decorrelate.
+        let multiplier = match salt {
+            0 => 0x5851_f42d_4c95_7f2d, // writes
+            1 => 0x9e37_79b9_7f4a_7c15, // syncs
+            2 => 0xc6a4_a793_5bd1_e995, // reads
+            _ => 0x5851_f42d_4c95_7f2d_u64.wrapping_add(salt),
+        };
+        let hash = seed.wrapping_add(counter).wrapping_mul(multiplier);
         let normalized = (hash as f64) / (u64::MAX as f64);
         normalized < rate
     }
@@ -682,9 +465,7 @@ impl SimulatedFile {
 #[allow(clippy::significant_drop_tightening, clippy::cast_possible_truncation)]
 impl StorageFile for SimulatedFile {
     async fn write_at(&self, offset: u64, data: &[u8]) -> WalResult<()> {
-        let counter = self
-            .write_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let counter = self.write_counter.fetch_add(1, Ordering::Relaxed);
 
         let config = self.fault_config.lock().expect("fault config lock poisoned");
 
@@ -715,7 +496,10 @@ impl StorageFile for SimulatedFile {
             Some(torn_offset)
         } else if self.should_inject_fault(config.torn_write_rate, counter) {
             // Random torn write position within the data.
-            let hash = self.seed.wrapping_add(counter).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let hash = self
+                .seed
+                .wrapping_add(counter)
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15);
             drop(config);
             Some(hash as usize % data.len().max(1))
         } else {
@@ -733,27 +517,34 @@ impl StorageFile for SimulatedFile {
         }
 
         // Write data (possibly torn).
-        let write_len = torn_at.unwrap_or(data.len());
-        let actual_write_len = write_len.min(data.len());
-        content[offset as usize..offset as usize + actual_write_len]
-            .copy_from_slice(&data[..actual_write_len]);
-
-        // If torn, truncate file to simulate crash during write.
-        if torn_at.is_some() {
+        if let Some(torn_offset) = torn_at {
+            // Torn write: simulate crash during write.
+            // Write partial data, then return error (process crashed).
+            let actual_write_len = torn_offset.min(data.len());
+            content[offset as usize..offset as usize + actual_write_len]
+                .copy_from_slice(&data[..actual_write_len]);
             content.truncate(offset as usize + actual_write_len);
+
+            // Return error - the calling process "crashed" during this write.
+            // This is more realistic than silently corrupting and continuing.
+            return Err(WalError::Io {
+                operation: "write",
+                message: "torn write (simulated crash during write)".to_string(),
+            });
         }
+
+        // Normal write.
+        content[offset as usize..offset as usize + data.len()].copy_from_slice(data);
 
         Ok(())
     }
 
     async fn read_at(&self, offset: u64, len: usize) -> WalResult<Bytes> {
-        // Check for read failure first.
+        // Check for read failure first (use separate read_counter AND salt=2).
         {
             let config = self.fault_config.lock().expect("fault config lock poisoned");
-            let counter = self
-                .write_counter
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if self.should_inject_fault(config.read_fail_rate, counter) {
+            let counter = self.read_counter.fetch_add(1, Ordering::Relaxed);
+            if Self::should_inject_fault_with_salt(self.seed, config.read_fail_rate, counter, 2) {
                 return Err(WalError::Io {
                     operation: "read",
                     message: "read failed (simulated)".to_string(),
@@ -775,14 +566,17 @@ impl StorageFile for SimulatedFile {
         let end = std::cmp::min(start + len, content.len());
         let mut data = content[start..end].to_vec();
 
-        // Check for read corruption.
+        // Check for read corruption (use separate read_counter AND salt=2).
         let config = self.fault_config.lock().expect("fault config lock poisoned");
-        let counter = self
-            .write_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.should_inject_fault(config.read_corruption_rate, counter) && !data.is_empty() {
+        let counter = self.read_counter.fetch_add(1, Ordering::Relaxed);
+        if Self::should_inject_fault_with_salt(self.seed, config.read_corruption_rate, counter, 2)
+            && !data.is_empty()
+        {
             // Corrupt a random byte.
-            let hash = self.seed.wrapping_add(counter).wrapping_mul(0xc6a4_a793_5bd1_e995);
+            let hash = self
+                .seed
+                .wrapping_add(counter)
+                .wrapping_mul(0xc6a4_a793_5bd1_e995);
             let corrupt_idx = hash as usize % data.len();
             data[corrupt_idx] ^= 0xFF;
         }
@@ -803,11 +597,12 @@ impl StorageFile for SimulatedFile {
 
     async fn sync(&self) -> WalResult<()> {
         let config = self.fault_config.lock().expect("fault config lock poisoned");
-        let counter = self
-            .write_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Use separate sync_counter AND salt=1 for independence from write faults.
+        let counter = self.sync_counter.fetch_add(1, Ordering::Relaxed);
+        let should_fail = config.force_fsync_fail
+            || Self::should_inject_fault_with_salt(self.seed, config.fsync_fail_rate, counter, 1);
 
-        if config.force_fsync_fail || self.should_inject_fault(config.fsync_fail_rate, counter) {
+        if should_fail {
             drop(config);
             let mut config = self.fault_config.lock().expect("fault config lock poisoned");
             config.force_fsync_fail = false;
@@ -846,84 +641,9 @@ impl StorageFile for SimulatedFile {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_statements)] // Const near usage is clearer.
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn test_tokio_storage_write_read() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("test.wal");
-
-        let storage = TokioStorage::new();
-        let file = storage.open(&path).await.unwrap();
-
-        // Write some data.
-        let data = b"hello, world!";
-        file.write_at(0, data).await.unwrap();
-        file.sync().await.unwrap();
-
-        // Read it back.
-        let read_data = file.read_at(0, data.len()).await.unwrap();
-        assert_eq!(&read_data[..], data);
-
-        // Check size.
-        let size = file.size().await.unwrap();
-        assert_eq!(size, data.len() as u64);
-    }
-
-    #[tokio::test]
-    async fn test_tokio_storage_read_all() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("test.wal");
-
-        let storage = TokioStorage::new();
-        let file = storage.open(&path).await.unwrap();
-
-        let data = b"some test data for reading";
-        file.write_at(0, data).await.unwrap();
-        file.sync().await.unwrap();
-
-        let all_data = file.read_all().await.unwrap();
-        assert_eq!(&all_data[..], data);
-    }
-
-    #[tokio::test]
-    async fn test_tokio_storage_list_files() {
-        let temp_dir = tempfile::tempdir().unwrap();
-
-        let storage = TokioStorage::new();
-
-        // Create some files.
-        for i in 0..3 {
-            let path = temp_dir.path().join(format!("segment-{i:04}.wal"));
-            let _ = storage.open(&path).await.unwrap();
-        }
-
-        // Also create a non-.wal file.
-        let other_path = temp_dir.path().join("other.txt");
-        let _ = storage.open(&other_path).await.unwrap();
-
-        // List .wal files.
-        let files = storage.list_files(temp_dir.path(), "wal").await.unwrap();
-        assert_eq!(files.len(), 3);
-    }
-
-    #[tokio::test]
-    async fn test_tokio_storage_exists() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let path = temp_dir.path().join("test.wal");
-
-        let storage = TokioStorage::new();
-
-        assert!(!storage.exists(&path).await.unwrap());
-
-        let _ = storage.open(&path).await.unwrap();
-        assert!(storage.exists(&path).await.unwrap());
-    }
-
-    // -------------------------------------------------------------------------
-    // SimulatedStorage Tests
-    // -------------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_simulated_storage_basic_operations() {
@@ -957,10 +677,12 @@ mod tests {
         let file = storage.open(path).await.unwrap();
 
         // Write 10 bytes, but it will be torn at byte 5.
+        // The write should fail (simulating crash during write).
         let data = b"0123456789";
-        file.write_at(0, data).await.unwrap();
+        let result = file.write_at(0, data).await;
+        assert!(result.is_err());
 
-        // File should only have 5 bytes.
+        // File should only have 5 bytes (partial write before "crash").
         let content = storage.get_raw_content(path).unwrap();
         assert_eq!(content.len(), 5);
         assert_eq!(&content[..], b"01234");
@@ -1074,5 +796,51 @@ mod tests {
         // Original should see the change.
         let content = storage.get_raw_content(path).unwrap();
         assert_ne!(content[0], b'o');
+    }
+
+    #[tokio::test]
+    async fn test_simulated_storage_fsync_rate_failures() {
+        // Test that rate-based fsync failures work correctly.
+        // With 100% fsync_fail_rate, all syncs should fail.
+        let config = FaultConfig::none().with_fsync_fail_rate(1.0);
+        let storage = SimulatedStorage::with_faults(42, config);
+        let path = Path::new("/test/rate.wal");
+
+        let file = storage.open(path).await.unwrap();
+        file.write_at(0, b"data").await.unwrap();
+
+        // With 100% rate, sync should always fail.
+        let result = file.sync().await;
+        assert!(result.is_err(), "100% fsync_fail_rate should cause failure");
+
+        // Try again - should still fail.
+        let result = file.sync().await;
+        assert!(result.is_err(), "100% fsync_fail_rate should consistently fail");
+    }
+
+    #[tokio::test]
+    async fn test_simulated_storage_fsync_rate_across_seeds() {
+        // Verify that fsync failures happen at expected rate across seeds.
+        let mut failures = 0;
+        const SEED_COUNT: u64 = 1000;
+
+        for seed in 0..SEED_COUNT {
+            let config = FaultConfig::none().with_fsync_fail_rate(0.10);
+            let storage = SimulatedStorage::with_faults(seed, config);
+            let path = Path::new("/test/rate.wal");
+
+            let file = storage.open(path).await.unwrap();
+            file.write_at(0, b"data").await.unwrap();
+
+            if file.sync().await.is_err() {
+                failures += 1;
+            }
+        }
+
+        // With 10% rate and 1000 seeds, expect ~100 failures (±30 for variance).
+        assert!(
+            failures > 50 && failures < 150,
+            "Expected ~100 fsync failures, got {failures}"
+        );
     }
 }

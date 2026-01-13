@@ -40,14 +40,30 @@ mod buffered;
 mod entry;
 mod error;
 mod segment;
+mod shared_entry;
+mod shared_wal;
 mod storage;
 mod wal;
 
 pub use buffered::{BufferedWal, BufferedWalConfig};
-pub use entry::{Entry, EntryHeader, ENTRY_HEADER_SIZE};
+pub use entry::{Entry, EntryHeader, WalEntry, ENTRY_HEADER_SIZE};
 pub use error::{WalError, WalResult};
 pub use segment::{Segment, SegmentConfig, SegmentHeader, SegmentId, SEGMENT_HEADER_SIZE};
-pub use storage::{FaultConfig, SimulatedStorage, Storage, StorageFile, TokioStorage};
+pub use shared_entry::{SharedEntry, SharedEntryHeader, SHARED_ENTRY_HEADER_SIZE};
+pub use shared_wal::{
+    CoordinatorConfig, DurableAck, SharedWal, SharedWalConfig, SharedWalCoordinator,
+    SharedWalHandle,
+};
+pub use storage::{create_storage, FaultConfig, SimulatedStorage, Storage, StorageFile, TokioStorage};
+
+// Low-level io_uring types (for direct use within tokio_uring context).
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub use storage::{IoUringFile, IoUringStorage};
+
+// Worker-based io_uring types (Send + Sync, for use with standard tokio).
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub use storage::{IoUringInitError, IoUringWorkerFile, IoUringWorkerStorage};
+
 pub use wal::{SegmentInfo, Wal, WalConfig};
 
 /// WAL configuration limits.

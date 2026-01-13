@@ -1,7 +1,15 @@
-//! Simple BufferedWal benchmark for comparison.
+//! Simple `BufferedWal` benchmark for comparison.
 //!
-//! Run with: cargo run --release --example simple_bench
+//! Run with: `cargo run --release --example simple_bench`
 
+// Benchmark code has relaxed lint requirements.
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::option_if_let_else)]
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::explicit_iter_loop)]
+#![allow(clippy::redundant_closure_for_method_calls)]
+
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,61 +18,24 @@ use tokio::task::JoinSet;
 
 use helix_wal::{BufferedWal, BufferedWalConfig, Entry, TokioStorage, WalConfig};
 
-/// Benchmark with shared atomic counter (entries arrive out of order).
-async fn run_bench_shared_counter(concurrency: usize, entries_per_task: usize, data_size: usize) {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
-    let wal_config = WalConfig::new(temp_dir.path());
-    let config = BufferedWalConfig::new(wal_config)
-        .with_flush_interval(Duration::from_millis(10))
-        .with_max_buffer_entries(100_000);
+/// Returns the benchmark base directory from HELIX_BENCH_DIR env var, or None for system temp.
+fn bench_base_dir() -> Option<PathBuf> {
+    std::env::var("HELIX_BENCH_DIR").ok().map(PathBuf::from)
+}
 
-    let wal = Arc::new(
-        BufferedWal::open(TokioStorage::new(), config)
-            .await
-            .expect("open WAL"),
-    );
-
-    let data = Bytes::from(vec![0u8; data_size]);
-    let counter = Arc::new(std::sync::atomic::AtomicU64::new(1));
-    let total_entries = concurrency * entries_per_task;
-
-    let start = Instant::now();
-
-    let mut join_set = JoinSet::new();
-    for _ in 0..concurrency {
-        let wal_clone = wal.clone();
-        let data_clone = data.clone();
-        let counter_clone = counter.clone();
-
-        join_set.spawn(async move {
-            for _ in 0..entries_per_task {
-                let idx = counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let entry = Entry::new(1, idx, data_clone.clone()).expect("entry");
-                wal_clone.append(entry).await.expect("append");
-            }
-        });
+/// Creates a temp directory, using HELIX_BENCH_DIR if set.
+fn create_temp_dir() -> tempfile::TempDir {
+    match bench_base_dir() {
+        Some(base) => tempfile::tempdir_in(base).expect("temp dir in HELIX_BENCH_DIR"),
+        None => tempfile::tempdir().expect("temp dir"),
     }
-
-    while join_set.join_next().await.is_some() {}
-    wal.flush().await.expect("flush");
-
-    let elapsed = start.elapsed();
-    let throughput = total_entries as f64 / elapsed.as_secs_f64();
-
-    println!(
-        "shared_ctr: conc {:>5} | entries {:>6} | {:>8.2}ms | {:>10.0}/sec",
-        concurrency,
-        total_entries,
-        elapsed.as_secs_f64() * 1000.0,
-        throughput
-    );
 }
 
 /// Benchmark with separate WAL per partition (realistic production pattern).
 /// Pre-creates WALs to measure steady-state write throughput.
 #[allow(dead_code)]
 async fn run_bench_wal_per_partition(num_partitions: usize, entries_per_partition: usize, data_size: usize) {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let temp_dir = create_temp_dir();
     let data = Bytes::from(vec![0u8; data_size]);
     let total_entries = num_partitions * entries_per_partition;
 
@@ -122,7 +93,7 @@ async fn run_bench_wal_per_partition(num_partitions: usize, entries_per_partitio
 /// Benchmark with few WALs, many entries each (simulates per-core model).
 /// This is closer to how high-throughput systems with thread-per-core designs operate.
 async fn run_bench_few_wals_many_entries(num_wals: usize, entries_per_wal: usize, data_size: usize) {
-    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let temp_dir = create_temp_dir();
     let data = Bytes::from(vec![0u8; data_size]);
     let total_entries = num_wals * entries_per_wal;
 
@@ -149,7 +120,7 @@ async fn run_bench_few_wals_many_entries(num_wals: usize, entries_per_wal: usize
     let start = Instant::now();
 
     let mut join_set = JoinSet::new();
-    for wal in wals.into_iter() {
+    for wal in wals {
         let data_clone = data.clone();
 
         join_set.spawn(async move {
@@ -178,29 +149,25 @@ async fn run_bench_few_wals_many_entries(num_wals: usize, entries_per_wal: usize
 #[tokio::main]
 async fn main() {
     println!("BufferedWal Benchmark (10ms flush, 1KB records)");
-    println!("================================================\n");
+    println!("================================================");
+    println!("Tests per-shard WAL model: each shard has its own WAL (no sharing).\n");
+
+    // Detect CPU count for realistic benchmark
+    let num_cpus = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(8);
 
     // Warm up
     println!("Warming up...");
-    run_bench_few_wals_many_entries(8, 1000, 1024).await;
+    run_bench_few_wals_many_entries(num_cpus, 1000, 1024).await;
 
-    println!("\n--- Few WALs, Many Entries (per-core model) ---");
-    println!("Fixed WAL count, scaling entries. Similar to thread-per-core designs.\n");
+    println!("\n--- Per-Core WAL Model ({num_cpus} WALs = {num_cpus} vCPUs) ---");
+    println!("One WAL per core, scaling entries per WAL.\n");
 
-    // 8 WALs (like 8 CPU cores), increasing entries
+    // WALs matching CPU count, increasing entries
     for &entries_per_wal in &[1000, 4000, 16000] {
         for _ in 0..3 {
-            run_bench_few_wals_many_entries(8, entries_per_wal, 1024).await;
-        }
-        println!();
-    }
-
-    println!("\n--- Shared Counter Mode (single WAL, random arrival) ---");
-    println!("Single WAL with entries arriving out of order.\n");
-
-    for &concurrency in &[64, 256, 1024] {
-        for _ in 0..3 {
-            run_bench_shared_counter(concurrency, 100, 1024).await;
+            run_bench_few_wals_many_entries(num_cpus, entries_per_wal, 1024).await;
         }
         println!();
     }

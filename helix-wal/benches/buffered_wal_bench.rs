@@ -1,9 +1,15 @@
-//! BufferedWal benchmarks.
+//! `BufferedWal` benchmarks.
 //!
 //! Measures throughput with different flush intervals and concurrency levels.
 
 #![allow(missing_docs)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::option_if_let_else)]
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::missing_const_for_fn)]
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,9 +48,18 @@ impl BenchConfig {
     }
 }
 
+/// Returns the benchmark base directory from HELIX_BENCH_DIR env var, or None for system temp.
+fn bench_base_dir() -> Option<PathBuf> {
+    std::env::var("HELIX_BENCH_DIR").ok().map(PathBuf::from)
+}
+
 /// Creates a BufferedWal for benchmarking.
+/// Uses HELIX_BENCH_DIR env var if set, otherwise system temp directory.
 async fn setup_buffered_wal(flush_interval_ms: u64) -> (BufferedWal<TokioStorage>, TempDir) {
-    let tempdir = tempfile::tempdir().expect("failed to create temp dir");
+    let tempdir = match bench_base_dir() {
+        Some(base) => tempfile::tempdir_in(base).expect("failed to create temp dir in HELIX_BENCH_DIR"),
+        None => tempfile::tempdir().expect("failed to create temp dir"),
+    };
     let wal_config = WalConfig::new(tempdir.path());
     let config = BufferedWalConfig::new(wal_config)
         .with_flush_interval(Duration::from_millis(flush_interval_ms))
