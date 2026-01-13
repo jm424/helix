@@ -4,6 +4,7 @@
 //! to the server and exchanging Kafka protocol messages.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,6 +20,19 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 use helix_kafka_compat::server::KafkaServerConfig;
+
+/// Counter for unique test directory names.
+static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Creates a unique temp directory for test data.
+fn test_data_dir() -> std::path::PathBuf {
+    let counter = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    std::env::temp_dir().join(format!(
+        "helix-kafka-integration-{}-{}",
+        std::process::id(),
+        counter
+    ))
+}
 
 /// Builds a Kafka request with length-prefixed framing.
 fn build_request(api_key: ApiKey, api_version: i16, correlation_id: i32, body: &[u8]) -> BytesMut {
@@ -61,7 +75,7 @@ async fn read_response(stream: &mut TcpStream) -> BytesMut {
 async fn test_api_versions_over_tcp() {
     // Start server on a random port.
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let config = KafkaServerConfig::new(addr, 1);
+    let config = KafkaServerConfig::new(addr, 1, test_data_dir());
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await.unwrap();
     let actual_addr = listener.local_addr().unwrap();
@@ -78,6 +92,7 @@ async fn test_api_versions_over_tcp() {
                 1,
                 "localhost".to_string(),
                 actual_addr.port() as i32,
+                test_data_dir(),
             ));
 
             tokio::spawn(async move {
@@ -131,7 +146,7 @@ async fn test_api_versions_over_tcp() {
 async fn test_metadata_over_tcp() {
     // Start server on a random port.
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let config = KafkaServerConfig::new(addr, 1);
+    let config = KafkaServerConfig::new(addr, 1, test_data_dir());
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await.unwrap();
     let actual_addr = listener.local_addr().unwrap();
@@ -148,6 +163,7 @@ async fn test_metadata_over_tcp() {
                 1,
                 "localhost".to_string(),
                 actual_addr.port() as i32,
+                test_data_dir(),
             ));
 
             tokio::spawn(async move {
@@ -212,7 +228,7 @@ async fn handle_test_connection(
         // Process frames.
         while let Some(payload) = helix_kafka_compat::codec::read_frame(&mut read_buf)? {
             let request = helix_kafka_compat::codec::decode_request_header(payload)?;
-            let response_body = helix_kafka_compat::handler::handle_request(&ctx, &request)?;
+            let response_body = helix_kafka_compat::handler::handle_request(&ctx, &request).await?;
 
             // Write response with length prefix.
             let mut response_frame = BytesMut::new();
@@ -228,7 +244,7 @@ async fn handle_test_connection(
 async fn test_produce_and_fetch_over_tcp() {
     // Start server on a random port.
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let config = KafkaServerConfig::new(addr, 1);
+    let config = KafkaServerConfig::new(addr, 1, test_data_dir());
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await.unwrap();
     let actual_addr = listener.local_addr().unwrap();
@@ -238,6 +254,7 @@ async fn test_produce_and_fetch_over_tcp() {
         1,
         "localhost".to_string(),
         actual_addr.port() as i32,
+        test_data_dir(),
     ));
     let server_ctx = ctx.clone();
 
@@ -463,7 +480,7 @@ async fn setup_test_server() -> (
     tokio::task::JoinHandle<()>,
 ) {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    let config = KafkaServerConfig::new(addr, 1);
+    let config = KafkaServerConfig::new(addr, 1, test_data_dir());
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await.unwrap();
     let actual_addr = listener.local_addr().unwrap();
@@ -472,6 +489,7 @@ async fn setup_test_server() -> (
         1,
         "localhost".to_string(),
         actual_addr.port() as i32,
+        test_data_dir(),
     ));
     let server_ctx = ctx.clone();
 

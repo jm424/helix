@@ -5,16 +5,17 @@
 //!
 //! # Storage Architecture
 //!
-//! Uses protocol-agnostic blob storage via `helix_server::storage::Partition`.
+//! Uses protocol-agnostic blob storage via `helix_server::storage::DurablePartition`.
 //! Kafka `RecordBatch` bytes are stored as-is without parsing, enabling
-//! zero-copy on the fetch path.
+//! zero-copy on the fetch path. Data is persisted to WAL for durability.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::path::PathBuf;
 
 use bytes::{Bytes, BytesMut};
 use helix_core::{PartitionId, TopicId};
-use helix_server::storage::{Partition, PartitionConfig};
+use helix_server::storage::{DurablePartition, DurablePartitionConfig};
+use tokio::sync::RwLock;
 use kafka_protocol::{
     messages::{
         ApiKey, ApiVersionsResponse, BrokerId, FetchRequest, FetchResponse,
@@ -76,6 +77,7 @@ static NEXT_TOPIC_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// Handler context containing Helix storage and configuration.
 ///
 /// Uses protocol-agnostic blob storage for Kafka `RecordBatch` data.
+/// Data is persisted to WAL via `DurablePartition`.
 pub struct HandlerContext {
     /// Node ID of this Helix node.
     pub node_id: i32,
@@ -85,26 +87,29 @@ pub struct HandlerContext {
     pub port: i32,
     /// Cluster ID.
     pub cluster_id: String,
+    /// Data directory for WAL storage.
+    data_dir: PathBuf,
     /// Topic name to ID mapping.
-    topic_ids: RwLock<HashMap<String, TopicId>>,
-    /// Partition storage (topic+partition -> Partition with blob storage).
-    partitions: RwLock<HashMap<PartitionKey, Partition>>,
+    topic_ids: std::sync::RwLock<HashMap<String, TopicId>>,
+    /// Partition storage (topic+partition -> `DurablePartition` with blob storage).
+    partitions: RwLock<HashMap<PartitionKey, DurablePartition>>,
     /// Consumer group committed offsets (group+topic+partition -> offset).
-    committed_offsets: RwLock<HashMap<ConsumerGroupPartitionKey, i64>>,
+    committed_offsets: std::sync::RwLock<HashMap<ConsumerGroupPartitionKey, i64>>,
 }
 
 impl HandlerContext {
     /// Create a new handler context.
     #[must_use]
-    pub fn new(node_id: i32, host: String, port: i32) -> Self {
+    pub fn new(node_id: i32, host: String, port: i32, data_dir: PathBuf) -> Self {
         Self {
             node_id,
             host,
             port,
             cluster_id: "helix-cluster".to_string(),
-            topic_ids: RwLock::new(HashMap::new()),
+            data_dir,
+            topic_ids: std::sync::RwLock::new(HashMap::new()),
             partitions: RwLock::new(HashMap::new()),
-            committed_offsets: RwLock::new(HashMap::new()),
+            committed_offsets: std::sync::RwLock::new(HashMap::new()),
         }
     }
 
@@ -127,8 +132,8 @@ impl HandlerContext {
 
     /// Gets or creates a partition for the given topic and partition ID.
     ///
-    /// Creates the underlying Helix Partition with blob storage support.
-    fn ensure_partition(&self, topic: &str, partition: i32) {
+    /// Creates the underlying Helix `DurablePartition` with WAL-backed blob storage.
+    async fn ensure_partition(&self, topic: &str, partition: i32) {
         let key = PartitionKey {
             topic: topic.to_string(),
             partition,
@@ -136,53 +141,67 @@ impl HandlerContext {
 
         // Check if partition exists.
         {
-            let partitions = self.partitions.read().unwrap();
+            let partitions = self.partitions.read().await;
             if partitions.contains_key(&key) {
                 return;
             }
         }
 
-        // Create new partition with blob storage support.
+        // Create new partition with WAL-backed blob storage.
         let topic_id = self.get_or_create_topic_id(topic);
         // Safe cast: partition ID fits in u32.
         #[allow(clippy::cast_sign_loss)]
         let partition_id = PartitionId::new(u64::from(partition as u32));
-        let config = PartitionConfig::new(topic_id, partition_id);
-        let new_partition = Partition::new(config);
 
-        let mut partitions = self.partitions.write().unwrap();
+        // Create partition directory: data_dir/topic_id/partition_id
+        let partition_dir = self
+            .data_dir
+            .join(format!("topic-{}", topic_id.get()))
+            .join(format!("partition-{}", partition_id.get()));
+
+        let config = DurablePartitionConfig::new(partition_dir, topic_id, partition_id);
+
+        // Open the durable partition (creates WAL if needed).
+        let new_partition = DurablePartition::open(config)
+            .await
+            .expect("failed to open durable partition");
+
+        let mut partitions = self.partitions.write().await;
         partitions.entry(key).or_insert(new_partition);
     }
 
     /// Store a blob (Kafka `RecordBatch`) in the partition.
     ///
     /// Returns the base offset assigned to this batch.
-    #[allow(clippy::significant_drop_tightening)] // Lock must be held for get_mut and append.
-    fn store_blob(&self, topic: &str, partition: i32, record_count: u32, data: Bytes) -> u64 {
-        self.ensure_partition(topic, partition);
+    #[allow(clippy::significant_drop_tightening)]
+    async fn store_blob(&self, topic: &str, partition: i32, record_count: u32, data: Bytes) -> u64 {
+        self.ensure_partition(topic, partition).await;
 
         let key = PartitionKey {
             topic: topic.to_string(),
             partition,
         };
 
-        let mut partitions = self.partitions.write().unwrap();
-        let p = partitions.get_mut(&key).expect("partition should exist after ensure");
+        let mut partitions = self.partitions.write().await;
+        let p = partitions
+            .get_mut(&key)
+            .expect("partition should exist after ensure");
 
         // append_blob returns the base offset.
         p.append_blob(data, record_count)
-            .expect("append_blob should not fail on in-memory partition")
+            .await
+            .expect("append_blob should not fail")
             .get()
     }
 
     /// Get the current log end offset for a partition.
-    fn log_end_offset(&self, topic: &str, partition: i32) -> u64 {
+    async fn log_end_offset(&self, topic: &str, partition: i32) -> u64 {
         let key = PartitionKey {
             topic: topic.to_string(),
             partition,
         };
 
-        let partitions = self.partitions.read().unwrap();
+        let partitions = self.partitions.read().await;
         partitions
             .get(&key)
             .map_or(0, |p| p.blob_log_end_offset().get())
@@ -192,13 +211,19 @@ impl HandlerContext {
     ///
     /// Returns raw Kafka `RecordBatch` bytes that overlap with the requested range.
     #[allow(clippy::cast_sign_loss, clippy::significant_drop_tightening)]
-    fn fetch_blobs(&self, topic: &str, partition: i32, start_offset: u64, max_bytes: i32) -> Vec<Bytes> {
+    async fn fetch_blobs(
+        &self,
+        topic: &str,
+        partition: i32,
+        start_offset: u64,
+        max_bytes: i32,
+    ) -> Vec<Bytes> {
         let key = PartitionKey {
             topic: topic.to_string(),
             partition,
         };
 
-        let partitions = self.partitions.read().unwrap();
+        let partitions = self.partitions.read().await;
         let Some(p) = partitions.get(&key) else {
             return vec![];
         };
@@ -242,23 +267,22 @@ impl HandlerContext {
     }
 
     /// Check if a partition exists (has been written to).
-    #[allow(clippy::significant_drop_tightening)] // Lock must be held for get.
-    fn partition_exists(&self, topic: &str, partition: i32) -> bool {
+    async fn partition_exists(&self, topic: &str, partition: i32) -> bool {
         let key = PartitionKey {
             topic: topic.to_string(),
             partition,
         };
 
-        let partitions = self.partitions.read().unwrap();
+        let partitions = self.partitions.read().await;
         partitions
             .get(&key)
-            .is_some_and(|p| p.blob_log_end_offset().get() > 0)
+            .is_some_and(DurablePartition::blob_partition_exists)
     }
 
     /// Get all known topics and their partitions.
-    #[allow(clippy::significant_drop_tightening)] // Lock must be held during iteration.
-    fn get_known_topics(&self) -> HashMap<String, Vec<i32>> {
-        let partitions = self.partitions.read().unwrap();
+    #[allow(clippy::significant_drop_tightening)]
+    async fn get_known_topics(&self) -> HashMap<String, Vec<i32>> {
+        let partitions = self.partitions.read().await;
         let mut topics: HashMap<String, Vec<i32>> = HashMap::new();
 
         for key in partitions.keys() {
@@ -282,7 +306,7 @@ impl HandlerContext {
 /// # Errors
 ///
 /// Returns an error if the API is unsupported or encoding/decoding fails.
-pub fn handle_request(
+pub async fn handle_request(
     ctx: &HandlerContext,
     request: &DecodedRequest,
 ) -> KafkaCompatResult<BytesMut> {
@@ -294,30 +318,14 @@ pub fn handle_request(
     );
 
     match request.api_key {
-        x if x == ApiKey::ApiVersions as i16 => {
-            handle_api_versions(ctx, request)
-        }
-        x if x == ApiKey::Metadata as i16 => {
-            handle_metadata(ctx, request)
-        }
-        x if x == ApiKey::Produce as i16 => {
-            handle_produce(ctx, request)
-        }
-        x if x == ApiKey::Fetch as i16 => {
-            handle_fetch(ctx, request)
-        }
-        x if x == ApiKey::ListOffsets as i16 => {
-            handle_list_offsets(ctx, request)
-        }
-        x if x == ApiKey::FindCoordinator as i16 => {
-            handle_find_coordinator(ctx, request)
-        }
-        x if x == ApiKey::OffsetCommit as i16 => {
-            handle_offset_commit(ctx, request)
-        }
-        x if x == ApiKey::OffsetFetch as i16 => {
-            handle_offset_fetch(ctx, request)
-        }
+        x if x == ApiKey::ApiVersions as i16 => handle_api_versions(ctx, request),
+        x if x == ApiKey::Metadata as i16 => handle_metadata(ctx, request).await,
+        x if x == ApiKey::Produce as i16 => handle_produce(ctx, request).await,
+        x if x == ApiKey::Fetch as i16 => handle_fetch(ctx, request).await,
+        x if x == ApiKey::ListOffsets as i16 => handle_list_offsets(ctx, request).await,
+        x if x == ApiKey::FindCoordinator as i16 => handle_find_coordinator(ctx, request),
+        x if x == ApiKey::OffsetCommit as i16 => handle_offset_commit(ctx, request),
+        x if x == ApiKey::OffsetFetch as i16 => handle_offset_fetch(ctx, request),
         _ => {
             warn!(api_key = request.api_key, "Unsupported API");
             Err(KafkaCompatError::UnsupportedApi {
@@ -358,7 +366,7 @@ fn handle_api_versions(
 /// Handle Metadata request.
 ///
 /// Returns broker and topic/partition information.
-fn handle_metadata(
+async fn handle_metadata(
     ctx: &HandlerContext,
     request: &DecodedRequest,
 ) -> KafkaCompatResult<BytesMut> {
@@ -388,7 +396,7 @@ fn handle_metadata(
     response.controller_id = BrokerId(ctx.node_id);
 
     // Get all known topics and partitions.
-    let known_topics = ctx.get_known_topics();
+    let known_topics = ctx.get_known_topics().await;
 
     // Build topic metadata based on request.
     // If topics is None or empty, return all known topics.
@@ -455,7 +463,7 @@ fn handle_metadata(
 /// Handle Produce request.
 ///
 /// Writes records to Helix partitions.
-fn handle_produce(
+async fn handle_produce(
     ctx: &HandlerContext,
     request: &DecodedRequest,
 ) -> KafkaCompatResult<BytesMut> {
@@ -478,7 +486,8 @@ fn handle_produce(
         let topic_name = topic_data.name.to_string();
         debug!(topic = %topic_name, "Processing topic");
 
-        let mut topic_response = kafka_protocol::messages::produce_response::TopicProduceResponse::default();
+        let mut topic_response =
+            kafka_protocol::messages::produce_response::TopicProduceResponse::default();
         topic_response.name = topic_data.name.clone();
 
         // Process each partition.
@@ -497,16 +506,19 @@ fn handle_produce(
                 "Processing partition"
             );
 
-            let mut partition_response = kafka_protocol::messages::produce_response::PartitionProduceResponse::default();
+            let mut partition_response =
+                kafka_protocol::messages::produce_response::PartitionProduceResponse::default();
             partition_response.index = partition_id;
 
             // Store blob and get base offset (or get current end offset if empty).
             // Safe cast: record_count is u64 from counting, but limited by batch size.
-            #[allow(clippy::cast_possible_truncation, clippy::option_if_let_else)]
+            #[allow(clippy::cast_possible_truncation)]
             let base_offset = if record_count > 0 {
                 if let Some(data) = records_bytes {
                     // Store raw Kafka `RecordBatch` bytes as blob.
-                    let offset = ctx.store_blob(&topic_name, partition_id, record_count as u32, data.clone());
+                    let offset = ctx
+                        .store_blob(&topic_name, partition_id, record_count as u32, data.clone())
+                        .await;
 
                     info!(
                         topic = %topic_name,
@@ -518,11 +530,11 @@ fn handle_produce(
 
                     offset
                 } else {
-                    ctx.log_end_offset(&topic_name, partition_id)
+                    ctx.log_end_offset(&topic_name, partition_id).await
                 }
             } else {
                 // Empty batch - return current end offset without advancing.
-                ctx.log_end_offset(&topic_name, partition_id)
+                ctx.log_end_offset(&topic_name, partition_id).await
             };
 
             partition_response.error_code = 0;
@@ -578,7 +590,8 @@ fn count_records_in_batch(bytes: &bytes::Bytes) -> u64 {
 /// Handle Fetch request.
 ///
 /// Reads records from Helix partitions.
-fn handle_fetch(
+#[allow(clippy::too_many_lines)]
+async fn handle_fetch(
     ctx: &HandlerContext,
     request: &DecodedRequest,
 ) -> KafkaCompatResult<BytesMut> {
@@ -625,7 +638,7 @@ fn handle_fetch(
             partition_response.partition_index = partition_id;
 
             // Check if partition exists.
-            if !ctx.partition_exists(&topic_name, partition_id) {
+            if !ctx.partition_exists(&topic_name, partition_id).await {
                 // Return UNKNOWN_TOPIC_OR_PARTITION error.
                 partition_response.error_code = 3;
                 partition_response.high_watermark = -1;
@@ -644,15 +657,17 @@ fn handle_fetch(
             }
 
             // Get the high watermark (log end offset).
-            let high_watermark = ctx.log_end_offset(&topic_name, partition_id);
+            let high_watermark = ctx.log_end_offset(&topic_name, partition_id).await;
 
             // Fetch blobs from storage.
-            let blobs = ctx.fetch_blobs(
-                &topic_name,
-                partition_id,
-                fetch_offset,
-                partition_data.partition_max_bytes,
-            );
+            let blobs = ctx
+                .fetch_blobs(
+                    &topic_name,
+                    partition_id,
+                    fetch_offset,
+                    partition_data.partition_max_bytes,
+                )
+                .await;
 
             if blobs.is_empty() && fetch_offset >= high_watermark {
                 // No data available yet - return empty response.
@@ -716,7 +731,7 @@ fn handle_fetch(
 ///
 /// Returns the earliest or latest offset for partitions.
 /// Timestamp-based lookup returns the latest offset (simplified).
-fn handle_list_offsets(
+async fn handle_list_offsets(
     ctx: &HandlerContext,
     request: &DecodedRequest,
 ) -> KafkaCompatResult<BytesMut> {
@@ -756,7 +771,7 @@ fn handle_list_offsets(
             partition_response.partition_index = partition_id;
 
             // Get the current log end offset (high watermark).
-            let log_end_offset = ctx.log_end_offset(&topic_name, partition_id);
+            let log_end_offset = ctx.log_end_offset(&topic_name, partition_id).await;
 
             // Kafka timestamp conventions:
             // -1 = LATEST (high watermark)
@@ -980,11 +995,15 @@ mod tests {
     use kafka_protocol::protocol::Encodable;
 
     fn test_context() -> HandlerContext {
-        HandlerContext::new(1, "localhost".to_string(), 9092)
+        let temp_dir = std::env::temp_dir().join(format!(
+            "helix-kafka-test-{}",
+            std::process::id()
+        ));
+        HandlerContext::new(1, "localhost".to_string(), 9092, temp_dir)
     }
 
-    #[test]
-    fn test_api_versions() {
+    #[tokio::test]
+    async fn test_api_versions() {
         let ctx = test_context();
 
         // Build ApiVersions request.
@@ -1005,14 +1024,14 @@ mod tests {
 
         // Decode and handle.
         let decoded = codec::decode_request_header(full_request.freeze()).unwrap();
-        let response = handle_request(&ctx, &decoded).unwrap();
+        let response = handle_request(&ctx, &decoded).await.unwrap();
 
         // Verify response is not empty.
         assert!(!response.is_empty());
     }
 
-    #[test]
-    fn test_metadata() {
+    #[tokio::test]
+    async fn test_metadata() {
         let ctx = test_context();
 
         // Build Metadata request.
@@ -1032,7 +1051,7 @@ mod tests {
 
         // Decode and handle.
         let decoded = codec::decode_request_header(full_request.freeze()).unwrap();
-        let response = handle_request(&ctx, &decoded).unwrap();
+        let response = handle_request(&ctx, &decoded).await.unwrap();
 
         // Verify response is not empty.
         assert!(!response.is_empty());

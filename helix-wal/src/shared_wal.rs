@@ -916,7 +916,7 @@ async fn flush_loop<S: Storage + Clone + Send + Sync + 'static>(inner: Arc<Coord
 ///
 /// # Why 16?
 ///
-/// 1. **NVMe fsync parallelism**: Modern NVMe SSDs handle ~4-8 parallel fsyncs
+/// 1. **`NVMe` fsync parallelism**: Modern `NVMe` SSDs handle ~4-8 parallel fsyncs
 ///    efficiently. Beyond that, the device's internal queue depth and flash
 ///    translation layer become the bottleneck, not the number of parallel ops.
 ///
@@ -928,7 +928,7 @@ async fn flush_loop<S: Storage + Clone + Send + Sync + 'static>(inner: Arc<Coord
 ///    reduction, 4 WALs gives 25x, 16 WALs gives 6x. Beyond 16, you're
 ///    approaching per-partition WALs with little amortization benefit.
 ///
-/// 4. **TigerStyle**: "Put a limit on everything." This catches configuration
+/// 4. **`TigerStyle`**: "Put a limit on everything." This catches configuration
 ///    bugs early (e.g., `wal_count = 1000` is almost certainly a mistake).
 pub const POOL_WAL_COUNT_MAX: u32 = 16;
 

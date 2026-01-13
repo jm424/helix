@@ -2,7 +2,7 @@
 //!
 //! Accepts connections speaking Kafka wire protocol and dispatches to handlers.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use bytes::BytesMut;
 use tokio::{
@@ -31,12 +31,14 @@ pub struct KafkaServerConfig {
     pub advertised_port: i32,
     /// Maximum connections.
     pub max_connections: usize,
+    /// Data directory for WAL storage.
+    pub data_dir: PathBuf,
 }
 
 impl KafkaServerConfig {
     /// Create a new server config with defaults.
     #[must_use]
-    pub fn new(bind_addr: SocketAddr, node_id: i32) -> Self {
+    pub fn new(bind_addr: SocketAddr, node_id: i32, data_dir: impl Into<PathBuf>) -> Self {
         let host = bind_addr.ip().to_string();
         let port = i32::from(bind_addr.port());
         Self {
@@ -45,6 +47,7 @@ impl KafkaServerConfig {
             advertised_host: host,
             advertised_port: port,
             max_connections: 1000,
+            data_dir: data_dir.into(),
         }
     }
 
@@ -92,6 +95,7 @@ impl KafkaServer {
             self.config.node_id,
             self.config.advertised_host.clone(),
             self.config.advertised_port,
+            self.config.data_dir.clone(),
         ));
 
         loop {
@@ -160,7 +164,7 @@ async fn handle_connection(
             );
 
             // Handle the request.
-            let response_body = handler::handle_request(&ctx, &request)?;
+            let response_body = handler::handle_request(&ctx, &request).await?;
 
             // Write response with length prefix.
             let mut response_frame = BytesMut::new();
@@ -178,18 +182,19 @@ mod tests {
     #[test]
     fn test_config_defaults() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9092);
-        let config = KafkaServerConfig::new(addr, 1);
+        let config = KafkaServerConfig::new(addr, 1, "/tmp/helix-data");
 
         assert_eq!(config.bind_addr, addr);
         assert_eq!(config.node_id, 1);
         assert_eq!(config.advertised_host, "127.0.0.1");
         assert_eq!(config.advertised_port, 9092);
+        assert_eq!(config.data_dir, PathBuf::from("/tmp/helix-data"));
     }
 
     #[test]
     fn test_config_advertised() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9092);
-        let config = KafkaServerConfig::new(addr, 1)
+        let config = KafkaServerConfig::new(addr, 1, "/tmp/helix-data")
             .with_advertised_listener("kafka.example.com".to_string(), 19092);
 
         assert_eq!(config.advertised_host, "kafka.example.com");
