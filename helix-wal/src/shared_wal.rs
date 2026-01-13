@@ -914,10 +914,22 @@ async fn flush_loop<S: Storage + Clone + Send + Sync + 'static>(inner: Arc<Coord
 
 /// Maximum number of WALs in a pool.
 ///
-/// Why this limit: A pool distributes partitions across WALs to parallelize fsyncs.
-/// Beyond 16 WALs, the benefit diminishes (`NVMe` can handle ~4-8 parallel fsyncs well)
-/// and complexity increases. For NUMA systems, 1 WAL per NUMA node (typically 2-8)
-/// is optimal.
+/// # Why 16?
+///
+/// 1. **NVMe fsync parallelism**: Modern NVMe SSDs handle ~4-8 parallel fsyncs
+///    efficiently. Beyond that, the device's internal queue depth and flash
+///    translation layer become the bottleneck, not the number of parallel ops.
+///
+/// 2. **NUMA topology**: Typical servers have 2-8 NUMA nodes. The optimal setup
+///    is 1 WAL per NUMA node for memory locality. 16 covers large multi-socket
+///    systems.
+///
+/// 3. **Diminishing returns**: With 100 partitions, 1 WAL gives 100x fsync
+///    reduction, 4 WALs gives 25x, 16 WALs gives 6x. Beyond 16, you're
+///    approaching per-partition WALs with little amortization benefit.
+///
+/// 4. **TigerStyle**: "Put a limit on everything." This catches configuration
+///    bugs early (e.g., `wal_count = 1000` is almost certainly a mistake).
 pub const POOL_WAL_COUNT_MAX: u32 = 16;
 
 /// Configuration for a pool of shared WALs.
