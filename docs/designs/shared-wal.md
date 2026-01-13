@@ -577,8 +577,13 @@ SharedWal needs additional features:
 
 **Gate**: Phase 3 complete ✅, Phase 5.5 DST complete ✅
 
+**Phase 6 Progress:**
+- `SharedWalPool` ✅ - Multiple shared WALs with partition distribution
+- `PoolConfig` ✅ - Configuration with `POOL_WAL_COUNT_MAX = 16` limit
+- Pool unit tests ✅ - Basic ops, recovery, distribution, panic cases
+
 **Next Steps:**
-1. Phase 6: SharedWalPool + benchmarks
+1. Phase 6: Benchmarks comparing configurations (single WAL vs pool vs per-partition)
 2. Phase 7: 10K hours stress testing target
 
 ### Phase 6: SharedWalPool + Integration
