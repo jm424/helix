@@ -26,6 +26,7 @@ use bytes::{Bytes, BytesMut};
 use helix_core::NodeId;
 use helix_raft::multi::GroupMessage;
 use helix_raft::Message;
+use socket2::{Domain, Socket, Type};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -277,13 +278,13 @@ impl Transport {
     /// # Errors
     /// Returns an error if binding fails.
     pub async fn start(self) -> TransportResult<TransportHandle> {
-        // Bind the listener.
-        let listener = TcpListener::bind(self.config.listen_addr)
-            .await
-            .map_err(|e| TransportError::BindFailed {
+        // Bind the listener with SO_REUSEADDR to allow quick restarts.
+        let listener = create_reusable_listener(self.config.listen_addr).map_err(|e| {
+            TransportError::BindFailed {
                 addr: self.config.listen_addr,
                 source: e,
-            })?;
+            }
+        })?;
 
         info!(
             node_id = self.config.node_id.get(),
@@ -598,6 +599,32 @@ impl Transport {
 
         Ok(())
     }
+}
+
+/// Create a TCP listener with `SO_REUSEADDR` enabled.
+///
+/// This allows the transport to bind to a port that is in `TIME_WAIT` state,
+/// which is essential for fast restarts during testing.
+fn create_reusable_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+
+    let socket = Socket::new(domain, Type::STREAM, None)?;
+    socket.set_reuse_address(true)?;
+    // On macOS/BSD, SO_REUSEPORT allows multiple processes to bind to the same port.
+    // This helps with rapid test restarts when previous sockets are still closing.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    socket.set_reuse_port(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    // Backlog of 128 pending connections.
+    socket.listen(128)?;
+
+    let std_listener: std::net::TcpListener = socket.into();
+    TcpListener::from_std(std_listener)
 }
 
 /// Builder for transport configuration.

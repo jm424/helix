@@ -351,19 +351,29 @@ async fn process_outputs_multi_node(
                         {
                             let proposal = group_proposals.swap_remove(pos);
                             let result = match &apply_result {
-                                Ok(Some(offset)) => Ok(*offset),
+                                Ok(Some(offset)) => {
+                                    eprintln!("[NOTIFY] topic={} partition={} group_id={} index={} apply_result=Some({}) -> sending offset={}",
+                                        topic_id, partition_id, group_id, index, offset, offset);
+                                    Ok(*offset)
+                                }
                                 Ok(None) => {
                                     let storage = partition_storage.read().await;
                                     let offset = storage
                                         .get(group_id)
                                         .map_or(Offset::new(0), super::super::partition_storage::PartitionStorage::blob_log_end_offset);
+                                    eprintln!("[NOTIFY] topic={} partition={} group_id={} index={} apply_result=None -> sending blob_log_end_offset={}",
+                                        topic_id, partition_id, group_id, index, offset);
                                     Ok(offset)
                                 }
                                 Err(e) => Err(ServerError::Internal {
                                     message: format!("apply failed: {e}"),
                                 }),
                             };
-                            let _ = proposal.result_tx.send(result);
+                            let send_result = proposal.result_tx.send(result);
+                            if send_result.is_err() {
+                                eprintln!("[NOTIFY_FAILED] group_id={} index={} - receiver dropped",
+                                    group_id, index);
+                            }
                         }
                     }
 

@@ -24,6 +24,7 @@ helix-wal = { workspace = true }
 async-trait = { workspace = true }
 kafka-protocol = { workspace = true }
 tokio = { workspace = true }
+socket2 = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }

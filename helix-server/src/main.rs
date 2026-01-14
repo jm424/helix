@@ -227,13 +227,26 @@ fn parse_peer(s: &str) -> Result<ExtendedPeerInfo, String> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Diagnostic: confirm process is actually running (before any initialization).
+    eprintln!("[SERVER_START] pid={}", std::process::id());
+
     let args = Args::parse();
 
-    // Initialize logging.
+    // Diagnostic: confirm args parsed successfully.
+    eprintln!(
+        "[SERVER_ARGS] pid={} node_id={} listen_addr={} raft_addr={:?}",
+        std::process::id(),
+        args.node_id,
+        args.listen_addr,
+        args.raft_addr
+    );
+
+    // Initialize logging to stderr (stdout may be suppressed by test harness).
     let subscriber = FmtSubscriber::builder()
         .with_max_level(args.log_level)
         .with_target(true)
         .with_thread_ids(true)
+        .with_writer(std::io::stderr)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 

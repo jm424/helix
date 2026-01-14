@@ -20,6 +20,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 rand = { workspace = true }
+socket2 = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

@@ -438,6 +438,12 @@ pub enum ErrorCode {
     TooManyGroups = 15,
     /// Too many consumers in group.
     TooManyConsumers = 16,
+    /// Not the controller for this cluster.
+    NotController = 17,
+    /// Out of order sequence number (idempotent producer).
+    OutOfOrderSequence = 18,
+    /// Producer fenced (stale epoch).
+    ProducerFenced = 19,
 }
 impl ErrorCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -463,6 +469,9 @@ impl ErrorCode {
             ErrorCode::OffsetNotLeased => "OFFSET_NOT_LEASED",
             ErrorCode::TooManyGroups => "TOO_MANY_GROUPS",
             ErrorCode::TooManyConsumers => "TOO_MANY_CONSUMERS",
+            ErrorCode::NotController => "NOT_CONTROLLER",
+            ErrorCode::OutOfOrderSequence => "OUT_OF_ORDER_SEQUENCE",
+            ErrorCode::ProducerFenced => "PRODUCER_FENCED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -485,6 +494,9 @@ impl ErrorCode {
             "OFFSET_NOT_LEASED" => Some(Self::OffsetNotLeased),
             "TOO_MANY_GROUPS" => Some(Self::TooManyGroups),
             "TOO_MANY_CONSUMERS" => Some(Self::TooManyConsumers),
+            "NOT_CONTROLLER" => Some(Self::NotController),
+            "OUT_OF_ORDER_SEQUENCE" => Some(Self::OutOfOrderSequence),
+            "PRODUCER_FENCED" => Some(Self::ProducerFenced),
             _ => None,
         }
     }

@@ -465,13 +465,11 @@ impl ControllerState {
     }
 
     /// Returns all topics.
-    #[must_use]
     pub fn topics(&self) -> impl Iterator<Item = &TopicInfo> {
         self.topics.values()
     }
 
     /// Returns all assignments for a topic.
-    #[must_use]
     pub fn topic_assignments(
         &self,
         topic_id: TopicId,

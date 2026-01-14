@@ -160,9 +160,12 @@ impl HelixService {
         let proposed_index = {
             let mut mr = self.multi_raft.write().await;
             let Some((_, index)) = mr.propose_with_index(CONTROLLER_GROUP_ID, encoded) else {
-                return Err(ServerError::Internal {
-                    message: "not controller leader or controller group not ready".to_string(),
-                });
+                // Get controller leader hint if available.
+                let controller_hint = mr
+                    .group_state(CONTROLLER_GROUP_ID)
+                    .and_then(|s| s.leader_id)
+                    .map(|n| n.get());
+                return Err(ServerError::NotController { controller_hint });
             };
             index
         };

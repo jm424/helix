@@ -17,6 +17,8 @@ mod group_map;
 /// Kafka wire protocol support.
 pub mod kafka;
 mod partition_storage;
+/// Idempotent producer state tracking.
+pub mod producer_state;
 mod service;
 mod grpc;
 /// Partition storage implementations.

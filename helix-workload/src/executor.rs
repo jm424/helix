@@ -4,6 +4,7 @@
 //! The same workload can run against real Helix processes or in simulation.
 
 use std::collections::HashMap;
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -151,6 +152,8 @@ pub struct RealClusterConfig {
     pub auto_create_topics: bool,
     /// Default replication factor for auto-created topics.
     pub default_replication_factor: u32,
+    /// Topics to pre-create at startup (name, partition_count).
+    pub topics: Vec<(String, u32)>,
 }
 
 impl Default for RealClusterConfig {
@@ -163,6 +166,7 @@ impl Default for RealClusterConfig {
             data_dir: PathBuf::from("/tmp/helix-workload"),
             auto_create_topics: true,
             default_replication_factor: 3,
+            topics: Vec::new(),
         }
     }
 }
@@ -229,6 +233,16 @@ impl RealClusterBuilder {
         self
     }
 
+    /// Adds a topic to pre-create at cluster startup.
+    ///
+    /// Topics are created on all nodes via the `--topic` flag.
+    /// This ensures topics exist before any produce requests arrive.
+    #[must_use]
+    pub fn topic(mut self, name: impl Into<String>, partitions: u32) -> Self {
+        self.config.topics.push((name.into(), partitions));
+        self
+    }
+
     /// Builds and starts the cluster.
     ///
     /// # Errors
@@ -255,6 +269,15 @@ impl RealCluster {
 
     /// Starts a cluster with the given configuration.
     fn start(config: RealClusterConfig) -> Result<Self, ExecutorError> {
+        // Wait for all ports to be available before starting.
+        // This prevents failures from leftover processes or TIME_WAIT sockets.
+        for node_id in 1..=config.node_count {
+            let kafka_port = config.base_port + u16::try_from(node_id).unwrap_or(0);
+            let raft_port = config.raft_base_port + u16::try_from(node_id).unwrap_or(0);
+            wait_for_port_available(kafka_port, std::time::Duration::from_secs(5))?;
+            wait_for_port_available(raft_port, std::time::Duration::from_secs(5))?;
+        }
+
         let mut processes = Vec::with_capacity(config.node_count as usize);
 
         // Build peer list for each node.
@@ -295,10 +318,17 @@ impl RealCluster {
                 .arg("--raft-addr")
                 .arg(format!("127.0.0.1:{raft_port}"))
                 .arg("--data-dir")
-                .arg(&node_dir);
+                .arg(&node_dir)
+                .arg("--log-level")
+                .arg("debug");
 
             if config.auto_create_topics {
                 cmd.arg("--auto-create-topics");
+            }
+
+            // Add pre-created topics.
+            for (topic_name, partitions) in &config.topics {
+                cmd.arg("--topic").arg(format!("{topic_name}:{partitions}"));
             }
 
             // Add peers.
@@ -314,7 +344,40 @@ impl RealCluster {
                 .envs(std::env::vars());
 
             let child = cmd.spawn().map_err(ExecutorError::SpawnFailed)?;
+            eprintln!(
+                "[SPAWN] node_id={} pid={} kafka_port={} raft_port={}",
+                node_id,
+                child.id(),
+                kafka_port,
+                raft_port
+            );
             processes.push(child);
+        }
+
+        // Diagnostic: give processes a moment to start, then check if alive.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        for (i, proc) in processes.iter_mut().enumerate() {
+            match proc.try_wait() {
+                Ok(Some(status)) => {
+                    eprintln!(
+                        "[SPAWN_DIED] node_id={} pid={} exit_status={:?}",
+                        i + 1,
+                        proc.id(),
+                        status
+                    );
+                }
+                Ok(None) => {
+                    eprintln!("[SPAWN_ALIVE] node_id={} pid={}", i + 1, proc.id());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[SPAWN_CHECK_ERROR] node_id={} pid={} error={}",
+                        i + 1,
+                        proc.id(),
+                        e
+                    );
+                }
+            }
         }
 
         // Build bootstrap servers string.
@@ -592,9 +655,14 @@ impl RealExecutor {
     pub fn with_bootstrap_servers(bootstrap_servers: &str) -> Result<Self, ExecutorError> {
         // Configure rdkafka with connection retry settings so it handles
         // broker availability internally. No explicit wait loops needed.
+        // NOTE: Retries enabled for retriable errors (e.g., controller not available).
+        // This may cause duplicates until idempotent producers are implemented.
         let producer: FutureProducer = ClientConfig::new()
             .set("bootstrap.servers", bootstrap_servers)
-            .set("message.timeout.ms", "30000")
+            .set("message.timeout.ms", "60000") // Increased for slow Raft commits
+            .set("request.timeout.ms", "30000") // Allow time for retries
+            .set("retries", "5") // Retry on retriable errors
+            .set("retry.backoff.ms", "500") // Wait between retries
             .set("acks", "all")
             .set("reconnect.backoff.ms", "100")
             .set("reconnect.backoff.max.ms", "10000")
@@ -611,6 +679,9 @@ impl RealExecutor {
             .set("topic.metadata.refresh.fast.interval.ms", "100")
             // Enable partition EOF notifications so we know when we've consumed all data.
             .set("enable.partition.eof", "true")
+            // Connection timeout settings for multi-broker clusters.
+            .set("socket.timeout.ms", "30000")
+            .set("fetch.wait.max.ms", "500")
             .create()?;
 
         Ok(Self {
@@ -635,6 +706,9 @@ impl WorkloadExecutor for RealExecutor {
         partition: i32,
         payload: Bytes,
     ) -> Result<u64, ExecutorError> {
+        eprintln!("[SEND_START] topic={topic} partition={partition} payload_len={}", payload.len());
+        let send_start = std::time::Instant::now();
+
         let record: FutureRecord<'_, (), [u8]> = FutureRecord::to(topic)
             .partition(partition)
             .payload(payload.as_ref());
@@ -644,9 +718,12 @@ impl WorkloadExecutor for RealExecutor {
             .producer
             .send(record, Duration::from_secs(30))
             .await
-            .map_err(|(err, _record)| ExecutorError::Generic {
-                code: -1,
-                message: err.to_string(),
+            .map_err(|(err, _record)| {
+                eprintln!("[SEND_ERROR] topic={topic} partition={partition} elapsed={:?} error={err}", send_start.elapsed());
+                ExecutorError::Generic {
+                    code: -1,
+                    message: err.to_string(),
+                }
             })?;
 
         // Flush to ensure delivery (important before polling).
@@ -658,6 +735,8 @@ impl WorkloadExecutor for RealExecutor {
         // Extract the offset from the delivery result.
         #[allow(clippy::cast_sign_loss)]
         let offset = delivery_result.1 as u64;
+
+        eprintln!("[SEND] topic={topic} partition={partition} offset={offset}");
 
         Ok(offset)
     }
@@ -694,6 +773,8 @@ impl WorkloadExecutor for RealExecutor {
             message: e.to_string(),
         })?;
 
+        eprintln!("[POLL_START] topic={topic} partition={partition} start_offset={start_offset} max_messages={max_messages}");
+
         let mut messages = Vec::new();
 
         // Event-driven polling: keep polling until we have all expected messages
@@ -713,10 +794,12 @@ impl WorkloadExecutor for RealExecutor {
                         .payload()
                         .map(Bytes::copy_from_slice)
                         .unwrap_or_default();
+                    eprintln!("[POLL] topic={topic} partition={partition} offset={offset} payload_len={}", payload.len());
                     messages.push((offset, payload));
                 }
-                Some(Err(KafkaError::PartitionEOF(_))) => {
+                Some(Err(KafkaError::PartitionEOF(p))) => {
                     // Reached end of committed data - no more messages to read.
+                    eprintln!("[POLL] topic={topic} partition={partition} EOF at partition {p}");
                     break;
                 }
                 Some(Err(KafkaError::MessageConsumption(code)))
@@ -729,11 +812,12 @@ impl WorkloadExecutor for RealExecutor {
                 {
                     // Transient connection error - wait and retry.
                     retries += 1;
+                    eprintln!("[POLL] topic={topic} partition={partition} transient error {code:?}, retry {retries}");
                     std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(retries)));
                     continue;
                 }
                 Some(Err(e)) => {
-                    eprintln!("rdkafka poll error: {:?}", e);
+                    eprintln!("[POLL] topic={topic} partition={partition} error: {e:?}");
                     return Err(ExecutorError::Generic {
                         code: -1,
                         message: e.to_string(),
@@ -741,10 +825,13 @@ impl WorkloadExecutor for RealExecutor {
                 }
                 None => {
                     // Timeout with no message - break.
+                    eprintln!("[POLL] topic={topic} partition={partition} timeout (no message)");
                     break;
                 }
             }
         }
+
+        eprintln!("[POLL_END] topic={topic} partition={partition} received={} messages", messages.len());
 
         Ok(messages)
     }
@@ -809,23 +896,78 @@ impl WorkloadExecutor for RealExecutor {
         // tests proceed. Without this check, debug builds may see timing-related failures.
         let deadline = std::time::Instant::now() + timeout;
         let poll_interval = std::time::Duration::from_millis(100);
+        let start = std::time::Instant::now();
+        let mut attempt = 0u32;
+
+        eprintln!(
+            "[WAIT_READY_START] bootstrap_servers={} timeout={:?}",
+            self.bootstrap_servers, timeout
+        );
 
         while std::time::Instant::now() < deadline {
+            attempt += 1;
             // Try to fetch cluster metadata. This will fail if the server isn't ready.
             match self.consumer.fetch_metadata(None, std::time::Duration::from_secs(1)) {
-                Ok(_metadata) => return Ok(()),
-                Err(_) => {
-                    // Server not ready yet, wait and retry.
+                Ok(_metadata) => {
+                    eprintln!(
+                        "[WAIT_READY_OK] attempt={} elapsed={:?}",
+                        attempt,
+                        start.elapsed()
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    // Log every 50 attempts (~5 seconds) to avoid spam.
+                    if attempt % 50 == 0 {
+                        eprintln!(
+                            "[WAIT_READY_POLL] attempt={} elapsed={:?} error={:?}",
+                            attempt,
+                            start.elapsed(),
+                            e
+                        );
+                    }
                     tokio::time::sleep(poll_interval).await;
                 }
             }
         }
 
+        eprintln!(
+            "[WAIT_READY_TIMEOUT] attempts={} elapsed={:?}",
+            attempt,
+            start.elapsed()
+        );
         Err(ExecutorError::Generic {
             code: -1,
             message: format!("cluster not ready after {:?}", timeout),
         })
     }
+}
+
+/// Waits for a port to become available for binding.
+///
+/// This is used before starting servers to ensure no leftover processes
+/// or TIME_WAIT sockets are holding the port.
+fn wait_for_port_available(port: u16, timeout: Duration) -> Result<(), ExecutorError> {
+    let addr = format!("127.0.0.1:{port}");
+    let deadline = std::time::Instant::now() + timeout;
+    let poll_interval = Duration::from_millis(100);
+
+    while std::time::Instant::now() < deadline {
+        match TcpListener::bind(&addr) {
+            Ok(_listener) => {
+                // Port is available - listener is dropped immediately, releasing the port.
+                return Ok(());
+            }
+            Err(_) => {
+                // Port is in use - wait and retry.
+                std::thread::sleep(poll_interval);
+            }
+        }
+    }
+
+    Err(ExecutorError::Timeout(format!(
+        "port {port} not available after {timeout:?}"
+    )))
 }
 
 #[cfg(test)]

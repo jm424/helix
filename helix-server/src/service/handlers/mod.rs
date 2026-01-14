@@ -11,7 +11,7 @@
 //! - `blob`: Blob storage for Kafka protocol support
 //! - `util`: Utility methods (hashing, time, cluster info)
 
-mod blob;
+pub mod blob;
 mod consumer;
 mod metadata;
 mod read;

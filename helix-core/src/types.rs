@@ -95,6 +95,126 @@ define_id!(GroupId, "group", "Unique identifier for a Raft group.");
 // Shard management.
 define_id!(TransferId, "xfer", "Unique identifier for a shard transfer operation.");
 
+// Idempotent producer support.
+define_id!(ProducerId, "pid", "Unique identifier for an idempotent producer.");
+
+/// Producer epoch for fencing stale producer instances.
+///
+/// In Kafka protocol, this is a 16-bit value. When a producer reconnects
+/// and calls `InitProducerId`, it gets a new epoch, fencing any previous
+/// instances using the same producer ID.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub struct ProducerEpoch(u16);
+
+impl ProducerEpoch {
+    /// Creates a new producer epoch from a raw u16 value.
+    #[inline]
+    #[must_use]
+    pub const fn new(value: u16) -> Self {
+        Self(value)
+    }
+
+    /// Returns the raw u16 value.
+    #[inline]
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+
+    /// Returns the next epoch.
+    ///
+    /// # Panics
+    /// Panics if the epoch would overflow.
+    #[inline]
+    #[must_use]
+    pub const fn next(self) -> Self {
+        assert!(self.0 < u16::MAX, "epoch overflow");
+        Self(self.0 + 1)
+    }
+}
+
+impl fmt::Debug for ProducerEpoch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "epoch({})", self.0)
+    }
+}
+
+impl fmt::Display for ProducerEpoch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "epoch-{}", self.0)
+    }
+}
+
+impl From<u16> for ProducerEpoch {
+    fn from(value: u16) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<ProducerEpoch> for u16 {
+    fn from(epoch: ProducerEpoch) -> Self {
+        epoch.get()
+    }
+}
+
+/// Sequence number for idempotent producer deduplication.
+///
+/// In Kafka protocol, this is a 32-bit signed value. The producer increments
+/// this for each batch sent. The broker tracks the last sequence to detect
+/// duplicates and out-of-order messages.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub struct SequenceNum(i32);
+
+impl SequenceNum {
+    /// Creates a new sequence number from a raw i32 value.
+    #[inline]
+    #[must_use]
+    pub const fn new(value: i32) -> Self {
+        Self(value)
+    }
+
+    /// Returns the raw i32 value.
+    #[inline]
+    #[must_use]
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+
+    /// Returns the next sequence number (wraps around at `i32::MAX`).
+    #[inline]
+    #[must_use]
+    pub const fn next(self) -> Self {
+        // Sequence numbers wrap around in Kafka protocol.
+        Self(self.0.wrapping_add(1))
+    }
+}
+
+impl fmt::Debug for SequenceNum {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "seq({})", self.0)
+    }
+}
+
+impl fmt::Display for SequenceNum {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "seq-{}", self.0)
+    }
+}
+
+impl From<i32> for SequenceNum {
+    fn from(value: i32) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<SequenceNum> for i32 {
+    fn from(seq: SequenceNum) -> Self {
+        seq.get()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

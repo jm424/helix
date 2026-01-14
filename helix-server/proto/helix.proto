@@ -337,4 +337,10 @@ enum ErrorCode {
     TOO_MANY_GROUPS = 15;
     // Too many consumers in group.
     TOO_MANY_CONSUMERS = 16;
+    // Not the controller for this cluster.
+    NOT_CONTROLLER = 17;
+    // Out of order sequence number (idempotent producer).
+    OUT_OF_ORDER_SEQUENCE = 18;
+    // Producer fenced (stale epoch).
+    PRODUCER_FENCED = 19;
 }

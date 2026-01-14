@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::BytesMut;
+use socket2::{Domain, Socket, Type};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -102,7 +103,13 @@ impl KafkaServer {
     ///
     /// Returns an error if the server fails to bind or accept connections.
     pub async fn run(&self) -> KafkaResult<()> {
-        let listener = TcpListener::bind(self.config.bind_addr).await?;
+        let listener = create_reusable_listener(self.config.bind_addr)?;
+        // Diagnostic: confirm server is accepting connections.
+        eprintln!(
+            "[SERVER_LISTENING] pid={} addr={}",
+            std::process::id(),
+            self.config.bind_addr
+        );
         info!(addr = %self.config.bind_addr, "Kafka server listening");
 
         loop {
@@ -143,6 +150,34 @@ impl KafkaServer {
 
         Ok(())
     }
+}
+
+/// Create a TCP listener with `SO_REUSEADDR` enabled.
+///
+/// This allows the server to bind to a port that is in `TIME_WAIT` state,
+/// which is essential for fast restarts during testing.
+fn create_reusable_listener(addr: SocketAddr) -> KafkaResult<TcpListener> {
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+
+    let socket = Socket::new(domain, Type::STREAM, None)?;
+    socket.set_reuse_address(true)?;
+    // On macOS/BSD, SO_REUSEPORT allows multiple processes to bind to the same port.
+    // This helps with rapid test restarts when previous sockets are still closing.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    socket.set_reuse_port(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    // Backlog of 128 pending connections.
+    socket.listen(128)?;
+
+    let std_listener: std::net::TcpListener = socket.into();
+    let listener = TcpListener::from_std(std_listener)?;
+
+    Ok(listener)
 }
 
 /// Handle a single client connection.

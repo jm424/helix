@@ -6,7 +6,8 @@
 //! The service is backed by Multi-Raft for consensus across multiple
 //! partition groups, with configurable partition storage.
 
-mod handlers;
+/// Handler implementations for the Helix service.
+pub mod handlers;
 mod tick;
 
 use std::collections::HashMap;

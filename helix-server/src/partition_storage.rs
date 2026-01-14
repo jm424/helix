@@ -6,10 +6,11 @@
 use std::path::PathBuf;
 
 use bytes::Bytes;
-use helix_core::{LogIndex, Offset, PartitionId, Record, TopicId};
+use helix_core::{LogIndex, Offset, PartitionId, ProducerEpoch, ProducerId, Record, SequenceNum, TopicId};
 use tracing::warn;
 
 use crate::error::{ServerError, ServerResult};
+use crate::producer_state::{PartitionProducerState, SequenceCheckResult};
 use crate::storage::{
     BlobFormat, DurablePartition, DurablePartitionConfig, DurablePartitionError, Partition,
     PartitionCommand, PartitionConfig, patch_kafka_base_offset,
@@ -36,17 +37,21 @@ pub struct PartitionStorage {
     pub(crate) inner: PartitionStorageInner,
     /// Last applied Raft log index.
     last_applied: LogIndex,
+    /// Producer state for idempotent deduplication.
+    #[allow(dead_code)] // Used in append_blob integration (coming soon).
+    producer_state: PartitionProducerState,
 }
 
 impl PartitionStorage {
     /// Creates new in-memory partition storage.
-    pub const fn new_in_memory(topic_id: TopicId, partition_id: PartitionId) -> Self {
+    pub fn new_in_memory(topic_id: TopicId, partition_id: PartitionId) -> Self {
         let config = PartitionConfig::new(topic_id, partition_id);
         Self {
             topic_id,
             partition_id,
             inner: PartitionStorageInner::InMemory(Partition::new(config)),
             last_applied: LogIndex::new(0),
+            producer_state: PartitionProducerState::new(),
         }
     }
 
@@ -66,6 +71,7 @@ impl PartitionStorage {
             partition_id,
             inner: PartitionStorageInner::Durable(Box::new(durable)),
             last_applied: LogIndex::new(0),
+            producer_state: PartitionProducerState::new(),
         })
     }
 
@@ -109,6 +115,50 @@ impl PartitionStorage {
         self.last_applied
     }
 
+    /// Checks if a produce request is a duplicate.
+    ///
+    /// This should be called BEFORE proposing to Raft to prevent duplicate log entries.
+    ///
+    /// # Returns
+    ///
+    /// - `Valid` if this is a new request that should be proposed
+    /// - `Duplicate { cached_offset }` if this is a retry of an already-committed batch
+    /// - `OutOfSequence` if there's a gap in sequence numbers
+    /// - `ProducerFenced` if the epoch is stale
+    #[allow(dead_code)] // Will be used in append_blob integration.
+    pub fn check_producer_sequence(
+        &self,
+        producer_id: ProducerId,
+        epoch: ProducerEpoch,
+        sequence: SequenceNum,
+    ) -> SequenceCheckResult {
+        self.producer_state.check_sequence(producer_id, epoch, sequence)
+    }
+
+    /// Records a successful produce after Raft commit.
+    ///
+    /// Updates the producer state with the new sequence number and offset.
+    /// This should be called after the batch has been committed to Raft.
+    #[allow(dead_code)] // Will be used in append_blob integration.
+    pub fn record_producer_sequence(
+        &mut self,
+        producer_id: ProducerId,
+        epoch: ProducerEpoch,
+        sequence: SequenceNum,
+        base_offset: Offset,
+    ) {
+        // Use current timestamp (microseconds since start would be better,
+        // but for simplicity we use a monotonic counter based on offset).
+        let timestamp_us = base_offset.get();
+        self.producer_state.record_produce(
+            producer_id,
+            epoch,
+            sequence,
+            base_offset,
+            timestamp_us,
+        );
+    }
+
     /// Reads records from the partition.
     pub fn read(&self, start_offset: Offset, max_records: u32) -> ServerResult<Vec<Record>> {
         match &self.inner {
@@ -130,11 +180,15 @@ impl PartitionStorage {
     pub fn apply_entry_sync(&mut self, index: LogIndex, data: &Bytes) -> ServerResult<Option<Offset>> {
         // Skip if already applied.
         if index <= self.last_applied {
+            eprintln!("[APPLY_SKIP] topic={} partition={} index={} (already applied, last={})",
+                self.topic_id, self.partition_id, index, self.last_applied);
             return Ok(None);
         }
 
         // Skip empty entries (e.g., no-op entries).
         if data.is_empty() {
+            eprintln!("[APPLY_NOOP] topic={} partition={} index={} empty entry",
+                self.topic_id, self.partition_id, index);
             self.last_applied = index;
             return Ok(None);
         }
@@ -146,6 +200,7 @@ impl PartitionStorage {
         let base_offset = match &mut self.inner {
             PartitionStorageInner::InMemory(partition) => match command {
                 PartitionCommand::Append { records } => {
+                    let record_count = records.len();
                     let offset = partition.append(records).map_err(|e| ServerError::Internal {
                         message: format!("failed to append: {e}"),
                     })?;
@@ -154,6 +209,8 @@ impl PartitionStorage {
                     let new_hwm = partition.log_end_offset();
                     partition.set_high_watermark(new_hwm);
 
+                    eprintln!("[APPLY_APPEND] topic={} partition={} index={} records={} base_offset={} new_hwm={}",
+                        self.topic_id, self.partition_id, index, record_count, offset, new_hwm);
                     Some(offset)
                 }
                 PartitionCommand::AppendBlob { blob, record_count, format } => {
@@ -175,15 +232,21 @@ impl PartitionStorage {
                     let new_hwm = partition.blob_log_end_offset();
                     partition.set_high_watermark(new_hwm);
 
+                    eprintln!("[APPLY_BLOB] topic={} partition={} index={} records={} base_offset={} new_hwm={} format={:?}",
+                        self.topic_id, self.partition_id, index, record_count, offset, new_hwm, format);
                     Some(offset)
                 }
                 PartitionCommand::Truncate { from_offset } => {
+                    eprintln!("[APPLY_TRUNCATE] topic={} partition={} index={} from_offset={}",
+                        self.topic_id, self.partition_id, index, from_offset);
                     partition.truncate(from_offset).map_err(|e| ServerError::Internal {
                         message: format!("failed to truncate: {e}"),
                     })?;
                     None
                 }
                 PartitionCommand::UpdateHighWatermark { high_watermark } => {
+                    eprintln!("[APPLY_HWM] topic={} partition={} index={} hwm={}",
+                        self.topic_id, self.partition_id, index, high_watermark);
                     partition.set_high_watermark(high_watermark);
                     None
                 }
@@ -208,11 +271,15 @@ impl PartitionStorage {
     ) -> ServerResult<Option<Offset>> {
         // Skip if already applied.
         if index <= self.last_applied {
+            eprintln!("[APPLY_SKIP] topic={} partition={} index={} (already applied, last={})",
+                self.topic_id, self.partition_id, index, self.last_applied);
             return Ok(None);
         }
 
         // Skip empty entries (e.g., no-op entries).
         if data.is_empty() {
+            eprintln!("[APPLY_NOOP] topic={} partition={} index={} empty entry",
+                self.topic_id, self.partition_id, index);
             self.last_applied = index;
             return Ok(None);
         }
@@ -224,6 +291,7 @@ impl PartitionStorage {
         let base_offset = match &mut self.inner {
             PartitionStorageInner::InMemory(partition) => match command {
                 PartitionCommand::Append { records } => {
+                    let record_count = records.len();
                     let offset = partition.append(records).map_err(|e| ServerError::Internal {
                         message: format!("failed to append: {e}"),
                     })?;
@@ -231,6 +299,8 @@ impl PartitionStorage {
                     let new_hwm = partition.log_end_offset();
                     partition.set_high_watermark(new_hwm);
 
+                    eprintln!("[APPLY_APPEND] topic={} partition={} index={} records={} base_offset={} new_hwm={}",
+                        self.topic_id, self.partition_id, index, record_count, offset, new_hwm);
                     Some(offset)
                 }
                 PartitionCommand::AppendBlob { blob, record_count, format } => {
@@ -252,15 +322,21 @@ impl PartitionStorage {
                     let new_hwm = partition.blob_log_end_offset();
                     partition.set_high_watermark(new_hwm);
 
+                    eprintln!("[APPLY_BLOB] topic={} partition={} index={} records={} base_offset={} new_hwm={} format={:?}",
+                        self.topic_id, self.partition_id, index, record_count, offset, new_hwm, format);
                     Some(offset)
                 }
                 PartitionCommand::Truncate { from_offset } => {
+                    eprintln!("[APPLY_TRUNCATE] topic={} partition={} index={} from_offset={}",
+                        self.topic_id, self.partition_id, index, from_offset);
                     partition.truncate(from_offset).map_err(|e| ServerError::Internal {
                         message: format!("failed to truncate: {e}"),
                     })?;
                     None
                 }
                 PartitionCommand::UpdateHighWatermark { high_watermark } => {
+                    eprintln!("[APPLY_HWM] topic={} partition={} index={} hwm={}",
+                        self.topic_id, self.partition_id, index, high_watermark);
                     partition.set_high_watermark(high_watermark);
                     None
                 }

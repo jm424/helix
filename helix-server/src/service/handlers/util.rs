@@ -3,6 +3,7 @@
 use helix_core::{NodeId, PartitionId};
 
 use super::super::HelixService;
+use crate::controller::CONTROLLER_GROUP_ID;
 
 impl HelixService {
     /// Hashes a string to produce a deterministic u64 ID.
@@ -58,6 +59,22 @@ impl HelixService {
         // Get leader from MultiRaft.
         let mr = self.multi_raft.read().await;
         mr.group_state(group_id).and_then(|s| s.leader_id)
+    }
+
+    /// Gets the controller leader's node ID.
+    ///
+    /// Returns `None` if no controller leader has been elected yet.
+    /// In single-node mode, returns this node's ID.
+    pub async fn get_controller_leader(&self) -> Option<NodeId> {
+        if !self.is_multi_node() {
+            // Single-node mode: this node is always the controller.
+            return Some(self.node_id);
+        }
+
+        // Multi-node mode: check the controller Raft group for leader.
+        let mr = self.multi_raft.read().await;
+        mr.group_state(CONTROLLER_GROUP_ID)
+            .and_then(|s| s.leader_id)
     }
 
     /// Checks if this node is the leader for a topic/partition.

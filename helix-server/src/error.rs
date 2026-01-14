@@ -44,6 +44,13 @@ pub enum ServerError {
         leader_hint: Option<u64>,
     },
 
+    /// Not the controller for this cluster.
+    #[error("not the controller for this cluster")]
+    NotController {
+        /// Hint about who the controller might be.
+        controller_hint: Option<u64>,
+    },
+
     /// Record batch too large.
     #[error("record batch too large: {size} bytes exceeds limit of {limit} bytes")]
     RecordBatchTooLarge {
@@ -125,6 +132,30 @@ pub enum ServerError {
     #[error("progress error: {0}")]
     Progress(#[from] ProgressError),
 
+    /// Out of order sequence number (idempotent producer).
+    #[error("out of order sequence for partition {partition} of topic {topic}: expected {expected}, got {received}")]
+    OutOfOrderSequence {
+        /// The topic name.
+        topic: String,
+        /// The partition index.
+        partition: i32,
+        /// Expected sequence number.
+        expected: i32,
+        /// Received sequence number.
+        received: i32,
+    },
+
+    /// Producer fenced (stale epoch).
+    #[error("producer {producer_id} fenced for partition {partition} of topic {topic}")]
+    ProducerFenced {
+        /// The topic name.
+        topic: String,
+        /// The partition index.
+        partition: i32,
+        /// The producer ID.
+        producer_id: u64,
+    },
+
     /// Internal error.
     #[error("internal error: {message}")]
     Internal {
@@ -142,6 +173,7 @@ impl ServerError {
             Self::PartitionNotFound { .. } => ErrorCode::InvalidPartition,
             Self::OffsetOutOfRange { .. } => ErrorCode::OffsetOutOfRange,
             Self::NotLeader { .. } => ErrorCode::NotLeader,
+            Self::NotController { .. } => ErrorCode::NotController,
             Self::RecordBatchTooLarge { .. } => ErrorCode::RecordBatchTooLarge,
             Self::ConsumerGroupNotFound { .. } => ErrorCode::ConsumerGroupNotFound,
             Self::ConsumerNotFound { .. } => ErrorCode::ConsumerNotFound,
@@ -152,6 +184,8 @@ impl ServerError {
             Self::TooManyGroups { .. } => ErrorCode::TooManyGroups,
             Self::TooManyConsumers { .. } => ErrorCode::TooManyConsumers,
             Self::Progress(e) => progress_error_to_code(e),
+            Self::OutOfOrderSequence { .. } => ErrorCode::OutOfOrderSequence,
+            Self::ProducerFenced { .. } => ErrorCode::ProducerFenced,
             Self::Internal { .. } => ErrorCode::Unknown,
         }
     }
