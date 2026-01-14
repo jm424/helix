@@ -297,8 +297,10 @@ impl Verification {
             let mut offsets: Vec<u64> = sends.iter().map(|(offset, _, _)| *offset).collect();
             offsets.sort_unstable();
 
-            // Check for gaps starting from 0.
-            let mut expected = 0u64;
+            // Check for gaps between consecutive offsets within this workload session.
+            // We start from the first offset we produced, not 0, since Kafka supports
+            // log truncation and persistent storage means offsets can start anywhere.
+            let mut expected = offsets.first().copied().unwrap_or(0);
             for offset in offsets {
                 if offset != expected {
                     violations.push(Violation::OffsetGap {

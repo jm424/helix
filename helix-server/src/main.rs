@@ -289,10 +289,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Wait for controller to be ready before creating topics (multi-node only).
+    if service.is_multi_node() && !args.topics.is_empty() {
+        info!("Waiting for controller leader election before creating topics...");
+        service
+            .wait_for_controller_ready(std::time::Duration::from_secs(30))
+            .await?;
+    }
+
     // Pre-create topics specified via --topic flags.
-    // All nodes should specify the same topics to ensure consistent group IDs.
+    // In multi-node mode, use controller partition for coordination.
     for topic in &args.topics {
-        match service.create_topic(topic.name.clone(), topic.partitions).await {
+        #[allow(clippy::cast_sign_loss)]
+        let result = if service.is_multi_node() {
+            // Multi-node: use controller to coordinate topic creation across cluster.
+            // Default replication factor to cluster size (max 3).
+            let replication_factor = service.cluster_nodes().len().min(3) as u32;
+            service
+                .create_topic_via_controller(
+                    topic.name.clone(),
+                    topic.partitions as u32,
+                    replication_factor,
+                )
+                .await
+        } else {
+            // Single-node: create directly.
+            service.create_topic(topic.name.clone(), topic.partitions).await
+        };
+
+        match result {
             Ok(()) => {
                 info!(
                     topic = %topic.name,

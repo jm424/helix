@@ -198,10 +198,11 @@ impl WorkloadBuilder {
         self
     }
 
-    /// Adds a single topic.
+    /// Sets a single topic (replaces any existing topics).
     #[must_use]
     pub fn topic(mut self, name: impl Into<String>, partitions: i32) -> Self {
-        self.config.topics.push(TopicConfig::new(name, partitions, 3));
+        // Clear existing topics and set this one.
+        self.config.topics = vec![TopicConfig::new(name, partitions, 3)];
         self
     }
 
@@ -376,10 +377,14 @@ impl Workload {
         }
 
         // Poll phase: read everything back.
+        // Start from the minimum offset we wrote (not 0) to handle persistent storage.
         let high_watermark = self.history.high_watermark(&topic, partition);
-        if high_watermark > 0 {
+        let low_watermark = self.history.low_watermark(&topic, partition).unwrap_or(0);
+        if high_watermark > low_watermark {
+            #[allow(clippy::cast_possible_truncation)] // bounded by operations count
+            let count = (high_watermark - low_watermark) as u32;
             let latency = self
-                .execute_poll(executor, &topic, partition, 0, high_watermark as u32)
+                .execute_poll(executor, &topic, partition, low_watermark, count)
                 .await;
             if let Some(us) = latency {
                 let _ = poll_latencies.record(us);
@@ -447,11 +452,15 @@ impl Workload {
         }
 
         // Poll from each partition.
+        // Start from the minimum offset we wrote (not 0) to handle persistent storage.
         for partition in &partitions {
             let high_watermark = self.history.high_watermark(&topic, *partition);
-            if high_watermark > 0 {
+            let low_watermark = self.history.low_watermark(&topic, *partition).unwrap_or(0);
+            if high_watermark > low_watermark {
+                #[allow(clippy::cast_possible_truncation)] // bounded by operations count
+                let count = (high_watermark - low_watermark) as u32;
                 let latency = self
-                    .execute_poll(executor, &topic, *partition, 0, high_watermark as u32)
+                    .execute_poll(executor, &topic, *partition, low_watermark, count)
                     .await;
                 if let Some(us) = latency {
                     let _ = poll_latencies.record(us);

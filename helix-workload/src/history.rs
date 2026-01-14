@@ -172,6 +172,19 @@ impl History {
             .unwrap_or(0)
     }
 
+    /// Returns the low watermark (minimum offset written) for a partition.
+    ///
+    /// Returns `None` if no sends have been recorded for this partition.
+    #[must_use]
+    pub fn low_watermark(&self, topic: &str, partition: i32) -> Option<u64> {
+        // Find the minimum offset in sends for this partition.
+        self.sends
+            .keys()
+            .filter(|(t, p, _)| t == topic && *p == partition)
+            .map(|(_, _, offset)| *offset)
+            .min()
+    }
+
     /// Returns all partitions that have activity.
     #[must_use]
     pub fn active_partitions(&self) -> Vec<PartitionKey> {

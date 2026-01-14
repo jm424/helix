@@ -13,7 +13,7 @@ use bytes::Bytes;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
-use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::Message;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -258,14 +258,16 @@ impl RealCluster {
         let mut processes = Vec::with_capacity(config.node_count as usize);
 
         // Build peer list for each node.
+        // Format: node_id:host:kafka_port:raft_port
         let mut peer_args: Vec<Vec<String>> = Vec::new();
         for node_id in 1..=config.node_count {
             let mut peers = Vec::new();
             for other_id in 1..=config.node_count {
                 if other_id != node_id {
-                    let port = config.base_port + u16::try_from(other_id).unwrap_or(0);
+                    let kafka_port = config.base_port + u16::try_from(other_id).unwrap_or(0);
+                    let raft_port = config.raft_base_port + u16::try_from(other_id).unwrap_or(0);
                     peers.push("--peer".to_string());
-                    peers.push(format!("{other_id}:localhost:{port}"));
+                    peers.push(format!("{other_id}:127.0.0.1:{kafka_port}:{raft_port}"));
                 }
             }
             peer_args.push(peers);
@@ -279,7 +281,7 @@ impl RealCluster {
 
         // Spawn each node.
         for node_id in 1..=config.node_count {
-            let port = config.base_port + u16::try_from(node_id).unwrap_or(0);
+            let kafka_port = config.base_port + u16::try_from(node_id).unwrap_or(0);
             let raft_port = config.raft_base_port + u16::try_from(node_id).unwrap_or(0);
             let node_dir = config.data_dir.join(format!("node-{node_id}"));
 
@@ -288,10 +290,10 @@ impl RealCluster {
                 .arg("kafka")
                 .arg("--node-id")
                 .arg(node_id.to_string())
-                .arg("--port")
-                .arg(port.to_string())
-                .arg("--raft-port")
-                .arg(raft_port.to_string())
+                .arg("--listen-addr")
+                .arg(format!("127.0.0.1:{kafka_port}"))
+                .arg("--raft-addr")
+                .arg(format!("127.0.0.1:{raft_port}"))
                 .arg("--data-dir")
                 .arg(&node_dir);
 
@@ -305,17 +307,23 @@ impl RealCluster {
                 cmd.arg(peer_arg);
             }
 
-            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+            // Inherit stderr for debugging, suppress stdout.
+            // Explicitly inherit env so RUST_LOG propagates to child processes.
+            cmd.stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .envs(std::env::vars());
 
             let child = cmd.spawn().map_err(ExecutorError::SpawnFailed)?;
             processes.push(child);
         }
 
         // Build bootstrap servers string.
+        // Use explicit IPv4 address (127.0.0.1) instead of localhost to avoid IPv6 resolution
+        // issues when the server only binds to IPv4.
         let bootstrap_servers: Vec<String> = (1..=config.node_count)
             .map(|id| {
                 let port = config.base_port + u16::try_from(id).unwrap_or(0);
-                format!("localhost:{port}")
+                format!("127.0.0.1:{port}")
             })
             .collect();
         let bootstrap_servers = bootstrap_servers.join(",");
@@ -406,7 +414,7 @@ impl RealCluster {
             )));
         }
 
-        let port = self.config.base_port + u16::try_from(node_id).unwrap_or(0);
+        let kafka_port = self.config.base_port + u16::try_from(node_id).unwrap_or(0);
         let raft_port = self.config.raft_base_port + u16::try_from(node_id).unwrap_or(0);
         let node_dir = self.config.data_dir.join(format!("node-{node_id}"));
 
@@ -415,10 +423,10 @@ impl RealCluster {
             .arg("kafka")
             .arg("--node-id")
             .arg(node_id.to_string())
-            .arg("--port")
-            .arg(port.to_string())
-            .arg("--raft-port")
-            .arg(raft_port.to_string())
+            .arg("--listen-addr")
+            .arg(format!("127.0.0.1:{kafka_port}"))
+            .arg("--raft-addr")
+            .arg(format!("127.0.0.1:{raft_port}"))
             .arg("--data-dir")
             .arg(&node_dir);
 
@@ -426,20 +434,123 @@ impl RealCluster {
             cmd.arg("--auto-create-topics");
         }
 
-        // Add peers.
+        // Add peers (format: node_id:host:kafka_port:raft_port).
         for other_id in 1..=self.config.node_count {
             if u64::from(other_id) != node_id {
-                let other_port = self.config.base_port + u16::try_from(other_id).unwrap_or(0);
+                let other_kafka_port = self.config.base_port + u16::try_from(other_id).unwrap_or(0);
+                let other_raft_port =
+                    self.config.raft_base_port + u16::try_from(other_id).unwrap_or(0);
                 cmd.arg("--peer");
-                cmd.arg(format!("{other_id}:localhost:{other_port}"));
+                cmd.arg(format!(
+                    "{other_id}:127.0.0.1:{other_kafka_port}:{other_raft_port}"
+                ));
             }
         }
 
+        // Suppress stdout/stderr to avoid I/O overload.
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
 
         let child = cmd.spawn().map_err(ExecutorError::SpawnFailed)?;
         self.processes[idx] = child;
         Ok(())
+    }
+
+    /// Creates a topic on all nodes in the cluster.
+    ///
+    /// This simulates what a control plane would do: tell each node about the topic.
+    /// Each node creates a Raft group with the same ID (deterministic based on order).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if topic creation fails on any node.
+    pub async fn create_topic_on_all_nodes(&self, topic: &str) -> Result<(), ExecutorError> {
+        use rdkafka::consumer::{BaseConsumer, Consumer};
+
+        for node_id in 1..=self.config.node_count {
+            let port = self.config.base_port + u16::try_from(node_id).unwrap_or(0);
+            let bootstrap = format!("127.0.0.1:{port}");
+
+            // Create a consumer that connects only to this specific node.
+            let consumer: BaseConsumer = ClientConfig::new()
+                .set("bootstrap.servers", &bootstrap)
+                .set("group.id", "topic-creator")
+                .create()
+                .map_err(|e| ExecutorError::InvalidConfig(e.to_string()))?;
+
+            // Request metadata for the topic - this triggers auto-create if enabled.
+            let timeout = std::time::Duration::from_secs(10);
+            match consumer.fetch_metadata(Some(topic), timeout) {
+                Ok(metadata) => {
+                    // Check if topic was created.
+                    let topic_exists = metadata.topics().iter().any(|t| {
+                        t.name() == topic && t.partitions().iter().any(|p| p.error().is_none())
+                    });
+                    if topic_exists {
+                        eprintln!("  Created topic '{topic}' on node {node_id}");
+                    } else {
+                        eprintln!("  Topic '{topic}' not found on node {node_id} (may need retry)");
+                    }
+                }
+                Err(e) => {
+                    return Err(ExecutorError::InvalidConfig(format!(
+                        "failed to create topic on node {node_id}: {e}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Waits for a topic partition to have a leader.
+    ///
+    /// Polls metadata until the partition reports a valid leader (not -1).
+    /// This should be called after `create_topic_on_all_nodes` to ensure
+    /// Raft has elected a leader before running workloads.
+    pub async fn wait_for_leader(
+        &self,
+        topic: &str,
+        partition: i32,
+        timeout: std::time::Duration,
+    ) -> Result<u64, ExecutorError> {
+        use rdkafka::consumer::{BaseConsumer, Consumer};
+
+        let deadline = std::time::Instant::now() + timeout;
+        let bootstrap = self.bootstrap_servers();
+
+        let consumer: BaseConsumer = ClientConfig::new()
+            .set("bootstrap.servers", bootstrap)
+            .set("group.id", "leader-waiter")
+            .create()
+            .map_err(|e| ExecutorError::InvalidConfig(e.to_string()))?;
+
+        while std::time::Instant::now() < deadline {
+            match consumer.fetch_metadata(Some(topic), std::time::Duration::from_secs(5)) {
+                Ok(metadata) => {
+                    for t in metadata.topics() {
+                        if t.name() != topic {
+                            continue;
+                        }
+                        for p in t.partitions() {
+                            if p.id() == partition {
+                                let leader = p.leader();
+                                if leader >= 0 {
+                                    #[allow(clippy::cast_sign_loss)]
+                                    return Ok(leader as u64);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  Metadata fetch error: {e}");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        Err(ExecutorError::Timeout(format!(
+            "no leader for {topic}:{partition} after {timeout:?}"
+        )))
     }
 }
 
@@ -454,7 +565,7 @@ impl Drop for RealCluster {
 /// Executor that runs operations against a real Helix cluster.
 pub struct RealExecutor {
     bootstrap_servers: String,
-    producer: BaseProducer,
+    producer: FutureProducer,
     consumer: BaseConsumer,
     /// Tracks consumer position per partition (for future use in consumer group tracking).
     #[allow(dead_code)]
@@ -470,28 +581,7 @@ impl RealExecutor {
     ///
     /// Returns an error if Kafka clients cannot be created.
     pub fn new(cluster: &RealCluster) -> Result<Self, ExecutorError> {
-        let bootstrap_servers = cluster.bootstrap_servers().to_string();
-
-        let producer: BaseProducer = ClientConfig::new()
-            .set("bootstrap.servers", &bootstrap_servers)
-            .set("message.timeout.ms", "5000")
-            .set("acks", "all")
-            .create()?;
-
-        let consumer: BaseConsumer = ClientConfig::new()
-            .set("bootstrap.servers", &bootstrap_servers)
-            .set("group.id", "helix-workload-default")
-            .set("enable.auto.commit", "false")
-            .set("auto.offset.reset", "earliest")
-            .create()?;
-
-        Ok(Self {
-            bootstrap_servers,
-            producer,
-            consumer,
-            consumer_positions: Arc::new(RwLock::new(HashMap::new())),
-            start_time: std::time::Instant::now(),
-        })
+        Self::with_bootstrap_servers(cluster.bootstrap_servers())
     }
 
     /// Creates an executor with custom bootstrap servers.
@@ -500,17 +590,27 @@ impl RealExecutor {
     ///
     /// Returns an error if Kafka clients cannot be created.
     pub fn with_bootstrap_servers(bootstrap_servers: &str) -> Result<Self, ExecutorError> {
-        let producer: BaseProducer = ClientConfig::new()
+        // Configure rdkafka with connection retry settings so it handles
+        // broker availability internally. No explicit wait loops needed.
+        let producer: FutureProducer = ClientConfig::new()
             .set("bootstrap.servers", bootstrap_servers)
-            .set("message.timeout.ms", "5000")
+            .set("message.timeout.ms", "30000")
             .set("acks", "all")
+            .set("reconnect.backoff.ms", "100")
+            .set("reconnect.backoff.max.ms", "10000")
             .create()?;
 
         let consumer: BaseConsumer = ClientConfig::new()
             .set("bootstrap.servers", bootstrap_servers)
-            .set("group.id", "helix-workload-default")
+            .set("group.id", "helix-workload-consumer")
             .set("enable.auto.commit", "false")
             .set("auto.offset.reset", "earliest")
+            .set("reconnect.backoff.ms", "100")
+            .set("reconnect.backoff.max.ms", "10000")
+            // Refresh metadata quickly when topic info is missing or stale.
+            .set("topic.metadata.refresh.fast.interval.ms", "100")
+            // Enable partition EOF notifications so we know when we've consumed all data.
+            .set("enable.partition.eof", "true")
             .create()?;
 
         Ok(Self {
@@ -535,24 +635,31 @@ impl WorkloadExecutor for RealExecutor {
         partition: i32,
         payload: Bytes,
     ) -> Result<u64, ExecutorError> {
-        let record: BaseRecord<'_, (), [u8]> = BaseRecord::to(topic)
+        let record: FutureRecord<'_, (), [u8]> = FutureRecord::to(topic)
             .partition(partition)
             .payload(payload.as_ref());
 
-        self.producer.send(record).map_err(|(err, _record)| {
-            ExecutorError::Generic {
+        // FutureProducer returns the delivery result with offset.
+        let delivery_result = self
+            .producer
+            .send(record, Duration::from_secs(30))
+            .await
+            .map_err(|(err, _record)| ExecutorError::Generic {
                 code: -1,
                 message: err.to_string(),
-            }
+            })?;
+
+        // Flush to ensure delivery (important before polling).
+        self.producer.flush(Duration::from_secs(5)).map_err(|e| ExecutorError::Generic {
+            code: -1,
+            message: format!("producer flush failed: {e}"),
         })?;
 
-        // Flush to ensure delivery.
-        self.producer.flush(Duration::from_secs(5)).ok();
+        // Extract the offset from the delivery result.
+        #[allow(clippy::cast_sign_loss)]
+        let offset = delivery_result.1 as u64;
 
-        // For real Kafka, we don't get the offset back from send directly.
-        // We'd need to use delivery callbacks for that. For now, return 0.
-        // In a real implementation, we'd use the delivery future.
-        Ok(0)
+        Ok(offset)
     }
 
     async fn poll(
@@ -564,11 +671,23 @@ impl WorkloadExecutor for RealExecutor {
     ) -> Result<Vec<(u64, Bytes)>, ExecutorError> {
         use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 
-        // Assign partition with specific offset.
+        // One-time metadata discovery: ensure consumer knows about the topic.
+        // rdkafka handles connection/retry internally with configured backoff.
+        self.consumer
+            .fetch_metadata(Some(topic), None)
+            .map_err(|e| ExecutorError::Generic {
+                code: -1,
+                message: format!("metadata fetch failed: {e}"),
+            })?;
+
+        // Assign partition with starting offset.
         let mut tpl = TopicPartitionList::new();
         #[allow(clippy::cast_possible_wrap)]
         tpl.add_partition_offset(topic, partition, Offset::Offset(start_offset as i64))
-            .ok();
+            .map_err(|e| ExecutorError::Generic {
+                code: -1,
+                message: e.to_string(),
+            })?;
 
         self.consumer.assign(&tpl).map_err(|e| ExecutorError::Generic {
             code: -1,
@@ -576,16 +695,18 @@ impl WorkloadExecutor for RealExecutor {
         })?;
 
         let mut messages = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+
+        // Event-driven polling: keep polling until we have all expected messages
+        // or receive PartitionEOF (end of committed data).
+        // Retry on transient transport errors since connection may still be establishing.
+        let poll_timeout = std::time::Duration::from_secs(10);
+        let mut retries = 0;
+        const MAX_RETRIES: u32 = 5;
 
         while messages.len() < max_messages as usize {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-
-            match self.consumer.poll(remaining) {
+            match self.consumer.poll(poll_timeout) {
                 Some(Ok(msg)) => {
+                    retries = 0; // Reset on success.
                     #[allow(clippy::cast_sign_loss)]
                     let offset = msg.offset() as u64;
                     let payload = msg
@@ -594,17 +715,32 @@ impl WorkloadExecutor for RealExecutor {
                         .unwrap_or_default();
                     messages.push((offset, payload));
                 }
-                Some(Err(e)) => {
-                    if messages.is_empty() {
-                        return Err(ExecutorError::Generic {
-                            code: -1,
-                            message: e.to_string(),
-                        });
-                    }
+                Some(Err(KafkaError::PartitionEOF(_))) => {
+                    // Reached end of committed data - no more messages to read.
                     break;
                 }
+                Some(Err(KafkaError::MessageConsumption(code)))
+                    if retries < MAX_RETRIES
+                        && matches!(
+                            code,
+                            rdkafka::error::RDKafkaErrorCode::BrokerTransportFailure
+                                | rdkafka::error::RDKafkaErrorCode::AllBrokersDown
+                        ) =>
+                {
+                    // Transient connection error - wait and retry.
+                    retries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(retries)));
+                    continue;
+                }
+                Some(Err(e)) => {
+                    eprintln!("rdkafka poll error: {:?}", e);
+                    return Err(ExecutorError::Generic {
+                        code: -1,
+                        message: e.to_string(),
+                    });
+                }
                 None => {
-                    // No more messages available.
+                    // Timeout with no message - break.
                     break;
                 }
             }
@@ -641,7 +777,9 @@ impl WorkloadExecutor for RealExecutor {
         topic: &str,
         partition: i32,
     ) -> Result<Option<u64>, ExecutorError> {
-        match self.consumer.committed(Duration::from_secs(5)) {
+        // Non-blocking check - if data isn't immediately available, return None.
+        // Caller can retry if needed. No timing assumptions.
+        match self.consumer.committed(Duration::ZERO) {
             Ok(committed) => {
                 let offset = committed
                     .elements()
@@ -656,10 +794,8 @@ impl WorkloadExecutor for RealExecutor {
                     });
                 Ok(offset)
             }
-            Err(e) => Err(ExecutorError::Generic {
-                code: -1,
-                message: e.to_string(),
-            }),
+            // With Duration::ZERO, timeout/error is expected - return None
+            Err(_) => Ok(None),
         }
     }
 
@@ -668,23 +804,27 @@ impl WorkloadExecutor for RealExecutor {
     }
 
     async fn wait_ready(&self, timeout: Duration) -> Result<(), ExecutorError> {
+        // Wait until we can successfully connect to the cluster and fetch metadata.
+        // This ensures the server is actually running and accepting connections before
+        // tests proceed. Without this check, debug builds may see timing-related failures.
         let deadline = std::time::Instant::now() + timeout;
+        let poll_interval = std::time::Duration::from_millis(100);
 
         while std::time::Instant::now() < deadline {
-            // Try to fetch metadata to check if cluster is ready.
-            if let Ok(metadata) = self.producer.client().fetch_metadata(None, Duration::from_secs(2)) {
-                if !metadata.brokers().is_empty() {
-                    return Ok(());
+            // Try to fetch cluster metadata. This will fail if the server isn't ready.
+            match self.consumer.fetch_metadata(None, std::time::Duration::from_secs(1)) {
+                Ok(_metadata) => return Ok(()),
+                Err(_) => {
+                    // Server not ready yet, wait and retry.
+                    tokio::time::sleep(poll_interval).await;
                 }
-            } else {
-                // Not ready yet.
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        Err(ExecutorError::Timeout(format!(
-            "cluster not ready after {timeout:?}"
-        )))
+        Err(ExecutorError::Generic {
+            code: -1,
+            message: format!("cluster not ready after {:?}", timeout),
+        })
     }
 }
 

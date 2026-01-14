@@ -14,18 +14,25 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 use kafka_protocol::{
     messages::{
-        api_versions_response::ApiVersion, fetch_response::FetchableTopicResponse,
-        fetch_response::PartitionData, find_coordinator_response::Coordinator,
+        api_versions_response::ApiVersion,
+        create_topics_response::CreatableTopicResult,
+        fetch_response::FetchableTopicResponse, fetch_response::PartitionData,
+        find_coordinator_response::Coordinator,
         list_offsets_response::ListOffsetsPartitionResponse,
         list_offsets_response::ListOffsetsTopicResponse,
-        metadata_response::MetadataResponseBroker, ApiKey, ApiVersionsResponse, BrokerId,
-        FetchRequest, FetchResponse, FindCoordinatorRequest, FindCoordinatorResponse,
-        ListOffsetsRequest, ListOffsetsResponse, MetadataRequest, MetadataResponse,
-        ProduceRequest, ProduceResponse,
+        metadata_response::MetadataResponseBroker,
+        offset_commit_response::OffsetCommitResponsePartition,
+        offset_commit_response::OffsetCommitResponseTopic,
+        offset_fetch_response::OffsetFetchResponsePartition,
+        offset_fetch_response::OffsetFetchResponseTopic, ApiKey, ApiVersionsResponse, BrokerId,
+        CreateTopicsRequest, CreateTopicsResponse, FetchRequest, FetchResponse,
+        FindCoordinatorRequest, FindCoordinatorResponse, ListOffsetsRequest, ListOffsetsResponse,
+        MetadataRequest, MetadataResponse, OffsetCommitRequest, OffsetCommitResponse,
+        OffsetFetchRequest, OffsetFetchResponse, ProduceRequest, ProduceResponse,
     },
     protocol::{Decodable, StrBytes},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::codec::{self, DecodedRequest};
 use super::error::{KafkaError, KafkaResult};
@@ -41,6 +48,9 @@ const SUPPORTED_APIS: &[(i16, i16, i16)] = &[
     (ApiKey::Fetch as i16, 4, 12),
     (ApiKey::ListOffsets as i16, 0, 7),
     (ApiKey::FindCoordinator as i16, 0, 4),
+    (ApiKey::OffsetCommit as i16, 0, 8),
+    (ApiKey::OffsetFetch as i16, 0, 6),
+    (ApiKey::CreateTopics as i16, 2, 7),
 ];
 
 /// Kafka protocol handler backed by `HelixService`.
@@ -83,13 +93,6 @@ impl KafkaHandler {
     ///
     /// Returns an error if the API is unsupported or encoding/decoding fails.
     pub async fn handle_request(&self, request: &DecodedRequest) -> KafkaResult<BytesMut> {
-        debug!(
-            api_key = request.api_key,
-            api_version = request.api_version,
-            correlation_id = request.correlation_id,
-            "Handling Kafka request"
-        );
-
         match request.api_key {
             x if x == ApiKey::ApiVersions as i16 => self.handle_api_versions(request),
             x if x == ApiKey::Metadata as i16 => self.handle_metadata(request).await,
@@ -97,8 +100,16 @@ impl KafkaHandler {
             x if x == ApiKey::Fetch as i16 => self.handle_fetch(request).await,
             x if x == ApiKey::ListOffsets as i16 => self.handle_list_offsets(request).await,
             x if x == ApiKey::FindCoordinator as i16 => self.handle_find_coordinator(request),
+            x if x == ApiKey::OffsetCommit as i16 => self.handle_offset_commit(request),
+            x if x == ApiKey::OffsetFetch as i16 => self.handle_offset_fetch(request),
+            x if x == ApiKey::CreateTopics as i16 => self.handle_create_topics(request).await,
             _ => {
-                warn!(api_key = request.api_key, "Unsupported Kafka API");
+                error!(
+                    api_key = request.api_key,
+                    api_version = request.api_version,
+                    correlation_id = request.correlation_id,
+                    "UNSUPPORTED API - this will close the connection!"
+                );
                 Err(KafkaError::UnsupportedApi {
                     api_key: request.api_key,
                     api_version: request.api_version,
@@ -230,7 +241,19 @@ impl KafkaHandler {
 
                 if self.auto_create_topics {
                     // Auto-create topic with 1 partition.
-                    if let Err(e) = self.service.create_topic(topic_name.clone(), 1).await {
+                    // In multi-node mode, use controller; in single-node, use direct creation.
+                    let create_result = if self.service.is_multi_node() {
+                        // Use full replication factor (all nodes) for now.
+                        // TODO: Make this configurable.
+                        let replication_factor =
+                            u32::try_from(self.service.cluster_nodes().len()).unwrap_or(3);
+                        self.service
+                            .create_topic_via_controller(topic_name.clone(), 1, replication_factor)
+                            .await
+                    } else {
+                        self.service.create_topic(topic_name.clone(), 1).await
+                    };
+                    if let Err(e) = create_result {
                         warn!(topic = %topic_name, error = %e, "Failed to auto-create topic");
                     } else {
                         info!(topic = %topic_name, "Auto-created topic");
@@ -275,28 +298,31 @@ impl KafkaHandler {
         use kafka_protocol::messages::metadata_response::MetadataResponsePartition;
 
         let mut partition_response = MetadataResponsePartition::default();
-        partition_response.error_code = 0;
         partition_response.partition_index = partition_id;
 
         // Get leader from MultiRaft.
-        let leader_id = self
-            .service
-            .get_leader(topic_name, partition_id)
-            .await
-            .unwrap_or_else(|| self.service.node_id());
+        let leader_id = self.service.get_leader(topic_name, partition_id).await;
 
         // Safe cast: NodeId (u64) fits in i32 for reasonable cluster sizes.
         #[allow(clippy::cast_possible_truncation)]
-        {
-            partition_response.leader_id = BrokerId(leader_id.get() as i32);
-            partition_response.replica_nodes = self
-                .service
-                .cluster_nodes()
-                .iter()
-                .map(|n| BrokerId(n.get() as i32))
-                .collect();
-            partition_response.isr_nodes = vec![BrokerId(leader_id.get() as i32)];
+        if let Some(leader) = leader_id {
+            partition_response.error_code = 0;
+            partition_response.leader_id = BrokerId(leader.get() as i32);
+            partition_response.isr_nodes = vec![BrokerId(leader.get() as i32)];
+        } else {
+            // No leader elected yet - return LEADER_NOT_AVAILABLE (error code 5).
+            // This tells the client to retry after refreshing metadata.
+            partition_response.error_code = 5;
+            partition_response.leader_id = BrokerId(-1);
+            partition_response.isr_nodes = vec![];
         }
+
+        partition_response.replica_nodes = self
+            .service
+            .cluster_nodes()
+            .iter()
+            .map(|n| BrokerId(n.get() as i32))
+            .collect();
         partition_response.leader_epoch = 0;
         partition_response.offline_replicas = vec![];
 
@@ -387,7 +413,18 @@ impl KafkaHandler {
         // Ensure topic exists (auto-create if enabled).
         if !self.service.topic_exists(topic).await {
             if self.auto_create_topics {
-                if let Err(e) = self.service.create_topic(topic.to_string(), 1).await {
+                // In multi-node mode, use controller; in single-node, use direct creation.
+                let create_result = if self.service.is_multi_node() {
+                    // Use full replication across all nodes for availability.
+                    let replication_factor =
+                        u32::try_from(self.service.cluster_nodes().len()).unwrap_or(3);
+                    self.service
+                        .create_topic_via_controller(topic.to_string(), 1, replication_factor)
+                        .await
+                } else {
+                    self.service.create_topic(topic.to_string(), 1).await
+                };
+                if let Err(e) = create_result {
                     warn!(topic = %topic, error = %e, "Failed to auto-create topic");
                     return (0, 3); // UNKNOWN_TOPIC_OR_PARTITION
                 }
@@ -451,6 +488,14 @@ impl KafkaHandler {
             .unwrap_or(0)
     }
 
+    /// Get log start offset (earliest available), returning 0 if not found.
+    ///
+    /// For now, log start offset is always 0 (no log truncation/compaction).
+    async fn get_log_start_offset(&self, _topic: &str, _partition: i32) -> u64 {
+        // TODO: Implement log truncation/compaction and track actual start offset.
+        0
+    }
+
     /// Handle Fetch request.
     #[allow(clippy::too_many_lines)]
     async fn handle_fetch(&self, request: &DecodedRequest) -> KafkaResult<BytesMut> {
@@ -458,7 +503,8 @@ impl KafkaHandler {
         let fetch_request =
             FetchRequest::decode(&mut body, request.api_version).map_err(KafkaError::decode)?;
 
-        debug!(
+        info!(
+            api_version = request.api_version,
             max_wait_ms = fetch_request.max_wait_ms,
             min_bytes = fetch_request.min_bytes,
             max_bytes = fetch_request.max_bytes,
@@ -496,8 +542,9 @@ impl KafkaHandler {
                     continue;
                 }
 
-                // Get high watermark.
+                // Get high watermark and log start offset.
                 let high_watermark = self.get_log_end_offset(&topic_name, partition_id).await;
+                let log_start = self.get_log_start_offset(&topic_name, partition_id).await;
 
                 // Fetch blobs.
                 // Safe cast: partition_max_bytes is i32 but we clamp negative to MAX.
@@ -522,7 +569,7 @@ impl KafkaHandler {
                             {
                                 partition_response.high_watermark = high_watermark as i64;
                                 partition_response.last_stable_offset = high_watermark as i64;
-                                partition_response.log_start_offset = 0;
+                                partition_response.log_start_offset = log_start as i64;
                             }
                             partition_response.records = Some(Bytes::new());
                         } else {
@@ -539,7 +586,7 @@ impl KafkaHandler {
                             {
                                 partition_response.high_watermark = high_watermark as i64;
                                 partition_response.last_stable_offset = high_watermark as i64;
-                                partition_response.log_start_offset = 0;
+                                partition_response.log_start_offset = log_start as i64;
                             }
                             partition_response.records = Some(records_data.freeze());
 
@@ -604,10 +651,11 @@ impl KafkaHandler {
                 partition_response.partition_index = partition_id;
 
                 let log_end_offset = self.get_log_end_offset(&topic_name, partition_id).await;
+                let log_start_offset = self.get_log_start_offset(&topic_name, partition_id).await;
 
                 // -2 = EARLIEST, -1 = LATEST
                 let offset = match timestamp {
-                    -2 => 0, // EARLIEST
+                    -2 => log_start_offset, // EARLIEST
                     _ => log_end_offset,
                 };
 
@@ -663,6 +711,202 @@ impl KafkaHandler {
             coordinator.error_code = 0;
             response.coordinators.push(coordinator);
         }
+
+        codec::encode_response(
+            request.api_key,
+            request.api_version,
+            request.correlation_id,
+            &response,
+        )
+    }
+
+    /// Handle `OffsetCommit` request.
+    ///
+    /// For now, returns success for all commit requests (offsets are not persisted).
+    /// This unblocks consumer group operations even without real offset storage.
+    fn handle_offset_commit(&self, request: &DecodedRequest) -> KafkaResult<BytesMut> {
+        let mut body = request.body.clone();
+        let offset_commit_request =
+            OffsetCommitRequest::decode(&mut body, request.api_version)
+                .map_err(KafkaError::decode)?;
+
+        let group_id = offset_commit_request.group_id.to_string();
+        debug!(group_id = %group_id, "OffsetCommit request");
+
+        let mut response = OffsetCommitResponse::default();
+
+        // Return success for each topic/partition in the request.
+        for topic in &offset_commit_request.topics {
+            let mut topic_response = OffsetCommitResponseTopic::default();
+            topic_response.name = topic.name.clone();
+
+            for partition in &topic.partitions {
+                let mut partition_response = OffsetCommitResponsePartition::default();
+                partition_response.partition_index = partition.partition_index;
+                partition_response.error_code = 0; // No error.
+                topic_response.partitions.push(partition_response);
+            }
+
+            response.topics.push(topic_response);
+        }
+
+        codec::encode_response(
+            request.api_key,
+            request.api_version,
+            request.correlation_id,
+            &response,
+        )
+    }
+
+    /// Handle `OffsetFetch` request.
+    ///
+    /// Returns -1 (unknown offset) for all requested partitions, indicating
+    /// that no offsets are committed. This allows the consumer to fall back
+    /// to `auto.offset.reset` behavior.
+    fn handle_offset_fetch(&self, request: &DecodedRequest) -> KafkaResult<BytesMut> {
+        let mut body = request.body.clone();
+        let offset_fetch_request =
+            OffsetFetchRequest::decode(&mut body, request.api_version)
+                .map_err(KafkaError::decode)?;
+
+        let group_id = offset_fetch_request.group_id.to_string();
+        debug!(group_id = %group_id, "OffsetFetch request");
+
+        let mut response = OffsetFetchResponse::default();
+        response.error_code = 0;
+
+        // Return "no committed offset" for each requested topic/partition.
+        // Handle the Option<Vec<...>> field properly.
+        if let Some(ref topics) = offset_fetch_request.topics {
+            for topic in topics {
+                let mut topic_response = OffsetFetchResponseTopic::default();
+                topic_response.name = topic.name.clone();
+
+                for partition in &topic.partition_indexes {
+                    let mut partition_response = OffsetFetchResponsePartition::default();
+                    partition_response.partition_index = *partition;
+                    partition_response.committed_offset = -1; // No committed offset.
+                    partition_response.error_code = 0;
+                    topic_response.partitions.push(partition_response);
+                }
+
+                response.topics.push(topic_response);
+            }
+        }
+
+        codec::encode_response(
+            request.api_key,
+            request.api_version,
+            request.correlation_id,
+            &response,
+        )
+    }
+
+    /// Handle `CreateTopics` request.
+    ///
+    /// Creates topics through the controller partition in multi-node mode,
+    /// or directly in single-node mode.
+    async fn handle_create_topics(&self, request: &DecodedRequest) -> KafkaResult<BytesMut> {
+        let mut body = request.body.clone();
+        let create_request = CreateTopicsRequest::decode(&mut body, request.api_version)
+            .map_err(KafkaError::decode)?;
+
+        info!(
+            num_topics = create_request.topics.len(),
+            timeout_ms = create_request.timeout_ms,
+            validate_only = create_request.validate_only,
+            "CreateTopics request"
+        );
+
+        let mut results = Vec::with_capacity(create_request.topics.len());
+
+        for topic in &create_request.topics {
+            let topic_name = topic.name.to_string();
+            let num_partitions = if topic.num_partitions <= 0 {
+                1 // Default to 1 partition.
+            } else {
+                topic.num_partitions
+            };
+            let replication_factor = if topic.replication_factor <= 0 {
+                // Default replication factor: use cluster size or 1.
+                let cluster_size = self.service.cluster_nodes().len();
+                if cluster_size > 1 {
+                    cluster_size.min(3) as i16
+                } else {
+                    1
+                }
+            } else {
+                topic.replication_factor
+            };
+
+            // Skip if validate_only is true.
+            if create_request.validate_only {
+                results.push(
+                    CreatableTopicResult::default()
+                        .with_name(topic.name.clone())
+                        .with_error_code(0)
+                        .with_num_partitions(num_partitions)
+                        .with_replication_factor(replication_factor),
+                );
+                continue;
+            }
+
+            // Create the topic.
+            #[allow(clippy::cast_sign_loss)]
+            let create_result = if self.service.is_multi_node() {
+                self.service
+                    .create_topic_via_controller(
+                        topic_name.clone(),
+                        num_partitions as u32,
+                        replication_factor as u32,
+                    )
+                    .await
+            } else {
+                self.service
+                    .create_topic(topic_name.clone(), num_partitions)
+                    .await
+            };
+
+            let result = match create_result {
+                Ok(()) => {
+                    info!(
+                        topic = %topic_name,
+                        partitions = num_partitions,
+                        replication = replication_factor,
+                        "Created topic"
+                    );
+                    CreatableTopicResult::default()
+                        .with_name(topic.name.clone())
+                        .with_error_code(0)
+                        .with_num_partitions(num_partitions)
+                        .with_replication_factor(replication_factor)
+                }
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    // Check if topic already exists.
+                    let error_code = if error_msg.contains("already exists") {
+                        36 // TOPIC_ALREADY_EXISTS
+                    } else {
+                        -1 // UNKNOWN_SERVER_ERROR
+                    };
+                    warn!(
+                        topic = %topic_name,
+                        error = %error_msg,
+                        error_code = error_code,
+                        "Failed to create topic"
+                    );
+                    CreatableTopicResult::default()
+                        .with_name(topic.name.clone())
+                        .with_error_code(error_code)
+                        .with_error_message(Some(StrBytes::from_string(error_msg)))
+                }
+            };
+            results.push(result);
+        }
+
+        let response = CreateTopicsResponse::default()
+            .with_throttle_time_ms(0)
+            .with_topics(results);
 
         codec::encode_response(
             request.api_key,

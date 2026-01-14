@@ -10,10 +10,15 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+/// Controller partition for cluster metadata coordination.
+pub mod controller;
 mod error;
+mod group_map;
 /// Kafka wire protocol support.
 pub mod kafka;
+mod partition_storage;
 mod service;
+mod grpc;
 /// Partition storage implementations.
 pub mod storage;
 

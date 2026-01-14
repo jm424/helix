@@ -12,7 +12,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::Notify,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{error, info};
 
 use super::codec;
 use super::error::{KafkaError, KafkaResult};
@@ -110,7 +110,7 @@ impl KafkaServer {
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok((stream, peer_addr)) => {
-                            debug!(peer = %peer_addr, "New Kafka connection");
+                            info!(peer = %peer_addr, "New Kafka connection");
                             let handler = Arc::clone(&self.handler);
                             tokio::spawn(async move {
                                 if let Err(e) = handle_connection(stream, peer_addr, handler).await {
@@ -118,12 +118,14 @@ impl KafkaServer {
                                         KafkaError::Io(ref io_err)
                                             if io_err.kind() == std::io::ErrorKind::UnexpectedEof =>
                                         {
-                                            debug!(peer = %peer_addr, "Connection closed");
+                                            info!(peer = %peer_addr, "Connection closed by client (EOF)");
                                         }
                                         _ => {
-                                            warn!(peer = %peer_addr, error = %e, "Connection error");
+                                            error!(peer = %peer_addr, error = %e, "Connection error");
                                         }
                                     }
+                                } else {
+                                    info!(peer = %peer_addr, "Connection closed normally");
                                 }
                             });
                         }
@@ -155,7 +157,7 @@ async fn handle_connection(
         // Read data from the socket.
         let bytes_read = stream.read_buf(&mut read_buf).await?;
         if bytes_read == 0 {
-            // Connection closed.
+            // Connection closed by client.
             return Ok(());
         }
 
@@ -164,22 +166,71 @@ async fn handle_connection(
             // Decode request header.
             let request = codec::decode_request_header(payload)?;
 
-            debug!(
+            info!(
                 peer = %peer_addr,
                 api_key = request.api_key,
+                api_name = api_key_name(request.api_key),
                 api_version = request.api_version,
                 correlation_id = request.correlation_id,
-                "Processing Kafka request"
+                "Received Kafka request"
             );
 
             // Handle the request.
-            let response_body = handler.handle_request(&request).await?;
+            let response_body = match handler.handle_request(&request).await {
+                Ok(body) => body,
+                Err(e) => {
+                    error!(
+                        peer = %peer_addr,
+                        api_key = request.api_key,
+                        error = %e,
+                        "Handler error - closing connection"
+                    );
+                    return Err(e);
+                }
+            };
 
             // Write response with length prefix.
             let mut response_frame = BytesMut::new();
             codec::write_frame(&mut response_frame, &response_body);
-            stream.write_all(&response_frame).await?;
+            info!(
+                peer = %peer_addr,
+                api_key = request.api_key,
+                api_name = api_key_name(request.api_key),
+                response_len = response_frame.len(),
+                "Sending response"
+            );
+            if let Err(e) = stream.write_all(&response_frame).await {
+                error!(
+                    peer = %peer_addr,
+                    api_key = request.api_key,
+                    error = %e,
+                    "Failed to write response"
+                );
+                return Err(e.into());
+            }
         }
+    }
+}
+
+/// Convert API key to human-readable name for logging.
+const fn api_key_name(key: i16) -> &'static str {
+    match key {
+        0 => "Produce",
+        1 => "Fetch",
+        2 => "ListOffsets",
+        3 => "Metadata",
+        8 => "OffsetCommit",
+        9 => "OffsetFetch",
+        10 => "FindCoordinator",
+        11 => "JoinGroup",
+        12 => "Heartbeat",
+        13 => "LeaveGroup",
+        14 => "SyncGroup",
+        18 => "ApiVersions",
+        19 => "CreateTopics",
+        20 => "DeleteTopics",
+        22 => "InitProducerId",
+        _ => "Unknown",
     }
 }
 

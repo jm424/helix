@@ -37,5 +37,9 @@ hdrhistogram.workspace = true
 # Internal dependencies.
 helix-core.workspace = true
 
+[[bin]]
+name = "integration_test"
+path = "src/bin/integration_test.rs"
+
 [dev-dependencies]
 tempfile.workspace = true

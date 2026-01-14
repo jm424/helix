@@ -356,6 +356,27 @@ impl MultiRaft {
         Some(self.process_outputs(group_id, outputs))
     }
 
+    /// Proposes a client command and returns the log index.
+    ///
+    /// Returns `(outputs, log_index)` if this node is the leader.
+    /// The `log_index` is the index at which the entry was appended.
+    /// Returns `None` if not leader or group doesn't exist.
+    pub fn propose_with_index(
+        &mut self,
+        group_id: GroupId,
+        data: Bytes,
+    ) -> Option<(Vec<MultiRaftOutput>, LogIndex)> {
+        let info = self.groups.get_mut(&group_id)?;
+
+        // Get the index that will be assigned to the new entry.
+        let proposed_index = LogIndex::new(info.node.log().last_index().get() + 1);
+
+        let request = ClientRequest::new(data);
+        let outputs = info.node.handle_client_request(request)?;
+
+        Some((self.process_outputs(group_id, outputs), proposed_index))
+    }
+
     /// Handles an incoming message for a specific group.
     pub fn handle_message(
         &mut self,

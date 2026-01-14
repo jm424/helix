@@ -145,6 +145,20 @@ pub type SimulatedTieringManager =
 pub type SimulatedProgressManager = ProgressManager<SimulatedProgressStore>;
 
 // -----------------------------------------------------------------------------
+// BlobFormat
+// -----------------------------------------------------------------------------
+
+/// Format of blob data, used to determine protocol-specific transformations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlobFormat {
+    /// Raw blob data, no transformation needed.
+    #[default]
+    Raw,
+    /// Kafka `RecordBatch` format - requires baseOffset patching at apply time.
+    KafkaRecordBatch,
+}
+
+// -----------------------------------------------------------------------------
 // PartitionCommand
 // -----------------------------------------------------------------------------
 
@@ -156,12 +170,18 @@ pub enum PartitionCommand {
         /// Records to append.
         records: Vec<Record>,
     },
-    /// Append a blob to the partition (protocol-agnostic).
+    /// Append a blob to the partition (protocol-agnostic storage).
+    ///
+    /// Protocol-specific transformations (like Kafka baseOffset patching) are
+    /// applied at command application time, not at storage time. This ensures
+    /// data written to the log is correct while keeping storage protocol-agnostic.
     AppendBlob {
         /// Raw blob data.
         blob: Bytes,
         /// Number of records in the blob.
         record_count: u32,
+        /// Format of the blob data.
+        format: BlobFormat,
     },
     /// Truncate the partition from a given offset.
     Truncate {
@@ -191,9 +211,15 @@ impl PartitionCommand {
                     record.encode(&mut buf);
                 }
             }
-            Self::AppendBlob { blob, record_count } => {
+            Self::AppendBlob { blob, record_count, format } => {
                 buf.put_u8(3); // Command type for blob.
                 buf.put_u32_le(*record_count);
+                // Encode format: 0 = Raw, 1 = KafkaRecordBatch.
+                let format_byte = match format {
+                    BlobFormat::Raw => 0u8,
+                    BlobFormat::KafkaRecordBatch => 1u8,
+                };
+                buf.put_u8(format_byte);
                 // Safe cast: blob size bounded by protocol limits.
                 #[allow(clippy::cast_possible_truncation)]
                 let blob_len = blob.len() as u32;
@@ -252,21 +278,72 @@ impl PartitionCommand {
                 Some(Self::UpdateHighWatermark { high_watermark })
             }
             3 => {
-                // AppendBlob: record_count (u32) + blob_len (u32) + blob bytes.
-                if buf.remaining() < 8 {
+                // AppendBlob: record_count (u32) + format (u8) + blob_len (u32) + blob bytes.
+                if buf.remaining() < 9 {
                     return None;
                 }
                 let record_count = buf.get_u32_le();
+                let format_byte = buf.get_u8();
+                let format = match format_byte {
+                    0 => BlobFormat::Raw,
+                    1 => BlobFormat::KafkaRecordBatch,
+                    _ => return None, // Unknown format.
+                };
                 let blob_len = buf.get_u32_le() as usize;
                 if buf.remaining() < blob_len {
                     return None;
                 }
                 let blob = buf.copy_to_bytes(blob_len);
-                Some(Self::AppendBlob { blob, record_count })
+                Some(Self::AppendBlob { blob, record_count, format })
             }
             _ => None,
         }
     }
+}
+
+// -----------------------------------------------------------------------------
+// Kafka Format Helpers
+// -----------------------------------------------------------------------------
+
+/// Patches the baseOffset field in a Kafka `RecordBatch`.
+///
+/// In Kafka's `RecordBatch` format, the first 8 bytes contain the baseOffset.
+/// Clients send this as 0 since they don't know the actual offset. The broker
+/// patches this field when the batch is committed to the log.
+///
+/// This function returns a new `Bytes` with the patched offset, leaving the
+/// original data unchanged.
+#[must_use]
+pub fn patch_kafka_base_offset(blob: Bytes, base_offset: Offset) -> Bytes {
+    const KAFKA_BASE_OFFSET_SIZE: usize = 8;
+
+    if blob.len() < KAFKA_BASE_OFFSET_SIZE {
+        // Blob too small to be a valid RecordBatch, return as-is.
+        tracing::warn!(
+            blob_len = blob.len(),
+            "Blob too small for Kafka patching"
+        );
+        return blob;
+    }
+
+    // Read original baseOffset for debugging.
+    let original_base_offset = i64::from_be_bytes([
+        blob[0], blob[1], blob[2], blob[3], blob[4], blob[5], blob[6], blob[7],
+    ]);
+
+    let mut patched = BytesMut::with_capacity(blob.len());
+    patched.put_i64(base_offset.get() as i64); // baseOffset is big-endian i64.
+    patched.put_slice(&blob[KAFKA_BASE_OFFSET_SIZE..]);
+    let result = patched.freeze();
+
+    tracing::info!(
+        blob_len = blob.len(),
+        original_base_offset,
+        new_base_offset = base_offset.get(),
+        "Patched Kafka RecordBatch baseOffset"
+    );
+
+    result
 }
 
 /// Configuration for a partition.
@@ -493,6 +570,14 @@ impl Partition {
         self.blob_log_end_offset
     }
 
+    /// Returns the log start offset for blob storage (earliest available offset).
+    #[must_use]
+    pub fn blob_log_start_offset(&self) -> Offset {
+        self.blobs
+            .first()
+            .map_or(Offset::new(0), |b| b.base_offset)
+    }
+
     /// Appends a blob to the partition.
     ///
     /// The blob is stored as-is without parsing. The `record_count` is used
@@ -510,13 +595,9 @@ impl Partition {
 
         let base_offset = self.blob_log_end_offset;
 
-        // Patch the baseOffset field in the RecordBatch header (bytes 0-7, big-endian i64).
-        // The producer sends baseOffset=0, but we need to update it to our assigned offset.
-        // This is safe because the Kafka RecordBatch CRC only covers bytes from offset 21.
-        let patched_blob = patch_record_batch_base_offset(blob, base_offset.get());
-
-        // Store the blob with its metadata.
-        self.blobs.push(StoredBlob::new(base_offset, record_count, patched_blob));
+        // Store the blob as-is with its metadata.
+        // Protocol-specific transformations (like Kafka baseOffset patching) happen at read time.
+        self.blobs.push(StoredBlob::new(base_offset, record_count, blob));
 
         // Advance the log end offset.
         self.blob_log_end_offset = Offset::new(base_offset.get() + u64::from(record_count));
@@ -880,6 +961,12 @@ impl DurablePartition {
         self.cache.blob_log_end_offset()
     }
 
+    /// Returns the log start offset for blob storage (earliest available offset).
+    #[must_use]
+    pub fn blob_log_start_offset(&self) -> Offset {
+        self.cache.blob_log_start_offset()
+    }
+
     /// Appends a blob to the partition.
     ///
     /// The blob is written to WAL for durability, then applied to the
@@ -903,9 +990,12 @@ impl DurablePartition {
         let blob_size = blob.len();
 
         // Create WAL entry with blob command.
+        // Use Raw format since any protocol-specific patching already happened
+        // at the apply layer before this method is called.
         let command = PartitionCommand::AppendBlob {
             blob: blob.clone(),
             record_count,
+            format: BlobFormat::Raw,
         };
         let data = command.encode();
 
@@ -1003,7 +1093,9 @@ impl DurablePartition {
             PartitionCommand::Append { records } => {
                 cache.append(records)?;
             }
-            PartitionCommand::AppendBlob { blob, record_count } => {
+            PartitionCommand::AppendBlob { blob, record_count, format: _ } => {
+                // During WAL recovery, blobs are already in the correct format
+                // (patching happened at original apply time). Store as-is.
                 cache.append_blob(blob, record_count)?;
             }
             PartitionCommand::Truncate { from_offset } => {
@@ -1470,36 +1562,6 @@ impl std::fmt::Display for DurablePartitionError {
 
 impl std::error::Error for DurablePartitionError {}
 
-/// Patches the `baseOffset` field in a Kafka `RecordBatch` header.
-///
-/// The Kafka `RecordBatch` v2 format has `baseOffset` as a big-endian i64 at bytes 0-7.
-/// The CRC field only covers bytes from offset 21, so patching `baseOffset` is safe.
-///
-/// # Arguments
-/// * `blob` - The original `RecordBatch` bytes (consumed).
-/// * `new_base_offset` - The offset to write into the header.
-///
-/// # Returns
-/// A new `Bytes` with the patched `baseOffset`, or the original if too short.
-fn patch_record_batch_base_offset(blob: Bytes, new_base_offset: u64) -> Bytes {
-    const BASE_OFFSET_SIZE: usize = 8;
-
-    if blob.len() < BASE_OFFSET_SIZE {
-        // Blob too short to contain a valid RecordBatch header.
-        return blob;
-    }
-
-    // Safe cast: base_offset is u64 but Kafka uses i64 for wire format.
-    #[allow(clippy::cast_possible_wrap)]
-    let offset_bytes = (new_base_offset as i64).to_be_bytes();
-
-    // Create a new buffer with the patched offset.
-    let mut patched = bytes::BytesMut::with_capacity(blob.len());
-    patched.extend_from_slice(&offset_bytes);
-    patched.extend_from_slice(&blob[BASE_OFFSET_SIZE..]);
-    patched.freeze()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1925,6 +1987,7 @@ mod tests {
         let cmd = PartitionCommand::AppendBlob {
             blob: blob.clone(),
             record_count: 5,
+            format: BlobFormat::KafkaRecordBatch,
         };
         let encoded = cmd.encode();
         let decoded = PartitionCommand::decode(&encoded).unwrap();
@@ -1933,9 +1996,11 @@ mod tests {
             PartitionCommand::AppendBlob {
                 blob: decoded_blob,
                 record_count,
+                format,
             } => {
                 assert_eq!(decoded_blob, blob);
                 assert_eq!(record_count, 5);
+                assert_eq!(format, BlobFormat::KafkaRecordBatch);
             }
             _ => panic!("wrong command type"),
         }
