@@ -662,30 +662,38 @@ impl RealExecutor {
         // broker availability internally. No explicit wait loops needed.
         // NOTE: Retries enabled for retriable errors (e.g., controller not available).
         // This may cause duplicates until idempotent producers are implemented.
+        //
+        // Timeout settings aligned with DD's libstreaming for faster failover:
+        // - request.timeout.ms: 12.5s (vs 30s default) - fail faster on dead brokers
+        // - message.timeout.ms: 15s (vs 300s default) - retry faster with different partition
+        // - connections.max.idle.ms: 0 - avoid stale connection issues
         let producer: FutureProducer = ClientConfig::new()
             .set("bootstrap.servers", bootstrap_servers)
-            .set("message.timeout.ms", "60000") // Increased for slow Raft commits
-            .set("request.timeout.ms", "30000") // Allow time for retries
+            .set("message.timeout.ms", "15000")
+            .set("request.timeout.ms", "12500")
+            .set("connections.max.idle.ms", "0")
             .set("retries", "5") // Retry on retriable errors
             .set("retry.backoff.ms", "500") // Wait between retries
             .set("acks", "all")
             .set("reconnect.backoff.ms", "100")
-            .set("reconnect.backoff.max.ms", "10000")
+            .set("reconnect.backoff.max.ms", "1000") // 1s max backoff for faster recovery
             .create()?;
 
+        // Consumer config aligned with DD's libstreaming for faster failover.
         let consumer: BaseConsumer = ClientConfig::new()
             .set("bootstrap.servers", bootstrap_servers)
             .set("group.id", "helix-workload-consumer")
             .set("enable.auto.commit", "false")
             .set("auto.offset.reset", "earliest")
             .set("reconnect.backoff.ms", "100")
-            .set("reconnect.backoff.max.ms", "10000")
+            .set("reconnect.backoff.max.ms", "1000") // 1s max backoff for faster recovery
             // Refresh metadata quickly when topic info is missing or stale.
             .set("topic.metadata.refresh.fast.interval.ms", "100")
             // Enable partition EOF notifications so we know when we've consumed all data.
             .set("enable.partition.eof", "true")
-            // Connection timeout settings for multi-broker clusters.
-            .set("socket.timeout.ms", "30000")
+            // Connection timeout settings - aligned with DD's libstreaming.
+            .set("socket.timeout.ms", "12500")
+            .set("connections.max.idle.ms", "0")
             .set("fetch.wait.max.ms", "500")
             // Debug logging for librdkafka internals.
             .set("debug", "fetch,broker,topic,msg,protocol")
@@ -757,8 +765,6 @@ impl WorkloadExecutor for RealExecutor {
     ) -> Result<Vec<(u64, Bytes)>, ExecutorError> {
         use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 
-        const MAX_BACKOFF_MS: u64 = 2000;
-
         // One-time metadata discovery: ensure consumer knows about the topic.
         // rdkafka handles connection/retry internally with configured backoff.
         self.consumer
@@ -789,18 +795,17 @@ impl WorkloadExecutor for RealExecutor {
         // Event-driven polling: keep polling until we have all expected messages
         // or receive PartitionEOF (end of committed data).
         //
-        // Transient errors (BrokerTransportFailure, AllBrokersDown) are retried with
-        // exponential backoff until the deadline. These errors are explicitly marked
-        // as retriable in librdkafka (RD_KAFKA_ERR_ACTION_RETRY) and the library
-        // actively recovers from them via rebootstrap.
+        // Transient errors (BrokerTransportFailure, AllBrokersDown) are handled by
+        // continuing to poll. These errors come from rdkafka's background reconnection
+        // threads and DO NOT mean data isn't available - messages may already be buffered
+        // internally even while errors are being returned. The error queue and message
+        // queue are separate in librdkafka.
         let poll_timeout = std::time::Duration::from_secs(10);
         let deadline = std::time::Instant::now() + poll_timeout;
-        let mut backoff_ms: u64 = 100;
 
         while messages.len() < max_messages as usize {
             match self.consumer.poll(std::time::Duration::from_millis(500)) {
                 Some(Ok(msg)) => {
-                    backoff_ms = 100; // Reset on success.
                     #[allow(clippy::cast_sign_loss)]
                     let offset = msg.offset() as u64;
                     let payload = msg
@@ -827,12 +832,14 @@ impl WorkloadExecutor for RealExecutor {
                         eprintln!("[POLL] topic={topic} partition={partition} transient error {code:?} after deadline, returning partial");
                         break;
                     }
-                    // Exponential backoff with jitter until deadline.
-                    // Jitter: random value in [0.5 * backoff, 1.5 * backoff] to prevent thundering herd.
-                    let jitter = (backoff_ms / 2) + (rand::random::<u64>() % (backoff_ms + 1));
-                    eprintln!("[POLL] topic={topic} partition={partition} transient error {code:?}, backoff {jitter}ms");
-                    std::thread::sleep(std::time::Duration::from_millis(jitter));
-                    backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+                    // These errors come from rdkafka's background connection threads trying
+                    // to reconnect to dead brokers. Crucially, messages may ALREADY be buffered
+                    // internally even while errors are being returned. DO NOT sleep - just keep
+                    // polling to drain both the error queue and message queue.
+                    //
+                    // The error queue and message queue are separate in librdkafka.
+                    // Sleeping here just delays getting messages that are already available.
+                    eprintln!("[POLL] topic={topic} partition={partition} transient error {code:?}, continuing poll");
                 }
                 Some(Err(e)) => {
                     eprintln!("[POLL] topic={topic} partition={partition} error: {e:?}");

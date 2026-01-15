@@ -25,8 +25,11 @@ use super::{PendingControllerProposal, PendingProposal, TICK_INTERVAL_MS};
 
 /// Interval for sending broker heartbeats to the controller (in milliseconds).
 ///
+/// Set to 1 second for fast dead broker detection. Combined with a 5 second
+/// timeout, this allows up to 5 missed heartbeats before a broker is fenced.
+///
 /// Used by both production tick tasks and DST simulation actors.
-pub const HEARTBEAT_INTERVAL_MS: u64 = 3_000; // 3 seconds.
+pub const HEARTBEAT_INTERVAL_MS: u64 = 1_000; // 1 second.
 
 /// Background task to handle Raft ticks for all groups (single-node).
 #[allow(clippy::significant_drop_tightening)]
