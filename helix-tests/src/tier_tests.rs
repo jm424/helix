@@ -44,12 +44,13 @@ use bloodhound::buggify;
 use bytes::Bytes;
 use helix_core::{PartitionId, Record, TopicId};
 use helix_server::storage::{DurablePartition, DurablePartitionConfig};
+use helix_wal::TokioStorage;
 use helix_tier::{
     InMemoryMetadataStore, IntegratedTieringManager, MetadataStoreFaultConfig, ObjectKey,
     ObjectStorage, ObjectStorageFaultConfig, SegmentLocation, SegmentMetadata, SegmentReader,
     SimulatedObjectStorage, TierError, TierResult, TieringConfig, TieringManager,
 };
-use helix_wal::{Entry, SegmentConfig, SegmentId, TokioStorage, Wal, WalConfig};
+use helix_wal::{Entry, SegmentConfig, SegmentId, Wal, WalConfig};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -632,7 +633,7 @@ async fn test_e2e_durable_partition_tiering_init() {
     let config = DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
         .with_tiering(TieringConfig::for_testing());
 
-    let partition = DurablePartition::open(config).await.unwrap();
+    let partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
 
     // Tiering should be enabled.
     assert!(partition.tiering_manager().is_some());
@@ -646,7 +647,7 @@ async fn test_e2e_write_and_tiering_hooks() {
     let config = DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
         .with_tiering(TieringConfig::for_testing());
 
-    let mut partition = DurablePartition::open(config).await.unwrap();
+    let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
 
     // Write some records.
     for i in 0..10 {
@@ -673,7 +674,7 @@ async fn test_e2e_tiering_hooks_idempotent() {
     let config = DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
         .with_tiering(TieringConfig::for_testing());
 
-    let mut partition = DurablePartition::open(config).await.unwrap();
+    let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
 
     // Write records.
     for i in 0..5 {
@@ -701,7 +702,7 @@ async fn test_e2e_partition_without_tiering() {
     let config =
         DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0));
 
-    let mut partition = DurablePartition::open(config).await.unwrap();
+    let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
 
     // Tiering should be disabled.
     assert!(partition.tiering_manager().is_none());
@@ -731,7 +732,7 @@ async fn test_e2e_concurrent_writes_with_tiering() {
     let config = DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
         .with_tiering(TieringConfig::for_testing());
 
-    let mut partition = DurablePartition::open(config).await.unwrap();
+    let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
 
     // Interleave writes and tiering hooks.
     for batch in 0..5 {
@@ -767,7 +768,7 @@ async fn test_e2e_tiering_config_variations() {
     let config = DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
         .with_tiering(custom_config);
 
-    let mut partition = DurablePartition::open(config).await.unwrap();
+    let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
 
     // Write and verify.
     let records = vec![Record::new(Bytes::from("test-data"))];
@@ -788,8 +789,8 @@ async fn test_e2e_multi_partition_tiering_isolation() {
     let config2 = DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(1))
         .with_tiering(TieringConfig::for_testing());
 
-    let mut partition1 = DurablePartition::open(config1).await.unwrap();
-    let mut partition2 = DurablePartition::open(config2).await.unwrap();
+    let mut partition1 = DurablePartition::open(TokioStorage::new(), config1).await.unwrap();
+    let mut partition2 = DurablePartition::open(TokioStorage::new(), config2).await.unwrap();
 
     // Write to each partition.
     partition1
@@ -829,7 +830,7 @@ async fn test_e2e_multi_seed_tiering_stress() {
             DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
                 .with_tiering(TieringConfig::for_testing());
 
-        let mut partition = DurablePartition::open(config).await.unwrap();
+        let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
 
         // Write records with seed-based variation.
         for i in 0..10 {

@@ -13,13 +13,16 @@
 /// Controller partition for cluster metadata coordination.
 pub mod controller;
 mod error;
-mod group_map;
+/// Group ID mapping for topic/partition to Raft group.
+pub mod group_map;
 /// Kafka wire protocol support.
 pub mod kafka;
-mod partition_storage;
+/// Partition storage (in-memory and durable).
+pub mod partition_storage;
 /// Idempotent producer state tracking.
 pub mod producer_state;
-mod service;
+/// Helix service implementation.
+pub mod service;
 mod grpc;
 /// Partition storage implementations.
 pub mod storage;

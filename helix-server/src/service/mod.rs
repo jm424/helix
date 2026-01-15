@@ -24,7 +24,7 @@ use tracing::{error, info};
 
 use crate::controller::{ControllerState, BROKER_HEARTBEAT_TIMEOUT_MS, CONTROLLER_GROUP_ID};
 use crate::group_map::GroupMap;
-use crate::partition_storage::PartitionStorage;
+use crate::partition_storage::ProductionPartitionStorage;
 
 /// Maximum records per write request.
 pub const MAX_RECORDS_PER_WRITE: usize = 1000;
@@ -34,6 +34,10 @@ pub const MAX_BYTES_PER_READ: u32 = 1024 * 1024;
 
 /// Tick interval in milliseconds.
 pub const TICK_INTERVAL_MS: u64 = 50;
+
+/// Heartbeat interval in milliseconds (re-exported for DST use).
+#[allow(unused_imports)]
+pub use tick::HEARTBEAT_INTERVAL_MS;
 
 /// A pending proposal waiting for Raft commit.
 ///
@@ -77,7 +81,7 @@ pub struct HelixService {
     /// Multi-Raft engine for consensus.
     pub(crate) multi_raft: Arc<RwLock<MultiRaft>>,
     /// Partition storage indexed by `GroupId`.
-    pub(crate) partition_storage: Arc<RwLock<HashMap<GroupId, PartitionStorage>>>,
+    pub(crate) partition_storage: Arc<RwLock<HashMap<GroupId, ProductionPartitionStorage>>>,
     /// Group ID mapping.
     pub(crate) group_map: Arc<RwLock<GroupMap>>,
     /// Topic name to metadata mapping.
@@ -105,7 +109,7 @@ pub struct HelixService {
     pub(crate) pending_controller_proposals: Arc<RwLock<Vec<PendingControllerProposal>>>,
     /// Local broker heartbeat timestamps (soft state, not Raft-replicated).
     ///
-    /// Following Kafka KRaft pattern, heartbeats are maintained as soft state
+    /// Following Kafka `KRaft` pattern, heartbeats are maintained as soft state
     /// on each node. Each broker sends heartbeats via transport to all peers,
     /// and each node maintains its own view of broker liveness.
     pub(crate) local_broker_heartbeats: Arc<RwLock<HashMap<NodeId, u64>>>,
@@ -137,6 +141,7 @@ impl HelixService {
         let multi_raft = Arc::new(RwLock::new(MultiRaft::new(node_id)));
         let partition_storage = Arc::new(RwLock::new(HashMap::new()));
         let group_map = Arc::new(RwLock::new(GroupMap::new()));
+        let pending_proposals = Arc::new(RwLock::new(HashMap::new()));
 
         // Create progress manager with simulated store.
         let progress_store = SimulatedProgressStore::new(node_id.get());
@@ -150,6 +155,7 @@ impl HelixService {
             Arc::clone(&multi_raft),
             Arc::clone(&partition_storage),
             Arc::clone(&group_map),
+            Arc::clone(&pending_proposals),
             shutdown_rx,
         ));
 
@@ -168,7 +174,7 @@ impl HelixService {
             transport_handle: None,
             progress_manager,
             controller_state: Arc::new(RwLock::new(ControllerState::new())),
-            pending_proposals: Arc::new(RwLock::new(HashMap::new())),
+            pending_proposals,
             pending_controller_proposals: Arc::new(RwLock::new(Vec::new())),
             local_broker_heartbeats: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -293,7 +299,7 @@ impl HelixService {
     /// In multi-node mode, filters out brokers that have missed heartbeats.
     /// In single-node mode, returns all cluster nodes (no heartbeat filtering).
     ///
-    /// # Kafka KRaft Pattern
+    /// # Kafka `KRaft` Pattern
     ///
     /// Unlike other controller state, heartbeats are **soft state** (not Raft-replicated).
     /// Each broker sends heartbeats via transport to all peers, and each node maintains
@@ -323,7 +329,7 @@ impl HelixService {
             .filter(|&node_id| {
                 heartbeats
                     .get(node_id)
-                    .map_or(false, |&last_heartbeat| {
+                    .is_some_and(|&last_heartbeat| {
                         current_time_ms.saturating_sub(last_heartbeat) < BROKER_HEARTBEAT_TIMEOUT_MS
                     })
             })

@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use bytes::Bytes;
 use helix_core::{LogIndex, Offset, PartitionId, ProducerEpoch, ProducerId, Record, SequenceNum, TopicId};
+use helix_wal::{Storage, TokioStorage};
 use tracing::warn;
 
 use crate::error::{ServerError, ServerResult};
@@ -17,16 +18,24 @@ use crate::storage::{
 };
 
 /// Inner storage type for a partition.
-pub enum PartitionStorageInner {
+///
+/// # Type Parameters
+///
+/// * `S` - Storage backend (e.g., `TokioStorage` for production, `SimulatedStorage` for DST)
+pub enum PartitionStorageInner<S: Storage + 'static> {
     /// In-memory storage (for testing).
     InMemory(Partition),
     /// Durable WAL-backed storage (for production).
     /// Boxed to reduce enum size difference between variants.
-    Durable(Box<DurablePartition>),
+    Durable(Box<DurablePartition<S>>),
 }
 
 /// Storage for a single partition.
-pub struct PartitionStorage {
+///
+/// # Type Parameters
+///
+/// * `S` - Storage backend (e.g., `TokioStorage` for production, `SimulatedStorage` for DST)
+pub struct PartitionStorage<S: Storage + 'static> {
     /// Topic ID.
     #[allow(dead_code)]
     topic_id: TopicId,
@@ -34,7 +43,7 @@ pub struct PartitionStorage {
     #[allow(dead_code)]
     partition_id: PartitionId,
     /// The underlying partition storage.
-    pub(crate) inner: PartitionStorageInner,
+    pub(crate) inner: PartitionStorageInner<S>,
     /// Last applied Raft log index.
     last_applied: LogIndex,
     /// Producer state for idempotent deduplication.
@@ -42,8 +51,12 @@ pub struct PartitionStorage {
     producer_state: PartitionProducerState,
 }
 
-impl PartitionStorage {
+/// Type alias for production partition storage using Tokio filesystem.
+pub type ProductionPartitionStorage = PartitionStorage<TokioStorage>;
+
+impl<S: Storage + 'static> PartitionStorage<S> {
     /// Creates new in-memory partition storage.
+    #[must_use] 
     pub fn new_in_memory(topic_id: TopicId, partition_id: PartitionId) -> Self {
         let config = PartitionConfig::new(topic_id, partition_id);
         Self {
@@ -55,17 +68,25 @@ impl PartitionStorage {
         }
     }
 
-    /// Creates new durable partition storage.
+    /// Creates new durable partition storage with the given storage backend.
+    ///
+    /// # Arguments
+    ///
+    /// * `storage` - Storage backend to use for WAL operations
+    /// * `data_dir` - Base directory for partition data
+    /// * `topic_id` - Topic identifier
+    /// * `partition_id` - Partition identifier
     ///
     /// # Errors
     /// Returns an error if the WAL cannot be opened.
     pub async fn new_durable(
+        storage: S,
         data_dir: &PathBuf,
         topic_id: TopicId,
         partition_id: PartitionId,
     ) -> Result<Self, DurablePartitionError> {
         let config = DurablePartitionConfig::new(data_dir, topic_id, partition_id);
-        let durable = DurablePartition::open(config).await?;
+        let durable = DurablePartition::open(storage, config).await?;
         Ok(Self {
             topic_id,
             partition_id,
@@ -77,6 +98,7 @@ impl PartitionStorage {
 
     /// Returns the log start offset.
     #[allow(clippy::missing_const_for_fn)] // Const match not stable yet.
+    #[must_use] 
     pub fn log_start_offset(&self) -> Offset {
         match &self.inner {
             PartitionStorageInner::InMemory(p) => p.log_start_offset(),
@@ -85,6 +107,7 @@ impl PartitionStorage {
     }
 
     /// Returns the log end offset.
+    #[must_use] 
     pub fn log_end_offset(&self) -> Offset {
         match &self.inner {
             PartitionStorageInner::InMemory(p) => p.log_end_offset(),
@@ -94,6 +117,7 @@ impl PartitionStorage {
 
     /// Returns the high watermark.
     #[allow(clippy::missing_const_for_fn)] // Const match not stable yet.
+    #[must_use] 
     pub fn high_watermark(&self) -> Offset {
         match &self.inner {
             PartitionStorageInner::InMemory(p) => p.high_watermark(),
@@ -102,6 +126,7 @@ impl PartitionStorage {
     }
 
     /// Returns the blob log end offset (for Kafka batch storage).
+    #[must_use] 
     pub fn blob_log_end_offset(&self) -> Offset {
         match &self.inner {
             PartitionStorageInner::InMemory(p) => p.blob_log_end_offset(),
@@ -111,6 +136,7 @@ impl PartitionStorage {
 
     /// Returns the last applied Raft log index.
     #[allow(dead_code)]
+    #[must_use] 
     pub const fn last_applied(&self) -> LogIndex {
         self.last_applied
     }
@@ -126,6 +152,7 @@ impl PartitionStorage {
     /// - `OutOfSequence` if there's a gap in sequence numbers
     /// - `ProducerFenced` if the epoch is stale
     #[allow(dead_code)] // Will be used in append_blob integration.
+    #[must_use] 
     pub fn check_producer_sequence(
         &self,
         producer_id: ProducerId,

@@ -6,6 +6,7 @@
 //! ## Test Organization
 //!
 //! **DST Tests** (`*_dst.rs`): Deterministic simulation with fault injection
+//! - `helix_service_dst`: Full Helix service E2E DST
 //! - `raft_dst`: Raft consensus DST with Bloodhound simulation
 //! - `wal_dst`: Per-partition WAL DST with `SimulatedStorage`
 //! - `shared_wal_dst`: `SharedWal` DST with `SimulatedStorage`
@@ -19,6 +20,7 @@
 //!
 //! **Support Modules**:
 //! - `raft_actor`: Raft `SimulatedActor` for Bloodhound simulation
+//! - `helix_service_actor`: Helix service `SimulatedActor` for E2E DST
 //! - `properties`: Property definitions (`SingleLeaderPerTerm`, `LogMatching`, etc.)
 //! - `scenarios`: Reusable test scenarios
 //!
@@ -34,11 +36,15 @@
 #![warn(clippy::pedantic)]
 #![warn(clippy::nursery)]
 
+pub mod helix_service_actor;
 pub mod properties;
 pub mod raft_actor;
 pub mod scenarios;
+pub mod simulated_transport;
 
 // DST test modules (deterministic simulation with fault injection).
+#[cfg(test)]
+mod helix_service_dst;
 #[cfg(test)]
 mod raft_dst;
 #[cfg(test)]

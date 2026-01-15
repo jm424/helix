@@ -601,8 +601,10 @@ impl ControllerState {
             })
     }
 
-    /// Records a broker heartbeat directly (for testing).
-    #[cfg(test)]
+    /// Records a broker heartbeat directly.
+    ///
+    /// This is used for direct heartbeat recording (e.g., in DST) instead of
+    /// going through the Raft `BrokerHeartbeat` command.
     pub fn record_heartbeat(&mut self, node_id: NodeId, timestamp_ms: u64) {
         self.broker_heartbeats.insert(node_id, timestamp_ms);
     }

@@ -19,6 +19,7 @@ pub struct GroupMap {
 
 impl GroupMap {
     /// Creates a new empty group map.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             by_key: HashMap::new(),
@@ -47,11 +48,13 @@ impl GroupMap {
     }
 
     /// Gets the group ID for a topic/partition pair.
+    #[must_use]
     pub fn get(&self, topic_id: TopicId, partition_id: PartitionId) -> Option<GroupId> {
         self.by_key.get(&(topic_id, partition_id)).copied()
     }
 
     /// Gets the topic/partition pair for a group ID.
+    #[must_use]
     pub fn get_key(&self, group_id: GroupId) -> Option<(TopicId, PartitionId)> {
         self.by_group.get(&group_id).copied()
     }

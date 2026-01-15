@@ -79,7 +79,7 @@ use helix_tier::{
     InMemoryMetadataStore, IntegratedTieringManager, SegmentMetadata, SegmentReader,
     SimulatedObjectStorage, TierError, TierResult, TieringConfig,
 };
-use helix_wal::{Entry, SegmentId, TokioStorage, Wal, WalConfig};
+use helix_wal::{Entry, SegmentId, Storage, TokioStorage, Wal, WalConfig};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -93,21 +93,21 @@ use tracing::{debug, info, warn};
 /// from the WAL when tiering to S3.
 ///
 /// Uses `RwLock` to allow concurrent reads while writes are exclusive.
-pub struct WalSegmentReader {
+pub struct WalSegmentReader<S: Storage> {
     /// Shared reference to the WAL (behind `RwLock` for concurrent access).
-    wal: Arc<RwLock<Wal<TokioStorage>>>,
+    wal: Arc<RwLock<Wal<S>>>,
 }
 
-impl WalSegmentReader {
+impl<S: Storage> WalSegmentReader<S> {
     /// Creates a new segment reader for the given WAL.
     #[must_use]
-    pub const fn new(wal: Arc<RwLock<Wal<TokioStorage>>>) -> Self {
+    pub const fn new(wal: Arc<RwLock<Wal<S>>>) -> Self {
         Self { wal }
     }
 }
 
 #[async_trait]
-impl SegmentReader for WalSegmentReader {
+impl<S: Storage + 'static> SegmentReader for WalSegmentReader<S> {
     async fn read_segment_bytes(&self, segment_id: SegmentId) -> TierResult<Bytes> {
         let wal = self.wal.read().await;
 
@@ -138,8 +138,8 @@ impl SegmentReader for WalSegmentReader {
 // -----------------------------------------------------------------------------
 
 /// Type alias for the tiering manager with simulated storage (for testing).
-pub type SimulatedTieringManager =
-    IntegratedTieringManager<SimulatedObjectStorage, InMemoryMetadataStore, WalSegmentReader>;
+pub type SimulatedTieringManager<S> =
+    IntegratedTieringManager<SimulatedObjectStorage, InMemoryMetadataStore, WalSegmentReader<S>>;
 
 /// Type alias for the progress manager with simulated storage (for testing).
 pub type SimulatedProgressManager = ProgressManager<SimulatedProgressStore>;
@@ -732,34 +732,46 @@ impl DurablePartitionConfig {
 /// When tiering is enabled, sealed segments can be uploaded to S3. The
 /// partition tracks the last committed index to determine when segments
 /// are safe to tier.
+///
+/// # Type Parameters
+///
+/// * `S` - Storage backend (e.g., `TokioStorage` for production, `SimulatedStorage` for DST)
 #[allow(dead_code)] // Used in tests and will be used in service.rs integration.
-pub struct DurablePartition {
+pub struct DurablePartition<S: Storage + 'static> {
     /// Configuration.
     config: DurablePartitionConfig,
     /// WAL for durable storage (shared with tiering manager via `RwLock`).
-    wal: Arc<RwLock<Wal<TokioStorage>>>,
+    wal: Arc<RwLock<Wal<S>>>,
     /// In-memory cache for fast reads.
     cache: Partition,
     /// Last applied WAL index.
     last_applied_index: u64,
     /// Tiering manager for S3 uploads (optional).
-    tiering: Option<SimulatedTieringManager>,
+    tiering: Option<SimulatedTieringManager<S>>,
     /// Set of segment IDs that have been registered with tiering.
     tiered_segments: std::collections::HashSet<u64>,
     /// Progress manager for consumer offset tracking (optional).
     progress: Option<SimulatedProgressManager>,
 }
 
+/// Type alias for production durable partition using Tokio filesystem.
+pub type ProductionPartition = DurablePartition<TokioStorage>;
+
 #[allow(dead_code)] // Used in tests and will be used in service.rs integration.
-impl DurablePartition {
-    /// Opens or creates a durable partition.
+impl<S: Storage + 'static> DurablePartition<S> {
+    /// Opens or creates a durable partition with the given storage backend.
     ///
     /// If the WAL exists, entries are recovered and replayed to rebuild
     /// the in-memory cache.
     ///
+    /// # Arguments
+    ///
+    /// * `storage` - Storage backend to use for WAL operations
+    /// * `config` - Partition configuration
+    ///
     /// # Errors
     /// Returns an error if the WAL cannot be opened or recovery fails.
-    pub async fn open(config: DurablePartitionConfig) -> Result<Self, DurablePartitionError> {
+    pub async fn open(storage: S, config: DurablePartitionConfig) -> Result<Self, DurablePartitionError> {
         let wal_dir = config.wal_dir();
         let wal_config = WalConfig::new(&wal_dir).with_sync_on_write(config.sync_on_write);
 
@@ -771,7 +783,7 @@ impl DurablePartition {
             "Opening durable partition"
         );
 
-        let wal = Wal::open(TokioStorage::new(), wal_config)
+        let wal = Wal::open(storage, wal_config)
             .await
             .map_err(|e| DurablePartitionError::WalOpen {
                 path: wal_dir.clone(),
@@ -1319,7 +1331,7 @@ impl DurablePartition {
 
     /// Returns the tiering manager for testing purposes.
     #[must_use]
-    pub const fn tiering_manager(&self) -> Option<&SimulatedTieringManager> {
+    pub const fn tiering_manager(&self) -> Option<&SimulatedTieringManager<S>> {
         self.tiering.as_ref()
     }
 
@@ -1609,7 +1621,7 @@ mod tests {
             PartitionId::new(0),
         );
 
-        let mut partition = DurablePartition::open(config).await.unwrap();
+        let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
 
         let records = vec![
             Record::new(Bytes::from("value1")),
@@ -1637,7 +1649,7 @@ mod tests {
                 PartitionId::new(0),
             );
 
-            let mut partition = DurablePartition::open(config).await.unwrap();
+            let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
 
             for i in 0..5 {
                 let records = vec![Record::new(Bytes::from(format!("value-{i}")))];
@@ -1655,7 +1667,7 @@ mod tests {
                 PartitionId::new(0),
             );
 
-            let partition = DurablePartition::open(config).await.unwrap();
+            let partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
 
             assert_eq!(partition.log_end_offset(), Offset::new(5));
 
@@ -1676,7 +1688,7 @@ mod tests {
         )
         .with_tiering(TieringConfig::for_testing());
 
-        let mut partition = DurablePartition::open(config).await.unwrap();
+        let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
 
         // Verify tiering is enabled.
         assert!(partition.tiering_manager().is_some());
@@ -1711,7 +1723,7 @@ mod tests {
         )
         .with_progress(ProgressConfig::for_testing());
 
-        let partition = DurablePartition::open(config).await.unwrap();
+        let partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
 
         // Verify progress is enabled.
         assert!(partition.has_progress());
@@ -1729,7 +1741,7 @@ mod tests {
         )
         .with_progress(ProgressConfig::for_testing());
 
-        let partition = DurablePartition::open(config).await.unwrap();
+        let partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
 
         let group_id = ConsumerGroupId::new(1);
         let consumer_id = ConsumerId::new(100);
@@ -1759,7 +1771,7 @@ mod tests {
         )
         .with_progress(ProgressConfig::for_testing());
 
-        let mut partition = DurablePartition::open(config).await.unwrap();
+        let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
 
         // Write some records first.
         let records = vec![
@@ -1820,7 +1832,7 @@ mod tests {
         )
         .with_progress(ProgressConfig::for_testing());
 
-        let mut partition = DurablePartition::open(config).await.unwrap();
+        let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
 
         // Write records.
         let records = vec![
@@ -1889,7 +1901,7 @@ mod tests {
             PartitionId::new(0),
         );
 
-        let partition = DurablePartition::open(config).await.unwrap();
+        let partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
 
         // Attempting to use progress methods should fail.
         let group_id = ConsumerGroupId::new(1);
@@ -2015,7 +2027,7 @@ mod tests {
             PartitionId::new(0),
         );
 
-        let mut partition = DurablePartition::open(config).await.unwrap();
+        let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
 
         // Append blobs.
         let blob1 = Bytes::from("kafka-batch-1");
@@ -2048,7 +2060,7 @@ mod tests {
                 PartitionId::new(0),
             );
 
-            let mut partition = DurablePartition::open(config).await.unwrap();
+            let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
 
             for i in 0..5 {
                 let blob = Bytes::from(format!("kafka-batch-{i}"));
@@ -2066,7 +2078,7 @@ mod tests {
                 PartitionId::new(0),
             );
 
-            let partition = DurablePartition::open(config).await.unwrap();
+            let partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
 
             // 5 blobs * 2 records each = 10 total offset advancement.
             assert_eq!(partition.blob_log_end_offset(), Offset::new(10));

@@ -11,6 +11,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 helix-core = { workspace = true }
 helix-raft = { workspace = true }
 helix-routing = { workspace = true }

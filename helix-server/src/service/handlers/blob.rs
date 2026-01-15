@@ -116,8 +116,7 @@ impl HelixService {
 
             // Register the pending proposal so the tick task can notify us.
             {
-                eprintln!("[PROPOSE] topic={} partition={} group_id={} proposed_index={}",
-                    topic, partition, group_id, proposed_index);
+                eprintln!("[PROPOSE] topic={topic} partition={partition} group_id={group_id} proposed_index={proposed_index}");
                 let mut proposals = self.pending_proposals.write().await;
                 proposals
                     .entry(group_id)

@@ -44,7 +44,7 @@ tokio-stream = { version = "0.1", features = ["net"] }
 tokio-uring = "0.5"
 async-trait = "0.1"
 futures = "0.3"
-socket2 = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
 
 # Serialization.
 bytes = "1.5"

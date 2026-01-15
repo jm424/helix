@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use helix_core::NodeId;
 use helix_raft::multi::GroupMessage;
@@ -38,6 +39,7 @@ use crate::codec::{
     encode_group_batch, encode_message, is_broker_heartbeat, is_group_batch, BrokerHeartbeat,
     CodecError,
 };
+use crate::transport_trait::TransportService;
 
 /// Maximum read buffer size (1 MB).
 const READ_BUFFER_SIZE: usize = 1024 * 1024;
@@ -279,6 +281,28 @@ impl TransportHandle {
     /// Returns true if the transport is shutdown.
     pub async fn is_shutdown(&self) -> bool {
         *self.shutdown.lock().await
+    }
+}
+
+/// Implementation of `TransportService` for `TransportHandle`.
+///
+/// This allows `TransportHandle` to be used generically where `TransportService`
+/// is expected, enabling both production (TCP) and simulated (Bloodhound) transports.
+#[async_trait]
+impl TransportService for TransportHandle {
+    async fn send_batch(&self, to: NodeId, messages: Vec<GroupMessage>) -> TransportResult<()> {
+        // Delegate to the inherent method.
+        Self::send_batch(self, to, messages).await
+    }
+
+    async fn send_heartbeat(&self, to: NodeId, heartbeat: &BrokerHeartbeat) -> TransportResult<()> {
+        // Delegate to the inherent method.
+        Self::send_heartbeat(self, to, heartbeat).await
+    }
+
+    fn node_id(&self) -> NodeId {
+        // Delegate to the inherent method.
+        Self::node_id(self)
     }
 }
 

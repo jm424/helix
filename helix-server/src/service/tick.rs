@@ -10,25 +10,29 @@ use helix_core::{GroupId, NodeId, Offset};
 use helix_raft::multi::{MultiRaft, MultiRaftOutput};
 use helix_raft::RaftState;
 use helix_runtime::{BrokerHeartbeat, IncomingMessage, TransportHandle};
+use helix_wal::TokioStorage;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::controller::{ControllerCommand, ControllerState, CONTROLLER_GROUP_ID};
 use crate::error::ServerError;
 use crate::group_map::GroupMap;
-use crate::partition_storage::PartitionStorage;
+use crate::partition_storage::ProductionPartitionStorage;
 
 use super::{PendingControllerProposal, PendingProposal, TICK_INTERVAL_MS};
 
 /// Interval for sending broker heartbeats to the controller (in milliseconds).
-const HEARTBEAT_INTERVAL_MS: u64 = 3_000; // 3 seconds.
+///
+/// Used by both production tick tasks and DST simulation actors.
+pub const HEARTBEAT_INTERVAL_MS: u64 = 3_000; // 3 seconds.
 
 /// Background task to handle Raft ticks for all groups (single-node).
 #[allow(clippy::significant_drop_tightening)]
 pub async fn tick_task(
     multi_raft: Arc<RwLock<MultiRaft>>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, PartitionStorage>>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, ProductionPartitionStorage>>>,
     group_map: Arc<RwLock<GroupMap>>,
+    pending_proposals: Arc<RwLock<HashMap<GroupId, Vec<PendingProposal>>>>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
     let mut tick_interval =
@@ -49,6 +53,7 @@ pub async fn tick_task(
                     &outputs,
                     &partition_storage,
                     &group_map,
+                    &pending_proposals,
                 ).await;
             }
         }
@@ -60,7 +65,7 @@ pub async fn tick_task(
 #[allow(clippy::too_many_arguments)]
 pub async fn tick_task_multi_node(
     multi_raft: Arc<RwLock<MultiRaft>>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, PartitionStorage>>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, ProductionPartitionStorage>>>,
     group_map: Arc<RwLock<GroupMap>>,
     controller_state: Arc<RwLock<ControllerState>>,
     pending_proposals: Arc<RwLock<HashMap<GroupId, Vec<PendingProposal>>>>,
@@ -165,7 +170,7 @@ pub async fn tick_task_multi_node(
     }
 }
 
-/// Sends broker heartbeats to all peers via transport (Kafka KRaft pattern).
+/// Sends broker heartbeats to all peers via transport (Kafka `KRaft` pattern).
 ///
 /// Unlike Raft-replicated state, heartbeats are soft state. Each broker:
 /// 1. Records its own heartbeat locally
@@ -220,8 +225,9 @@ async fn send_broker_heartbeats_to_peers(
 /// Processes Multi-Raft outputs (single-node).
 async fn process_outputs(
     outputs: &[MultiRaftOutput],
-    partition_storage: &Arc<RwLock<HashMap<GroupId, PartitionStorage>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, ProductionPartitionStorage>>>,
     group_map: &Arc<RwLock<GroupMap>>,
+    pending_proposals: &Arc<RwLock<HashMap<GroupId, Vec<PendingProposal>>>>,
 ) {
     for output in outputs {
         match output {
@@ -235,17 +241,56 @@ async fn process_outputs(
                     gm.get_key(*group_id)
                 };
 
-                if let Some((topic_id, partition_id)) = key {
+                let apply_result = if let Some((topic_id, partition_id)) = key {
                     let mut storage = partition_storage.write().await;
                     if let Some(ps) = storage.get_mut(group_id) {
-                        if let Err(e) = ps.apply_entry_async(*index, data).await {
-                            warn!(
-                                topic = topic_id.get(),
-                                partition = partition_id.get(),
-                                error = %e,
-                                "Failed to apply committed entry"
-                            );
+                        match ps.apply_entry_async(*index, data).await {
+                            Ok(offset) => Ok(offset),
+                            Err(e) => {
+                                warn!(
+                                    topic = topic_id.get(),
+                                    partition = partition_id.get(),
+                                    error = %e,
+                                    "Failed to apply committed entry"
+                                );
+                                Err(e)
+                            }
                         }
+                    } else {
+                        Err(ServerError::Internal {
+                            message: "partition storage not found".to_string(),
+                        })
+                    }
+                } else {
+                    Err(ServerError::Internal {
+                        message: "group not found in group map".to_string(),
+                    })
+                };
+
+                // Find and notify any pending proposal for this entry.
+                let mut proposals = pending_proposals.write().await;
+                if let Some(group_proposals) = proposals.get_mut(group_id) {
+                    if let Some(pos) = group_proposals
+                        .iter()
+                        .position(|p| p.log_index == *index)
+                    {
+                        let proposal = group_proposals.swap_remove(pos);
+                        let result = match &apply_result {
+                            Ok(Some(offset)) => Ok(*offset),
+                            Ok(None) => {
+                                // No offset returned (e.g., empty entry), use current log end.
+                                let storage = partition_storage.read().await;
+                                let offset = storage
+                                    .get(group_id)
+                                    .map_or(Offset::new(0), |ps| ps.log_end_offset());
+                                Ok(offset)
+                            }
+                            Err(e) => Err(ServerError::Internal {
+                                message: format!("apply failed: {e}"),
+                            }),
+                        };
+                        // Ignore send errors (receiver may have timed out).
+                        let _ = proposal.result_tx.send(result);
                     }
                 }
             }
@@ -293,7 +338,7 @@ async fn process_outputs(
 async fn process_outputs_multi_node(
     outputs: &[MultiRaftOutput],
     multi_raft: &Arc<RwLock<MultiRaft>>,
-    partition_storage: &Arc<RwLock<HashMap<GroupId, PartitionStorage>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, ProductionPartitionStorage>>>,
     group_map: &Arc<RwLock<GroupMap>>,
     controller_state: &Arc<RwLock<ControllerState>>,
     pending_proposals: &Arc<RwLock<HashMap<GroupId, Vec<PendingProposal>>>>,
@@ -407,9 +452,9 @@ async fn process_outputs_multi_node(
                             // Create partition storage (durable if data_dir is set).
                             {
                                 let mut storage = partition_storage.write().await;
-                                if !storage.contains_key(&data_group_id) {
+                                if let std::collections::hash_map::Entry::Vacant(e) = storage.entry(data_group_id) {
                                     let ps = if let Some(dir) = data_dir {
-                                        match PartitionStorage::new_durable(dir, topic_id, partition_id).await {
+                                        match ProductionPartitionStorage::new_durable(TokioStorage::new(), dir, topic_id, partition_id).await {
                                             Ok(durable) => durable,
                                             Err(e) => {
                                                 error!(
@@ -418,13 +463,13 @@ async fn process_outputs_multi_node(
                                                     error = %e,
                                                     "Failed to create durable partition, falling back to in-memory"
                                                 );
-                                                PartitionStorage::new_in_memory(topic_id, partition_id)
+                                                ProductionPartitionStorage::new_in_memory(topic_id, partition_id)
                                             }
                                         }
                                     } else {
-                                        PartitionStorage::new_in_memory(topic_id, partition_id)
+                                        ProductionPartitionStorage::new_in_memory(topic_id, partition_id)
                                     };
-                                    storage.insert(data_group_id, ps);
+                                    e.insert(ps);
                                 }
                             }
                         }
@@ -461,17 +506,15 @@ async fn process_outputs_multi_node(
                             let proposal = group_proposals.swap_remove(pos);
                             let result = match &apply_result {
                                 Ok(Some(offset)) => {
-                                    eprintln!("[NOTIFY] topic={} partition={} group_id={} index={} apply_result=Some({}) -> sending offset={}",
-                                        topic_id, partition_id, group_id, index, offset, offset);
+                                    eprintln!("[NOTIFY] topic={topic_id} partition={partition_id} group_id={group_id} index={index} apply_result=Some({offset}) -> sending offset={offset}");
                                     Ok(*offset)
                                 }
                                 Ok(None) => {
                                     let storage = partition_storage.read().await;
                                     let offset = storage
                                         .get(group_id)
-                                        .map_or(Offset::new(0), super::super::partition_storage::PartitionStorage::blob_log_end_offset);
-                                    eprintln!("[NOTIFY] topic={} partition={} group_id={} index={} apply_result=None -> sending blob_log_end_offset={}",
-                                        topic_id, partition_id, group_id, index, offset);
+                                        .map_or(Offset::new(0), ProductionPartitionStorage::blob_log_end_offset);
+                                    eprintln!("[NOTIFY] topic={topic_id} partition={partition_id} group_id={group_id} index={index} apply_result=None -> sending blob_log_end_offset={offset}");
                                     Ok(offset)
                                 }
                                 Err(e) => Err(ServerError::Internal {
@@ -480,8 +523,7 @@ async fn process_outputs_multi_node(
                             };
                             let send_result = proposal.result_tx.send(result);
                             if send_result.is_err() {
-                                eprintln!("[NOTIFY_FAILED] group_id={} index={} - receiver dropped",
-                                    group_id, index);
+                                eprintln!("[NOTIFY_FAILED] group_id={group_id} index={index} - receiver dropped");
                             }
                         }
                     }

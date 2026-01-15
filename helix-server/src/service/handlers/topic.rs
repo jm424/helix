@@ -6,9 +6,11 @@ use helix_raft::RaftState;
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
+use helix_wal::TokioStorage;
+
 use crate::controller::{ControllerCommand, CONTROLLER_GROUP_ID};
 use crate::error::{ServerError, ServerResult};
-use crate::partition_storage::PartitionStorage;
+use crate::partition_storage::ProductionPartitionStorage;
 
 use super::super::{HelixService, PendingControllerProposal, TopicMetadata};
 
@@ -58,13 +60,13 @@ impl HelixService {
 
             // Create partition storage (durable or in-memory based on config).
             let ps = if let Some(data_dir) = &self.data_dir {
-                PartitionStorage::new_durable(data_dir, topic_id, partition_id)
+                ProductionPartitionStorage::new_durable(TokioStorage::new(), data_dir, topic_id, partition_id)
                     .await
                     .map_err(|e| ServerError::Internal {
                         message: format!("failed to create durable partition: {e}"),
                     })?
             } else {
-                PartitionStorage::new_in_memory(topic_id, partition_id)
+                ProductionPartitionStorage::new_in_memory(topic_id, partition_id)
             };
             partition_storage.insert(group_id, ps);
 
@@ -164,7 +166,7 @@ impl HelixService {
                 let controller_hint = mr
                     .group_state(CONTROLLER_GROUP_ID)
                     .and_then(|s| s.leader_id)
-                    .map(|n| n.get());
+                    .map(helix_core::NodeId::get);
                 return Err(ServerError::NotController { controller_hint });
             };
             index
@@ -253,7 +255,7 @@ impl HelixService {
 
                 (0..partition_count).all(|p| {
                     let partition_id = PartitionId::new(u64::from(p));
-                    state.get_assignment(topic_id, partition_id).map_or(false, |assignment| {
+                    state.get_assignment(topic_id, partition_id).is_some_and(|assignment| {
                         mr.group_state(assignment.group_id)
                             .is_some_and(|gs| gs.leader_id.is_some())
                     })

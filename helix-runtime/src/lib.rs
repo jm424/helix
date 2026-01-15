@@ -39,6 +39,7 @@ mod codec;
 mod config;
 mod server;
 mod transport;
+mod transport_trait;
 
 pub use codec::{
     decode_broker_heartbeat, decode_group_batch, decode_message, decode_transfer_message,
@@ -52,3 +53,4 @@ pub use transport::{
     IncomingMessage, PeerInfo, Transport, TransportBuilder, TransportConfig, TransportError,
     TransportHandle, TransportResult,
 };
+pub use transport_trait::TransportService;

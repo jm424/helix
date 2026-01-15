@@ -1778,6 +1778,7 @@ dependencies = [
 name = "helix-runtime"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "helix-core",
  "helix-raft",

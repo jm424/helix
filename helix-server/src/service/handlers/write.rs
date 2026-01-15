@@ -4,13 +4,14 @@ use bytes::Bytes;
 use helix_core::{NodeId, PartitionId, Record};
 use helix_raft::multi::MultiRaftOutput;
 use helix_raft::RaftState;
+use tokio::sync::oneshot;
 use tracing::debug;
 
 use crate::error::{ServerError, ServerResult};
 use crate::generated::{ErrorCode, Record as ProtoRecord, WriteRequest, WriteResponse};
 use crate::storage::PartitionCommand;
 
-use super::super::{HelixService, MAX_RECORDS_PER_WRITE};
+use super::super::{HelixService, PendingProposal, MAX_RECORDS_PER_WRITE};
 
 impl HelixService {
     /// Converts a proto Record to a core Record.
@@ -35,8 +36,12 @@ impl HelixService {
     }
 
     /// Internal write implementation using Multi-Raft.
+    ///
+    /// Uses the `PendingProposal` pattern: propose to Raft, register a pending
+    /// proposal, and wait for the tick task to apply and notify us with the
+    /// resulting offset. This ensures entries are applied in Raft log order
+    /// regardless of concurrent write timing.
     #[allow(clippy::significant_drop_tightening)]
-    #[allow(clippy::too_many_lines)] // Complex flow with validation, Raft, and storage.
     pub(crate) async fn write_internal(&self, request: WriteRequest) -> ServerResult<WriteResponse> {
         // Validate request.
         assert!(!request.topic.is_empty(), "topic cannot be empty");
@@ -81,21 +86,6 @@ impl HelixService {
             })?
         };
 
-        // Convert proto records to core records.
-        let records: Vec<Record> = request.records.iter().map(Self::proto_to_record).collect();
-
-        let record_count = records.len();
-
-        // Get base offset before proposing.
-        let base_offset = {
-            let storage = self.partition_storage.read().await;
-            let ps = storage.get(&group_id).ok_or_else(|| ServerError::PartitionNotFound {
-                topic: request.topic.clone(),
-                partition: partition_idx,
-            })?;
-            ps.log_end_offset()
-        };
-
         // Check if we're the leader.
         let (is_leader, leader_hint) = {
             let mr = self.multi_raft.read().await;
@@ -113,37 +103,97 @@ impl HelixService {
             });
         }
 
-        // Encode command and propose to Raft.
+        // Convert proto records to core records.
+        let records: Vec<Record> = request.records.iter().map(Self::proto_to_record).collect();
+        let record_count = records.len();
+
+        // Encode command.
         let command = PartitionCommand::Append { records };
         let data = command.encode();
 
-        let outputs = {
+        // Create channel for receiving the apply result.
+        let (result_tx, result_rx) = oneshot::channel();
+
+        // Propose to Raft and get the log index.
+        let (outputs, proposed_index) = {
             let mut mr = self.multi_raft.write().await;
-            mr.propose(group_id, data)
+            mr.propose_with_index(group_id, data).ok_or_else(|| {
+                ServerError::NotLeader {
+                    topic: request.topic.clone(),
+                    partition: partition_idx,
+                    leader_hint: None,
+                }
+            })?
         };
 
-        // Apply any committed entries (single-node: immediate commit).
-        if let Some(outputs) = outputs {
-            for output in &outputs {
-                if let MultiRaftOutput::CommitEntry {
-                    group_id: gid,
-                    index,
-                    data,
-                } = output
-                {
-                    if *gid == group_id {
-                        let mut storage = self.partition_storage.write().await;
-                        if let Some(ps) = storage.get_mut(&group_id) {
-                            ps.apply_entry_async(*index, data)
-                                .await
-                                .map_err(|e| ServerError::Internal {
-                                    message: format!("failed to apply: {e}"),
-                                })?;
+        // In single-node mode, the commit happens synchronously and the CommitEntry
+        // is returned in outputs. We can apply immediately IF our entry is next in
+        // line (index == last_applied + 1). If there's a gap (another concurrent
+        // write's entry needs to be applied first), we wait for the tick task.
+        //
+        // In multi-node mode, outputs won't contain CommitEntry (needs replication),
+        // so we always register a pending proposal and wait for the tick task.
+        let mut immediate_offset = None;
+        for output in &outputs {
+            if let MultiRaftOutput::CommitEntry {
+                group_id: gid,
+                index,
+                data: entry_data,
+            } = output
+            {
+                if *gid == group_id && *index == proposed_index {
+                    let mut storage = self.partition_storage.write().await;
+                    if let Some(ps) = storage.get_mut(&group_id) {
+                        // Only apply if we're next in line (no gap).
+                        // This ensures entries are applied in order even with concurrent writes.
+                        let last_applied = ps.last_applied();
+                        let expected_next = helix_core::LogIndex::new(last_applied.get() + 1);
+
+                        if *index == expected_next {
+                            match ps.apply_entry_async(*index, entry_data).await {
+                                Ok(Some(offset)) => immediate_offset = Some(offset),
+                                Ok(None) => immediate_offset = Some(ps.log_end_offset()),
+                                Err(e) => {
+                                    return Err(ServerError::Internal {
+                                        message: format!("failed to apply: {e}"),
+                                    });
+                                }
+                            }
                         }
+                        // If index > expected_next, there's a gap - another write's entry
+                        // needs to be applied first. Fall through to wait for tick task.
                     }
                 }
             }
         }
+
+        // If we got an immediate offset, we're done (single-node fast path).
+        // Otherwise, register pending proposal and wait for tick task.
+        let base_offset = if let Some(offset) = immediate_offset {
+            offset
+        } else {
+            // Register the pending proposal so the tick task can notify us.
+            {
+                let mut proposals = self.pending_proposals.write().await;
+                proposals
+                    .entry(group_id)
+                    .or_insert_with(Vec::new)
+                    .push(PendingProposal {
+                        log_index: proposed_index,
+                        result_tx,
+                    });
+            }
+
+            // Wait for commit and apply with timeout.
+            tokio::time::timeout(std::time::Duration::from_secs(30), result_rx)
+                .await
+                .map_err(|_| ServerError::Internal {
+                    message: "timeout waiting for commit".to_string(),
+                })?
+                .map_err(|_| ServerError::Internal {
+                    message: "commit notification channel closed".to_string(),
+                })??
+        };
 
         debug!(
             topic = %request.topic,
