@@ -73,6 +73,18 @@ pub enum ControllerCommand {
         /// New leader node ID (None if no leader).
         leader: Option<NodeId>,
     },
+
+    /// Broker heartbeat to indicate liveness.
+    ///
+    /// Each broker sends periodic heartbeats to the controller. Brokers that
+    /// miss heartbeats are considered dead and excluded from metadata responses.
+    /// This follows the Kafka `KRaft` broker heartbeat pattern.
+    BrokerHeartbeat {
+        /// The broker's node ID.
+        node_id: NodeId,
+        /// Timestamp in milliseconds when this heartbeat was sent.
+        timestamp_ms: u64,
+    },
 }
 
 /// Command type tags for encoding.
@@ -80,6 +92,7 @@ const CMD_CREATE_TOPIC: u8 = 1;
 const CMD_DELETE_TOPIC: u8 = 2;
 const CMD_ASSIGN_PARTITION: u8 = 3;
 const CMD_UPDATE_PARTITION_LEADER: u8 = 4;
+const CMD_BROKER_HEARTBEAT: u8 = 5;
 
 impl ControllerCommand {
     /// Encodes the command to bytes for Raft replication.
@@ -146,6 +159,15 @@ impl ControllerCommand {
                         buf.put_u8(0); // No leader.
                     }
                 }
+            }
+
+            Self::BrokerHeartbeat {
+                node_id,
+                timestamp_ms,
+            } => {
+                buf.put_u8(CMD_BROKER_HEARTBEAT);
+                buf.put_u64_le(node_id.get());
+                buf.put_u64_le(*timestamp_ms);
             }
         }
 
@@ -245,6 +267,19 @@ impl ControllerCommand {
                 })
             }
 
+            CMD_BROKER_HEARTBEAT => {
+                if buf.remaining() < 16 {
+                    return None;
+                }
+                let node_id = NodeId::new(buf.get_u64_le());
+                let timestamp_ms = buf.get_u64_le();
+
+                Some(Self::BrokerHeartbeat {
+                    node_id,
+                    timestamp_ms,
+                })
+            }
+
             _ => None, // Unknown command type.
         }
     }
@@ -278,6 +313,11 @@ pub struct PartitionAssignment {
     pub leader: Option<NodeId>,
 }
 
+/// Broker heartbeat timeout in milliseconds.
+/// Brokers that haven't sent a heartbeat within this period are considered dead.
+/// Set to 6 seconds (2x heartbeat interval of 3s) for reasonable detection time.
+pub const BROKER_HEARTBEAT_TIMEOUT_MS: u64 = 6_000; // 6 seconds.
+
 /// Controller state machine.
 ///
 /// This state is rebuilt by replaying committed controller commands.
@@ -294,6 +334,9 @@ pub struct ControllerState {
     next_topic_id: u64,
     /// Next group ID to allocate (starts at 1, since 0 is controller).
     next_group_id: u64,
+    /// Last heartbeat timestamp (ms) for each broker.
+    /// Brokers that miss heartbeats are considered dead and excluded from metadata.
+    broker_heartbeats: HashMap<NodeId, u64>,
 }
 
 impl ControllerState {
@@ -306,6 +349,7 @@ impl ControllerState {
             assignments: HashMap::new(),
             next_topic_id: 1,
             next_group_id: 1, // 0 is reserved for controller partition.
+            broker_heartbeats: HashMap::new(),
         }
     }
 
@@ -401,6 +445,13 @@ impl ControllerState {
                 if let Some(assignment) = self.assignments.get_mut(&(*topic_id, *partition_id)) {
                     assignment.leader = *leader;
                 }
+            }
+
+            ControllerCommand::BrokerHeartbeat {
+                node_id,
+                timestamp_ms,
+            } => {
+                self.broker_heartbeats.insert(*node_id, *timestamp_ms);
             }
         }
 
@@ -509,6 +560,51 @@ impl ControllerState {
             .filter(|(_, assignment)| assignment.replicas.contains(&node_id))
             .map(|((topic_id, partition_id), assignment)| (*topic_id, *partition_id, assignment))
             .collect()
+    }
+
+    /// Returns live brokers (those with recent heartbeats).
+    ///
+    /// A broker is considered live if it has sent a heartbeat within
+    /// `BROKER_HEARTBEAT_TIMEOUT_MS` of `current_time_ms`.
+    ///
+    /// # Arguments
+    ///
+    /// * `cluster_nodes` - All configured nodes in the cluster
+    /// * `current_time_ms` - Current timestamp in milliseconds
+    #[must_use]
+    pub fn live_brokers(&self, cluster_nodes: &[NodeId], current_time_ms: u64) -> Vec<NodeId> {
+        cluster_nodes
+            .iter()
+            .filter(|&node_id| self.is_broker_live(*node_id, current_time_ms))
+            .copied()
+            .collect()
+    }
+
+    /// Checks if a specific broker is live.
+    ///
+    /// Returns `true` if the broker has sent a heartbeat within the timeout period,
+    /// OR if no heartbeats have been received at all (initial state before heartbeats
+    /// are established - all brokers are assumed live).
+    #[must_use]
+    pub fn is_broker_live(&self, node_id: NodeId, current_time_ms: u64) -> bool {
+        // If no heartbeats have been recorded at all, assume all brokers are live.
+        // This handles the initial startup case before heartbeats are established.
+        if self.broker_heartbeats.is_empty() {
+            return true;
+        }
+
+        // Check if this broker has a recent heartbeat.
+        self.broker_heartbeats
+            .get(&node_id)
+            .is_some_and(|&last_heartbeat| {
+                current_time_ms.saturating_sub(last_heartbeat) < BROKER_HEARTBEAT_TIMEOUT_MS
+            })
+    }
+
+    /// Records a broker heartbeat directly (for testing).
+    #[cfg(test)]
+    pub fn record_heartbeat(&mut self, node_id: NodeId, timestamp_ms: u64) {
+        self.broker_heartbeats.insert(node_id, timestamp_ms);
     }
 }
 

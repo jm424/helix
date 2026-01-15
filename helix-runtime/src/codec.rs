@@ -723,6 +723,10 @@ const TAG_TRANSFER_SWITCH_REQUEST: u8 = 24;
 const TAG_TRANSFER_SWITCH_RESPONSE: u8 = 25;
 const TAG_TRANSFER_CANCEL_REQUEST: u8 = 26;
 
+/// Broker heartbeat message tag.
+/// Heartbeats are soft-state messages (not Raft-replicated) sent directly between nodes.
+const TAG_BROKER_HEARTBEAT: u8 = 30;
+
 use helix_core::TransferId;
 use helix_routing::{ShardRange, TransferMessage};
 
@@ -996,6 +1000,119 @@ fn decode_transfer_cancel_request(buf: &mut &[u8]) -> CodecResult<TransferMessag
 pub fn is_transfer_message(data: &[u8]) -> bool {
     // Need at least 5 bytes: 4 (length) + 1 (tag).
     data.len() >= 5 && (TAG_TRANSFER_PREPARE_REQUEST..=TAG_TRANSFER_CANCEL_REQUEST).contains(&data[4])
+}
+
+// =============================================================================
+// Broker Heartbeat Codec
+// =============================================================================
+
+/// Broker heartbeat message.
+///
+/// Unlike other controller state, heartbeats are **soft state** (not Raft-replicated).
+/// Each broker sends heartbeats directly to all peers via transport. Each node
+/// maintains its own local view of broker liveness based on received heartbeats.
+///
+/// This follows the Kafka `KRaft` pattern where `BrokerHeartbeatRequest` is a
+/// separate RPC mechanism, not part of Raft replication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerHeartbeat {
+    /// The broker's node ID.
+    pub node_id: NodeId,
+    /// Timestamp in milliseconds when this heartbeat was sent.
+    pub timestamp_ms: u64,
+}
+
+impl BrokerHeartbeat {
+    /// Creates a new broker heartbeat.
+    #[must_use]
+    pub const fn new(node_id: NodeId, timestamp_ms: u64) -> Self {
+        Self {
+            node_id,
+            timestamp_ms,
+        }
+    }
+}
+
+/// Encodes a broker heartbeat to bytes.
+///
+/// Wire format:
+/// - 4 bytes: message length (u32 little-endian, not including header)
+/// - 1 byte: tag (30)
+/// - 8 bytes: node ID (u64 little-endian)
+/// - 8 bytes: `timestamp_ms` (u64 little-endian)
+///
+/// # Errors
+///
+/// Returns an error if encoding fails (should not happen for heartbeats).
+pub fn encode_broker_heartbeat(heartbeat: &BrokerHeartbeat) -> CodecResult<Bytes> {
+    let mut buf = BytesMut::with_capacity(21); // 4 + 1 + 8 + 8
+
+    // Reserve space for length prefix.
+    buf.put_u32_le(0);
+
+    buf.put_u8(TAG_BROKER_HEARTBEAT);
+    buf.put_u64_le(heartbeat.node_id.get());
+    buf.put_u64_le(heartbeat.timestamp_ms);
+
+    // Fill in length (excluding the 4-byte header).
+    #[allow(clippy::cast_possible_truncation)]
+    let len = (buf.len() - 4) as u32;
+    buf[0..4].copy_from_slice(&len.to_le_bytes());
+
+    Ok(buf.freeze())
+}
+
+/// Decodes a broker heartbeat from bytes.
+///
+/// Expects the full framed message including length prefix.
+///
+/// # Errors
+///
+/// Returns an error if the data is malformed or incomplete.
+pub fn decode_broker_heartbeat(data: &[u8]) -> CodecResult<(BrokerHeartbeat, usize)> {
+    if data.len() < 4 {
+        return Err(CodecError::InsufficientData {
+            need: 4,
+            have: data.len(),
+        });
+    }
+
+    let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let total_len = 4 + len;
+
+    if data.len() < total_len {
+        return Err(CodecError::InsufficientData {
+            need: total_len,
+            have: data.len(),
+        });
+    }
+
+    let payload = &data[4..total_len];
+    if payload.len() < 17 {
+        // 1 (tag) + 8 (node_id) + 8 (timestamp_ms)
+        return Err(CodecError::InsufficientData {
+            need: 17,
+            have: payload.len(),
+        });
+    }
+
+    let tag = payload[0];
+    if tag != TAG_BROKER_HEARTBEAT {
+        return Err(CodecError::UnknownMessageType { tag });
+    }
+
+    let mut buf = &payload[1..];
+    let node_id = NodeId::new(buf.get_u64_le());
+    let timestamp_ms = buf.get_u64_le();
+
+    Ok((BrokerHeartbeat::new(node_id, timestamp_ms), total_len))
+}
+
+/// Checks if the given data starts with a broker heartbeat tag.
+#[must_use]
+pub fn is_broker_heartbeat(data: &[u8]) -> bool {
+    // Need at least 5 bytes: 4 (length) + 1 (tag).
+    data.len() >= 5 && data[4] == TAG_BROKER_HEARTBEAT
 }
 
 #[cfg(test)]

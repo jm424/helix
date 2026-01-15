@@ -181,10 +181,12 @@ impl KafkaHandler {
 
         let mut response = MetadataResponse::default();
 
-        // Add all brokers in the cluster.
+        // Add only live brokers to the cluster metadata.
+        // Dead brokers (those that haven't sent heartbeats) are filtered out.
         // Safe cast: NodeId (u64) fits in i32 for reasonable cluster sizes.
+        let live_brokers = self.service.live_brokers().await;
         #[allow(clippy::cast_possible_truncation)]
-        for node_id in self.service.cluster_nodes() {
+        for node_id in &live_brokers {
             let mut broker = MetadataResponseBroker::default();
             broker.node_id = BrokerId(node_id.get() as i32);
 
@@ -371,11 +373,12 @@ impl KafkaHandler {
         }
 
         // Safe cast: NodeId (u64) fits in i32 for reasonable cluster sizes.
+        // Only include live brokers in replica list to prevent clients from trying
+        // to connect to dead brokers.
+        let live_brokers = self.service.live_brokers().await;
         #[allow(clippy::cast_possible_truncation)]
         {
-            partition_response.replica_nodes = self
-                .service
-                .cluster_nodes()
+            partition_response.replica_nodes = live_brokers
                 .iter()
                 .map(|n| BrokerId(n.get() as i32))
                 .collect();

@@ -22,7 +22,7 @@ use helix_runtime::{PeerInfo, TransportConfig, TransportError, TransportHandle};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{error, info};
 
-use crate::controller::{ControllerState, CONTROLLER_GROUP_ID};
+use crate::controller::{ControllerState, BROKER_HEARTBEAT_TIMEOUT_MS, CONTROLLER_GROUP_ID};
 use crate::group_map::GroupMap;
 use crate::partition_storage::PartitionStorage;
 
@@ -103,6 +103,12 @@ pub struct HelixService {
     pub(crate) pending_proposals: Arc<RwLock<HashMap<GroupId, Vec<PendingProposal>>>>,
     /// Pending controller proposals waiting for Raft commit.
     pub(crate) pending_controller_proposals: Arc<RwLock<Vec<PendingControllerProposal>>>,
+    /// Local broker heartbeat timestamps (soft state, not Raft-replicated).
+    ///
+    /// Following Kafka KRaft pattern, heartbeats are maintained as soft state
+    /// on each node. Each broker sends heartbeats via transport to all peers,
+    /// and each node maintains its own view of broker liveness.
+    pub(crate) local_broker_heartbeats: Arc<RwLock<HashMap<NodeId, u64>>>,
 }
 
 impl HelixService {
@@ -164,6 +170,7 @@ impl HelixService {
             controller_state: Arc::new(RwLock::new(ControllerState::new())),
             pending_proposals: Arc::new(RwLock::new(HashMap::new())),
             pending_controller_proposals: Arc::new(RwLock::new(Vec::new())),
+            local_broker_heartbeats: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -204,6 +211,7 @@ impl HelixService {
         let controller_state = Arc::new(RwLock::new(ControllerState::new()));
         let pending_proposals = Arc::new(RwLock::new(HashMap::new()));
         let pending_controller_proposals = Arc::new(RwLock::new(Vec::new()));
+        let local_broker_heartbeats = Arc::new(RwLock::new(HashMap::new()));
 
         // Create controller partition (group 0) with all cluster nodes.
         {
@@ -234,6 +242,7 @@ impl HelixService {
             Arc::clone(&controller_state),
             Arc::clone(&pending_proposals),
             Arc::clone(&pending_controller_proposals),
+            Arc::clone(&local_broker_heartbeats),
             cluster_nodes.clone(),
             transport_handle.clone(),
             incoming_rx,
@@ -268,13 +277,57 @@ impl HelixService {
             controller_state,
             pending_proposals,
             pending_controller_proposals,
+            local_broker_heartbeats,
         })
     }
 
     /// Returns the cluster nodes.
-    #[must_use] 
+    #[must_use]
     pub fn cluster_nodes(&self) -> &[NodeId] {
         &self.cluster_nodes
+    }
+
+    /// Returns live brokers (those with recent heartbeats).
+    ///
+    /// In multi-node mode, filters out brokers that have missed heartbeats.
+    /// In single-node mode, returns all cluster nodes (no heartbeat filtering).
+    ///
+    /// # Kafka KRaft Pattern
+    ///
+    /// Unlike other controller state, heartbeats are **soft state** (not Raft-replicated).
+    /// Each broker sends heartbeats via transport to all peers, and each node maintains
+    /// its own local view of broker liveness based on received heartbeats.
+    pub async fn live_brokers(&self) -> Vec<NodeId> {
+        // In single-node mode, all brokers are "live".
+        if !self.is_multi_node() {
+            return self.cluster_nodes.clone();
+        }
+
+        // Get current time in milliseconds.
+        let current_time_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+
+        // Use local heartbeat soft state (not Raft-replicated controller state).
+        let heartbeats = self.local_broker_heartbeats.read().await;
+
+        // If no heartbeats have been recorded yet, assume all brokers are live.
+        // This handles initial startup before heartbeats are established.
+        if heartbeats.is_empty() {
+            return self.cluster_nodes.clone();
+        }
+
+        self.cluster_nodes
+            .iter()
+            .filter(|&node_id| {
+                heartbeats
+                    .get(node_id)
+                    .map_or(false, |&last_heartbeat| {
+                        current_time_ms.saturating_sub(last_heartbeat) < BROKER_HEARTBEAT_TIMEOUT_MS
+                    })
+            })
+            .copied()
+            .collect()
     }
 
     /// Returns the cluster ID.

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use helix_core::{GroupId, NodeId, Offset};
 use helix_raft::multi::{MultiRaft, MultiRaftOutput};
 use helix_raft::RaftState;
-use helix_runtime::{IncomingMessage, TransportHandle};
+use helix_runtime::{BrokerHeartbeat, IncomingMessage, TransportHandle};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
@@ -18,6 +18,9 @@ use crate::group_map::GroupMap;
 use crate::partition_storage::PartitionStorage;
 
 use super::{PendingControllerProposal, PendingProposal, TICK_INTERVAL_MS};
+
+/// Interval for sending broker heartbeats to the controller (in milliseconds).
+const HEARTBEAT_INTERVAL_MS: u64 = 3_000; // 3 seconds.
 
 /// Background task to handle Raft ticks for all groups (single-node).
 #[allow(clippy::significant_drop_tightening)]
@@ -61,6 +64,7 @@ pub async fn tick_task_multi_node(
     controller_state: Arc<RwLock<ControllerState>>,
     pending_proposals: Arc<RwLock<HashMap<GroupId, Vec<PendingProposal>>>>,
     pending_controller_proposals: Arc<RwLock<Vec<PendingControllerProposal>>>,
+    local_broker_heartbeats: Arc<RwLock<HashMap<NodeId, u64>>>,
     cluster_nodes: Vec<NodeId>,
     transport_handle: TransportHandle,
     mut incoming_rx: mpsc::Receiver<IncomingMessage>,
@@ -68,6 +72,14 @@ pub async fn tick_task_multi_node(
 ) {
     let mut tick_interval =
         tokio::time::interval(tokio::time::Duration::from_millis(TICK_INTERVAL_MS));
+    let mut heartbeat_interval =
+        tokio::time::interval(tokio::time::Duration::from_millis(HEARTBEAT_INTERVAL_MS));
+
+    // Get our node ID for heartbeats.
+    let node_id = {
+        let mr = multi_raft.read().await;
+        mr.node_id()
+    };
 
     loop {
         tokio::select! {
@@ -92,6 +104,17 @@ pub async fn tick_task_multi_node(
                     &transport_handle,
                 ).await;
             }
+            _ = heartbeat_interval.tick() => {
+                // Send broker heartbeat via transport to all peers (Kafka KRaft pattern).
+                // Unlike Raft-replicated state, heartbeats are soft state maintained locally
+                // on each node based on received heartbeat messages.
+                send_broker_heartbeats_to_peers(
+                    &local_broker_heartbeats,
+                    node_id,
+                    &cluster_nodes,
+                    &transport_handle,
+                ).await;
+            }
             Some(incoming) = incoming_rx.recv() => {
                 let outputs = match incoming {
                     IncomingMessage::Single(_message) => {
@@ -110,6 +133,17 @@ pub async fn tick_task_multi_node(
                         }
                         all_outputs
                     }
+                    IncomingMessage::Heartbeat(heartbeat) => {
+                        // Update local heartbeat soft state.
+                        let mut heartbeats = local_broker_heartbeats.write().await;
+                        heartbeats.insert(heartbeat.node_id, heartbeat.timestamp_ms);
+                        debug!(
+                            from = heartbeat.node_id.get(),
+                            timestamp_ms = heartbeat.timestamp_ms,
+                            "Recorded heartbeat from peer"
+                        );
+                        vec![] // No Raft outputs for heartbeats.
+                    }
                 };
                 process_outputs_multi_node(
                     &outputs,
@@ -125,6 +159,58 @@ pub async fn tick_task_multi_node(
             }
         }
     }
+}
+
+/// Sends broker heartbeats to all peers via transport (Kafka KRaft pattern).
+///
+/// Unlike Raft-replicated state, heartbeats are soft state. Each broker:
+/// 1. Records its own heartbeat locally
+/// 2. Sends heartbeats to all other nodes via transport
+///
+/// This ensures all nodes have a local view of broker liveness without requiring
+/// Raft consensus, which would only work for the leader node.
+async fn send_broker_heartbeats_to_peers(
+    local_broker_heartbeats: &Arc<RwLock<HashMap<NodeId, u64>>>,
+    node_id: NodeId,
+    cluster_nodes: &[NodeId],
+    transport_handle: &TransportHandle,
+) {
+    // Get current time in milliseconds.
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+
+    // Record our own heartbeat locally.
+    {
+        let mut heartbeats = local_broker_heartbeats.write().await;
+        heartbeats.insert(node_id, timestamp_ms);
+    }
+
+    // Create the heartbeat message.
+    let heartbeat = BrokerHeartbeat::new(node_id, timestamp_ms);
+
+    // Send to all other nodes.
+    for peer_id in cluster_nodes {
+        if *peer_id == node_id {
+            continue; // Don't send to self.
+        }
+
+        if let Err(e) = transport_handle.send_heartbeat(*peer_id, &heartbeat).await {
+            debug!(
+                peer_id = peer_id.get(),
+                error = %e,
+                "Failed to send heartbeat to peer"
+            );
+            // Non-fatal - we'll retry on next interval.
+        }
+    }
+
+    debug!(
+        node_id = node_id.get(),
+        timestamp_ms = timestamp_ms,
+        peer_count = cluster_nodes.len() - 1,
+        "Sent broker heartbeats"
+    );
 }
 
 /// Processes Multi-Raft outputs (single-node).

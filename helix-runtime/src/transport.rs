@@ -34,7 +34,8 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::codec::{
-    decode_group_batch, decode_message, encode_group_batch, encode_message, is_group_batch,
+    decode_broker_heartbeat, decode_group_batch, decode_message, encode_broker_heartbeat,
+    encode_group_batch, encode_message, is_broker_heartbeat, is_group_batch, BrokerHeartbeat,
     CodecError,
 };
 
@@ -96,14 +97,16 @@ pub type TransportResult<T> = Result<T, TransportError>;
 
 /// Incoming message from a peer.
 ///
-/// This enum distinguishes between single messages (backward compatible)
-/// and batches of `GroupMessage`s used by Multi-Raft.
+/// This enum distinguishes between single messages (backward compatible),
+/// batches of `GroupMessage`s used by Multi-Raft, and broker heartbeats.
 #[derive(Debug, Clone)]
 pub enum IncomingMessage {
     /// A single Raft message.
     Single(Message),
     /// A batch of `GroupMessage`s from Multi-Raft.
     Batch(Vec<GroupMessage>),
+    /// A broker heartbeat (soft state, not Raft-replicated).
+    Heartbeat(BrokerHeartbeat),
 }
 
 /// Internal type for outbound data.
@@ -112,6 +115,8 @@ enum OutgoingData {
     Single(Message),
     /// A batch of group messages to send.
     Batch(Bytes),
+    /// A broker heartbeat to send.
+    Heartbeat(Bytes),
 }
 
 /// Configuration for a peer node.
@@ -235,6 +240,40 @@ impl TransportHandle {
         conn.sender
             .try_send(OutgoingData::Batch(encoded))
             .map_err(|_| TransportError::QueueFull(to))
+    }
+
+    /// Sends a broker heartbeat to a peer.
+    ///
+    /// Heartbeats are soft-state messages (not Raft-replicated) used to track
+    /// broker liveness. Each node sends heartbeats to all peers.
+    ///
+    /// # Errors
+    /// Returns an error if the peer is unknown, the send queue is full, or
+    /// encoding fails.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn send_heartbeat(&self, to: NodeId, heartbeat: &BrokerHeartbeat) -> TransportResult<()> {
+        // Precondition: can't send to self.
+        debug_assert!(to != self.node_id, "cannot send heartbeat to self");
+
+        if *self.shutdown.lock().await {
+            return Err(TransportError::Shutdown);
+        }
+
+        // Encode the heartbeat upfront.
+        let encoded = encode_broker_heartbeat(heartbeat)?;
+
+        let peers = self.peers.read().await;
+        let conn = peers.get(&to).ok_or(TransportError::UnknownPeer(to))?;
+
+        conn.sender
+            .try_send(OutgoingData::Heartbeat(encoded))
+            .map_err(|_| TransportError::QueueFull(to))
+    }
+
+    /// Returns the node ID of this transport.
+    #[must_use]
+    pub const fn node_id(&self) -> NodeId {
+        self.node_id
     }
 
     /// Returns true if the transport is shutdown.
@@ -440,7 +479,9 @@ impl Transport {
                             Err(e) => Err(e.into()),
                         }
                     }
-                    OutgoingData::Batch(bytes) => Self::send_bytes(s, bytes).await,
+                    OutgoingData::Batch(bytes) | OutgoingData::Heartbeat(bytes) => {
+                        Self::send_bytes(s, bytes).await
+                    }
                 };
 
                 match result {
@@ -450,6 +491,7 @@ impl Transport {
                                 format!("single:{:?}", std::mem::discriminant(m))
                             }
                             OutgoingData::Batch(b) => format!("batch:{} bytes", b.len()),
+                            OutgoingData::Heartbeat(_) => "heartbeat".to_string(),
                         };
                         debug!(peer_id = peer_id.get(), msg = %msg_desc, "Sent data");
                     }
@@ -535,7 +577,7 @@ impl Transport {
 
             // Try to decode messages from buffer.
             while !buffer.is_empty() {
-                // Check if this is a batch or single message.
+                // Check message type and decode accordingly.
                 if is_group_batch(&buffer) {
                     match decode_group_batch(&buffer) {
                         Ok((messages, consumed)) => {
@@ -557,6 +599,34 @@ impl Transport {
                         }
                         Err(e) => {
                             error!(error = %e, "Failed to decode batch");
+                            return Err(e.into());
+                        }
+                    }
+                } else if is_broker_heartbeat(&buffer) {
+                    match decode_broker_heartbeat(&buffer) {
+                        Ok((heartbeat, consumed)) => {
+                            debug!(
+                                node_id = heartbeat.node_id.get(),
+                                timestamp_ms = heartbeat.timestamp_ms,
+                                "Received heartbeat"
+                            );
+
+                            // Forward to handler.
+                            let incoming = IncomingMessage::Heartbeat(heartbeat);
+                            if incoming_tx.send(incoming).await.is_err() {
+                                // Receiver dropped.
+                                return Ok(());
+                            }
+
+                            // Remove consumed bytes.
+                            let _ = buffer.split_to(consumed);
+                        }
+                        Err(CodecError::InsufficientData { .. }) => {
+                            // Need more data.
+                            break;
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Failed to decode heartbeat");
                             return Err(e.into());
                         }
                     }
