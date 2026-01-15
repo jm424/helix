@@ -245,6 +245,7 @@ impl HelixService {
             Arc::clone(&local_broker_heartbeats),
             cluster_nodes.clone(),
             transport_handle.clone(),
+            data_dir.clone(),
             incoming_rx,
             shutdown_rx,
         ));

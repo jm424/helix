@@ -3,6 +3,7 @@
 //! This module handles periodic ticks and message processing for Raft groups.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use helix_core::{GroupId, NodeId, Offset};
@@ -67,6 +68,7 @@ pub async fn tick_task_multi_node(
     local_broker_heartbeats: Arc<RwLock<HashMap<NodeId, u64>>>,
     cluster_nodes: Vec<NodeId>,
     transport_handle: TransportHandle,
+    data_dir: Option<PathBuf>,
     mut incoming_rx: mpsc::Receiver<IncomingMessage>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
@@ -102,6 +104,7 @@ pub async fn tick_task_multi_node(
                     &pending_controller_proposals,
                     &cluster_nodes,
                     &transport_handle,
+                    &data_dir,
                 ).await;
             }
             _ = heartbeat_interval.tick() => {
@@ -155,6 +158,7 @@ pub async fn tick_task_multi_node(
                     &pending_controller_proposals,
                     &cluster_nodes,
                     &transport_handle,
+                    &data_dir,
                 ).await;
             }
         }
@@ -296,6 +300,7 @@ async fn process_outputs_multi_node(
     pending_controller_proposals: &Arc<RwLock<Vec<PendingControllerProposal>>>,
     cluster_nodes: &[NodeId],
     transport_handle: &TransportHandle,
+    data_dir: &Option<PathBuf>,
 ) {
     for output in outputs {
         match output {
@@ -399,10 +404,28 @@ async fn process_outputs_multi_node(
                                 gm.insert(topic_id, partition_id, data_group_id);
                             }
 
-                            // Create partition storage.
+                            // Create partition storage (durable if data_dir is set).
                             {
                                 let mut storage = partition_storage.write().await;
-                                storage.entry(data_group_id).or_insert_with(|| PartitionStorage::new_in_memory(topic_id, partition_id));
+                                if !storage.contains_key(&data_group_id) {
+                                    let ps = if let Some(dir) = data_dir {
+                                        match PartitionStorage::new_durable(dir, topic_id, partition_id).await {
+                                            Ok(durable) => durable,
+                                            Err(e) => {
+                                                error!(
+                                                    topic = topic_id.get(),
+                                                    partition = partition_id.get(),
+                                                    error = %e,
+                                                    "Failed to create durable partition, falling back to in-memory"
+                                                );
+                                                PartitionStorage::new_in_memory(topic_id, partition_id)
+                                            }
+                                        }
+                                    } else {
+                                        PartitionStorage::new_in_memory(topic_id, partition_id)
+                                    };
+                                    storage.insert(data_group_id, ps);
+                                }
                             }
                         }
                     }
