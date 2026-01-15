@@ -55,6 +55,8 @@ use tracing_subscriber::FmtSubscriber;
 use helix_server::generated::helix_server::HelixServer;
 use helix_server::kafka::{KafkaServer, KafkaServerConfig};
 use helix_server::HelixService;
+#[cfg(feature = "s3")]
+use helix_tier::S3Config;
 
 /// Protocol to use for client connections.
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -107,8 +109,31 @@ struct Args {
     /// Directory for object storage (tiered storage backend).
     /// When specified, enables filesystem-based object storage for tiering.
     /// If not specified, uses simulated in-memory storage.
+    /// Mutually exclusive with --s3-bucket.
     #[arg(long)]
     object_storage_dir: Option<PathBuf>,
+
+    /// S3 bucket for tiered storage (requires --features s3).
+    /// When specified, enables S3-based object storage for tiering.
+    /// Mutually exclusive with --object-storage-dir.
+    #[arg(long)]
+    s3_bucket: Option<String>,
+
+    /// S3 key prefix for tiered segments (default: "helix/segments/").
+    #[arg(long, default_value = "helix/segments/")]
+    s3_prefix: String,
+
+    /// S3 region (default: from AWS config/environment).
+    #[arg(long)]
+    s3_region: Option<String>,
+
+    /// Custom S3 endpoint URL (for LocalStack/MinIO).
+    #[arg(long)]
+    s3_endpoint: Option<String>,
+
+    /// Force path-style S3 addressing (required for LocalStack/MinIO).
+    #[arg(long)]
+    s3_force_path_style: bool,
 
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info")]
@@ -289,7 +314,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // This node's Kafka address (from listen_addr).
         let kafka_addr = args.listen_addr.to_string();
 
-        HelixService::new_multi_node(
+        // Build S3 config if bucket is specified.
+        #[cfg(feature = "s3")]
+        let s3_config = args.s3_bucket.as_ref().map(|bucket| {
+            let mut config = S3Config::new(bucket.clone());
+            config.key_prefix = args.s3_prefix.clone();
+            if let Some(region) = &args.s3_region {
+                config.region = Some(region.clone());
+            }
+            if let Some(endpoint) = &args.s3_endpoint {
+                config.endpoint_url = Some(endpoint.clone());
+            }
+            config.force_path_style = args.s3_force_path_style;
+            config
+        });
+
+        #[cfg(feature = "s3")]
+        let service = HelixService::new_multi_node(
+            args.cluster_id,
+            args.node_id,
+            raft_addr,
+            raft_peers,
+            args.data_dir,
+            args.object_storage_dir,
+            s3_config,
+            kafka_addr,
+            kafka_peer_addrs,
+        )
+        .await?;
+        #[cfg(not(feature = "s3"))]
+        let service = HelixService::new_multi_node(
             args.cluster_id,
             args.node_id,
             raft_addr,
@@ -299,7 +353,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             kafka_addr,
             kafka_peer_addrs,
         )
-        .await?
+        .await?;
+        service
     } else {
         // Single-node mode (for development/testing).
         info!("Starting in single-node mode");

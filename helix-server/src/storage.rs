@@ -79,6 +79,8 @@ use helix_tier::{
     FilesystemConfig, FilesystemObjectStorage, InMemoryMetadataStore, IntegratedTieringManager,
     SegmentMetadata, SegmentReader, SimulatedObjectStorage, TierError, TierResult, TieringConfig,
 };
+#[cfg(feature = "s3")]
+use helix_tier::{S3Config, S3ObjectStorage};
 use helix_wal::{Entry, SegmentId, Storage, TokioStorage, Wal, WalConfig};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -145,6 +147,11 @@ pub type SimulatedTieringManager<S> =
 pub type FilesystemTieringManager<S> =
     IntegratedTieringManager<FilesystemObjectStorage, InMemoryMetadataStore, WalSegmentReader<S>>;
 
+/// Type alias for the tiering manager with S3 storage (for production).
+#[cfg(feature = "s3")]
+pub type S3TieringManager<S> =
+    IntegratedTieringManager<S3ObjectStorage, InMemoryMetadataStore, WalSegmentReader<S>>;
+
 /// Type alias for the progress manager with simulated storage (for testing).
 pub type SimulatedProgressManager = ProgressManager<SimulatedProgressStore>;
 
@@ -152,15 +159,18 @@ pub type SimulatedProgressManager = ProgressManager<SimulatedProgressStore>;
 // TieringBackend
 // -----------------------------------------------------------------------------
 
-/// Enum to hold either simulated or filesystem-based tiering manager.
+/// Enum to hold different tiering manager backends.
 ///
 /// This allows runtime selection of the object storage backend while
 /// maintaining compile-time type safety for each variant.
 pub enum TieringBackend<S: Storage + 'static> {
     /// Simulated object storage (for testing/DST).
     Simulated(SimulatedTieringManager<S>),
-    /// Filesystem object storage (for development/production).
+    /// Filesystem object storage (for development).
     Filesystem(FilesystemTieringManager<S>),
+    /// S3 object storage (for production).
+    #[cfg(feature = "s3")]
+    S3(S3TieringManager<S>),
 }
 
 impl<S: Storage + 'static> TieringBackend<S> {
@@ -173,6 +183,8 @@ impl<S: Storage + 'static> TieringBackend<S> {
         match self {
             Self::Simulated(m) => m.register_segment(metadata).await,
             Self::Filesystem(m) => m.register_segment(metadata).await,
+            #[cfg(feature = "s3")]
+            Self::S3(m) => m.register_segment(metadata).await,
         }
     }
 
@@ -185,6 +197,8 @@ impl<S: Storage + 'static> TieringBackend<S> {
         match self {
             Self::Simulated(m) => m.mark_sealed(segment_id).await,
             Self::Filesystem(m) => m.mark_sealed(segment_id).await,
+            #[cfg(feature = "s3")]
+            Self::S3(m) => m.mark_sealed(segment_id).await,
         }
     }
 
@@ -197,6 +211,8 @@ impl<S: Storage + 'static> TieringBackend<S> {
         match self {
             Self::Simulated(m) => m.mark_committed(segment_id).await,
             Self::Filesystem(m) => m.mark_committed(segment_id).await,
+            #[cfg(feature = "s3")]
+            Self::S3(m) => m.mark_committed(segment_id).await,
         }
     }
 
@@ -209,6 +225,8 @@ impl<S: Storage + 'static> TieringBackend<S> {
         match self {
             Self::Simulated(m) => m.find_eligible_segments().await,
             Self::Filesystem(m) => m.find_eligible_segments().await,
+            #[cfg(feature = "s3")]
+            Self::S3(m) => m.find_eligible_segments().await,
         }
     }
 
@@ -221,6 +239,8 @@ impl<S: Storage + 'static> TieringBackend<S> {
         match self {
             Self::Simulated(m) => m.tier_segment(segment_id).await,
             Self::Filesystem(m) => m.tier_segment(segment_id).await,
+            #[cfg(feature = "s3")]
+            Self::S3(m) => m.tier_segment(segment_id).await,
         }
     }
 
@@ -236,6 +256,8 @@ impl<S: Storage + 'static> TieringBackend<S> {
         match self {
             Self::Simulated(m) => m.evict_with_progress(safe_offset).await,
             Self::Filesystem(m) => m.evict_with_progress(safe_offset).await,
+            #[cfg(feature = "s3")]
+            Self::S3(m) => m.evict_with_progress(safe_offset).await,
         }
     }
 }
@@ -770,6 +792,11 @@ pub struct DurablePartitionConfig {
     /// Directory for object storage (filesystem backend).
     /// If `Some`, uses `FilesystemObjectStorage`; otherwise uses `SimulatedObjectStorage`.
     pub object_storage_dir: Option<PathBuf>,
+    /// S3 configuration for object storage (production backend).
+    /// If `Some`, uses `S3ObjectStorage` (requires `s3` feature).
+    /// Takes precedence over `object_storage_dir` if both are set.
+    #[cfg(feature = "s3")]
+    pub s3_config: Option<S3Config>,
 }
 
 #[allow(dead_code)] // Used in tests and will be used in service.rs integration.
@@ -785,6 +812,8 @@ impl DurablePartitionConfig {
             tiering: None,
             progress: None,
             object_storage_dir: None,
+            #[cfg(feature = "s3")]
+            s3_config: None,
         }
     }
 
@@ -815,6 +844,17 @@ impl DurablePartitionConfig {
     #[must_use]
     pub fn with_object_storage_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.object_storage_dir = Some(dir.into());
+        self
+    }
+
+    /// Sets the S3 configuration for S3-based tiering (production).
+    ///
+    /// When set, uses `S3ObjectStorage` for tiered storage.
+    /// Takes precedence over `object_storage_dir` if both are set.
+    #[cfg(feature = "s3")]
+    #[must_use]
+    pub fn with_s3_config(mut self, config: S3Config) -> Self {
+        self.s3_config = Some(config);
         self
     }
 
@@ -950,8 +990,73 @@ impl<S: Storage + 'static> DurablePartition<S> {
             let segment_reader = WalSegmentReader::new(wal.clone());
             let metadata_store = InMemoryMetadataStore::new();
 
+            // Select backend: S3 (if configured) > Filesystem > Simulated
+            #[cfg(feature = "s3")]
+            let backend = if let Some(s3_config) = &config.s3_config {
+                // Use S3 storage for production.
+                let object_storage = S3ObjectStorage::new(s3_config.clone())
+                    .await
+                    .expect("failed to create S3 object storage");
+
+                info!(
+                    bucket = %s3_config.bucket,
+                    prefix = %s3_config.key_prefix,
+                    min_age_secs = tiering_config.min_age_secs,
+                    max_concurrent = tiering_config.max_concurrent_uploads,
+                    "Tiering enabled with S3 storage"
+                );
+
+                TieringBackend::S3(IntegratedTieringManager::new(
+                    object_storage,
+                    metadata_store,
+                    segment_reader,
+                    tiering_config.clone(),
+                ))
+            } else if let Some(object_dir) = &config.object_storage_dir {
+                // Use filesystem storage for development.
+                let fs_config = FilesystemConfig {
+                    base_path: object_dir.clone(),
+                    sync_on_write: config.sync_on_write,
+                    create_if_missing: true,
+                };
+                let object_storage = FilesystemObjectStorage::new(fs_config)
+                    .await
+                    .expect("failed to create filesystem object storage");
+
+                info!(
+                    object_storage_dir = ?object_dir,
+                    min_age_secs = tiering_config.min_age_secs,
+                    max_concurrent = tiering_config.max_concurrent_uploads,
+                    "Tiering enabled with filesystem storage"
+                );
+
+                TieringBackend::Filesystem(IntegratedTieringManager::new(
+                    object_storage,
+                    metadata_store,
+                    segment_reader,
+                    tiering_config.clone(),
+                ))
+            } else {
+                // Use simulated storage for testing.
+                let object_storage = SimulatedObjectStorage::new(42);
+
+                info!(
+                    min_age_secs = tiering_config.min_age_secs,
+                    max_concurrent = tiering_config.max_concurrent_uploads,
+                    "Tiering enabled with simulated storage"
+                );
+
+                TieringBackend::Simulated(IntegratedTieringManager::new(
+                    object_storage,
+                    metadata_store,
+                    segment_reader,
+                    tiering_config.clone(),
+                ))
+            };
+
+            #[cfg(not(feature = "s3"))]
             let backend = if let Some(object_dir) = &config.object_storage_dir {
-                // Use filesystem storage for development/production.
+                // Use filesystem storage for development.
                 let fs_config = FilesystemConfig {
                     base_path: object_dir.clone(),
                     sync_on_write: config.sync_on_write,

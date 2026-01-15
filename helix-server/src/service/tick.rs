@@ -18,6 +18,8 @@ use crate::controller::{ControllerCommand, ControllerState, CONTROLLER_GROUP_ID}
 use crate::error::ServerError;
 use crate::group_map::GroupMap;
 use crate::partition_storage::ProductionPartitionStorage;
+#[cfg(feature = "s3")]
+use helix_tier::S3Config;
 
 use super::{PendingControllerProposal, PendingProposal, TICK_INTERVAL_MS};
 
@@ -75,6 +77,7 @@ pub async fn tick_task_multi_node(
     transport_handle: TransportHandle,
     data_dir: Option<PathBuf>,
     object_storage_dir: Option<PathBuf>,
+    #[cfg(feature = "s3")] s3_config: Option<S3Config>,
     mut incoming_rx: mpsc::Receiver<IncomingMessage>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
@@ -100,6 +103,22 @@ pub async fn tick_task_multi_node(
                     let mut mr = multi_raft.write().await;
                     mr.tick()
                 };
+                #[cfg(feature = "s3")]
+                process_outputs_multi_node(
+                    &outputs,
+                    &multi_raft,
+                    &partition_storage,
+                    &group_map,
+                    &controller_state,
+                    &pending_proposals,
+                    &pending_controller_proposals,
+                    &cluster_nodes,
+                    &transport_handle,
+                    &data_dir,
+                    &object_storage_dir,
+                    &s3_config,
+                ).await;
+                #[cfg(not(feature = "s3"))]
                 process_outputs_multi_node(
                     &outputs,
                     &multi_raft,
@@ -155,6 +174,22 @@ pub async fn tick_task_multi_node(
                         vec![] // No Raft outputs for heartbeats.
                     }
                 };
+                #[cfg(feature = "s3")]
+                process_outputs_multi_node(
+                    &outputs,
+                    &multi_raft,
+                    &partition_storage,
+                    &group_map,
+                    &controller_state,
+                    &pending_proposals,
+                    &pending_controller_proposals,
+                    &cluster_nodes,
+                    &transport_handle,
+                    &data_dir,
+                    &object_storage_dir,
+                    &s3_config,
+                ).await;
+                #[cfg(not(feature = "s3"))]
                 process_outputs_multi_node(
                     &outputs,
                     &multi_raft,
@@ -348,6 +383,7 @@ async fn process_outputs(
     clippy::ref_option,
     clippy::significant_drop_tightening
 )]
+#[allow(clippy::too_many_arguments)]
 async fn process_outputs_multi_node(
     outputs: &[MultiRaftOutput],
     multi_raft: &Arc<RwLock<MultiRaft>>,
@@ -360,6 +396,7 @@ async fn process_outputs_multi_node(
     transport_handle: &TransportHandle,
     data_dir: &Option<PathBuf>,
     object_storage_dir: &Option<PathBuf>,
+    #[cfg(feature = "s3")] s3_config: &Option<S3Config>,
 ) {
     for output in outputs {
         match output {
@@ -467,6 +504,31 @@ async fn process_outputs_multi_node(
                             {
                                 let mut storage = partition_storage.write().await;
                                 if let std::collections::hash_map::Entry::Vacant(e) = storage.entry(data_group_id) {
+                                    #[cfg(feature = "s3")]
+                                    let ps = if let Some(dir) = data_dir {
+                                        match ProductionPartitionStorage::new_durable(
+                                            TokioStorage::new(),
+                                            dir,
+                                            object_storage_dir.as_ref(),
+                                            s3_config.as_ref(),
+                                            topic_id,
+                                            partition_id,
+                                        ).await {
+                                            Ok(durable) => durable,
+                                            Err(e) => {
+                                                error!(
+                                                    topic = topic_id.get(),
+                                                    partition = partition_id.get(),
+                                                    error = %e,
+                                                    "Failed to create durable partition, falling back to in-memory"
+                                                );
+                                                ProductionPartitionStorage::new_in_memory(topic_id, partition_id)
+                                            }
+                                        }
+                                    } else {
+                                        ProductionPartitionStorage::new_in_memory(topic_id, partition_id)
+                                    };
+                                    #[cfg(not(feature = "s3"))]
                                     let ps = if let Some(dir) = data_dir {
                                         match ProductionPartitionStorage::new_durable(
                                             TokioStorage::new(),

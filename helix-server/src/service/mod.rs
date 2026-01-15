@@ -98,6 +98,9 @@ pub struct HelixService {
     pub(crate) data_dir: Option<PathBuf>,
     /// Object storage directory for tiering (None = simulated storage).
     pub(crate) object_storage_dir: Option<PathBuf>,
+    /// S3 configuration for tiering (None = use filesystem or simulated).
+    #[cfg(feature = "s3")]
+    pub(crate) s3_config: Option<helix_tier::S3Config>,
     /// Transport handle for sending Raft messages (multi-node only).
     #[allow(dead_code)]
     pub(crate) transport_handle: Option<TransportHandle>,
@@ -194,6 +197,8 @@ impl HelixService {
             _shutdown_tx: shutdown_tx,
             data_dir,
             object_storage_dir,
+            #[cfg(feature = "s3")]
+            s3_config: None,
             transport_handle: None,
             progress_manager,
             controller_state: Arc::new(RwLock::new(ControllerState::new())),
@@ -211,6 +216,7 @@ impl HelixService {
     /// # Errors
     /// Returns an error if the transport cannot be started.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "s3")]
     pub async fn new_multi_node(
         cluster_id: String,
         node_id: u64,
@@ -218,6 +224,65 @@ impl HelixService {
         peers: Vec<PeerInfo>,
         data_dir: Option<PathBuf>,
         object_storage_dir: Option<PathBuf>,
+        s3_config: Option<helix_tier::S3Config>,
+        kafka_addr: String,
+        kafka_peer_addrs: HashMap<NodeId, String>,
+    ) -> Result<Self, TransportError> {
+        Self::new_multi_node_internal(
+            cluster_id,
+            node_id,
+            listen_addr,
+            peers,
+            data_dir,
+            object_storage_dir,
+            s3_config,
+            kafka_addr,
+            kafka_peer_addrs,
+        )
+        .await
+    }
+
+    /// Creates a new Helix service with multi-node networking.
+    ///
+    /// This starts both the Raft tick task and the transport for peer
+    /// communication. Partition data is persisted to the specified directory.
+    ///
+    /// # Errors
+    /// Returns an error if the transport cannot be started.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(not(feature = "s3"))]
+    pub async fn new_multi_node(
+        cluster_id: String,
+        node_id: u64,
+        listen_addr: SocketAddr,
+        peers: Vec<PeerInfo>,
+        data_dir: Option<PathBuf>,
+        object_storage_dir: Option<PathBuf>,
+        kafka_addr: String,
+        kafka_peer_addrs: HashMap<NodeId, String>,
+    ) -> Result<Self, TransportError> {
+        Self::new_multi_node_internal(
+            cluster_id,
+            node_id,
+            listen_addr,
+            peers,
+            data_dir,
+            object_storage_dir,
+            kafka_addr,
+            kafka_peer_addrs,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn new_multi_node_internal(
+        cluster_id: String,
+        node_id: u64,
+        listen_addr: SocketAddr,
+        peers: Vec<PeerInfo>,
+        data_dir: Option<PathBuf>,
+        object_storage_dir: Option<PathBuf>,
+        #[cfg(feature = "s3")] s3_config: Option<helix_tier::S3Config>,
         kafka_addr: String,
         kafka_peer_addrs: HashMap<NodeId, String>,
     ) -> Result<Self, TransportError> {
@@ -266,6 +331,24 @@ impl HelixService {
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
         // Start background tick task with transport.
+        #[cfg(feature = "s3")]
+        tokio::spawn(tick::tick_task_multi_node(
+            Arc::clone(&multi_raft),
+            Arc::clone(&partition_storage),
+            Arc::clone(&group_map),
+            Arc::clone(&controller_state),
+            Arc::clone(&pending_proposals),
+            Arc::clone(&pending_controller_proposals),
+            Arc::clone(&local_broker_heartbeats),
+            cluster_nodes.clone(),
+            transport_handle.clone(),
+            data_dir.clone(),
+            object_storage_dir.clone(),
+            s3_config.clone(),
+            incoming_rx,
+            shutdown_rx,
+        ));
+        #[cfg(not(feature = "s3"))]
         tokio::spawn(tick::tick_task_multi_node(
             Arc::clone(&multi_raft),
             Arc::clone(&partition_storage),
@@ -306,6 +389,8 @@ impl HelixService {
             _shutdown_tx: shutdown_tx,
             data_dir,
             object_storage_dir,
+            #[cfg(feature = "s3")]
+            s3_config,
             transport_handle: Some(transport_handle),
             progress_manager,
             controller_state,
@@ -313,6 +398,14 @@ impl HelixService {
             pending_controller_proposals,
             local_broker_heartbeats,
         })
+    }
+
+    /// Sets the S3 configuration for tiered storage.
+    ///
+    /// This should be called after creating the service if S3 tiering is desired.
+    #[cfg(feature = "s3")]
+    pub fn set_s3_config(&mut self, config: helix_tier::S3Config) {
+        self.s3_config = Some(config);
     }
 
     /// Returns the cluster nodes.

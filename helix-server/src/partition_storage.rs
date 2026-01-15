@@ -16,6 +16,8 @@ use crate::storage::{
     BlobFormat, DurablePartition, DurablePartitionConfig, DurablePartitionError, Partition,
     PartitionCommand, PartitionConfig, patch_kafka_base_offset,
 };
+#[cfg(feature = "s3")]
+use helix_tier::S3Config;
 
 /// Inner storage type for a partition.
 ///
@@ -75,11 +77,50 @@ impl<S: Storage + 'static> PartitionStorage<S> {
     /// * `storage` - Storage backend to use for WAL operations
     /// * `data_dir` - Base directory for partition data
     /// * `object_storage_dir` - Optional directory for object storage (tiering)
+    /// * `s3_config` - Optional S3 configuration for tiering (requires `s3` feature)
     /// * `topic_id` - Topic identifier
     /// * `partition_id` - Partition identifier
     ///
     /// # Errors
     /// Returns an error if the WAL cannot be opened.
+    #[cfg(feature = "s3")]
+    pub async fn new_durable(
+        storage: S,
+        data_dir: &PathBuf,
+        object_storage_dir: Option<&PathBuf>,
+        s3_config: Option<&S3Config>,
+        topic_id: TopicId,
+        partition_id: PartitionId,
+    ) -> Result<Self, DurablePartitionError> {
+        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id);
+        if let Some(s3_cfg) = s3_config {
+            config = config.with_s3_config(s3_cfg.clone());
+        } else if let Some(object_dir) = object_storage_dir {
+            config = config.with_object_storage_dir(object_dir);
+        }
+        let durable = DurablePartition::open(storage, config).await?;
+        Ok(Self {
+            topic_id,
+            partition_id,
+            inner: PartitionStorageInner::Durable(Box::new(durable)),
+            last_applied: LogIndex::new(0),
+            producer_state: PartitionProducerState::new(),
+        })
+    }
+
+    /// Creates new durable partition storage with the given storage backend.
+    ///
+    /// # Arguments
+    ///
+    /// * `storage` - Storage backend to use for WAL operations
+    /// * `data_dir` - Base directory for partition data
+    /// * `object_storage_dir` - Optional directory for object storage (tiering)
+    /// * `topic_id` - Topic identifier
+    /// * `partition_id` - Partition identifier
+    ///
+    /// # Errors
+    /// Returns an error if the WAL cannot be opened.
+    #[cfg(not(feature = "s3"))]
     pub async fn new_durable(
         storage: S,
         data_dir: &PathBuf,

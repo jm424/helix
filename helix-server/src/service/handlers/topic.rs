@@ -59,6 +59,24 @@ impl HelixService {
                 })?;
 
             // Create partition storage (durable or in-memory based on config).
+            #[cfg(feature = "s3")]
+            let ps = if let Some(data_dir) = &self.data_dir {
+                ProductionPartitionStorage::new_durable(
+                    TokioStorage::new(),
+                    data_dir,
+                    self.object_storage_dir.as_ref(),
+                    self.s3_config.as_ref(),
+                    topic_id,
+                    partition_id,
+                )
+                .await
+                .map_err(|e| ServerError::Internal {
+                    message: format!("failed to create durable partition: {e}"),
+                })?
+            } else {
+                ProductionPartitionStorage::new_in_memory(topic_id, partition_id)
+            };
+            #[cfg(not(feature = "s3"))]
             let ps = if let Some(data_dir) = &self.data_dir {
                 ProductionPartitionStorage::new_durable(
                     TokioStorage::new(),
