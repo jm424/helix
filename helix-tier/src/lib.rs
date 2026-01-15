@@ -57,11 +57,15 @@ mod error;
 mod filesystem;
 mod manager;
 mod metadata;
+#[cfg(feature = "s3")]
+mod s3;
 mod storage;
 
 pub use error::{TierError, TierResult};
 pub use filesystem::{FilesystemConfig, FilesystemObjectStorage};
 pub use manager::{IntegratedTieringManager, TieringConfig, TieringManager};
+#[cfg(feature = "s3")]
+pub use s3::{S3Config, S3ConfigError, S3ObjectStorage, S3StorageClass};
 pub use metadata::{
     InMemoryMetadataStore, MetadataStore, MetadataStoreFaultConfig, SegmentLocation,
     SegmentMetadata,
