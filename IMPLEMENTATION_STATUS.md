@@ -279,8 +279,9 @@ The plan requires:
 | TieringConfig | ✅ Done | min_segment_age_secs configuration |
 | FilesystemObjectStorage | ✅ Done | Local filesystem backend for development |
 | S3ObjectStorage | ✅ Done | Behind `s3` feature flag (aws-sdk-s3) |
-| TieringBackend enum | ✅ Done | Runtime selection: Simulated vs Filesystem |
+| TieringBackend enum | ✅ Done | Runtime selection: Simulated, Filesystem, or S3 |
 | Server integration | ✅ Done | `--object-storage-dir` CLI flag |
+| S3 CLI integration | ✅ Done | `--s3-bucket`, `--s3-prefix`, `--s3-region`, `--s3-endpoint`, `--s3-force-path-style` |
 
 **Testing Milestones:**
 | Item | Status |
@@ -492,7 +493,7 @@ The plan requires:
 | **Eviction Coordination** | Progress-aware eviction, 3 bugs found/fixed, 4 integration tests |
 | **Consumer gRPC API** | Pull/Ack/CreateConsumerGroup RPCs, integrated with helix-progress, 3 new tests |
 | **helix-flow** | TokenBucket, WeightedFairQueue, AimdController, DST-compatible, 36 tests |
-| **Object Storage** | FilesystemObjectStorage, S3ObjectStorage (feature-gated), server integration via `--object-storage-dir` |
+| **Object Storage** | FilesystemObjectStorage, S3ObjectStorage (feature-gated), server integration via `--object-storage-dir` and `--s3-*` CLI flags |
 
 **Bugs Found via DST:**
 - helix-tier: orphaned data (seed 197562), ordering violation (seed 17)
@@ -511,7 +512,7 @@ The plan requires:
 - helix-flow (rate limiting, fair queuing, AIMD)
 - Kafka Wire Protocol (integrated into helix-server, kcat tested)
 - Object Storage backends (FilesystemObjectStorage, S3ObjectStorage with feature flag)
-- Server integration (`--object-storage-dir` CLI flag, TieringBackend runtime selection)
+- Server integration (`--object-storage-dir` and `--s3-*` CLI flags, TieringBackend runtime selection)
 
 ### Priority 1: Production Readiness (Phase 5)
 
@@ -545,7 +546,7 @@ The plan requires:
 | `helix-raft` | ✅ Complete | Pre-vote, leadership transfer, tick-based timing, MultiRaft engine |
 | `helix-routing` | ✅ Exists | ShardMap, LeaderCache, ShardRouter |
 | `helix-runtime` | ⚠️ Partial | Tick-based server, missing io_uring |
-| `helix-tier` | ✅ Complete | FilesystemObjectStorage, S3ObjectStorage (feature-gated), server integration, 100+ tests |
+| `helix-tier` | ✅ Complete | FilesystemObjectStorage, S3ObjectStorage (feature-gated), full server integration with CLI flags, 100+ tests |
 | `helix-progress` | ✅ Complete | Consumer progress tracking, leases, watermarks, DST verified |
 | `helix-flow` | ✅ Complete | TokenBucket, WeightedFairQueue, AimdController, FlowController (36 tests) |
 | `helix-server` | ✅ Complete | Multi-Raft done, WAL-backed durable storage, **includes Kafka wire protocol** |
