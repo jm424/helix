@@ -779,15 +779,20 @@ impl WorkloadExecutor for RealExecutor {
 
         // Event-driven polling: keep polling until we have all expected messages
         // or receive PartitionEOF (end of committed data).
-        // Retry on transient transport errors since connection may still be establishing.
+        //
+        // Transient errors (BrokerTransportFailure, AllBrokersDown) are retried with
+        // exponential backoff until the deadline. These errors are explicitly marked
+        // as retriable in librdkafka (RD_KAFKA_ERR_ACTION_RETRY) and the library
+        // actively recovers from them via rebootstrap.
         let poll_timeout = std::time::Duration::from_secs(10);
-        let mut retries = 0;
-        const MAX_RETRIES: u32 = 5;
+        let deadline = std::time::Instant::now() + poll_timeout;
+        let mut backoff_ms: u64 = 100;
+        const MAX_BACKOFF_MS: u64 = 2000;
 
         while messages.len() < max_messages as usize {
-            match self.consumer.poll(poll_timeout) {
+            match self.consumer.poll(std::time::Duration::from_millis(500)) {
                 Some(Ok(msg)) => {
-                    retries = 0; // Reset on success.
+                    backoff_ms = 100; // Reset on success.
                     #[allow(clippy::cast_sign_loss)]
                     let offset = msg.offset() as u64;
                     let payload = msg
@@ -803,17 +808,19 @@ impl WorkloadExecutor for RealExecutor {
                     break;
                 }
                 Some(Err(KafkaError::MessageConsumption(code)))
-                    if retries < MAX_RETRIES
+                    if std::time::Instant::now() < deadline
                         && matches!(
                             code,
                             rdkafka::error::RDKafkaErrorCode::BrokerTransportFailure
                                 | rdkafka::error::RDKafkaErrorCode::AllBrokersDown
                         ) =>
                 {
-                    // Transient connection error - wait and retry.
-                    retries += 1;
-                    eprintln!("[POLL] topic={topic} partition={partition} transient error {code:?}, retry {retries}");
-                    std::thread::sleep(std::time::Duration::from_millis(100 * u64::from(retries)));
+                    // Transient connection error - exponential backoff with jitter until deadline.
+                    // Jitter: random value in [0.5 * backoff, 1.5 * backoff] to prevent thundering herd.
+                    let jitter = (backoff_ms / 2) + (rand::random::<u64>() % (backoff_ms + 1));
+                    eprintln!("[POLL] topic={topic} partition={partition} transient error {code:?}, backoff {jitter}ms");
+                    std::thread::sleep(std::time::Duration::from_millis(jitter));
+                    backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
                     continue;
                 }
                 Some(Err(e)) => {
@@ -824,9 +831,12 @@ impl WorkloadExecutor for RealExecutor {
                     });
                 }
                 None => {
-                    // Timeout with no message - break.
-                    eprintln!("[POLL] topic={topic} partition={partition} timeout (no message)");
-                    break;
+                    // Timeout with no message - check if we've hit the deadline.
+                    if std::time::Instant::now() >= deadline {
+                        eprintln!("[POLL] topic={topic} partition={partition} deadline reached");
+                        break;
+                    }
+                    // Otherwise keep polling - librdkafka may still be recovering.
                 }
             }
         }
