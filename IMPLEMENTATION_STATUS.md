@@ -10,7 +10,7 @@ This document tracks progress against the [implementation plan](../helix-impleme
 | Phase 1: Core Consensus | ✅ Complete | 100% (WAL DST hardened, 500-seed stress test passing) |
 | Phase 2: Multi-Raft & Sharding | ✅ Complete | 100% (shard movement infrastructure done) |
 | Phase 3: Storage Features | ✅ Complete | 100% (helix-tier + helix-progress + eviction coordination) |
-| Phase 4: API & Flow Control | ⚠️ Partial | ~95% (gRPC API + Flow Control complete, Kafka proxy not started) |
+| Phase 4: API & Flow Control | ✅ Complete | 100% (gRPC API, Flow Control, and Kafka wire protocol all complete) |
 | Phase 5: Production Readiness | Not Started | 0% |
 
 ## Deviations from Plan
@@ -437,11 +437,28 @@ The plan requires:
 - No use of `Instant::now()` or system time
 - Deterministic behavior for simulation testing
 
-#### 4.3 Kafka Compatibility Proxy
+#### 4.3 Kafka Wire Protocol
 
-**Status: NOT STARTED**
+**Status: ✅ COMPLETE** (integrated into helix-server, not a separate proxy crate)
 
-Missing: `helix-kafka-proxy` crate.
+| Item | Status | Notes |
+|------|--------|-------|
+| Kafka wire protocol handler | ✅ Done | `helix-server/src/kafka/handler.rs` (1,340 lines) |
+| TCP server for Kafka | ✅ Done | `helix-server/src/kafka/server.rs` |
+| Request/response codec | ✅ Done | `helix-server/src/kafka/codec.rs` |
+| ApiVersions (v0-3) | ✅ Done | Returns supported API versions |
+| Metadata (v0-12) | ✅ Done | Returns broker/topic info |
+| Produce (v0-9) | ✅ Done | WAL-backed DurablePartition |
+| Fetch (v4-12) | ✅ Done | Returns stored blobs |
+| ListOffsets (v0-7) | ✅ Done | Earliest/Latest/Timestamp queries |
+| FindCoordinator (v0-4) | ✅ Done | Returns self as coordinator |
+| OffsetCommit (v0-8) | ✅ Done | Via ProgressManager |
+| OffsetFetch (v0-6) | ✅ Done | Via ProgressManager |
+| CreateTopics (v2-7) | ✅ Done | Topic auto-creation |
+| InitProducerId (v0-4) | ✅ Done | Idempotent producer support |
+| kcat/librdkafka tested | ✅ Done | E2E verified |
+
+**Architecture Decision**: Instead of a separate `helix-kafka-proxy` crate, Kafka wire protocol support is built directly into `helix-server`. The server can run in either gRPC mode (`--protocol grpc`) or Kafka mode (`--protocol kafka`).
 
 ---
 
@@ -480,44 +497,31 @@ Missing: `helix-kafka-proxy` crate.
 
 ## Prioritized Next Steps
 
-### Priority 1: Shard Movement DST Testing ✅ COMPLETE
+### Completed Priorities
 
-**1. Bloodhound DST for Shard Transfers** ✅ DONE
-   - Phase 2 checkpoint met: "Shard transfer works under faults"
-   - DST tests: 500 seeds × concurrent transfers, 3% message drop, 0.5% node crash
-   - ~96% success rate under aggressive fault injection
-   - See: `helix-tests/src/shard_transfer_tests.rs`
+**Phase 1-4 Core Features** ✅ ALL COMPLETE
+- Shard Movement DST (500 seeds, ~96% success under aggressive faults)
+- helix-progress (consumer tracking, leases, DST verified)
+- helix-flow (rate limiting, fair queuing, AIMD)
+- Kafka Wire Protocol (integrated into helix-server, kcat tested)
 
-### Priority 2: Complete Phase 3 (Storage Features) ✅ COMPLETE
+### Priority 1: Production Readiness (Phase 5)
 
-**2. helix-progress** ✅ DONE
-   - Phase 3 checkpoint met: "Complete data lifecycle (write→tier→read→consume)"
-   - Offset commits with leases (Cumulative + Individual ack modes)
-   - Consumer group coordination with ProgressManager
-   - Low watermark advancement with RoaringBitmap
-   - DST testing: 32 unit tests + 16 integration tests
-   - Eviction coordination: 3 bugs found and fixed
-   - See: `helix-progress/src/`, `helix-tests/src/progress_tests.rs`
-
-**3. S3ObjectStorage** - Real S3 implementation
+**1. S3ObjectStorage** - Real S3 implementation
    - Behind `s3` feature flag (aws-sdk-s3)
    - Integration test with localstack
    - Retry logic with exponential backoff
-   - Estimated: 1 week
 
-### Priority 3: Phase 4 Completion
+**2. Observability**
+   - Prometheus metrics
+   - Distributed tracing (OpenTelemetry)
+   - Structured logging
+   - Health checks
 
-**4. helix-flow** ✅ DONE
-   - Token buckets for rate limiting
-   - Weighted fair queuing for IO classes
-   - AIMD controller for adaptive limits
-   - See: `helix-flow/src/`, 36 tests
-
-**5. helix-kafka-proxy** - Kafka compatibility
-   - Protocol translation layer
-   - Topic/partition mapping
-   - Offset translation
-   - Estimated: 2-3 weeks
+**3. Operations Tooling**
+   - `helix-cli` for cluster management
+   - Admin API
+   - Metrics dashboards
 
 ### Optional / Deferred
 
@@ -541,7 +545,8 @@ Missing: `helix-kafka-proxy` crate.
 | `helix-tier` | ✅ Complete | Wired into DurablePartition, 500-seed stress DST found 2 bugs (fixed), 43 tests |
 | `helix-progress` | ✅ Complete | Consumer progress tracking, leases, watermarks, DST verified |
 | `helix-flow` | ✅ Complete | TokenBucket, WeightedFairQueue, AimdController, FlowController (36 tests) |
-| `helix-server` | ✅ Complete | Multi-Raft done, WAL-backed durable storage integrated |
-| `helix-kafka-proxy` | ❌ Missing | Need to create |
+| `helix-server` | ✅ Complete | Multi-Raft done, WAL-backed durable storage, **includes Kafka wire protocol** |
+| `helix-kafka-proxy` | ✅ N/A | **Not needed** - Kafka protocol integrated into helix-server |
 | `helix-cli` | ❌ Missing | Need to create |
+| `helix-workload` | ✅ Complete | E2E verifiable load testing, history tracking, violation detection |
 | `helix-tests` | ✅ Good | DST-friendly tick-based tests, faults, 150+ seeds, WAL DST (29 tests + 500-seed stress), Tier tests (43 tests) |
