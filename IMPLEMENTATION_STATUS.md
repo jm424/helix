@@ -277,7 +277,10 @@ The plan requires:
 | IntegratedTieringManager | ✅ Done | WAL-integrated tiering with SegmentReader trait |
 | SegmentReader trait | ✅ Done | Abstraction for reading segment bytes from WAL |
 | TieringConfig | ✅ Done | min_segment_age_secs configuration |
-| S3ObjectStorage | ❌ Not Started | Behind `s3` feature flag |
+| FilesystemObjectStorage | ✅ Done | Local filesystem backend for development |
+| S3ObjectStorage | ✅ Done | Behind `s3` feature flag (aws-sdk-s3) |
+| TieringBackend enum | ✅ Done | Runtime selection: Simulated vs Filesystem |
+| Server integration | ✅ Done | `--object-storage-dir` CLI flag |
 
 **Testing Milestones:**
 | Item | Status |
@@ -303,7 +306,9 @@ The plan requires:
 | - test_real_tiering_with_upload_failures | ✅ Fault injection with retry |
 | - test_real_tiering_corruption_detection | ✅ Corruption on download |
 | - test_real_multi_segment_tiering | ✅ 15 entries, 3 entries/segment |
-| Integration test with real S3 (localstack) | ❌ Not Started |
+| FilesystemObjectStorage tests | ✅ Done (13 tests) |
+| S3ObjectStorage unit tests | ✅ Done (40 tests) |
+| S3 LocalStack integration tests | ✅ Done (10 tests, ignored by default) |
 
 **Bugs Found Through DST:**
 | Bug | Seed/Op | Fix |
@@ -487,6 +492,7 @@ The plan requires:
 | **Eviction Coordination** | Progress-aware eviction, 3 bugs found/fixed, 4 integration tests |
 | **Consumer gRPC API** | Pull/Ack/CreateConsumerGroup RPCs, integrated with helix-progress, 3 new tests |
 | **helix-flow** | TokenBucket, WeightedFairQueue, AimdController, DST-compatible, 36 tests |
+| **Object Storage** | FilesystemObjectStorage, S3ObjectStorage (feature-gated), server integration via `--object-storage-dir` |
 
 **Bugs Found via DST:**
 - helix-tier: orphaned data (seed 197562), ordering violation (seed 17)
@@ -504,21 +510,18 @@ The plan requires:
 - helix-progress (consumer tracking, leases, DST verified)
 - helix-flow (rate limiting, fair queuing, AIMD)
 - Kafka Wire Protocol (integrated into helix-server, kcat tested)
+- Object Storage backends (FilesystemObjectStorage, S3ObjectStorage with feature flag)
+- Server integration (`--object-storage-dir` CLI flag, TieringBackend runtime selection)
 
 ### Priority 1: Production Readiness (Phase 5)
 
-**1. S3ObjectStorage** - Real S3 implementation
-   - Behind `s3` feature flag (aws-sdk-s3)
-   - Integration test with localstack
-   - Retry logic with exponential backoff
-
-**2. Observability**
+**1. Observability**
    - Prometheus metrics
    - Distributed tracing (OpenTelemetry)
    - Structured logging
    - Health checks
 
-**3. Operations Tooling**
+**2. Operations Tooling**
    - `helix-cli` for cluster management
    - Admin API
    - Metrics dashboards
@@ -542,7 +545,7 @@ The plan requires:
 | `helix-raft` | ✅ Complete | Pre-vote, leadership transfer, tick-based timing, MultiRaft engine |
 | `helix-routing` | ✅ Exists | ShardMap, LeaderCache, ShardRouter |
 | `helix-runtime` | ⚠️ Partial | Tick-based server, missing io_uring |
-| `helix-tier` | ✅ Complete | Wired into DurablePartition, 500-seed stress DST found 2 bugs (fixed), 43 tests |
+| `helix-tier` | ✅ Complete | FilesystemObjectStorage, S3ObjectStorage (feature-gated), server integration, 100+ tests |
 | `helix-progress` | ✅ Complete | Consumer progress tracking, leases, watermarks, DST verified |
 | `helix-flow` | ✅ Complete | TokenBucket, WeightedFairQueue, AimdController, FlowController (36 tests) |
 | `helix-server` | ✅ Complete | Multi-Raft done, WAL-backed durable storage, **includes Kafka wire protocol** |
