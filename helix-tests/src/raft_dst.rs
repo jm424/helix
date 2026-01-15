@@ -396,23 +396,31 @@ fn test_property_functions_standalone() {
 #[ignore = "Long-running test, run with --ignored"]
 fn test_simulation_extended_duration() {
     // Run for longer simulated time to find rare bugs.
-    let config = SimulationTestConfig {
-        seed: 12345,
-        max_time_secs: 60, // 60 simulated seconds.
-        inject_faults: true,
-        crash_time_ms: 10_000,
-        recover_time_ms: 30_000,
-        crash_node_index: 1,
-        ..Default::default()
-    };
-    assert!(run_simulation_test(&config));
+    let seed_count = 500;
+
+    for seed in 0..seed_count {
+        let config = SimulationTestConfig {
+            seed,
+            max_time_secs: 60, // 60 simulated seconds.
+            inject_faults: true,
+            crash_time_ms: 10_000 + (seed % 5000),
+            recover_time_ms: 30_000 + (seed % 10_000),
+            crash_node_index: (seed % 3) as usize,
+            ..Default::default()
+        };
+        assert!(
+            run_simulation_test(&config),
+            "Extended duration simulation failed with seed {seed}"
+        );
+    }
+    println!("Passed {seed_count} extended duration runs");
 }
 
 #[test]
 #[ignore = "Long-running test, run with --ignored"]
 fn test_simulation_many_seeds() {
     // Run with many seeds for statistical confidence.
-    let seed_count = 100;
+    let seed_count = 500;
 
     for seed in 0..seed_count {
         let config = SimulationTestConfig {
@@ -432,7 +440,7 @@ fn test_simulation_many_seeds() {
 #[ignore = "Long-running test, run with --ignored"]
 fn test_simulation_many_seeds_with_faults() {
     // Run with many seeds and fault injection.
-    let seed_count = 50;
+    let seed_count = 500;
 
     for seed in 0..seed_count {
         let config = SimulationTestConfig {
@@ -1412,7 +1420,7 @@ fn test_verified_multiple_seeds() {
 #[ignore = "Long-running test, run with --ignored"]
 fn test_verified_extensive_seeds() {
     // Run many seeds with property verification.
-    let seed_count = 100;
+    let seed_count = 500;
     let mut violations_found = 0;
 
     for seed in 0..seed_count {
