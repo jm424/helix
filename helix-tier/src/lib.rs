@@ -13,6 +13,7 @@
 //! # Storage Backends
 //!
 //! - [`SimulatedObjectStorage`]: In-memory storage with fault injection for DST
+//! - [`FilesystemObjectStorage`]: Local filesystem storage for development/testing
 //! - `S3ObjectStorage`: Production S3 backend (behind `s3` feature flag)
 //!
 //! # Example
@@ -53,11 +54,13 @@
 #![warn(clippy::nursery)]
 
 mod error;
+mod filesystem;
 mod manager;
 mod metadata;
 mod storage;
 
 pub use error::{TierError, TierResult};
+pub use filesystem::{FilesystemConfig, FilesystemObjectStorage};
 pub use manager::{IntegratedTieringManager, TieringConfig, TieringManager};
 pub use metadata::{
     InMemoryMetadataStore, MetadataStore, MetadataStoreFaultConfig, SegmentLocation,
