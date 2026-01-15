@@ -1,7 +1,8 @@
 # S3 Storage Backend Design
 
-**Status**: Design Phase
-**Created**: 2025-01-14
+**Status**: ✅ Complete
+**Created**: 2026-01-14
+**Completed**: 2026-01-15
 
 ## Overview
 
@@ -1092,10 +1093,10 @@ fn test_tiering_with_s3_faults() {
 | Add to `ObjectStorageBackend` enum | `helix-tier/src/storage.rs` |
 | Add to `create_object_storage` factory | `helix-tier/src/storage.rs` |
 
-**Acceptance Criteria**:
-- [ ] All unit tests pass
-- [ ] `cargo clippy` clean
-- [ ] Can run existing tier tests with filesystem backend
+**Acceptance Criteria**: ✅
+- [x] All unit tests pass (13 tests)
+- [x] `cargo clippy` clean
+- [x] Can run existing tier tests with filesystem backend
 
 ---
 
@@ -1167,10 +1168,10 @@ HELIX_S3_BUCKET=test HELIX_S3_ENDPOINT=http://localhost:4566 \
 | Add `S3` variant to `ObjectStorageBackend` | `helix-tier/src/storage.rs` |
 | Update `create_object_storage` factory | `helix-tier/src/storage.rs` |
 
-**Acceptance Criteria**:
-- [ ] All integration tests pass against LocalStack
-- [ ] `cargo clippy --features s3` clean
-- [ ] Feature flag works (compiles without `s3` feature)
+**Acceptance Criteria**: ✅
+- [x] All integration tests pass against LocalStack (10 tests)
+- [x] `cargo clippy --features s3` clean
+- [x] Feature flag works (compiles without `s3` feature)
 
 ---
 
@@ -1228,11 +1229,11 @@ pub enum TierBackend {
 | Accept `Option<Arc<dyn ObjectStorage>>` | In constructor or config |
 | Skip tiering calls if None | Guard `tier_eligible_segments()` |
 
-**Acceptance Criteria**:
-- [ ] `helix-server --help` shows tier options
-- [ ] Server starts with `--tier-backend none` (default)
-- [ ] Server starts with `--tier-backend filesystem --tier-path /tmp/tier`
-- [ ] Server starts with `--tier-backend s3` (requires env vars)
+**Acceptance Criteria**: ✅
+- [x] `helix-server --help` shows tier options
+- [x] Server starts with no tier backend (default - simulated)
+- [x] Server starts with `--object-storage-dir /tmp/tier` (filesystem)
+- [x] Server starts with `--s3-bucket` options (requires s3 feature)
 
 ---
 
@@ -1265,36 +1266,38 @@ Only if needed for specific tests. Current DST doesn't require real latency.
 ### Implementation Checklist
 
 ```
-Phase 1: FilesystemObjectStorage
-  [ ] helix-tier/src/filesystem.rs created
-  [ ] FilesystemConfig struct
-  [ ] FilesystemObjectStorage struct
-  [ ] ObjectStorage trait impl (5 methods)
-  [ ] clear_all() utility
-  [ ] 9 unit tests
-  [ ] Added to lib.rs exports
-  [ ] Added to factory
+Phase 1: FilesystemObjectStorage ✅
+  [x] helix-tier/src/filesystem.rs created
+  [x] FilesystemConfig struct
+  [x] FilesystemObjectStorage struct
+  [x] ObjectStorage trait impl (5 methods)
+  [x] clear_all() utility
+  [x] 13 unit tests (exceeded target)
+  [x] Added to lib.rs exports
+  [x] Added to factory
 
-Phase 2: S3ObjectStorage
-  [ ] Cargo.toml updated with optional deps
-  [ ] helix-tier/src/s3.rs created
-  [ ] S3Config struct with from_env()
-  [ ] S3StorageClass enum
-  [ ] S3ObjectStorage struct
-  [ ] ObjectStorage trait impl (5 methods)
-  [ ] is_not_found_error() helper
-  [ ] 7 integration tests (ignored)
-  [ ] Added to lib.rs exports (cfg-gated)
-  [ ] Added to factory (cfg-gated)
+Phase 2: S3ObjectStorage ✅
+  [x] Cargo.toml updated with optional deps
+  [x] helix-tier/src/s3.rs created
+  [x] S3Config struct with from_env()
+  [x] S3StorageClass enum
+  [x] S3ObjectStorage struct
+  [x] ObjectStorage trait impl (5 methods)
+  [x] is_not_found_error() helper
+  [x] 10 integration tests (ignored, exceeded target)
+  [x] 40 unit tests
+  [x] Added to lib.rs exports (cfg-gated)
+  [x] Added to factory (cfg-gated)
 
-Phase 3: Server Integration
-  [ ] CLI args added to main.rs
-  [ ] TierConfig struct
-  [ ] Storage initialization in startup
-  [ ] DurablePartition accepts Option<ObjectStorage>
-  [ ] Manual testing with all 3 backends
+Phase 3: Server Integration ✅
+  [x] CLI args added to main.rs (--object-storage-dir, --s3-bucket, --s3-prefix, --s3-region, --s3-endpoint, --s3-force-path-style)
+  [x] TieringBackend enum (Simulated, Filesystem, S3)
+  [x] Storage initialization in startup
+  [x] DurablePartition accepts tiering config
+  [x] S3Config wired through HelixService, tick task, topic handlers
+  [x] Feature flag: cargo build --features s3
 
-Phase 4: DST Enhancements (Optional)
+Phase 4: DST Enhancements (Deferred)
   [ ] StorageMetrics struct
   [ ] Metrics tracking in SimulatedObjectStorage
   [ ] metrics() and reset_metrics() methods
