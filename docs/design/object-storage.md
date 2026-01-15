@@ -1046,31 +1046,259 @@ fn test_tiering_with_s3_faults() {
 
 ---
 
-## 6. Implementation Order
+## 6. Implementation Plan
 
-### Phase 1: FilesystemObjectStorage (1-2 days)
-1. Implement `FilesystemObjectStorage` struct
-2. Implement all 5 trait methods
-3. Add unit tests
-4. Add to factory
+### Phase 1: FilesystemObjectStorage
 
-### Phase 2: S3ObjectStorage (2-3 days)
-1. Update Cargo.toml dependencies
-2. Implement `S3Config` and `S3ObjectStorage`
-3. Implement trait methods with error mapping
-4. Add LocalStack integration tests
-5. Add to factory
+**Goal**: Local filesystem backend for development and CI without S3 dependencies.
 
-### Phase 3: SimulatedObjectStorage Enhancements (1-2 days)
-1. Add `LatencyConfig` structure
-2. Add `StorageMetrics` tracking
-3. Add preset configurations
-4. Update DST tests to use new features
+#### 1.1 Create FilesystemObjectStorage
 
-### Phase 4: Integration (1 day)
-1. Wire into `helix-server` configuration
-2. Add CLI flags for storage backend selection
-3. Update documentation
+**File**: `helix-tier/src/filesystem.rs`
+
+| Task | Details |
+|------|---------|
+| Define `FilesystemConfig` | `base_path`, `sync_on_write`, `create_if_missing` |
+| Implement `FilesystemObjectStorage` struct | Hold config, implement path helpers |
+| Implement `put` | Atomic write (temp file + rename), optional fsync |
+| Implement `get` | Read file, map NotFound error |
+| Implement `delete` | Remove file, idempotent (ignore NotFound) |
+| Implement `list` | Recursive directory walk, filter by prefix |
+| Implement `exists` | Path existence check |
+| Add `clear_all` utility | For test cleanup |
+
+#### 1.2 Unit Tests
+
+**File**: `helix-tier/src/filesystem.rs` (inline tests)
+
+| Test | Description |
+|------|-------------|
+| `test_put_get_roundtrip` | Write and read back data |
+| `test_put_overwrites` | Verify overwrite behavior |
+| `test_get_not_found` | Returns `TierError::NotFound` |
+| `test_delete_idempotent` | Delete non-existent key succeeds |
+| `test_list_with_prefix` | Filter by prefix correctly |
+| `test_list_empty_dir` | Returns empty vec |
+| `test_exists` | True for existing, false for missing |
+| `test_atomic_write` | Verify no partial writes on crash |
+| `test_nested_directories` | Keys with `/` create subdirs |
+
+#### 1.3 Wire Up
+
+| Task | File |
+|------|------|
+| Add `mod filesystem` | `helix-tier/src/lib.rs` |
+| Re-export `FilesystemObjectStorage` | `helix-tier/src/lib.rs` |
+| Add to `ObjectStorageBackend` enum | `helix-tier/src/storage.rs` |
+| Add to `create_object_storage` factory | `helix-tier/src/storage.rs` |
+
+**Acceptance Criteria**:
+- [ ] All unit tests pass
+- [ ] `cargo clippy` clean
+- [ ] Can run existing tier tests with filesystem backend
+
+---
+
+### Phase 2: S3ObjectStorage
+
+**Goal**: Production S3 backend with LocalStack testing support.
+
+#### 2.1 Add Dependencies
+
+**File**: `helix-tier/Cargo.toml`
+
+```toml
+[features]
+s3 = ["aws-sdk-s3", "aws-config", "aws-smithy-runtime-api"]
+
+[dependencies]
+aws-sdk-s3 = { version = "1.65", optional = true }
+aws-config = { version = "1.5", optional = true }
+aws-smithy-runtime-api = { version = "1.7", optional = true }
+```
+
+#### 2.2 Create S3ObjectStorage
+
+**File**: `helix-tier/src/s3.rs` (behind `#[cfg(feature = "s3")]`)
+
+| Task | Details |
+|------|---------|
+| Define `S3Config` | bucket, key_prefix, region, endpoint_url, force_path_style, timeout, retries, storage_class |
+| Define `S3StorageClass` enum | Standard, StandardIa, IntelligentTiering, GlacierInstantRetrieval |
+| Implement `S3Config::default()` | Sensible defaults |
+| Implement `S3Config::from_env()` | Load from `HELIX_S3_*` env vars |
+| Implement `S3ObjectStorage::new()` | Build AWS client with config |
+| Implement `S3ObjectStorage::from_client()` | For testing with custom client |
+| Implement `full_key()` helper | Prepend key_prefix |
+| Implement `put` | PutObject with storage class |
+| Implement `get` | GetObject, handle 404 → NotFound |
+| Implement `delete` | DeleteObject (idempotent) |
+| Implement `list` | ListObjectsV2 with pagination |
+| Implement `exists` | HeadObject, handle 404 |
+| Add `is_not_found_error()` helper | Check HTTP 404 from SDK error |
+
+#### 2.3 Integration Tests
+
+**File**: `helix-tier/tests/s3_integration.rs`
+
+| Test | Description |
+|------|-------------|
+| `test_s3_put_get_roundtrip` | Basic write/read |
+| `test_s3_delete` | Delete and verify gone |
+| `test_s3_list_pagination` | List > 1000 objects |
+| `test_s3_exists` | HeadObject checks |
+| `test_s3_not_found` | Get missing key returns NotFound |
+| `test_s3_overwrite` | Put same key twice |
+| `test_s3_key_prefix` | Verify prefix applied correctly |
+
+All tests marked `#[ignore]` - run with:
+```bash
+docker run -d -p 4566:4566 localstack/localstack
+HELIX_S3_BUCKET=test HELIX_S3_ENDPOINT=http://localhost:4566 \
+  cargo test --features s3 -- --ignored
+```
+
+#### 2.4 Wire Up
+
+| Task | File |
+|------|------|
+| Add `#[cfg(feature = "s3")] mod s3` | `helix-tier/src/lib.rs` |
+| Re-export `S3ObjectStorage`, `S3Config` | `helix-tier/src/lib.rs` |
+| Add `S3` variant to `ObjectStorageBackend` | `helix-tier/src/storage.rs` |
+| Update `create_object_storage` factory | `helix-tier/src/storage.rs` |
+
+**Acceptance Criteria**:
+- [ ] All integration tests pass against LocalStack
+- [ ] `cargo clippy --features s3` clean
+- [ ] Feature flag works (compiles without `s3` feature)
+
+---
+
+### Phase 3: Server Integration
+
+**Goal**: Wire object storage backends into helix-server CLI.
+
+#### 3.1 Add CLI Arguments
+
+**File**: `helix-server/src/main.rs`
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `--tier-backend` | enum | `none` | `none`, `filesystem`, `s3` |
+| `--tier-path` | PathBuf | - | Base path for filesystem backend |
+| `--tier-s3-bucket` | String | env | S3 bucket (or `HELIX_S3_BUCKET`) |
+| `--tier-s3-prefix` | String | `helix/segments/` | S3 key prefix |
+| `--tier-s3-endpoint` | String | - | Custom S3 endpoint |
+
+#### 3.2 Configuration Struct
+
+**File**: `helix-server/src/config.rs` (or inline in main.rs)
+
+```rust
+pub struct TierConfig {
+    pub backend: TierBackend,
+    pub filesystem_path: Option<PathBuf>,
+    pub s3_config: Option<S3Config>,
+}
+
+pub enum TierBackend {
+    None,       // Tiering disabled
+    Filesystem,
+    S3,
+}
+```
+
+#### 3.3 Initialize Storage
+
+**File**: `helix-server/src/main.rs` or `helix-server/src/service/mod.rs`
+
+| Task | Details |
+|------|---------|
+| Parse CLI args into `TierConfig` | Validate required fields per backend |
+| Create `ObjectStorage` instance | Use factory from helix-tier |
+| Pass to `HelixService` | Or create `IntegratedTieringManager` |
+| Handle `None` backend | Skip tiering entirely |
+
+#### 3.4 Update DurablePartition
+
+**File**: `helix-server/src/partition_storage.rs`
+
+| Task | Details |
+|------|---------|
+| Accept `Option<Arc<dyn ObjectStorage>>` | In constructor or config |
+| Skip tiering calls if None | Guard `tier_eligible_segments()` |
+
+**Acceptance Criteria**:
+- [ ] `helix-server --help` shows tier options
+- [ ] Server starts with `--tier-backend none` (default)
+- [ ] Server starts with `--tier-backend filesystem --tier-path /tmp/tier`
+- [ ] Server starts with `--tier-backend s3` (requires env vars)
+
+---
+
+### Phase 4: DST Enhancements (Optional)
+
+**Goal**: Enhanced SimulatedObjectStorage for more realistic testing.
+
+#### 4.1 Add StorageMetrics
+
+**File**: `helix-tier/src/storage.rs`
+
+| Task | Details |
+|------|---------|
+| Define `StorageMetrics` struct | Counters for all operations |
+| Add `metrics: Arc<Mutex<StorageMetrics>>` | To SimulatedObjectStorage |
+| Increment counters in each method | put_count, get_count, etc. |
+| Add `metrics()` getter | Return snapshot |
+| Add `reset_metrics()` | Clear counters |
+
+#### 4.2 Add Latency Simulation (Optional)
+
+Only if needed for specific tests. Current DST doesn't require real latency.
+
+**Acceptance Criteria**:
+- [ ] Metrics tracked correctly
+- [ ] Existing DST tests still pass
+
+---
+
+### Implementation Checklist
+
+```
+Phase 1: FilesystemObjectStorage
+  [ ] helix-tier/src/filesystem.rs created
+  [ ] FilesystemConfig struct
+  [ ] FilesystemObjectStorage struct
+  [ ] ObjectStorage trait impl (5 methods)
+  [ ] clear_all() utility
+  [ ] 9 unit tests
+  [ ] Added to lib.rs exports
+  [ ] Added to factory
+
+Phase 2: S3ObjectStorage
+  [ ] Cargo.toml updated with optional deps
+  [ ] helix-tier/src/s3.rs created
+  [ ] S3Config struct with from_env()
+  [ ] S3StorageClass enum
+  [ ] S3ObjectStorage struct
+  [ ] ObjectStorage trait impl (5 methods)
+  [ ] is_not_found_error() helper
+  [ ] 7 integration tests (ignored)
+  [ ] Added to lib.rs exports (cfg-gated)
+  [ ] Added to factory (cfg-gated)
+
+Phase 3: Server Integration
+  [ ] CLI args added to main.rs
+  [ ] TierConfig struct
+  [ ] Storage initialization in startup
+  [ ] DurablePartition accepts Option<ObjectStorage>
+  [ ] Manual testing with all 3 backends
+
+Phase 4: DST Enhancements (Optional)
+  [ ] StorageMetrics struct
+  [ ] Metrics tracking in SimulatedObjectStorage
+  [ ] metrics() and reset_metrics() methods
+```
 
 ---
 
