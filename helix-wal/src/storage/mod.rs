@@ -44,7 +44,7 @@ use bytes::Bytes;
 use crate::error::WalResult;
 
 // Re-export storage implementations.
-pub use simulated::{FaultConfig, SimulatedStorage};
+pub use simulated::{FaultConfig, FaultStats, SimulatedFile, SimulatedStorage};
 pub use tokio_storage::TokioStorage;
 
 // Re-export low-level io_uring types (for direct use within tokio_uring context).

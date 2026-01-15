@@ -227,7 +227,7 @@ impl<S: Storage + 'static> PartitionStorage<S> {
         let base_offset = match &mut self.inner {
             PartitionStorageInner::InMemory(partition) => match command {
                 PartitionCommand::Append { records } => {
-                    let record_count = records.len();
+                    let _record_count = records.len();
                     let offset = partition.append(records).map_err(|e| ServerError::Internal {
                         message: format!("failed to append: {e}"),
                     })?;
@@ -236,8 +236,6 @@ impl<S: Storage + 'static> PartitionStorage<S> {
                     let new_hwm = partition.log_end_offset();
                     partition.set_high_watermark(new_hwm);
 
-                    eprintln!("[APPLY_APPEND] topic={} partition={} index={} records={} base_offset={} new_hwm={}",
-                        self.topic_id, self.partition_id, index, record_count, offset, new_hwm);
                     Some(offset)
                 }
                 PartitionCommand::AppendBlob { blob, record_count, format } => {
@@ -318,7 +316,7 @@ impl<S: Storage + 'static> PartitionStorage<S> {
         let base_offset = match &mut self.inner {
             PartitionStorageInner::InMemory(partition) => match command {
                 PartitionCommand::Append { records } => {
-                    let record_count = records.len();
+                    let _record_count = records.len();
                     let offset = partition.append(records).map_err(|e| ServerError::Internal {
                         message: format!("failed to append: {e}"),
                     })?;
@@ -326,8 +324,6 @@ impl<S: Storage + 'static> PartitionStorage<S> {
                     let new_hwm = partition.log_end_offset();
                     partition.set_high_watermark(new_hwm);
 
-                    eprintln!("[APPLY_APPEND] topic={} partition={} index={} records={} base_offset={} new_hwm={}",
-                        self.topic_id, self.partition_id, index, record_count, offset, new_hwm);
                     Some(offset)
                 }
                 PartitionCommand::AppendBlob { blob, record_count, format } => {

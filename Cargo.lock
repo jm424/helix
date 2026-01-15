@@ -1829,6 +1829,7 @@ dependencies = [
  "async-trait",
  "bloodhound",
  "bytes",
+ "futures",
  "helix-core",
  "helix-progress",
  "helix-raft",

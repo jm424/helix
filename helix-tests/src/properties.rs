@@ -618,6 +618,408 @@ pub mod progress {
     pub struct EventualProgress;
 }
 
+// ============================================================================
+// Helix Service Property Tracking (for E2E DST)
+// ============================================================================
+
+/// Snapshot of a Helix service node's state.
+#[derive(Debug, Clone)]
+pub struct HelixNodeSnapshot {
+    /// Node ID.
+    pub node_id: u64,
+    /// Controller term.
+    pub controller_term: u64,
+    /// Controller state (Leader, Follower, Candidate).
+    pub controller_state: RaftState,
+    /// Whether the node is crashed.
+    pub crashed: bool,
+}
+
+/// A data integrity violation record.
+#[derive(Debug, Clone)]
+pub struct DataIntegrityViolationRecord {
+    /// Node where the violation was detected.
+    pub node_id: u64,
+    /// Topic ID.
+    pub topic_id: u64,
+    /// Partition ID.
+    pub partition_id: u64,
+    /// Offset that was committed.
+    pub offset: u64,
+    /// Expected hash of the data.
+    pub expected_hash: u64,
+    /// Actual hash read back (None if data missing).
+    pub actual_hash: Option<u64>,
+    /// Reason for violation.
+    pub reason: String,
+}
+
+impl std::fmt::Display for DataIntegrityViolationRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.actual_hash {
+            Some(actual) => write!(
+                f,
+                "Data integrity violation on node {}: topic={}, partition={}, offset={} - \
+                 expected hash {:x}, got {:x} ({})",
+                self.node_id, self.topic_id, self.partition_id, self.offset,
+                self.expected_hash, actual, self.reason
+            ),
+            None => write!(
+                f,
+                "Data integrity violation on node {}: topic={}, partition={}, offset={} - \
+                 data missing ({})",
+                self.node_id, self.topic_id, self.partition_id, self.offset, self.reason
+            ),
+        }
+    }
+}
+
+/// A record of a client-acknowledged produce.
+///
+/// This represents what the client believes was successfully produced.
+/// The client receives this acknowledgment when the data is committed via Raft.
+#[derive(Debug, Clone)]
+pub struct ClientAckedProduce {
+    /// Topic ID.
+    pub topic_id: u64,
+    /// Partition ID.
+    pub partition_id: u64,
+    /// Offset assigned to the record.
+    pub offset: u64,
+    /// Hash of the record payload for verification.
+    pub payload_hash: u64,
+    /// Node that acknowledged the produce.
+    pub acking_node: u64,
+}
+
+/// Property state for Helix E2E DST.
+#[derive(Debug, Default)]
+pub struct HelixPropertyState {
+    /// Snapshots: node_id -> snapshot.
+    pub snapshots: BTreeMap<u64, HelixNodeSnapshot>,
+    /// Leaders observed per term: term -> set of node IDs.
+    pub leaders_by_term: BTreeMap<u64, BTreeSet<u64>>,
+    /// Total events processed.
+    pub events_processed: u64,
+    /// Total successful produce operations across all nodes.
+    pub total_produce_success: u64,
+    /// Total data partitions created across all nodes.
+    pub total_data_partitions: u64,
+    /// Total committed entries across all nodes.
+    pub total_committed_entries: u64,
+    /// Data integrity violations detected during verification.
+    pub data_integrity_violations: Vec<DataIntegrityViolationRecord>,
+    /// Whether data integrity verification has been performed.
+    pub integrity_verified: bool,
+    /// Client-acknowledged produces: (topic_id, partition_id) -> list of (offset, hash).
+    ///
+    /// This tracks what clients believe was successfully produced.
+    /// Used for end-to-end verification that all ack'd data is consumable.
+    pub client_acked_produces: BTreeMap<(u64, u64), Vec<(u64, u64)>>,
+    /// Successfully verified offsets: (topic_id, partition_id, offset).
+    ///
+    /// An offset is added here when ANY node successfully reads and verifies it.
+    pub verified_offsets: BTreeSet<(u64, u64, u64)>,
+    /// Consumer verification violations (ack'd but not consumable by ANY node).
+    pub consumer_violations: Vec<ConsumerViolation>,
+    /// Whether consumer verification has been performed.
+    pub consumer_verified: bool,
+}
+
+/// A violation where data was acknowledged to client but not consumable.
+#[derive(Debug, Clone)]
+pub struct ConsumerViolation {
+    /// Topic ID.
+    pub topic_id: u64,
+    /// Partition ID.
+    pub partition_id: u64,
+    /// Offset that was acknowledged.
+    pub offset: u64,
+    /// Expected hash of the payload.
+    pub expected_hash: u64,
+    /// Actual hash if data was found but corrupted, None if missing.
+    pub actual_hash: Option<u64>,
+    /// Description of the violation.
+    pub reason: String,
+}
+
+impl HelixPropertyState {
+    /// Creates new empty state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Updates snapshot for a node.
+    pub fn update_snapshot(&mut self, snapshot: HelixNodeSnapshot) {
+        // Track leaders by term.
+        if snapshot.controller_state == RaftState::Leader {
+            self.leaders_by_term
+                .entry(snapshot.controller_term)
+                .or_default()
+                .insert(snapshot.node_id);
+        }
+
+        self.snapshots.insert(snapshot.node_id, snapshot);
+    }
+
+    /// Increments event counter.
+    pub fn increment_events(&mut self) {
+        self.events_processed += 1;
+    }
+
+    /// Updates produce/commit stats from a node.
+    /// Uses max to avoid double-counting when collecting from multiple nodes.
+    pub fn update_stats(&mut self, produce_success: u64, data_partitions: u64, committed_entries: u64) {
+        // Use max instead of add - all nodes see the same commits, so max gives accurate count.
+        self.total_produce_success = self.total_produce_success.max(produce_success);
+        self.total_data_partitions = self.total_data_partitions.max(data_partitions);
+        self.total_committed_entries = self.total_committed_entries.max(committed_entries);
+    }
+
+    /// Records a data integrity violation.
+    pub fn record_integrity_violation(&mut self, violation: DataIntegrityViolationRecord) {
+        self.data_integrity_violations.push(violation);
+    }
+
+    /// Marks integrity verification as complete.
+    pub fn mark_integrity_verified(&mut self) {
+        self.integrity_verified = true;
+    }
+
+    /// Returns true if data integrity holds (no violations).
+    #[must_use]
+    pub fn data_integrity_ok(&self) -> bool {
+        self.data_integrity_violations.is_empty()
+    }
+
+    /// Records a client-acknowledged produce.
+    ///
+    /// This should be called when data is committed via Raft and the client
+    /// would receive an acknowledgment.
+    pub fn record_client_ack(&mut self, topic_id: u64, partition_id: u64, offset: u64, payload_hash: u64) {
+        self.client_acked_produces
+            .entry((topic_id, partition_id))
+            .or_default()
+            .push((offset, payload_hash));
+    }
+
+    /// Records a consumer verification violation.
+    pub fn record_consumer_violation(&mut self, violation: ConsumerViolation) {
+        self.consumer_violations.push(violation);
+    }
+
+    /// Records that an offset was successfully verified by a node.
+    ///
+    /// Once ANY node verifies an offset, it's considered verified.
+    pub fn record_verified_offset(&mut self, topic_id: u64, partition_id: u64, offset: u64) {
+        self.verified_offsets.insert((topic_id, partition_id, offset));
+    }
+
+    /// Finalizes consumer verification by checking which acks weren't verified.
+    ///
+    /// This should be called AFTER all nodes have reported their verifications.
+    /// It checks each client ack and reports a violation if NO node could verify it.
+    pub fn finalize_consumer_verification(&mut self) {
+        // Get unique acks (deduplicate since multiple leaders may have ack'd same offset).
+        let mut unique_acks: BTreeSet<(u64, u64, u64, u64)> = BTreeSet::new();
+        for ((topic_id, partition_id), acks) in &self.client_acked_produces {
+            for (offset, hash) in acks {
+                unique_acks.insert((*topic_id, *partition_id, *offset, *hash));
+            }
+        }
+
+        // Check each unique ack against verified offsets.
+        for (topic_id, partition_id, offset, expected_hash) in unique_acks {
+            if !self.verified_offsets.contains(&(topic_id, partition_id, offset)) {
+                // No node could verify this offset - this is a real data loss.
+                self.consumer_violations.push(ConsumerViolation {
+                    topic_id,
+                    partition_id,
+                    offset,
+                    expected_hash,
+                    actual_hash: None,
+                    reason: "no node could read this offset".to_string(),
+                });
+            }
+        }
+        self.consumer_verified = true;
+    }
+
+    /// Marks consumer verification as complete (legacy, prefer finalize_consumer_verification).
+    pub fn mark_consumer_verified(&mut self) {
+        self.consumer_verified = true;
+    }
+
+    /// Returns true if all ack'd data is consumable (no consumer violations).
+    #[must_use]
+    pub fn consumer_integrity_ok(&self) -> bool {
+        self.consumer_violations.is_empty()
+    }
+
+    /// Returns total number of client-acknowledged produces.
+    #[must_use]
+    pub fn total_client_acks(&self) -> usize {
+        self.client_acked_produces.values().map(Vec::len).sum()
+    }
+
+    /// Returns count of unique client acks (deduplicated by offset).
+    #[must_use]
+    pub fn unique_client_acks(&self) -> usize {
+        let mut unique: BTreeSet<(u64, u64, u64)> = BTreeSet::new();
+        for ((topic_id, partition_id), acks) in &self.client_acked_produces {
+            for (offset, _) in acks {
+                unique.insert((*topic_id, *partition_id, *offset));
+            }
+        }
+        unique.len()
+    }
+}
+
+/// Shared property state handle for Helix DST.
+pub type SharedHelixPropertyState = std::sync::Arc<std::sync::Mutex<HelixPropertyState>>;
+
+/// Property violation types for Helix E2E DST.
+#[derive(Debug, Clone)]
+pub enum HelixViolation {
+    /// Multiple leaders in same term.
+    MultipleLeadersInTerm {
+        /// The term in which multiple leaders were observed.
+        term: u64,
+        /// The node IDs of the leaders.
+        leaders: Vec<u64>,
+    },
+}
+
+impl std::fmt::Display for HelixViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MultipleLeadersInTerm { term, leaders } => {
+                write!(f, "Multiple leaders in term {term}: {leaders:?}")
+            }
+        }
+    }
+}
+
+/// Result of Helix property checking.
+#[derive(Debug)]
+pub struct HelixPropertyCheckResult {
+    /// Detected violations.
+    pub violations: Vec<HelixViolation>,
+    /// Data integrity violations.
+    pub data_integrity_violations: Vec<DataIntegrityViolationRecord>,
+    /// Consumer violations (ack'd but not consumable).
+    pub consumer_violations: Vec<ConsumerViolation>,
+    /// Events processed.
+    pub events_processed: u64,
+    /// Leader summary: term -> count of leaders seen.
+    pub leader_summary: BTreeMap<u64, usize>,
+    /// Total successful produce operations.
+    pub total_produce_success: u64,
+    /// Total data partitions created.
+    pub total_data_partitions: u64,
+    /// Total committed entries.
+    pub total_committed_entries: u64,
+    /// Whether integrity verification was performed.
+    pub integrity_verified: bool,
+    /// Whether consumer verification was performed.
+    pub consumer_verified: bool,
+    /// Total client-acknowledged produces.
+    pub total_client_acks: usize,
+}
+
+impl HelixPropertyCheckResult {
+    /// Returns true if no violations were detected (consensus + data integrity + consumer).
+    #[must_use]
+    pub fn is_ok(&self) -> bool {
+        self.violations.is_empty()
+            && self.data_integrity_violations.is_empty()
+            && self.consumer_violations.is_empty()
+    }
+
+    /// Returns total violation count (consensus + data integrity + consumer).
+    #[must_use]
+    pub fn total_violations(&self) -> usize {
+        self.violations.len() + self.data_integrity_violations.len() + self.consumer_violations.len()
+    }
+}
+
+/// Checks Helix property state for violations.
+///
+/// # Errors
+///
+/// Returns an error string if the lock is poisoned.
+pub fn check_helix_properties(
+    state: &SharedHelixPropertyState,
+) -> Result<HelixPropertyCheckResult, &'static str> {
+    let state = state.lock().map_err(|_| "lock poisoned")?;
+
+    let mut violations = Vec::new();
+    let mut leader_summary = BTreeMap::new();
+
+    // Check SingleLeaderPerTerm.
+    for (&term, leaders) in &state.leaders_by_term {
+        leader_summary.insert(term, leaders.len());
+
+        if leaders.len() > 1 {
+            violations.push(HelixViolation::MultipleLeadersInTerm {
+                term,
+                leaders: leaders.iter().copied().collect(),
+            });
+        }
+    }
+
+    Ok(HelixPropertyCheckResult {
+        violations,
+        data_integrity_violations: state.data_integrity_violations.clone(),
+        consumer_violations: state.consumer_violations.clone(),
+        events_processed: state.events_processed,
+        leader_summary,
+        total_produce_success: state.total_produce_success,
+        total_data_partitions: state.total_data_partitions,
+        total_committed_entries: state.total_committed_entries,
+        integrity_verified: state.integrity_verified,
+        consumer_verified: state.consumer_verified,
+        total_client_acks: state.total_client_acks(),
+    })
+}
+
+/// Asserts no Helix property violations (consensus + data integrity + consumer).
+///
+/// # Panics
+///
+/// Panics if violations were detected.
+pub fn assert_no_helix_violations(result: &HelixPropertyCheckResult, test_name: &str) {
+    if !result.is_ok() {
+        let mut all_violations: Vec<String> = Vec::new();
+
+        // Add consensus violations.
+        for v in &result.violations {
+            all_violations.push(format!("[CONSENSUS] {v}"));
+        }
+
+        // Add data integrity violations.
+        for v in &result.data_integrity_violations {
+            all_violations.push(format!("[DATA INTEGRITY] {v}"));
+        }
+
+        // Add consumer violations.
+        for v in &result.consumer_violations {
+            all_violations.push(format!(
+                "[CONSUMER] topic={} partition={} offset={}: {} (expected_hash={}, actual={:?})",
+                v.topic_id, v.partition_id, v.offset, v.reason, v.expected_hash, v.actual_hash
+            ));
+        }
+
+        panic!(
+            "{} FAILED with {} violations:\n{}",
+            test_name,
+            all_violations.len(),
+            all_violations.join("\n")
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,5 +1035,57 @@ mod tests {
     fn test_single_leader_check_empty() {
         let actors: Vec<RaftActor> = Vec::new();
         assert!(check_single_leader_per_term(&actors));
+    }
+
+    #[test]
+    fn test_helix_property_state_new() {
+        let state = HelixPropertyState::new();
+        assert!(state.snapshots.is_empty());
+        assert!(state.leaders_by_term.is_empty());
+        assert_eq!(state.events_processed, 0);
+    }
+
+    #[test]
+    fn test_helix_property_state_update_snapshot() {
+        let mut state = HelixPropertyState::new();
+
+        // Add a leader snapshot.
+        state.update_snapshot(HelixNodeSnapshot {
+            node_id: 1,
+            controller_term: 1,
+            controller_state: RaftState::Leader,
+            crashed: false,
+        });
+
+        assert_eq!(state.snapshots.len(), 1);
+        assert_eq!(state.leaders_by_term.get(&1).map(|s| s.len()), Some(1));
+    }
+
+    #[test]
+    fn test_helix_check_violations() {
+        use std::sync::{Arc, Mutex};
+
+        let state = Arc::new(Mutex::new(HelixPropertyState::new()));
+
+        // Add two leaders in the same term - this is a violation.
+        {
+            let mut s = state.lock().unwrap();
+            s.update_snapshot(HelixNodeSnapshot {
+                node_id: 1,
+                controller_term: 1,
+                controller_state: RaftState::Leader,
+                crashed: false,
+            });
+            s.update_snapshot(HelixNodeSnapshot {
+                node_id: 2,
+                controller_term: 1,
+                controller_state: RaftState::Leader,
+                crashed: false,
+            });
+        }
+
+        let result = check_helix_properties(&state).unwrap();
+        assert!(!result.is_ok());
+        assert_eq!(result.violations.len(), 1);
     }
 }

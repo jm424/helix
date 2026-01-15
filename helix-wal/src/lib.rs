@@ -54,7 +54,7 @@ pub use shared_wal::{
     CoordinatorConfig, DurableAck, PoolConfig, SharedWal, SharedWalConfig, SharedWalCoordinator,
     SharedWalHandle, SharedWalPool, POOL_WAL_COUNT_MAX,
 };
-pub use storage::{create_storage, FaultConfig, SimulatedStorage, Storage, StorageFile, TokioStorage};
+pub use storage::{create_storage, FaultConfig, FaultStats, SimulatedFile, SimulatedStorage, Storage, StorageFile, TokioStorage};
 
 // Low-level io_uring types (for direct use within tokio_uring context).
 #[cfg(all(target_os = "linux", feature = "io-uring"))]

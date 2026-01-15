@@ -27,18 +27,112 @@ use std::time::Duration;
 use bloodhound::simulation::discrete::actors::{SimulatedActor, SimulationContext};
 use bloodhound::simulation::discrete::event::{ActorId, EventKind};
 use bytes::Bytes;
-use helix_core::{GroupId, LogIndex, NodeId, PartitionId, TopicId};
+use helix_core::{GroupId, LogIndex, NodeId, Offset, PartitionId, Record, TopicId};
 use helix_raft::multi::{MultiRaft, MultiRaftOutput};
 use helix_raft::RaftState;
 use helix_server::controller::{ControllerCommand, ControllerState, CONTROLLER_GROUP_ID};
 use helix_server::group_map::GroupMap;
 use helix_server::partition_storage::PartitionStorage;
+use helix_server::storage::PartitionCommand;
 use helix_server::service::{HEARTBEAT_INTERVAL_MS, TICK_INTERVAL_MS};
-use helix_wal::SimulatedStorage;
+use helix_wal::{Entry, FaultConfig, FaultStats, SimulatedStorage, Wal, WalConfig};
 use tracing::{debug, error, info, warn};
 
+use crate::properties::{DataIntegrityViolationRecord, HelixNodeSnapshot, SharedHelixPropertyState};
 use crate::raft_actor::SharedNetworkState;
 use crate::simulated_transport::SimulatedTransport;
+
+// ============================================================================
+// DST WAL Wrapper (Sync access to async Wal)
+// ============================================================================
+
+/// Synchronous wrapper around `Wal` for DST.
+///
+/// Uses `futures::executor::block_on` to call async methods synchronously.
+/// Safe because `SimulatedStorage` is actually synchronous (in-memory HashMap).
+pub struct DstWal {
+    wal: Wal<SimulatedStorage>,
+}
+
+impl DstWal {
+    /// Opens or creates a WAL at the given directory.
+    pub fn open(storage: SimulatedStorage, dir: &std::path::Path) -> Result<Self, String> {
+        let config = WalConfig::new(dir);
+        let wal = futures::executor::block_on(Wal::open(storage, config))
+            .map_err(|e| format!("WAL open failed: {e}"))?;
+        Ok(Self { wal })
+    }
+
+    /// Appends an entry to the WAL. Returns the index of the appended entry.
+    pub fn append(&mut self, entry: Entry) -> Result<u64, String> {
+        futures::executor::block_on(self.wal.append(entry))
+            .map_err(|e| format!("WAL append failed: {e}"))
+    }
+
+    /// Syncs the WAL to durable storage.
+    pub fn sync(&mut self) -> Result<(), String> {
+        futures::executor::block_on(self.wal.sync())
+            .map_err(|e| format!("WAL sync failed: {e}"))
+    }
+
+    /// Returns the first index in the WAL.
+    pub fn first_index(&self) -> u64 {
+        self.wal.first_index()
+    }
+
+    /// Returns the last index in the WAL (if any).
+    pub fn last_index(&self) -> Option<u64> {
+        self.wal.last_index()
+    }
+
+    /// Reads an entry at the given index.
+    pub fn read(&self, index: u64) -> Result<Entry, String> {
+        self.wal.read(index).cloned().map_err(|e| format!("WAL read failed: {e}"))
+    }
+}
+
+// ============================================================================
+// Data Integrity Verification
+// ============================================================================
+
+/// A data integrity violation - committed data that is missing or corrupted.
+#[derive(Debug, Clone)]
+pub struct DataIntegrityViolation {
+    /// Node where the violation was detected.
+    pub node_id: u64,
+    /// Topic ID.
+    pub topic_id: u64,
+    /// Partition ID.
+    pub partition_id: u64,
+    /// Offset that was committed.
+    pub offset: u64,
+    /// Expected hash of the data.
+    pub expected_hash: u64,
+    /// Actual hash read back (None if data missing).
+    pub actual_hash: Option<u64>,
+    /// Reason for violation.
+    pub reason: String,
+}
+
+impl std::fmt::Display for DataIntegrityViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.actual_hash {
+            Some(actual) => write!(
+                f,
+                "Data integrity violation on node {}: topic={}, partition={}, offset={} - \
+                 expected hash {:x}, got {:x} ({})",
+                self.node_id, self.topic_id, self.partition_id, self.offset,
+                self.expected_hash, actual, self.reason
+            ),
+            None => write!(
+                f,
+                "Data integrity violation on node {}: topic={}, partition={}, offset={} - \
+                 data missing ({})",
+                self.node_id, self.topic_id, self.partition_id, self.offset, self.reason
+            ),
+        }
+    }
+}
 
 /// Timer IDs for service events.
 mod timer_ids {
@@ -56,6 +150,16 @@ pub mod custom_events {
     pub const FETCH: &str = "fetch";
     /// Create topic request.
     pub const CREATE_TOPIC: &str = "create_topic";
+    /// Collect state for property checking.
+    pub const COLLECT_STATE: &str = "collect_state";
+    /// Apply network partition.
+    pub const APPLY_PARTITION: &str = "apply_partition";
+    /// Heal network partition.
+    pub const HEAL_PARTITION: &str = "heal_partition";
+    /// Verify data integrity - reads back all committed data and verifies hashes.
+    pub const VERIFY_INTEGRITY: &str = "verify_integrity";
+    /// Verify consumer - reads back all client-ack'd data from any surviving node.
+    pub const VERIFY_CONSUMER: &str = "verify_consumer";
 }
 
 /// Type alias for partition storage with simulated backend.
@@ -91,13 +195,25 @@ pub struct HelixServiceActor {
     /// Whether this node is crashed.
     crashed: bool,
     /// Mapping from NodeId to ActorId.
-    #[allow(dead_code)] // Used by transport, kept for future state reconstruction.
     node_to_actor: BTreeMap<NodeId, ActorId>,
     /// Seed for deterministic behavior.
     #[allow(dead_code)] // Used for future random fault injection.
     seed: u64,
     /// Tick counter for time tracking (increments each tick).
     tick_count: u64,
+    /// Shared property state for verification.
+    property_state: SharedHelixPropertyState,
+    /// Committed data entries for durability verification.
+    /// Maps (topic_id, partition_id) -> list of (offset, data_hash) pairs.
+    committed_data: BTreeMap<(TopicId, PartitionId), Vec<(Offset, u64)>>,
+    /// Total produce operations attempted.
+    #[allow(dead_code)] // Tracked but not yet exposed.
+    produce_count: u64,
+    /// Total successful produce operations.
+    produce_success_count: u64,
+    /// Storage fault configuration.
+    #[allow(dead_code)] // Used to create storage, retained for recovery.
+    fault_config: FaultConfig,
 }
 
 impl HelixServiceActor {
@@ -110,6 +226,8 @@ impl HelixServiceActor {
     /// * `cluster_nodes` - All node IDs in the cluster
     /// * `node_to_actor` - Mapping from NodeId to ActorId
     /// * `network_state` - Shared network state for partitions
+    /// * `property_state` - Shared property state for verification
+    /// * `fault_config` - Storage fault injection configuration
     /// * `seed` - Random seed for deterministic behavior
     #[must_use]
     pub fn new(
@@ -118,12 +236,14 @@ impl HelixServiceActor {
         cluster_nodes: Vec<NodeId>,
         node_to_actor: BTreeMap<NodeId, ActorId>,
         network_state: SharedNetworkState,
+        property_state: SharedHelixPropertyState,
+        fault_config: FaultConfig,
         seed: u64,
     ) -> Self {
         let name = format!("helix-service-{}", node_id.get());
 
-        // Create simulated storage with the seed.
-        let storage = SimulatedStorage::new(seed);
+        // Create simulated storage with fault injection.
+        let storage = SimulatedStorage::with_faults(seed, fault_config.clone());
 
         // Create simulated transport.
         let transport = SimulatedTransport::new(
@@ -157,6 +277,11 @@ impl HelixServiceActor {
             node_to_actor,
             seed,
             tick_count: 0,
+            property_state,
+            committed_data: BTreeMap::new(),
+            produce_count: 0,
+            produce_success_count: 0,
+            fault_config,
         }
     }
 
@@ -178,6 +303,353 @@ impl HelixServiceActor {
         self.multi_raft
             .group_state(CONTROLLER_GROUP_ID)
             .is_some_and(|s| s.state == RaftState::Leader)
+    }
+
+    /// Returns the current controller term.
+    #[must_use]
+    pub fn controller_term(&self) -> u64 {
+        self.multi_raft
+            .group_state(CONTROLLER_GROUP_ID)
+            .map_or(0, |s| s.current_term.get())
+    }
+
+    /// Returns the current controller state.
+    #[must_use]
+    pub fn controller_state(&self) -> RaftState {
+        self.multi_raft
+            .group_state(CONTROLLER_GROUP_ID)
+            .map_or(RaftState::Follower, |s| s.state)
+    }
+
+    /// Creates a snapshot of the current node state for property verification.
+    #[must_use]
+    pub fn snapshot(&self) -> HelixNodeSnapshot {
+        HelixNodeSnapshot {
+            node_id: self.node_id.get(),
+            controller_term: self.controller_term(),
+            controller_state: self.controller_state(),
+            crashed: self.crashed,
+        }
+    }
+
+    /// Returns the number of successful produce operations.
+    #[must_use]
+    pub fn produce_success_count(&self) -> u64 {
+        self.produce_success_count
+    }
+
+    /// Returns the number of data partitions created.
+    #[must_use]
+    pub fn data_partition_count(&self) -> usize {
+        // Count partition_storage entries (excludes controller partition).
+        self.partition_storage.len()
+    }
+
+    /// Returns the total committed entry count across all partitions.
+    #[must_use]
+    pub fn committed_entry_count(&self) -> usize {
+        self.committed_data.values().map(Vec::len).sum()
+    }
+
+    /// Returns the storage fault statistics.
+    #[must_use]
+    pub fn fault_stats(&self) -> FaultStats {
+        self.storage.fault_stats()
+    }
+
+    /// Returns the committed data for verification.
+    /// Maps (topic_id, partition_id) -> list of (offset, data_hash).
+    #[must_use]
+    pub fn committed_data(&self) -> &BTreeMap<(TopicId, PartitionId), Vec<(Offset, u64)>> {
+        &self.committed_data
+    }
+
+    /// Verifies data integrity: all committed data is readable with correct hash.
+    ///
+    /// Returns a list of integrity violations (offset, expected_hash, actual_hash or None if missing).
+    #[must_use]
+    pub fn verify_data_integrity(&self) -> Vec<DataIntegrityViolation> {
+        let mut violations = Vec::new();
+
+        for (&(topic_id, partition_id), committed) in &self.committed_data {
+            // Find the partition storage.
+            let group_id = match self.group_map.get(topic_id, partition_id) {
+                Some(gid) => gid,
+                None => {
+                    // Group not found - this is a violation if we have committed data.
+                    for &(offset, expected_hash) in committed {
+                        violations.push(DataIntegrityViolation {
+                            node_id: self.node_id.get(),
+                            topic_id: topic_id.get(),
+                            partition_id: partition_id.get(),
+                            offset: offset.get(),
+                            expected_hash,
+                            actual_hash: None,
+                            reason: "partition storage not found".to_string(),
+                        });
+                    }
+                    continue;
+                }
+            };
+
+            let ps = match self.partition_storage.get(&group_id) {
+                Some(ps) => ps,
+                None => {
+                    // Storage not found - violation.
+                    for &(offset, expected_hash) in committed {
+                        violations.push(DataIntegrityViolation {
+                            node_id: self.node_id.get(),
+                            topic_id: topic_id.get(),
+                            partition_id: partition_id.get(),
+                            offset: offset.get(),
+                            expected_hash,
+                            actual_hash: None,
+                            reason: "partition storage not initialized".to_string(),
+                        });
+                    }
+                    continue;
+                }
+            };
+
+            // Verify each committed entry is readable with correct hash.
+            for &(offset, expected_hash) in committed {
+                // Read 1 record at the committed offset.
+                match ps.read(offset, 1) {
+                    Ok(records) if !records.is_empty() => {
+                        // For single record, use direct hash comparison.
+                        let actual_hash = Self::simple_hash(&records[0].value);
+                        if actual_hash != expected_hash {
+                            violations.push(DataIntegrityViolation {
+                                node_id: self.node_id.get(),
+                                topic_id: topic_id.get(),
+                                partition_id: partition_id.get(),
+                                offset: offset.get(),
+                                expected_hash,
+                                actual_hash: Some(actual_hash),
+                                reason: "hash mismatch".to_string(),
+                            });
+                        }
+                    }
+                    Ok(_) => {
+                        // Empty records returned.
+                        violations.push(DataIntegrityViolation {
+                            node_id: self.node_id.get(),
+                            topic_id: topic_id.get(),
+                            partition_id: partition_id.get(),
+                            offset: offset.get(),
+                            expected_hash,
+                            actual_hash: None,
+                            reason: "empty records at offset".to_string(),
+                        });
+                    }
+                    Err(e) => {
+                        violations.push(DataIntegrityViolation {
+                            node_id: self.node_id.get(),
+                            topic_id: topic_id.get(),
+                            partition_id: partition_id.get(),
+                            offset: offset.get(),
+                            expected_hash,
+                            actual_hash: None,
+                            reason: format!("read error: {e}"),
+                        });
+                    }
+                }
+            }
+        }
+
+        violations
+    }
+
+    /// Updates the shared property state with this node's current state.
+    fn update_property_state(&self) {
+        let snapshot = self.snapshot();
+        if let Ok(mut state) = self.property_state.lock() {
+            state.update_snapshot(snapshot);
+            state.increment_events();
+            // Update stats (only include this node's contribution).
+            state.update_stats(
+                self.produce_success_count,
+                self.data_partition_count() as u64,
+                self.committed_entry_count() as u64,
+            );
+        }
+    }
+
+    /// Handles the collect_state event - updates property state.
+    fn handle_collect_state(&self) {
+        self.update_property_state();
+    }
+
+    /// Handles the verify_integrity event - verifies all committed data is readable.
+    fn handle_verify_integrity(&self) {
+        info!(actor = %self.name, "Verifying data integrity");
+
+        let violations = self.verify_data_integrity();
+
+        // Record violations in shared property state.
+        if let Ok(mut state) = self.property_state.lock() {
+            for v in violations {
+                state.record_integrity_violation(DataIntegrityViolationRecord {
+                    node_id: v.node_id,
+                    topic_id: v.topic_id,
+                    partition_id: v.partition_id,
+                    offset: v.offset,
+                    expected_hash: v.expected_hash,
+                    actual_hash: v.actual_hash,
+                    reason: v.reason,
+                });
+            }
+            state.mark_integrity_verified();
+        }
+
+        info!(
+            actor = %self.name,
+            committed_entries = self.committed_entry_count(),
+            "Data integrity verification complete"
+        );
+    }
+
+    /// Handles consumer verification - records which client-ack'd offsets this node can read.
+    ///
+    /// Each node reports which offsets it can successfully read and verify.
+    /// After all nodes report, `finalize_consumer_verification` determines which
+    /// offsets NO node could verify (those are true data loss violations).
+    fn handle_verify_consumer(&self) {
+        info!(actor = %self.name, "Verifying consumer data (all client acks)");
+
+        // Get all client acks from shared state.
+        let client_acks: std::collections::BTreeMap<(u64, u64), Vec<(u64, u64)>> = {
+            match self.property_state.lock() {
+                Ok(state) => state.client_acked_produces.clone(),
+                Err(_) => {
+                    warn!(actor = %self.name, "Failed to lock property state for consumer verification");
+                    return;
+                }
+            }
+        };
+
+        let mut verified_offsets = Vec::new();
+        let mut verified_count = 0;
+
+        // For each partition with acks, try to read and verify from our storage.
+        for ((topic_id, partition_id), acks) in &client_acks {
+            let topic_id_typed = TopicId::new(*topic_id);
+            let partition_id_typed = PartitionId::new(*partition_id);
+
+            // Find partition storage for this topic/partition.
+            let Some(group_id) = self.group_map.get(topic_id_typed, partition_id_typed) else {
+                // This node doesn't have this partition - skip (other nodes will verify).
+                continue;
+            };
+
+            let Some(ps) = self.partition_storage.get(&group_id) else {
+                // Storage not initialized - can't verify from this node.
+                continue;
+            };
+
+            // Try to verify each ack'd offset.
+            for &(offset, expected_hash) in acks {
+                match ps.read(Offset::new(offset), 1) {
+                    Ok(records) if !records.is_empty() => {
+                        let actual_hash = Self::simple_hash(&records[0].value);
+                        if actual_hash == expected_hash {
+                            // This node can successfully verify this offset.
+                            verified_offsets.push((*topic_id, *partition_id, offset));
+                            verified_count += 1;
+                        }
+                        // Hash mismatch - don't mark as verified, other nodes might have correct data.
+                    }
+                    _ => {
+                        // Can't read - don't mark as verified, other nodes might have it.
+                    }
+                }
+            }
+        }
+
+        // Record verified offsets in shared property state.
+        if let Ok(mut state) = self.property_state.lock() {
+            for (topic_id, partition_id, offset) in verified_offsets {
+                state.record_verified_offset(topic_id, partition_id, offset);
+            }
+        }
+
+        info!(
+            actor = %self.name,
+            verified = verified_count,
+            total_acks = client_acks.values().map(Vec::len).sum::<usize>(),
+            "Consumer verification complete"
+        );
+    }
+
+    /// Handles applying a network partition from event data.
+    /// Data format: count (1 byte) + actor_ids (8 bytes each)
+    fn handle_apply_partition(&self, data: &[u8]) {
+        if data.is_empty() {
+            // Default: partition this node from all others.
+            let mut state = self.network_state.lock().expect("lock");
+            for &other_actor in self.node_to_actor.values() {
+                if other_actor != self.actor_id {
+                    state.partition(&[self.actor_id, other_actor]);
+                }
+            }
+            info!(actor = %self.name, "Applied partition (isolated from all)");
+            return;
+        }
+
+        // Parse partition data.
+        let count = data[0] as usize;
+        if data.len() < 1 + count * 8 {
+            warn!(actor = %self.name, "Invalid partition data");
+            return;
+        }
+
+        let mut actors = Vec::with_capacity(count);
+        for i in 0..count {
+            let start = 1 + i * 8;
+            let actor_id = u64::from_le_bytes(data[start..start + 8].try_into().unwrap());
+            actors.push(ActorId::new(actor_id));
+        }
+
+        let mut state = self.network_state.lock().expect("lock");
+        for pair in actors.windows(2) {
+            state.partition(&[pair[0], pair[1]]);
+        }
+        info!(actor = %self.name, actors = ?actors, "Applied partition");
+    }
+
+    /// Handles healing a network partition.
+    fn handle_heal_partition(&self, data: &[u8]) {
+        if data.is_empty() {
+            // Default: heal all partitions involving this node.
+            let mut state = self.network_state.lock().expect("lock");
+            for &other_actor in self.node_to_actor.values() {
+                if other_actor != self.actor_id {
+                    state.heal(&[self.actor_id, other_actor]);
+                }
+            }
+            info!(actor = %self.name, "Healed all partitions");
+            return;
+        }
+
+        // Parse heal data (same format as partition).
+        let count = data[0] as usize;
+        if data.len() < 1 + count * 8 {
+            warn!(actor = %self.name, "Invalid heal data");
+            return;
+        }
+
+        let mut actors = Vec::with_capacity(count);
+        for i in 0..count {
+            let start = 1 + i * 8;
+            let actor_id = u64::from_le_bytes(data[start..start + 8].try_into().unwrap());
+            actors.push(ActorId::new(actor_id));
+        }
+
+        let mut state = self.network_state.lock().expect("lock");
+        for pair in actors.windows(2) {
+            state.heal(&[pair[0], pair[1]]);
+        }
+        info!(actor = %self.name, actors = ?actors, "Healed partition");
     }
 
     /// Schedules the next tick timer.
@@ -209,6 +681,12 @@ impl HelixServiceActor {
 
         // Drain transport queue and schedule message deliveries.
         self.transport.drain_and_schedule(ctx);
+
+        // Update property state every 10 ticks (500ms at 50ms tick interval).
+        // This captures leader elections and term changes.
+        if self.tick_count % 10 == 0 {
+            self.update_property_state();
+        }
 
         // Schedule next tick.
         self.schedule_tick(ctx);
@@ -286,18 +764,144 @@ impl HelixServiceActor {
         // Regular data partition commit - apply to storage.
         if let Some((topic_id, partition_id)) = self.group_map.get_key(group_id) {
             if let Some(ps) = self.partition_storage.get_mut(&group_id) {
+                // Decode the command to get the actual record payloads.
+                let record_payloads: Vec<Vec<u8>> = match PartitionCommand::decode(data) {
+                    Some(PartitionCommand::Append { ref records }) => {
+                        records.iter().map(|r| r.value.to_vec()).collect()
+                    }
+                    _ => Vec::new(),
+                };
+
                 // Apply entry synchronously (DST uses in-memory storage).
-                if let Err(e) = ps.apply_entry_sync(index, data) {
-                    warn!(
-                        actor = %self.name,
-                        topic = topic_id.get(),
-                        partition = partition_id.get(),
-                        error = %e,
-                        "Failed to apply entry"
-                    );
+                match ps.apply_entry_sync(index, data) {
+                    Ok(offset_opt) => {
+                        // Track committed data for durability verification.
+                        let base_offset = offset_opt.unwrap_or(ps.log_end_offset());
+
+                        // Collect records to persist (to avoid borrow conflict with committed_data).
+                        let records_to_persist: Vec<(Offset, u64, Vec<u8>)> = record_payloads
+                            .iter()
+                            .enumerate()
+                            .map(|(i, payload)| {
+                                #[allow(clippy::cast_possible_truncation)]
+                                let offset = Offset::new(base_offset.get() + i as u64);
+                                let data_hash = Self::simple_hash(payload);
+                                (offset, data_hash, payload.clone())
+                            })
+                            .collect();
+
+                        // Update committed_data tracking.
+                        let committed = self.committed_data
+                            .entry((topic_id, partition_id))
+                            .or_insert_with(Vec::new);
+                        for (offset, data_hash, _) in &records_to_persist {
+                            committed.push((*offset, *data_hash));
+                        }
+
+                        // Persist to SimulatedStorage for high-fidelity crash recovery.
+                        // This is done after releasing the mutable borrow on committed_data.
+                        for (offset, _, payload) in &records_to_persist {
+                            self.persist_record(topic_id, partition_id, *offset, payload);
+                        }
+
+                        // Record client acknowledgments in shared state.
+                        // Only record if we're the leader - the leader is the one that
+                        // sends acks to clients in a real system.
+                        let is_leader = self.multi_raft
+                            .group_state(group_id)
+                            .map_or(false, |s| s.state == helix_raft::RaftState::Leader);
+
+                        if is_leader {
+                            if let Ok(mut state) = self.property_state.lock() {
+                                for (offset, data_hash, _) in &records_to_persist {
+                                    state.record_client_ack(
+                                        topic_id.get(),
+                                        partition_id.get(),
+                                        offset.get(),
+                                        *data_hash,
+                                    );
+                                }
+                            }
+                        }
+
+                        self.produce_success_count += 1;
+                    }
+                    Err(e) => {
+                        warn!(
+                            actor = %self.name,
+                            topic = topic_id.get(),
+                            partition = partition_id.get(),
+                            error = %e,
+                            "Failed to apply entry"
+                        );
+                    }
                 }
             }
         }
+    }
+
+    /// Persists a committed record to SimulatedStorage for durability.
+    ///
+    /// This stores the record data in a file path that can be recovered after crash.
+    /// Path format: /partitions/{topic_id}/{partition_id}/offset_{offset}
+    fn persist_record(&self, topic_id: TopicId, partition_id: PartitionId, offset: Offset, data: &[u8]) {
+        let path = std::path::PathBuf::from(format!(
+            "/partitions/{}/{}/offset_{}",
+            topic_id.get(),
+            partition_id.get(),
+            offset.get()
+        ));
+
+        // Use sync API for SimulatedStorage.
+        if let Ok(file) = self.storage.open_sync(&path) {
+            // Write the data.
+            if file.write_at_sync(0, data).is_ok() {
+                // Sync to make durable.
+                let _ = file.sync_data();
+            }
+        }
+    }
+
+    /// Loads all persisted records for a partition from SimulatedStorage.
+    ///
+    /// Returns a map of offset -> record data.
+    fn load_persisted_records(&self, topic_id: TopicId, partition_id: PartitionId) -> BTreeMap<Offset, Vec<u8>> {
+        let mut records = BTreeMap::new();
+        let dir_path = std::path::PathBuf::from(format!(
+            "/partitions/{}/{}",
+            topic_id.get(),
+            partition_id.get()
+        ));
+
+        // List files in the directory using sync API.
+        if let Ok(files) = self.storage.list_files_sync(&dir_path, "") {
+            for file_path in files {
+                if let Some(file_name) = file_path.file_name().and_then(|n| n.to_str()) {
+                    if let Some(offset_str) = file_name.strip_prefix("offset_") {
+                        if let Ok(offset_num) = offset_str.parse::<u64>() {
+                            if let Ok(file) = self.storage.open_sync(&file_path) {
+                                if let Ok(data) = file.read_all_sync() {
+                                    records.insert(Offset::new(offset_num), data.to_vec());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        records
+    }
+
+    /// Simple hash for data comparison.
+    fn simple_hash(data: &[u8]) -> u64 {
+        // FNV-1a hash for simplicity.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in data {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        hash
     }
 
     /// Handles a controller partition commit.
@@ -473,11 +1077,16 @@ impl HelixServiceActor {
             error!(actor = %self.name, error = %e, "Failed to recreate controller group");
         }
 
-        // Clear in-memory state (will be rebuilt from WAL on partition access).
+        // Clear in-memory state.
         self.partition_storage.clear();
         self.group_map = GroupMap::new();
         self.controller_state = ControllerState::new();
         self.tick_count = 0;
+        self.committed_data.clear();
+
+        // Recover partition data from SimulatedStorage.
+        // The storage reverted to last synced state on crash, so we reload durable data.
+        self.recover_partitions_from_storage();
 
         self.crashed = false;
 
@@ -485,7 +1094,86 @@ impl HelixServiceActor {
         self.schedule_tick(ctx);
         self.schedule_heartbeat(ctx);
 
-        info!(actor = %self.name, "RECOVERED - restarted as follower");
+        info!(
+            actor = %self.name,
+            recovered_partitions = self.partition_storage.len(),
+            recovered_records = self.committed_data.values().map(Vec::len).sum::<usize>(),
+            "RECOVERED - restarted as follower with durable data"
+        );
+    }
+
+    /// Recovers partition data from SimulatedStorage after crash.
+    fn recover_partitions_from_storage(&mut self) {
+        // Scan SimulatedStorage for partition data files.
+        // Path format: /partitions/{topic_id}/{partition_id}/offset_{offset}
+        // Use list_files_sync with empty extension to get all files.
+        let partitions_dir = std::path::PathBuf::from("/partitions");
+
+        // Get all files under /partitions (recursive via path prefix matching).
+        let Ok(all_files) = self.storage.list_files_sync(&partitions_dir, "") else {
+            return;
+        };
+
+        // Group files by (topic_id, partition_id).
+        let mut partition_files: BTreeMap<(TopicId, PartitionId), Vec<std::path::PathBuf>> = BTreeMap::new();
+
+        for file_path in all_files {
+            // Parse path: /partitions/{topic_id}/{partition_id}/offset_{offset}
+            let path_str = file_path.to_string_lossy();
+            let parts: Vec<&str> = path_str.split('/').collect();
+
+            // Expected: ["", "partitions", "{topic_id}", "{partition_id}", "offset_{offset}"]
+            if parts.len() >= 5 && parts[1] == "partitions" {
+                if let (Ok(topic_id), Ok(partition_id)) = (
+                    parts[2].parse::<u64>(),
+                    parts[3].parse::<u64>(),
+                ) {
+                    let key = (TopicId::new(topic_id), PartitionId::new(partition_id));
+                    partition_files.entry(key).or_default().push(file_path);
+                }
+            }
+        }
+
+        // Recover each partition.
+        for ((topic_id, partition_id), _files) in partition_files {
+            // Load persisted records for this partition.
+            let persisted = self.load_persisted_records(topic_id, partition_id);
+
+            if persisted.is_empty() {
+                continue;
+            }
+
+            // Recreate the partition storage.
+            let group_id = GroupId::new(topic_id.get() * 1000 + partition_id.get());
+            self.group_map.insert(topic_id, partition_id, group_id);
+
+            let mut ps = SimulatedPartitionStorage::new_in_memory(topic_id, partition_id);
+
+            // Rebuild committed_data tracking and partition storage.
+            let committed = self.committed_data
+                .entry((topic_id, partition_id))
+                .or_insert_with(Vec::new);
+
+            for (offset, data) in persisted {
+                let data_hash = Self::simple_hash(&data);
+                committed.push((offset, data_hash));
+
+                // Re-append to in-memory partition storage via apply_entry_sync.
+                let record = Record::new(Bytes::from(data));
+                let command = PartitionCommand::Append { records: vec![record] };
+                let encoded = command.encode();
+                // Use a synthetic log index based on offset.
+                let log_index = LogIndex::new(offset.get() + 1);
+                let _ = ps.apply_entry_sync(log_index, &encoded);
+            }
+
+            // Recreate Raft group for this partition.
+            if let Err(e) = self.multi_raft.create_group(group_id, self.cluster_nodes.clone()) {
+                warn!(actor = %self.name, group = group_id.get(), error = %e, "Failed to recreate partition group");
+            }
+
+            self.partition_storage.insert(group_id, ps);
+        }
     }
 
     /// Handles a client produce request.
@@ -511,14 +1199,27 @@ impl HelixServiceActor {
             return;
         };
 
+        // Create a proper Record from the payload.
+        let record = Record::new(payload);
+
+        // Create a PartitionCommand::Append with the record.
+        let command = PartitionCommand::Append {
+            records: vec![record],
+        };
+
+        // Encode the command for Raft.
+        let encoded = command.encode();
+
         // Propose to Raft.
-        if self.multi_raft.propose(group_id, payload).is_none() {
+        if self.multi_raft.propose(group_id, encoded).is_none() {
             debug!(
                 actor = %self.name,
                 group = group_id.get(),
                 "Not leader, cannot propose"
             );
         }
+
+        self.produce_count += 1;
 
         // Process any immediate outputs.
         let outputs = self.multi_raft.tick();
@@ -622,6 +1323,11 @@ impl SimulatedActor for HelixServiceActor {
                 match name.as_str() {
                     custom_events::PRODUCE => self.handle_produce(&data, ctx),
                     custom_events::CREATE_TOPIC => self.handle_create_topic(&data, ctx),
+                    custom_events::COLLECT_STATE => self.handle_collect_state(),
+                    custom_events::APPLY_PARTITION => self.handle_apply_partition(&data),
+                    custom_events::HEAL_PARTITION => self.handle_heal_partition(&data),
+                    custom_events::VERIFY_INTEGRITY => self.handle_verify_integrity(),
+                    custom_events::VERIFY_CONSUMER => self.handle_verify_consumer(),
                     _ => {
                         debug!(actor = %self.name, event = %name, "unknown custom event");
                     }
@@ -666,6 +1372,8 @@ impl SimulatedActor for HelixServiceActor {
 ///
 /// * `node_count` - Number of nodes (must be 1-7)
 /// * `base_seed` - Base seed for deterministic behavior
+/// * `property_state` - Shared property state for verification
+/// * `fault_config` - Storage fault injection configuration (shared by all nodes)
 ///
 /// # Returns
 ///
@@ -678,6 +1386,8 @@ impl SimulatedActor for HelixServiceActor {
 pub fn create_helix_cluster(
     node_count: usize,
     base_seed: u64,
+    property_state: SharedHelixPropertyState,
+    fault_config: FaultConfig,
 ) -> (Vec<HelixServiceActor>, SharedNetworkState) {
     assert!(node_count > 0, "cluster must have at least one node");
     assert!(node_count <= 7, "cluster size exceeds maximum");
@@ -712,6 +1422,8 @@ pub fn create_helix_cluster(
                 node_ids.clone(),
                 node_to_actor.clone(),
                 Arc::clone(&network_state),
+                Arc::clone(&property_state),
+                fault_config.clone(),
                 seed,
             )
         })
@@ -723,10 +1435,21 @@ pub fn create_helix_cluster(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::properties::HelixPropertyState;
+
+    fn create_test_property_state() -> SharedHelixPropertyState {
+        Arc::new(Mutex::new(HelixPropertyState::new()))
+    }
 
     #[test]
     fn test_create_helix_cluster() {
-        let (actors, _network_state) = create_helix_cluster(3, 42);
+        let property_state = create_test_property_state();
+        let (actors, _network_state) = create_helix_cluster(
+            3,
+            42,
+            property_state,
+            FaultConfig::default(),
+        );
         assert_eq!(actors.len(), 3);
 
         for (i, actor) in actors.iter().enumerate() {
@@ -739,7 +1462,13 @@ mod tests {
 
     #[test]
     fn test_actor_crash_and_recover() {
-        let (mut actors, _network_state) = create_helix_cluster(1, 42);
+        let property_state = create_test_property_state();
+        let (mut actors, _network_state) = create_helix_cluster(
+            1,
+            42,
+            property_state,
+            FaultConfig::default(),
+        );
         let actor = &mut actors[0];
 
         assert!(!actor.is_crashed());
@@ -747,5 +1476,17 @@ mod tests {
         assert!(actor.is_crashed());
 
         // Can't recover without context, but we can check the flag.
+    }
+
+    #[test]
+    fn test_create_cluster_with_faults() {
+        let property_state = create_test_property_state();
+        let (actors, _network_state) = create_helix_cluster(
+            3,
+            42,
+            property_state,
+            FaultConfig::flaky(),
+        );
+        assert_eq!(actors.len(), 3);
     }
 }
