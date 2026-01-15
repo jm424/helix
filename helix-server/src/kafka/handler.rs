@@ -85,10 +85,12 @@ impl KafkaHandler {
         // - 48 bits for microsecond timestamp (~8900 years from epoch)
         // This ensures uniqueness across restarts since timestamp always increases.
         let node_id = service.node_id().get();
+        // Safe truncation: timestamp_micros is masked to 48 bits (0x0000_FFFF_FFFF_FFFF),
+        // which fits in u64. The full u128 microseconds would overflow after ~8900 years.
+        #[allow(clippy::cast_possible_truncation)]
         let timestamp_micros = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as u64)
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_micros() as u64);
         let base_producer_id = (node_id << 48) | (timestamp_micros & 0x0000_FFFF_FFFF_FFFF);
 
         Self {
@@ -611,6 +613,8 @@ impl KafkaHandler {
     /// Get log start offset (earliest available), returning 0 if not found.
     ///
     /// For now, log start offset is always 0 (no log truncation/compaction).
+    /// Takes `&self` for future implementation that will access partition state.
+    #[allow(clippy::unused_self, clippy::missing_const_for_fn, clippy::unused_async)]
     async fn get_log_start_offset(&self, _topic: &str, _partition: i32) -> u64 {
         // TODO: Implement log truncation/compaction and track actual start offset.
         0

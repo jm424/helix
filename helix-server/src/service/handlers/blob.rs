@@ -33,7 +33,7 @@ impl HelixService {
     /// # Errors
     ///
     /// Returns an error if the topic/partition doesn't exist or this node is not leader.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     pub async fn append_blob(
         &self,
         topic: &str,

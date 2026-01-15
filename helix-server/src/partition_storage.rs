@@ -187,6 +187,10 @@ impl<S: Storage + 'static> PartitionStorage<S> {
     }
 
     /// Reads records from the partition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the read operation fails (e.g., internal storage error).
     pub fn read(&self, start_offset: Offset, max_records: u32) -> ServerResult<Vec<Record>> {
         match &self.inner {
             PartitionStorageInner::InMemory(p) => p.read(start_offset, max_records).map_err(|e| {
@@ -203,6 +207,10 @@ impl<S: Storage + 'static> PartitionStorage<S> {
     }
 
     /// Applies a committed entry to the partition (sync version for in-memory).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the entry cannot be decoded or applied.
     #[allow(dead_code)] // Kept for potential future use; async version used everywhere.
     pub fn apply_entry_sync(&mut self, index: LogIndex, data: &Bytes) -> ServerResult<Option<Offset>> {
         // Skip if already applied.
@@ -289,6 +297,10 @@ impl<S: Storage + 'static> PartitionStorage<S> {
     }
 
     /// Applies a committed entry to the partition (async version for durable).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the entry cannot be decoded or applied.
     pub async fn apply_entry_async(
         &mut self,
         index: LogIndex,

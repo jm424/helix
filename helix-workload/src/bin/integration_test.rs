@@ -97,31 +97,130 @@ async fn test_single_node() -> bool {
     stats.violations.is_empty() && stats.operations_failed == 0
 }
 
-async fn test_leader_failover() -> bool {
-    eprintln!("\n=== Leader Failover Test (3 nodes) ===\n");
+/// Sends messages to a topic/partition and tracks acknowledged offsets.
+async fn send_messages(
+    executor: &RealExecutor,
+    topic: &str,
+    partition: i32,
+    prefix: &str,
+    count: usize,
+    acknowledged_offsets: &mut Vec<u64>,
+    payloads: &mut std::collections::HashMap<u64, bytes::Bytes>,
+) {
+    for i in 0..count {
+        let payload = bytes::Bytes::from(format!("{prefix}-{i}"));
+        match executor.send(topic, partition, payload.clone()).await {
+            Ok(offset) => {
+                eprintln!("  Sent message {i} at offset {offset}");
+                acknowledged_offsets.push(offset);
+                payloads.insert(offset, payload);
+            }
+            Err(e) => {
+                eprintln!("  ERROR sending message {i}: {e}");
+            }
+        }
+    }
+}
 
-    // Clean up any previous data.
+/// Verifies no data loss by checking acknowledged offsets against received messages.
+fn verify_no_data_loss(
+    acknowledged_offsets: &[u64],
+    messages: &[(u64, bytes::Bytes)],
+    payloads: &std::collections::HashMap<u64, bytes::Bytes>,
+) -> (Vec<u64>, Vec<u64>) {
+    let received_offsets: std::collections::HashSet<u64> =
+        messages.iter().map(|(o, _)| *o).collect();
+
+    let lost_writes: Vec<u64> = acknowledged_offsets
+        .iter()
+        .filter(|o| !received_offsets.contains(o))
+        .copied()
+        .collect();
+
+    let corrupted: Vec<u64> = messages
+        .iter()
+        .filter_map(|(offset, payload)| {
+            payloads
+                .get(offset)
+                .filter(|expected| payload != *expected)
+                .map(|_| *offset)
+        })
+        .collect();
+
+    (lost_writes, corrupted)
+}
+
+/// Sets up a 3-node cluster for failover testing.
+fn setup_failover_cluster() -> Result<RealCluster, String> {
     let _ = std::fs::remove_dir_all("/tmp/helix-test-failover");
 
-    // Start a 3-node cluster with a pre-created topic.
-    eprintln!("Starting 3-node cluster...");
-    let mut cluster = match RealCluster::builder()
+    RealCluster::builder()
         .nodes(3)
-        .base_port(9492) // Different ports to avoid conflict.
+        .base_port(9492)
         .raft_base_port(50300)
         .binary_path(HELIX_BINARY)
         .data_dir("/tmp/helix-test-failover")
-        .topic("failover-topic", 1) // Pre-create topic.
+        .topic("failover-topic", 1)
         .build()
-    {
-        Ok(c) => c,
+        .map_err(|e| format!("Failed to start cluster: {e}"))
+}
+
+/// Polls messages and verifies no data loss, reporting results.
+async fn verify_and_report_results(
+    executor: &RealExecutor,
+    topic: &str,
+    partition: i32,
+    acknowledged_offsets: &[u64],
+    payloads: &std::collections::HashMap<u64, bytes::Bytes>,
+) -> bool {
+    eprintln!("\nPhase 4: Verifying no data loss...");
+    let min_offset = *acknowledged_offsets.iter().min().unwrap_or(&0);
+    let max_offset = *acknowledged_offsets.iter().max().unwrap_or(&0);
+    #[allow(clippy::cast_possible_truncation)]
+    let expected_count = (max_offset - min_offset + 1) as u32;
+
+    eprintln!("  Polling offsets {min_offset} to {max_offset} ({expected_count} messages)");
+
+    let messages = match executor.poll(topic, partition, min_offset, expected_count).await {
+        Ok(m) => m,
         Err(e) => {
-            eprintln!("ERROR: Failed to start cluster: {e}");
+            eprintln!("ERROR: Failed to poll messages: {e}");
             return false;
         }
     };
 
-    // Create executor.
+    eprintln!("  Received {} messages", messages.len());
+
+    let (lost_writes, corrupted) = verify_no_data_loss(acknowledged_offsets, &messages, payloads);
+
+    eprintln!("\n=== Failover Test Results ===");
+    eprintln!("  Messages acknowledged: {}", acknowledged_offsets.len());
+    eprintln!("  Messages received: {}", messages.len());
+    eprintln!("  Lost writes: {}", lost_writes.len());
+    eprintln!("  Corrupted: {}", corrupted.len());
+
+    if !lost_writes.is_empty() {
+        eprintln!("  Lost offsets: {lost_writes:?}");
+    }
+    if !corrupted.is_empty() {
+        eprintln!("  Corrupted offsets: {corrupted:?}");
+    }
+
+    lost_writes.is_empty() && corrupted.is_empty()
+}
+
+async fn test_leader_failover() -> bool {
+    eprintln!("\n=== Leader Failover Test (3 nodes) ===\n");
+
+    eprintln!("Starting 3-node cluster...");
+    let mut cluster = match setup_failover_cluster() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("ERROR: {e}");
+            return false;
+        }
+    };
+
     let executor = match RealExecutor::new(&cluster) {
         Ok(e) => e,
         Err(e) => {
@@ -130,16 +229,17 @@ async fn test_leader_failover() -> bool {
         }
     };
 
-    // Wait for cluster to be ready.
     eprintln!("Waiting for cluster to be ready...");
     if let Err(e) = executor.wait_ready(Duration::from_secs(30)).await {
         eprintln!("ERROR: Cluster not ready: {e}");
         return false;
     }
 
-    // Wait for leader election on the topic partition.
     eprintln!("Waiting for leader election...");
-    let leader = match cluster.wait_for_leader("failover-topic", 0, Duration::from_secs(30)).await {
+    let leader = match cluster
+        .wait_for_leader("failover-topic", 0, Duration::from_secs(30))
+        .await
+    {
         Ok(l) => {
             eprintln!("Leader elected: node {l}");
             l
@@ -150,27 +250,15 @@ async fn test_leader_failover() -> bool {
         }
     };
 
-    // Phase 1: Send some messages before failover.
     let topic = "failover-topic";
     let partition = 0;
     let mut acknowledged_offsets: Vec<u64> = Vec::new();
-    let mut payloads: std::collections::HashMap<u64, bytes::Bytes> = std::collections::HashMap::new();
+    let mut payloads: std::collections::HashMap<u64, bytes::Bytes> =
+        std::collections::HashMap::new();
 
     eprintln!("\nPhase 1: Sending 10 messages before failover...");
-    for i in 0..10 {
-        let payload = bytes::Bytes::from(format!("message-before-failover-{i}"));
-        match executor.send(topic, partition, payload.clone()).await {
-            Ok(offset) => {
-                eprintln!("  Sent message {i} at offset {offset}");
-                acknowledged_offsets.push(offset);
-                payloads.insert(offset, payload);
-            }
-            Err(e) => {
-                eprintln!("  ERROR sending message {i}: {e}");
-                // Continue - some failures are expected during leader election.
-            }
-        }
-    }
+    send_messages(&executor, topic, partition, "message-before-failover", 10,
+        &mut acknowledged_offsets, &mut payloads).await;
 
     if acknowledged_offsets.is_empty() {
         eprintln!("ERROR: No messages were acknowledged before failover");
@@ -178,7 +266,6 @@ async fn test_leader_failover() -> bool {
     }
     eprintln!("  Acknowledged {} messages", acknowledged_offsets.len());
 
-    // Phase 2: Kill the leader.
     eprintln!("\nPhase 2: Killing leader (node {leader})...");
     if let Err(e) = cluster.kill_node(leader) {
         eprintln!("ERROR: Failed to kill leader: {e}");
@@ -186,9 +273,11 @@ async fn test_leader_failover() -> bool {
     }
     eprintln!("  Leader killed");
 
-    // Wait for new leader election.
     eprintln!("Waiting for new leader...");
-    let new_leader = match cluster.wait_for_leader(topic, partition, Duration::from_secs(60)).await {
+    let new_leader = match cluster
+        .wait_for_leader(topic, partition, Duration::from_secs(60))
+        .await
+    {
         Ok(l) => {
             eprintln!("  New leader elected: node {l}");
             l
@@ -203,82 +292,15 @@ async fn test_leader_failover() -> bool {
         eprintln!("WARNING: Same leader re-elected (node may not be fully dead)");
     }
 
-    // Wait for heartbeat timeout to expire so dead broker is removed from metadata.
-    // The heartbeat timeout is 6 seconds, so we wait 8 seconds to be safe.
     eprintln!("Waiting for dead broker to be removed from metadata (heartbeat timeout)...");
     tokio::time::sleep(Duration::from_secs(8)).await;
 
-    // Phase 3: Send more messages after failover.
     eprintln!("\nPhase 3: Sending 10 messages after failover...");
-    for i in 0..10 {
-        let payload = bytes::Bytes::from(format!("message-after-failover-{i}"));
-        match executor.send(topic, partition, payload.clone()).await {
-            Ok(offset) => {
-                eprintln!("  Sent message {i} at offset {offset}");
-                acknowledged_offsets.push(offset);
-                payloads.insert(offset, payload);
-            }
-            Err(e) => {
-                eprintln!("  ERROR sending message {i}: {e}");
-                // Some failures may be expected during recovery.
-            }
-        }
-    }
+    send_messages(&executor, topic, partition, "message-after-failover", 10,
+        &mut acknowledged_offsets, &mut payloads).await;
     eprintln!("  Total acknowledged: {} messages", acknowledged_offsets.len());
 
-    // Phase 4: Poll all messages and verify no data loss.
-    eprintln!("\nPhase 4: Verifying no data loss...");
-    let min_offset = *acknowledged_offsets.iter().min().unwrap_or(&0);
-    let max_offset = *acknowledged_offsets.iter().max().unwrap_or(&0);
-    let expected_count = (max_offset - min_offset + 1) as u32;
-
-    eprintln!("  Polling offsets {} to {} ({} messages)", min_offset, max_offset, expected_count);
-
-    let messages = match executor.poll(topic, partition, min_offset, expected_count).await {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("ERROR: Failed to poll messages: {e}");
-            return false;
-        }
-    };
-
-    eprintln!("  Received {} messages", messages.len());
-
-    // Check that all acknowledged offsets are present in the poll result.
-    let received_offsets: std::collections::HashSet<u64> = messages.iter().map(|(o, _)| *o).collect();
-    let mut lost_writes = Vec::new();
-
-    for offset in &acknowledged_offsets {
-        if !received_offsets.contains(offset) {
-            lost_writes.push(*offset);
-        }
-    }
-
-    // Verify payload integrity.
-    let mut corrupted = Vec::new();
-    for (offset, payload) in &messages {
-        if let Some(expected) = payloads.get(offset) {
-            if payload != expected {
-                corrupted.push(*offset);
-            }
-        }
-    }
-
-    // Report results.
-    eprintln!("\n=== Failover Test Results ===");
-    eprintln!("  Messages acknowledged: {}", acknowledged_offsets.len());
-    eprintln!("  Messages received: {}", messages.len());
-    eprintln!("  Lost writes: {}", lost_writes.len());
-    eprintln!("  Corrupted: {}", corrupted.len());
-
-    if !lost_writes.is_empty() {
-        eprintln!("  Lost offsets: {:?}", lost_writes);
-    }
-    if !corrupted.is_empty() {
-        eprintln!("  Corrupted offsets: {:?}", corrupted);
-    }
-
-    lost_writes.is_empty() && corrupted.is_empty()
+    verify_and_report_results(&executor, topic, partition, &acknowledged_offsets, &payloads).await
 }
 
 async fn test_multi_node() -> bool {
@@ -366,27 +388,27 @@ async fn main() {
     let mut all_passed = true;
 
     // Test 1: Single-node
-    if !test_single_node().await {
+    if test_single_node().await {
+        eprintln!("\nPASSED: Single-node test");
+    } else {
         eprintln!("\nFAILED: Single-node test");
         all_passed = false;
-    } else {
-        eprintln!("\nPASSED: Single-node test");
     }
 
     // Test 2: Multi-node
-    if !test_multi_node().await {
+    if test_multi_node().await {
+        eprintln!("\nPASSED: Multi-node test");
+    } else {
         eprintln!("\nFAILED: Multi-node test");
         all_passed = false;
-    } else {
-        eprintln!("\nPASSED: Multi-node test");
     }
 
     // Test 3: Leader failover
-    if !test_leader_failover().await {
+    if test_leader_failover().await {
+        eprintln!("\nPASSED: Leader failover test");
+    } else {
         eprintln!("\nFAILED: Leader failover test");
         all_passed = false;
-    } else {
-        eprintln!("\nPASSED: Leader failover test");
     }
 
     eprintln!("\n=== Final Results ===");

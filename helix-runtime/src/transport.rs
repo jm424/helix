@@ -841,6 +841,7 @@ mod tests {
         match received_message.unwrap() {
             IncomingMessage::Single(msg) => assert_eq!(msg, message),
             IncomingMessage::Batch(_) => panic!("Expected single message, got batch"),
+            IncomingMessage::Heartbeat(_) => panic!("Expected single message, got heartbeat"),
         }
     }
 
@@ -893,6 +894,7 @@ mod tests {
                 assert_eq!(msgs[2].group_id.get(), 1);
             }
             IncomingMessage::Single(_) => panic!("Expected batch, got single message"),
+            IncomingMessage::Heartbeat(_) => panic!("Expected batch, got heartbeat"),
         }
     }
 

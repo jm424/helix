@@ -101,6 +101,10 @@ impl SimulatedTransport {
     /// # Arguments
     ///
     /// * `ctx` - The simulation context for scheduling events
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     pub fn drain_and_schedule(&self, ctx: &mut SimulationContext) {
         let messages = {
             let mut guard = self.pending_messages.lock().expect("lock poisoned");
@@ -135,12 +139,20 @@ impl SimulatedTransport {
     }
 
     /// Returns the number of pending messages.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn pending_count(&self) -> usize {
         self.pending_messages.lock().expect("lock poisoned").len()
     }
 
     /// Clears all pending messages (useful after crash simulation).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     pub fn clear_pending(&self) {
         self.pending_messages.lock().expect("lock poisoned").clear();
     }
@@ -149,22 +161,23 @@ impl SimulatedTransport {
     ///
     /// This is a sync wrapper around the async `send_batch` for use in
     /// simulation contexts where blocking is acceptable.
-    pub fn queue_batch(&self, to: NodeId, messages: Vec<GroupMessage>) {
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn queue_batch(&self, to: NodeId, messages: &[GroupMessage]) {
         if messages.is_empty() {
             return;
         }
 
         // Look up the destination actor ID.
-        let to_actor = match self.node_to_actor.get(&to) {
-            Some(&actor) => actor,
-            None => {
-                tracing::warn!(to = to.get(), "unknown destination node");
-                return;
-            }
+        let Some(&to_actor) = self.node_to_actor.get(&to) else {
+            tracing::warn!(to = to.get(), "unknown destination node");
+            return;
         };
 
         // Encode the batch.
-        let Ok(encoded) = encode_group_batch(&messages) else {
+        let Ok(encoded) = encode_group_batch(messages) else {
             tracing::warn!("failed to encode group batch");
             return;
         };
@@ -184,14 +197,15 @@ impl SimulatedTransport {
     /// Queues a heartbeat message synchronously.
     ///
     /// This is a sync wrapper for use in simulation contexts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     pub fn queue_heartbeat(&self, to: NodeId, heartbeat: &BrokerHeartbeat) {
         // Look up the destination actor ID.
-        let to_actor = match self.node_to_actor.get(&to) {
-            Some(&actor) => actor,
-            None => {
-                tracing::warn!(to = to.get(), "unknown destination node for heartbeat");
-                return;
-            }
+        let Some(&to_actor) = self.node_to_actor.get(&to) else {
+            tracing::warn!(to = to.get(), "unknown destination node for heartbeat");
+            return;
         };
 
         // Encode the heartbeat.
@@ -221,12 +235,9 @@ impl TransportService for SimulatedTransport {
         }
 
         // Look up the destination actor ID.
-        let to_actor = match self.node_to_actor.get(&to) {
-            Some(&actor) => actor,
-            None => {
-                tracing::warn!(to = to.get(), "unknown destination node");
-                return Ok(()); // Drop messages to unknown nodes (matches production behavior).
-            }
+        let Some(&to_actor) = self.node_to_actor.get(&to) else {
+            tracing::warn!(to = to.get(), "unknown destination node");
+            return Ok(()); // Drop messages to unknown nodes (matches production behavior).
         };
 
         // Encode the batch.
@@ -248,12 +259,9 @@ impl TransportService for SimulatedTransport {
 
     async fn send_heartbeat(&self, to: NodeId, heartbeat: &BrokerHeartbeat) -> TransportResult<()> {
         // Look up the destination actor ID.
-        let to_actor = match self.node_to_actor.get(&to) {
-            Some(&actor) => actor,
-            None => {
-                tracing::warn!(to = to.get(), "unknown destination node for heartbeat");
-                return Ok(()); // Drop heartbeats to unknown nodes.
-            }
+        let Some(&to_actor) = self.node_to_actor.get(&to) else {
+            tracing::warn!(to = to.get(), "unknown destination node for heartbeat");
+            return Ok(()); // Drop heartbeats to unknown nodes.
         };
 
         // Encode the heartbeat.
@@ -291,13 +299,13 @@ pub fn decode_simulated_message(data: &[u8]) -> Option<(u8, &[u8])> {
 
 /// Checks if the message is a group batch.
 #[must_use]
-pub fn is_group_batch(tag: u8) -> bool {
+pub const fn is_group_batch(tag: u8) -> bool {
     tag == message_tags::GROUP_BATCH
 }
 
 /// Checks if the message is a heartbeat.
 #[must_use]
-pub fn is_heartbeat(tag: u8) -> bool {
+pub const fn is_heartbeat(tag: u8) -> bool {
     tag == message_tags::HEARTBEAT
 }
 
@@ -387,6 +395,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::redundant_clone)]
     fn test_transport_is_clone() {
         let transport = create_test_transport();
         let _cloned = transport.clone();

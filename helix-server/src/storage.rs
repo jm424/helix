@@ -332,7 +332,10 @@ pub fn patch_kafka_base_offset(blob: Bytes, base_offset: Offset) -> Bytes {
     ]);
 
     let mut patched = BytesMut::with_capacity(blob.len());
-    patched.put_i64(base_offset.get() as i64); // baseOffset is big-endian i64.
+    // Safe wrap: Kafka offsets fit in i64 for practical usage (9 quintillion records).
+    #[allow(clippy::cast_possible_wrap)]
+    let base_offset_i64 = base_offset.get() as i64;
+    patched.put_i64(base_offset_i64); // baseOffset is big-endian i64.
     patched.put_slice(&blob[KAFKA_BASE_OFFSET_SIZE..]);
     let result = patched.freeze();
 

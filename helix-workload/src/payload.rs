@@ -220,7 +220,7 @@ mod tests {
     #[test]
     fn test_payload_roundtrip() {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
-        let payload = VerifiablePayload::new(1, 100, 1000000, 64, &mut rng);
+        let payload = VerifiablePayload::new(1, 100, 1_000_000, 64, &mut rng);
 
         let encoded = payload.encode();
         let decoded = VerifiablePayload::parse(&encoded).unwrap();
@@ -234,8 +234,8 @@ mod tests {
         let mut rng1 = ChaCha8Rng::seed_from_u64(42);
         let mut rng2 = ChaCha8Rng::seed_from_u64(42);
 
-        let payload1 = VerifiablePayload::new(1, 100, 1000000, 64, &mut rng1);
-        let payload2 = VerifiablePayload::new(1, 100, 1000000, 64, &mut rng2);
+        let payload1 = VerifiablePayload::new(1, 100, 1_000_000, 64, &mut rng1);
+        let payload2 = VerifiablePayload::new(1, 100, 1_000_000, 64, &mut rng2);
 
         assert_eq!(payload1, payload2);
     }
@@ -245,8 +245,8 @@ mod tests {
         let mut rng1 = ChaCha8Rng::seed_from_u64(42);
         let mut rng2 = ChaCha8Rng::seed_from_u64(43);
 
-        let payload1 = VerifiablePayload::new(1, 100, 1000000, 64, &mut rng1);
-        let payload2 = VerifiablePayload::new(1, 100, 1000000, 64, &mut rng2);
+        let payload1 = VerifiablePayload::new(1, 100, 1_000_000, 64, &mut rng1);
+        let payload2 = VerifiablePayload::new(1, 100, 1_000_000, 64, &mut rng2);
 
         // Same metadata, different data.
         assert_eq!(payload1.operation_id, payload2.operation_id);
@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn test_payload_length_mismatch() {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
-        let payload = VerifiablePayload::new(1, 100, 1000000, 64, &mut rng);
+        let payload = VerifiablePayload::new(1, 100, 1_000_000, 64, &mut rng);
         let mut encoded = payload.encode();
 
         // Truncate the data.
@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn test_payload_checksum_mismatch() {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
-        let payload = VerifiablePayload::new(1, 100, 1000000, 64, &mut rng);
+        let payload = VerifiablePayload::new(1, 100, 1_000_000, 64, &mut rng);
         let encoded = payload.encode();
 
         // Corrupt a byte in the data section.
@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn test_payload_empty_data() {
-        let payload = VerifiablePayload::with_data(1, 100, 1000000, Bytes::new());
+        let payload = VerifiablePayload::with_data(1, 100, 1_000_000, Bytes::new());
         assert_eq!(payload.encoded_size(), HEADER_SIZE);
 
         let encoded = payload.encode();

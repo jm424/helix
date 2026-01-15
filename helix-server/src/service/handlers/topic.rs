@@ -167,8 +167,10 @@ impl HelixService {
                     .group_state(CONTROLLER_GROUP_ID)
                     .and_then(|s| s.leader_id)
                     .map(helix_core::NodeId::get);
+                drop(mr); // Release lock early before returning.
                 return Err(ServerError::NotController { controller_hint });
             };
+            drop(mr); // Release lock early before awaiting result.
             index
         };
 

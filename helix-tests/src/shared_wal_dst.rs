@@ -14,6 +14,8 @@
 #![allow(clippy::field_reassign_with_default)]
 #![allow(clippy::manual_is_variant_and)]
 #![allow(clippy::unnecessary_map_or)]
+#![allow(clippy::similar_names)]
+#![allow(clippy::unreadable_literal)]
 
 use std::collections::{HashMap, HashSet};
 
@@ -126,8 +128,7 @@ fn verify_content(
         let appended_by_index: HashMap<u64, &TrackedEntry> = state
             .appended
             .get(partition_id)
-            .map(|v| v.iter().map(|e| (e.index, e)).collect())
-            .unwrap_or_default();
+            .map_or_else(HashMap::new, |v| v.iter().map(|e| (e.index, e)).collect());
 
         for recovered_entry in recovered_entries {
             if let Some(appended) = appended_by_index.get(&recovered_entry.index()) {
@@ -193,7 +194,7 @@ fn verify_prefix_consistency(
     for (partition_id, synced_indices) in &state.synced {
         let recovered_indices: HashSet<u64> = recovered
             .get(partition_id)
-            .map(|v| v.iter().map(|e| e.index()).collect())
+            .map(|v| v.iter().map(SharedEntry::index).collect())
             .unwrap_or_default();
 
         // Find max recovered index that was synced.
@@ -329,8 +330,8 @@ async fn test_dst_shared_wal_basic_durability() {
         );
 
         // Verify counts.
-        assert_eq!(recovered.get(&p1).map(|v| v.len()), Some(10));
-        assert_eq!(recovered.get(&p2).map(|v| v.len()), Some(10));
+        assert_eq!(recovered.get(&p1).map(Vec::len), Some(10));
+        assert_eq!(recovered.get(&p2).map(Vec::len), Some(10));
     }
 }
 
@@ -384,7 +385,7 @@ async fn test_dst_shared_wal_unsynced_entries_may_be_lost() {
         );
 
         // Verify synced entries are present.
-        let recovered_indices: HashSet<u64> = p1_entries.iter().map(|e| e.index()).collect();
+        let recovered_indices: HashSet<u64> = p1_entries.iter().map(SharedEntry::index).collect();
         for i in 1..=5u64 {
             assert!(
                 recovered_indices.contains(&i),
@@ -418,9 +419,8 @@ async fn test_dst_shared_wal_fsync_failure_rate_statistics() {
 
         let p1 = PartitionId::new(1);
 
-        let mut wal = match SharedWal::open(storage.clone(), config).await {
-            Ok(w) => w,
-            Err(_) => continue,
+        let Ok(mut wal) = SharedWal::open(storage.clone(), config).await else {
+            continue;
         };
 
         // Write just one entry to minimize torn write interference.
@@ -438,7 +438,7 @@ async fn test_dst_shared_wal_fsync_failure_rate_statistics() {
     let total = sync_successes + sync_failures;
     eprintln!(
         "Fsync rate test: {sync_failures}/{total} failures ({:.1}%)",
-        sync_failures as f64 / total as f64 * 100.0
+        f64::from(sync_failures) / f64::from(total) * 100.0
     );
 
     // With 10% rate, expect ~20 failures out of 200.
@@ -561,7 +561,7 @@ async fn test_dst_shared_wal_multi_partition_interleaved() {
         for p in 1..=partition_count as u64 {
             let partition_id = PartitionId::new(p);
             assert_eq!(
-                recovered.get(&partition_id).map(|v| v.len()),
+                recovered.get(&partition_id).map(Vec::len),
                 Some(entries_per_partition),
                 "Partition {} should have {} entries",
                 p,
@@ -682,12 +682,10 @@ async fn test_dst_shared_wal_torn_write_recovery() {
         assert!(violations.is_empty(), "Recovered entries should be ordered");
 
         // Entries that are recovered should be complete and valid.
-        if let Some(entries) = recovered.get(&p1) {
-            for entry in entries {
-                // Verify entry is valid (CRC passed during decode).
-                assert!(entry.index() > 0);
-                assert!(!entry.payload.is_empty());
-            }
+        for entry in recovered.get(&p1).into_iter().flatten() {
+            // Verify entry is valid (CRC passed during decode).
+            assert!(entry.index() > 0);
+            assert!(!entry.payload.is_empty());
         }
     }
 }
@@ -1225,12 +1223,9 @@ async fn test_dst_shared_wal_comprehensive_stress() {
         let sync_succeeded: bool;
         let mut entries_appended = 0u64;
         {
-            let mut wal = match SharedWal::open(storage.clone(), config.clone()).await {
-                Ok(w) => w,
-                Err(_) => {
-                    seeds_skipped += 1;
-                    continue;
-                }
+            let Ok(mut wal) = SharedWal::open(storage.clone(), config.clone()).await else {
+                seeds_skipped += 1;
+                continue;
             };
 
             // Write all entries, tracking what succeeded with full content.
@@ -1598,9 +1593,8 @@ async fn test_dst_shared_wal_last_write_wins_semantics() {
         // Phase 1: Write entries 1-10 at term 1, sync.
         let phase1_ok: bool;
         {
-            let mut wal = match SharedWal::open(storage.clone(), config.clone()).await {
-                Ok(w) => w,
-                Err(_) => continue,
+            let Ok(mut wal) = SharedWal::open(storage.clone(), config.clone()).await else {
+                continue;
             };
 
             let mut all_ok = true;
@@ -1625,9 +1619,8 @@ async fn test_dst_shared_wal_last_write_wins_semantics() {
         // Phase 2: Truncate after 5, write new entries 6-10 at term 2.
         let phase2_synced: bool;
         {
-            let mut wal = match SharedWal::open(storage.clone(), config.clone()).await {
-                Ok(w) => w,
-                Err(_) => continue,
+            let Ok(mut wal) = SharedWal::open(storage.clone(), config.clone()).await else {
+                continue;
             };
 
             let _ = wal.recover();
@@ -1654,13 +1647,12 @@ async fn test_dst_shared_wal_last_write_wins_semantics() {
 
         // Phase 3: Recover and verify consistency.
         {
-            let mut wal = match SharedWal::open(storage.clone(), config).await {
-                Ok(w) => w,
-                Err(_) => continue,
+            let Ok(mut wal) = SharedWal::open(storage.clone(), config).await else {
+                continue;
             };
 
             let recovered = wal.recover().unwrap_or_default();
-            let entries = recovered.get(&p1).map(|v| v.as_slice()).unwrap_or(&[]);
+            let entries = recovered.get(&p1).map_or(&[][..], Vec::as_slice);
 
             // Check for ordering violations.
             let mut has_ordering_violation = false;
@@ -1778,7 +1770,7 @@ async fn test_dst_shared_wal_partial_overwrite_stale_entries_reappear() {
         assert_eq!(entries.len(), 10, "Stale entries 9-10 should reappear");
 
         // Verify terms.
-        for entry in entries.iter() {
+        for entry in entries {
             let expected_term = if entry.index() >= 6 && entry.index() <= 8 {
                 2
             } else {
@@ -1794,7 +1786,7 @@ async fn test_dst_shared_wal_partial_overwrite_stale_entries_reappear() {
         }
 
         // Verify content matches term.
-        for entry in entries.iter() {
+        for entry in entries {
             let payload_str = String::from_utf8_lossy(&entry.payload);
             if entry.term() == 1 {
                 assert!(
@@ -1940,12 +1932,9 @@ async fn test_dst_shared_wal_segment_rollover_with_faults() {
         let entries_written: u64;
         let sync_succeeded: bool;
         {
-            let mut wal = match SharedWal::open(storage.clone(), config.clone()).await {
-                Ok(w) => w,
-                Err(_) => {
-                    skipped_early_failure += 1;
-                    continue;
-                }
+            let Ok(mut wal) = SharedWal::open(storage.clone(), config.clone()).await else {
+                skipped_early_failure += 1;
+                continue;
             };
 
             let mut next_index = 1u64;
@@ -1966,10 +1955,8 @@ async fn test_dst_shared_wal_segment_rollover_with_faults() {
                     break;
                 }
 
-                if next_index % 200 == 0 {
-                    if wal.sync().await.is_err() {
-                        sync_failures += 1;
-                    }
+                if next_index % 200 == 0 && wal.sync().await.is_err() {
+                    sync_failures += 1;
                 }
             }
 
@@ -1985,16 +1972,13 @@ async fn test_dst_shared_wal_segment_rollover_with_faults() {
         storage.simulate_crash();
 
         {
-            let mut wal = match SharedWal::open(storage.clone(), config).await {
-                Ok(w) => w,
-                Err(_) => {
-                    skipped_recovery_failed += 1;
-                    continue;
-                }
+            let Ok(mut wal) = SharedWal::open(storage.clone(), config).await else {
+                skipped_recovery_failed += 1;
+                continue;
             };
 
             let recovered = wal.recover().unwrap_or_default();
-            let entries = recovered.get(&p1).map(|v| v.len()).unwrap_or(0);
+            let entries = recovered.get(&p1).map_or(0, Vec::len);
 
             if entries > 0 {
                 successful_rollovers += 1;
@@ -2091,12 +2075,9 @@ async fn test_dst_shared_wal_high_fidelity_stress() {
         let p2 = PartitionId::new(2);
 
         let wal_result = SharedWal::open(storage.clone(), config.clone()).await;
-        let mut wal = match wal_result {
-            Ok(w) => w,
-            Err(_) => {
-                seeds_skipped += 1;
-                continue;
-            }
+        let Ok(mut wal) = wal_result else {
+            seeds_skipped += 1;
+            continue;
         };
 
         // Track per-partition state: (next_index, current_term)
@@ -2189,54 +2170,48 @@ async fn test_dst_shared_wal_high_fidelity_stress() {
 
                             if let Some(durable) = p1_durable_before {
                                 let recovered_count =
-                                    recovered.get(&p1).map(|e| e.len()).unwrap_or(0) as u64;
-                                if recovered_count < durable {
-                                    panic!(
-                                        "seed {seed}, op {op_num}: P1 DURABILITY VIOLATION - \
-                                         recovered {recovered_count} < durable {durable}"
-                                    );
-                                }
+                                    recovered.get(&p1).map_or(0, Vec::len) as u64;
+                                assert!(
+                                    recovered_count >= durable,
+                                    "seed {seed}, op {op_num}: P1 DURABILITY VIOLATION - \
+                                     recovered {recovered_count} < durable {durable}"
+                                );
                             }
 
                             if let Some(durable) = p2_durable_before {
                                 let recovered_count =
-                                    recovered.get(&p2).map(|e| e.len()).unwrap_or(0) as u64;
-                                if recovered_count < durable {
-                                    panic!(
-                                        "seed {seed}, op {op_num}: P2 DURABILITY VIOLATION - \
-                                         recovered {recovered_count} < durable {durable}"
-                                    );
-                                }
+                                    recovered.get(&p2).map_or(0, Vec::len) as u64;
+                                assert!(
+                                    recovered_count >= durable,
+                                    "seed {seed}, op {op_num}: P2 DURABILITY VIOLATION - \
+                                     recovered {recovered_count} < durable {durable}"
+                                );
                             }
 
                             // Verify ordering and no duplicates
                             let ordering_violations = verify_ordering(&recovered);
-                            if !ordering_violations.is_empty() {
-                                panic!(
-                                    "seed {seed}, op {op_num}: ORDERING VIOLATION - {:?}",
-                                    ordering_violations
-                                );
-                            }
+                            assert!(
+                                ordering_violations.is_empty(),
+                                "seed {seed}, op {op_num}: ORDERING VIOLATION - {:?}",
+                                ordering_violations
+                            );
 
                             let dup_violations = verify_no_duplicates(&recovered);
-                            if !dup_violations.is_empty() {
-                                panic!(
-                                    "seed {seed}, op {op_num}: DUPLICATE VIOLATION - {:?}",
-                                    dup_violations
-                                );
-                            }
+                            assert!(
+                                dup_violations.is_empty(),
+                                "seed {seed}, op {op_num}: DUPLICATE VIOLATION - {:?}",
+                                dup_violations
+                            );
 
                             // Reset state based on recovery
                             p1_next_idx = recovered
                                 .get(&p1)
                                 .and_then(|e| e.last())
-                                .map(|e| e.index() + 1)
-                                .unwrap_or(1);
+                                .map_or(1, |e| e.index() + 1);
                             p2_next_idx = recovered
                                 .get(&p2)
                                 .and_then(|e| e.last())
-                                .map(|e| e.index() + 1)
-                                .unwrap_or(1);
+                                .map_or(1, |e| e.index() + 1);
 
                             wal = w;
                         }
@@ -2282,21 +2257,19 @@ async fn test_dst_shared_wal_high_fidelity_stress() {
             let recovered = final_wal.recover().unwrap_or_default();
 
             if let Some(durable) = p1_final_durable {
-                let recovered_count = recovered.get(&p1).map(|e| e.len()).unwrap_or(0) as u64;
-                if recovered_count < durable {
-                    panic!(
-                        "seed {seed}: FINAL P1 DURABILITY VIOLATION - recovered {recovered_count} < durable {durable}"
-                    );
-                }
+                let recovered_count = recovered.get(&p1).map_or(0, Vec::len) as u64;
+                assert!(
+                    recovered_count >= durable,
+                    "seed {seed}: FINAL P1 DURABILITY VIOLATION - recovered {recovered_count} < durable {durable}"
+                );
             }
 
             if let Some(durable) = p2_final_durable {
-                let recovered_count = recovered.get(&p2).map(|e| e.len()).unwrap_or(0) as u64;
-                if recovered_count < durable {
-                    panic!(
-                        "seed {seed}: FINAL P2 DURABILITY VIOLATION - recovered {recovered_count} < durable {durable}"
-                    );
-                }
+                let recovered_count = recovered.get(&p2).map_or(0, Vec::len) as u64;
+                assert!(
+                    recovered_count >= durable,
+                    "seed {seed}: FINAL P2 DURABILITY VIOLATION - recovered {recovered_count} < durable {durable}"
+                );
             }
         }
     }

@@ -17,6 +17,7 @@
 #![allow(clippy::uninlined_format_args)]
 #![allow(clippy::needless_pass_by_value)]
 #![allow(clippy::similar_names)]
+#![allow(clippy::unreadable_literal)]
 #![allow(dead_code)]
 #![allow(unused_variables)]
 
@@ -1306,7 +1307,7 @@ async fn test_comprehensive_stress_100_seeds() {
 
 /// Large-scale stress test (500 seeds) - run with --ignored.
 #[tokio::test]
-#[ignore]
+#[ignore = "Long-running stress test, run with --ignored"]
 async fn test_comprehensive_stress_500_seeds() {
     const NUM_SEEDS: u64 = 500;
     const OPS_PER_SEED: u64 = 200;
@@ -1334,10 +1335,10 @@ async fn test_comprehensive_stress_500_seeds() {
 
         for g in 1..=num_groups {
             let group_id = ConsumerGroupId::new(g);
-            let mode = match g % 3 {
-                0 => AckMode::Cumulative,
-                1 => AckMode::Individual,
-                _ => AckMode::Cumulative,
+            let mode = if g % 3 == 1 {
+                AckMode::Individual
+            } else {
+                AckMode::Cumulative
             };
             let _ = manager.get_or_create_group_with_mode(group_id, 1000, mode).await;
 

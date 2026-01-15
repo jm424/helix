@@ -695,7 +695,7 @@ pub struct ClientAckedProduce {
 /// Property state for Helix E2E DST.
 #[derive(Debug, Default)]
 pub struct HelixPropertyState {
-    /// Snapshots: node_id -> snapshot.
+    /// Snapshots: `node_id` -> snapshot.
     pub snapshots: BTreeMap<u64, HelixNodeSnapshot>,
     /// Leaders observed per term: term -> set of node IDs.
     pub leaders_by_term: BTreeMap<u64, BTreeSet<u64>>,
@@ -711,12 +711,12 @@ pub struct HelixPropertyState {
     pub data_integrity_violations: Vec<DataIntegrityViolationRecord>,
     /// Whether data integrity verification has been performed.
     pub integrity_verified: bool,
-    /// Client-acknowledged produces: (topic_id, partition_id) -> list of (offset, hash).
+    /// Client-acknowledged produces: (`topic_id`, `partition_id`) -> list of (offset, hash).
     ///
     /// This tracks what clients believe was successfully produced.
     /// Used for end-to-end verification that all ack'd data is consumable.
     pub client_acked_produces: BTreeMap<(u64, u64), Vec<(u64, u64)>>,
-    /// Successfully verified offsets: (topic_id, partition_id, offset).
+    /// Successfully verified offsets: (`topic_id`, `partition_id`, offset).
     ///
     /// An offset is added here when ANY node successfully reads and verifies it.
     pub verified_offsets: BTreeSet<(u64, u64, u64)>,
@@ -764,7 +764,7 @@ impl HelixPropertyState {
     }
 
     /// Increments event counter.
-    pub fn increment_events(&mut self) {
+    pub const fn increment_events(&mut self) {
         self.events_processed += 1;
     }
 
@@ -783,7 +783,7 @@ impl HelixPropertyState {
     }
 
     /// Marks integrity verification as complete.
-    pub fn mark_integrity_verified(&mut self) {
+    pub const fn mark_integrity_verified(&mut self) {
         self.integrity_verified = true;
     }
 
@@ -846,8 +846,8 @@ impl HelixPropertyState {
         self.consumer_verified = true;
     }
 
-    /// Marks consumer verification as complete (legacy, prefer finalize_consumer_verification).
-    pub fn mark_consumer_verified(&mut self) {
+    /// Marks consumer verification as complete (legacy, prefer `finalize_consumer_verification`).
+    pub const fn mark_consumer_verified(&mut self) {
         self.consumer_verified = true;
     }
 
@@ -1058,7 +1058,7 @@ mod tests {
         });
 
         assert_eq!(state.snapshots.len(), 1);
-        assert_eq!(state.leaders_by_term.get(&1).map(|s| s.len()), Some(1));
+        assert_eq!(state.leaders_by_term.get(&1).map(std::collections::BTreeSet::len), Some(1));
     }
 
     #[test]

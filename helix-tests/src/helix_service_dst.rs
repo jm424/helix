@@ -49,6 +49,7 @@ use crate::raft_actor::SharedNetworkState;
 // ============================================================================
 
 /// Configuration for Helix E2E DST tests.
+#[allow(clippy::struct_excessive_bools)]
 pub struct HelixTestConfig {
     /// Number of nodes in the cluster.
     pub node_count: usize,
@@ -147,7 +148,7 @@ pub fn create_helix_simulation(
     );
 
     // Collect actor IDs.
-    let actor_ids: Vec<ActorId> = actors.iter().map(|a| a.id()).collect();
+    let actor_ids: Vec<ActorId> = actors.iter().map(SimulatedActor::id).collect();
 
     // Register actors with the engine.
     for actor in actors {
@@ -250,13 +251,13 @@ mod tests {
             // Produce data format: topic_id (8 bytes) + partition_id (8 bytes) + payload
             // We use topic_id=1 (first user topic after controller) and partition_id=0.
             for i in 0..config.produce_count {
-                let time_ms = 2500 + (i as u64) * config.produce_interval_ms;
+                let time_ms = 2500 + u64::from(i) * config.produce_interval_ms;
 
                 // Create produce payload with sequence number for verification.
                 let mut produce_data = Vec::with_capacity(24);
                 produce_data.extend_from_slice(&1u64.to_le_bytes()); // topic_id = 1
                 produce_data.extend_from_slice(&0u64.to_le_bytes()); // partition_id = 0
-                produce_data.extend_from_slice(&(i as u64).to_le_bytes()); // payload = sequence number
+                produce_data.extend_from_slice(&u64::from(i).to_le_bytes()); // payload = sequence number
 
                 // Round-robin across nodes (might hit non-leaders, which is realistic).
                 let target_actor = actor_ids[i as usize % actor_ids.len()];
@@ -597,7 +598,6 @@ mod tests {
             inject_client_traffic: true,
             produce_interval_ms: 100,
             produce_count: 400,
-            ..Default::default()
         };
 
         let result = run_basic_simulation(&config);

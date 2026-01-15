@@ -41,7 +41,7 @@ impl HelixService {
     /// proposal, and wait for the tick task to apply and notify us with the
     /// resulting offset. This ensures entries are applied in Raft log order
     /// regardless of concurrent write timing.
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     pub(crate) async fn write_internal(&self, request: WriteRequest) -> ServerResult<WriteResponse> {
         // Validate request.
         assert!(!request.topic.is_empty(), "topic cannot be empty");

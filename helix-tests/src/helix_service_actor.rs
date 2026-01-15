@@ -49,13 +49,17 @@ use crate::simulated_transport::SimulatedTransport;
 /// Synchronous wrapper around `Wal` for DST.
 ///
 /// Uses `futures::executor::block_on` to call async methods synchronously.
-/// Safe because `SimulatedStorage` is actually synchronous (in-memory HashMap).
+/// Safe because `SimulatedStorage` is actually synchronous (in-memory `HashMap`).
 pub struct DstWal {
     wal: Wal<SimulatedStorage>,
 }
 
 impl DstWal {
     /// Opens or creates a WAL at the given directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL cannot be opened or created.
     pub fn open(storage: SimulatedStorage, dir: &std::path::Path) -> Result<Self, String> {
         let config = WalConfig::new(dir);
         let wal = futures::executor::block_on(Wal::open(storage, config))
@@ -64,28 +68,42 @@ impl DstWal {
     }
 
     /// Appends an entry to the WAL. Returns the index of the appended entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the append operation fails.
     pub fn append(&mut self, entry: Entry) -> Result<u64, String> {
         futures::executor::block_on(self.wal.append(entry))
             .map_err(|e| format!("WAL append failed: {e}"))
     }
 
     /// Syncs the WAL to durable storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sync operation fails.
     pub fn sync(&mut self) -> Result<(), String> {
         futures::executor::block_on(self.wal.sync())
             .map_err(|e| format!("WAL sync failed: {e}"))
     }
 
     /// Returns the first index in the WAL.
-    pub fn first_index(&self) -> u64 {
+    #[must_use] 
+    pub const fn first_index(&self) -> u64 {
         self.wal.first_index()
     }
 
     /// Returns the last index in the WAL (if any).
-    pub fn last_index(&self) -> Option<u64> {
+    #[must_use] 
+    pub const fn last_index(&self) -> Option<u64> {
         self.wal.last_index()
     }
 
     /// Reads an entry at the given index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the entry cannot be read.
     pub fn read(&self, index: u64) -> Result<Entry, String> {
         self.wal.read(index).cloned().map_err(|e| format!("WAL read failed: {e}"))
     }
@@ -144,9 +162,9 @@ mod timer_ids {
 
 /// Custom event names for client operations.
 pub mod custom_events {
-    /// Produce request: data is serialized ProduceRequest.
+    /// Produce request: data is serialized `ProduceRequest`.
     pub const PRODUCE: &str = "produce";
-    /// Fetch request: data is serialized FetchRequest.
+    /// Fetch request: data is serialized `FetchRequest`.
     pub const FETCH: &str = "fetch";
     /// Create topic request.
     pub const CREATE_TOPIC: &str = "create_topic";
@@ -182,7 +200,7 @@ pub struct HelixServiceActor {
     multi_raft: MultiRaft,
     /// Partition storage indexed by group ID.
     partition_storage: BTreeMap<GroupId, SimulatedPartitionStorage>,
-    /// Group ID mapping (topic, partition) -> GroupId.
+    /// Group ID mapping (topic, partition) -> `GroupId`.
     group_map: GroupMap,
     /// Controller state machine.
     controller_state: ControllerState,
@@ -194,7 +212,7 @@ pub struct HelixServiceActor {
     network_state: SharedNetworkState,
     /// Whether this node is crashed.
     crashed: bool,
-    /// Mapping from NodeId to ActorId.
+    /// Mapping from `NodeId` to `ActorId`.
     node_to_actor: BTreeMap<NodeId, ActorId>,
     /// Seed for deterministic behavior.
     #[allow(dead_code)] // Used for future random fault injection.
@@ -204,7 +222,7 @@ pub struct HelixServiceActor {
     /// Shared property state for verification.
     property_state: SharedHelixPropertyState,
     /// Committed data entries for durability verification.
-    /// Maps (topic_id, partition_id) -> list of (offset, data_hash) pairs.
+    /// Maps (`topic_id`, `partition_id`) -> list of (offset, `data_hash`) pairs.
     committed_data: BTreeMap<(TopicId, PartitionId), Vec<(Offset, u64)>>,
     /// Total produce operations attempted.
     #[allow(dead_code)] // Tracked but not yet exposed.
@@ -224,12 +242,13 @@ impl HelixServiceActor {
     /// * `actor_id` - Bloodhound actor ID
     /// * `node_id` - Helix node ID
     /// * `cluster_nodes` - All node IDs in the cluster
-    /// * `node_to_actor` - Mapping from NodeId to ActorId
+    /// * `node_to_actor` - Mapping from `NodeId` to `ActorId`
     /// * `network_state` - Shared network state for partitions
     /// * `property_state` - Shared property state for verification
     /// * `fault_config` - Storage fault injection configuration
     /// * `seed` - Random seed for deterministic behavior
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         actor_id: ActorId,
         node_id: NodeId,
@@ -334,7 +353,7 @@ impl HelixServiceActor {
 
     /// Returns the number of successful produce operations.
     #[must_use]
-    pub fn produce_success_count(&self) -> u64 {
+    pub const fn produce_success_count(&self) -> u64 {
         self.produce_success_count
     }
 
@@ -358,57 +377,51 @@ impl HelixServiceActor {
     }
 
     /// Returns the committed data for verification.
-    /// Maps (topic_id, partition_id) -> list of (offset, data_hash).
+    /// Maps (`topic_id`, `partition_id`) -> list of (offset, `data_hash`).
     #[must_use]
-    pub fn committed_data(&self) -> &BTreeMap<(TopicId, PartitionId), Vec<(Offset, u64)>> {
+    pub const fn committed_data(&self) -> &BTreeMap<(TopicId, PartitionId), Vec<(Offset, u64)>> {
         &self.committed_data
     }
 
     /// Verifies data integrity: all committed data is readable with correct hash.
     ///
-    /// Returns a list of integrity violations (offset, expected_hash, actual_hash or None if missing).
+    /// Returns a list of integrity violations (offset, `expected_hash`, `actual_hash` or None if missing).
     #[must_use]
     pub fn verify_data_integrity(&self) -> Vec<DataIntegrityViolation> {
         let mut violations = Vec::new();
 
         for (&(topic_id, partition_id), committed) in &self.committed_data {
             // Find the partition storage.
-            let group_id = match self.group_map.get(topic_id, partition_id) {
-                Some(gid) => gid,
-                None => {
-                    // Group not found - this is a violation if we have committed data.
-                    for &(offset, expected_hash) in committed {
-                        violations.push(DataIntegrityViolation {
-                            node_id: self.node_id.get(),
-                            topic_id: topic_id.get(),
-                            partition_id: partition_id.get(),
-                            offset: offset.get(),
-                            expected_hash,
-                            actual_hash: None,
-                            reason: "partition storage not found".to_string(),
-                        });
-                    }
-                    continue;
+            let Some(group_id) = self.group_map.get(topic_id, partition_id) else {
+                // Group not found - this is a violation if we have committed data.
+                for &(offset, expected_hash) in committed {
+                    violations.push(DataIntegrityViolation {
+                        node_id: self.node_id.get(),
+                        topic_id: topic_id.get(),
+                        partition_id: partition_id.get(),
+                        offset: offset.get(),
+                        expected_hash,
+                        actual_hash: None,
+                        reason: "partition storage not found".to_string(),
+                    });
                 }
+                continue;
             };
 
-            let ps = match self.partition_storage.get(&group_id) {
-                Some(ps) => ps,
-                None => {
-                    // Storage not found - violation.
-                    for &(offset, expected_hash) in committed {
-                        violations.push(DataIntegrityViolation {
-                            node_id: self.node_id.get(),
-                            topic_id: topic_id.get(),
-                            partition_id: partition_id.get(),
-                            offset: offset.get(),
-                            expected_hash,
-                            actual_hash: None,
-                            reason: "partition storage not initialized".to_string(),
-                        });
-                    }
-                    continue;
+            let Some(ps) = self.partition_storage.get(&group_id) else {
+                // Storage not found - violation.
+                for &(offset, expected_hash) in committed {
+                    violations.push(DataIntegrityViolation {
+                        node_id: self.node_id.get(),
+                        topic_id: topic_id.get(),
+                        partition_id: partition_id.get(),
+                        offset: offset.get(),
+                        expected_hash,
+                        actual_hash: None,
+                        reason: "partition storage not initialized".to_string(),
+                    });
                 }
+                continue;
             };
 
             // Verify each committed entry is readable with correct hash.
@@ -475,12 +488,12 @@ impl HelixServiceActor {
         }
     }
 
-    /// Handles the collect_state event - updates property state.
+    /// Handles the `collect_state` event - updates property state.
     fn handle_collect_state(&self) {
         self.update_property_state();
     }
 
-    /// Handles the verify_integrity event - verifies all committed data is readable.
+    /// Handles the `verify_integrity` event - verifies all committed data is readable.
     fn handle_verify_integrity(&self) {
         info!(actor = %self.name, "Verifying data integrity");
 
@@ -519,12 +532,9 @@ impl HelixServiceActor {
 
         // Get all client acks from shared state.
         let client_acks: std::collections::BTreeMap<(u64, u64), Vec<(u64, u64)>> = {
-            match self.property_state.lock() {
-                Ok(state) => state.client_acked_produces.clone(),
-                Err(_) => {
-                    warn!(actor = %self.name, "Failed to lock property state for consumer verification");
-                    return;
-                }
+            if let Ok(state) = self.property_state.lock() { state.client_acked_produces.clone() } else {
+                warn!(actor = %self.name, "Failed to lock property state for consumer verification");
+                return;
             }
         };
 
@@ -582,7 +592,8 @@ impl HelixServiceActor {
     }
 
     /// Handles applying a network partition from event data.
-    /// Data format: count (1 byte) + actor_ids (8 bytes each)
+    /// Data format: count (1 byte) + `actor_ids` (8 bytes each)
+    #[allow(clippy::significant_drop_tightening)] // Lock must be held during loop iteration.
     fn handle_apply_partition(&self, data: &[u8]) {
         if data.is_empty() {
             // Default: partition this node from all others.
@@ -618,6 +629,7 @@ impl HelixServiceActor {
     }
 
     /// Handles healing a network partition.
+    #[allow(clippy::significant_drop_tightening)] // Lock must be held during loop iteration.
     fn handle_heal_partition(&self, data: &[u8]) {
         if data.is_empty() {
             // Default: heal all partitions involving this node.
@@ -653,6 +665,7 @@ impl HelixServiceActor {
     }
 
     /// Schedules the next tick timer.
+    #[allow(clippy::unused_self)] // Kept as method for consistency with other handlers.
     fn schedule_tick(&self, ctx: &mut SimulationContext) {
         ctx.set_timer(
             Duration::from_millis(TICK_INTERVAL_MS),
@@ -661,6 +674,7 @@ impl HelixServiceActor {
     }
 
     /// Schedules the next heartbeat timer.
+    #[allow(clippy::unused_self)] // Kept as method for consistency with other handlers.
     fn schedule_heartbeat(&self, ctx: &mut SimulationContext) {
         ctx.set_timer(
             Duration::from_millis(HEARTBEAT_INTERVAL_MS),
@@ -668,7 +682,7 @@ impl HelixServiceActor {
         );
     }
 
-    /// Handles a tick event - mirrors tick_task_multi_node logic.
+    /// Handles a tick event - mirrors `tick_task_multi_node` logic.
     fn handle_tick(&mut self, ctx: &mut SimulationContext) {
         // Increment tick counter for time tracking.
         self.tick_count += 1;
@@ -693,7 +707,7 @@ impl HelixServiceActor {
     }
 
     /// Handles a heartbeat timer event.
-    fn handle_heartbeat(&mut self, ctx: &mut SimulationContext) {
+    fn handle_heartbeat(&self, ctx: &mut SimulationContext) {
         // Use tick count as timestamp (deterministic).
         // Each tick is TICK_INTERVAL_MS, so we multiply.
         let timestamp_ms = self.tick_count * TICK_INTERVAL_MS;
@@ -727,7 +741,7 @@ impl HelixServiceActor {
                 }
                 MultiRaftOutput::SendMessages { to, messages } => {
                     // Queue messages for delivery via transport (sync).
-                    self.transport.queue_batch(*to, messages.clone());
+                    self.transport.queue_batch(*to, messages);
                 }
                 MultiRaftOutput::BecameLeader { group_id } => {
                     info!(
@@ -776,7 +790,7 @@ impl HelixServiceActor {
                 match ps.apply_entry_sync(index, data) {
                     Ok(offset_opt) => {
                         // Track committed data for durability verification.
-                        let base_offset = offset_opt.unwrap_or(ps.log_end_offset());
+                        let base_offset = offset_opt.unwrap_or_else(|| ps.log_end_offset());
 
                         // Collect records to persist (to avoid borrow conflict with committed_data).
                         let records_to_persist: Vec<(Offset, u64, Vec<u8>)> = record_payloads
@@ -793,7 +807,7 @@ impl HelixServiceActor {
                         // Update committed_data tracking.
                         let committed = self.committed_data
                             .entry((topic_id, partition_id))
-                            .or_insert_with(Vec::new);
+                            .or_default();
                         for (offset, data_hash, _) in &records_to_persist {
                             committed.push((*offset, *data_hash));
                         }
@@ -809,7 +823,7 @@ impl HelixServiceActor {
                         // sends acks to clients in a real system.
                         let is_leader = self.multi_raft
                             .group_state(group_id)
-                            .map_or(false, |s| s.state == helix_raft::RaftState::Leader);
+                            .is_some_and(|s| s.state == helix_raft::RaftState::Leader);
 
                         if is_leader {
                             if let Ok(mut state) = self.property_state.lock() {
@@ -840,10 +854,10 @@ impl HelixServiceActor {
         }
     }
 
-    /// Persists a committed record to SimulatedStorage for durability.
+    /// Persists a committed record to `SimulatedStorage` for durability.
     ///
     /// This stores the record data in a file path that can be recovered after crash.
-    /// Path format: /partitions/{topic_id}/{partition_id}/offset_{offset}
+    /// Path format: /`partitions/{topic_id}/{partition_id}/offset`_{offset}
     fn persist_record(&self, topic_id: TopicId, partition_id: PartitionId, offset: Offset, data: &[u8]) {
         let path = std::path::PathBuf::from(format!(
             "/partitions/{}/{}/offset_{}",
@@ -862,7 +876,7 @@ impl HelixServiceActor {
         }
     }
 
-    /// Loads all persisted records for a partition from SimulatedStorage.
+    /// Loads all persisted records for a partition from `SimulatedStorage`.
     ///
     /// Returns a map of offset -> record data.
     fn load_persisted_records(&self, topic_id: TopicId, partition_id: PartitionId) -> BTreeMap<Offset, Vec<u8>> {
@@ -986,10 +1000,9 @@ impl HelixServiceActor {
         self.group_map.insert(topic_id, partition_id, group_id);
 
         // Create partition storage with simulated backend.
-        if !self.partition_storage.contains_key(&group_id) {
-            let ps = SimulatedPartitionStorage::new_in_memory(topic_id, partition_id);
-            self.partition_storage.insert(group_id, ps);
-        }
+        self.partition_storage.entry(group_id).or_insert_with(|| {
+            SimulatedPartitionStorage::new_in_memory(topic_id, partition_id)
+        });
     }
 
     /// Handles incoming message from another node.
@@ -1102,7 +1115,7 @@ impl HelixServiceActor {
         );
     }
 
-    /// Recovers partition data from SimulatedStorage after crash.
+    /// Recovers partition data from `SimulatedStorage` after crash.
     fn recover_partitions_from_storage(&mut self) {
         // Scan SimulatedStorage for partition data files.
         // Path format: /partitions/{topic_id}/{partition_id}/offset_{offset}
@@ -1152,7 +1165,7 @@ impl HelixServiceActor {
             // Rebuild committed_data tracking and partition storage.
             let committed = self.committed_data
                 .entry((topic_id, partition_id))
-                .or_insert_with(Vec::new);
+                .or_default();
 
             for (offset, data) in persisted {
                 let data_hash = Self::simple_hash(&data);
@@ -1241,12 +1254,9 @@ impl HelixServiceActor {
             return;
         }
 
-        let name = match String::from_utf8(data[4..4 + name_len].to_vec()) {
-            Ok(n) => n,
-            Err(_) => {
-                warn!(actor = %self.name, "Invalid create topic request: invalid UTF-8 name");
-                return;
-            }
+        let Ok(name) = String::from_utf8(data[4..4 + name_len].to_vec()) else {
+            warn!(actor = %self.name, "Invalid create topic request: invalid UTF-8 name");
+            return;
         };
         let partition_count = u32::from_le_bytes(data[4 + name_len..4 + name_len + 4].try_into().unwrap());
         let replication_factor = u32::from_le_bytes(data[4 + name_len + 4..4 + name_len + 8].try_into().unwrap());
@@ -1377,12 +1387,13 @@ impl SimulatedActor for HelixServiceActor {
 ///
 /// # Returns
 ///
-/// A tuple of (actors, network_state) for the simulation.
+/// A tuple of (actors, `network_state`) for the simulation.
 ///
 /// # Panics
 ///
-/// Panics if node_count is 0 or greater than 7.
+/// Panics if `node_count` is 0 or greater than 7.
 #[must_use]
+#[allow(clippy::needless_pass_by_value)] // Arc is cheap to clone, FaultConfig is cloned anyway.
 pub fn create_helix_cluster(
     node_count: usize,
     base_seed: u64,

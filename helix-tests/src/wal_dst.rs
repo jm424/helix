@@ -911,14 +911,12 @@ fn check_wal_invariants<S: Storage>(
     }
 
     // INVARIANT 2: Post-recovery, durable_index == last_index
-    if ctx.is_post_recovery {
-        if wal.durable_index() != wal.last_index() {
-            return Err(format!(
-                "seed {seed}, op {op_num}: POST-RECOVERY VIOLATION - durable_index {:?} != last_index {:?}",
-                wal.durable_index(),
-                wal.last_index()
-            ));
-        }
+    if ctx.is_post_recovery && wal.durable_index() != wal.last_index() {
+        return Err(format!(
+            "seed {seed}, op {op_num}: POST-RECOVERY VIOLATION - durable_index {:?} != last_index {:?}",
+            wal.durable_index(),
+            wal.last_index()
+        ));
     }
 
     // INVARIANT 3: Cross-crash durability - durable entries MUST survive crash.
@@ -1040,12 +1038,9 @@ async fn test_comprehensive_wal_stress() {
         let mut current_term = 1u64;
 
         let wal_result = TestWal::open(storage.clone(), wal_config.clone()).await;
-        let mut wal = match wal_result {
-            Ok(w) => w,
-            Err(_) => {
-                seeds_skipped_open += 1;
-                continue;
-            }
+        let Ok(mut wal) = wal_result else {
+            seeds_skipped_open += 1;
+            continue;
         };
 
         for op_num in 0..OPS_PER_SEED {

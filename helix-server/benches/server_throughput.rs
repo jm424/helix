@@ -4,9 +4,11 @@
 //! Tests both single-node and can be extended for multi-node scenarios.
 
 #![allow(missing_docs)]
+#![allow(clippy::significant_drop_tightening)]
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -70,9 +72,10 @@ async fn create_client(addr: SocketAddr) -> HelixClient<tonic::transport::Channe
             Ok(client) => return client,
             Err(e) => {
                 retries += 1;
-                if retries > 10 {
-                    panic!("failed to connect to server after 10 retries: {e}");
-                }
+                assert!(
+                    retries <= 10,
+                    "failed to connect to server after 10 retries: {e}"
+                );
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
@@ -96,9 +99,10 @@ fn bench_write_throughput(c: &mut Criterion) {
 
     for &record_size in &record_sizes {
         for &batch_size in &batch_sizes {
+            #[allow(clippy::cast_sign_loss)]
             group.throughput(Throughput::Elements(batch_size as u64));
 
-            let id = format!("size_{}_batch_{}", record_size, batch_size);
+            let id = format!("size_{record_size}_batch_{batch_size}");
 
             group.bench_with_input(BenchmarkId::new("config", &id), &id, |b, _| {
                 // Start server once per benchmark.
@@ -109,7 +113,7 @@ fn bench_write_throughput(c: &mut Criterion) {
                     .map(|_| Record {
                         key: None,
                         value: vec![0u8; record_size],
-                        headers: Default::default(),
+                        headers: HashMap::default(),
                         timestamp_ms: None,
                     })
                     .collect();
@@ -160,6 +164,7 @@ fn bench_write_concurrent(c: &mut Criterion) {
 
     for &concurrency in &concurrency_levels {
         let total_writes = concurrency * writes_per_client;
+        #[allow(clippy::cast_sign_loss)]
         group.throughput(Throughput::Elements((total_writes * batch_size) as u64));
 
         let latencies = Arc::new(Mutex::new(Histogram::<u64>::new(3).expect("histogram")));
@@ -180,7 +185,7 @@ fn bench_write_concurrent(c: &mut Criterion) {
 
                             for client_id in 0..conc {
                                 let lat_clone = latencies_clone.clone();
-                                let partition = (client_id % 4) as i32;
+                                let partition = client_id % 4;
 
                                 join_set.spawn(async move {
                                     let mut client = create_client(addr).await;
@@ -189,7 +194,7 @@ fn bench_write_concurrent(c: &mut Criterion) {
                                         .map(|_| Record {
                                             key: None,
                                             value: vec![0u8; record_size],
-                                            headers: Default::default(),
+                                            headers: HashMap::default(),
                                             timestamp_ms: None,
                                         })
                                         .collect();
@@ -209,6 +214,7 @@ fn bench_write_concurrent(c: &mut Criterion) {
 
                                         black_box(response);
 
+                                        #[allow(clippy::cast_possible_truncation)]
                                         let _ = lat_clone
                                             .lock()
                                             .unwrap()
@@ -228,8 +234,8 @@ fn bench_write_concurrent(c: &mut Criterion) {
 
         // Print latency percentiles.
         let hist = latencies.lock().unwrap();
-        if hist.len() > 0 {
-            println!("\nWrite latency percentiles for concurrency={}:", concurrency);
+        if !hist.is_empty() {
+            println!("\nWrite latency percentiles for concurrency={concurrency}:");
             println!("  count: {}", hist.len());
             println!("  p50:   {} us", hist.value_at_quantile(0.50));
             println!("  p90:   {} us", hist.value_at_quantile(0.90));
@@ -259,9 +265,9 @@ fn bench_read_throughput(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10));
 
     for &read_batch in &read_batch_sizes {
-        group.throughput(Throughput::Elements(read_batch as u64));
+        group.throughput(Throughput::Elements(u64::from(read_batch)));
 
-        let id = format!("batch_{}", read_batch);
+        let id = format!("batch_{read_batch}");
 
         group.bench_with_input(BenchmarkId::new("config", &id), &id, |b, _| {
             // Start server and pre-populate.
@@ -274,7 +280,7 @@ fn bench_read_throughput(c: &mut Criterion) {
                     .map(|_| Record {
                         key: None,
                         value: vec![0u8; record_size],
-                        headers: Default::default(),
+                        headers: HashMap::default(),
                         timestamp_ms: None,
                     })
                     .collect();
@@ -336,6 +342,7 @@ fn bench_read_after_write(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(10));
 
     for &record_size in &record_sizes {
+        #[allow(clippy::cast_sign_loss)]
         group.throughput(Throughput::Elements(operation_count as u64));
 
         let latencies = Arc::new(Mutex::new(Histogram::<u64>::new(3).expect("histogram")));
@@ -358,7 +365,7 @@ fn bench_read_after_write(c: &mut Criterion) {
                                 let records = vec![Record {
                                     key: None,
                                     value: vec![0u8; size],
-                                    headers: Default::default(),
+                                    headers: HashMap::default(),
                                     timestamp_ms: None,
                                 }];
 
@@ -389,6 +396,7 @@ fn bench_read_after_write(c: &mut Criterion) {
                                 black_box(read_resp);
 
                                 let duration = op_start.elapsed();
+                                #[allow(clippy::cast_possible_truncation)]
                                 let _ = latencies_clone
                                     .lock()
                                     .unwrap()
@@ -406,11 +414,8 @@ fn bench_read_after_write(c: &mut Criterion) {
 
         // Print latency percentiles.
         let hist = latencies.lock().unwrap();
-        if hist.len() > 0 {
-            println!(
-                "\nRead-after-write latency percentiles for size={}:",
-                record_size
-            );
+        if !hist.is_empty() {
+            println!("\nRead-after-write latency percentiles for size={record_size}:");
             println!("  count: {}", hist.len());
             println!("  p50:   {} us", hist.value_at_quantile(0.50));
             println!("  p90:   {} us", hist.value_at_quantile(0.90));

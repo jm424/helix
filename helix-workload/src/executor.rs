@@ -152,7 +152,7 @@ pub struct RealClusterConfig {
     pub auto_create_topics: bool,
     /// Default replication factor for auto-created topics.
     pub default_replication_factor: u32,
-    /// Topics to pre-create at startup (name, partition_count).
+    /// Topics to pre-create at startup (name, `partition_count`).
     pub topics: Vec<(String, u32)>,
 }
 
@@ -526,7 +526,7 @@ impl RealCluster {
     /// # Errors
     ///
     /// Returns an error if topic creation fails on any node.
-    pub async fn create_topic_on_all_nodes(&self, topic: &str) -> Result<(), ExecutorError> {
+    pub fn create_topic_on_all_nodes(&self, topic: &str) -> Result<(), ExecutorError> {
         use rdkafka::consumer::{BaseConsumer, Consumer};
 
         for node_id in 1..=self.config.node_count {
@@ -569,6 +569,11 @@ impl RealCluster {
     /// Polls metadata until the partition reports a valid leader (not -1).
     /// This should be called after `create_topic_on_all_nodes` to ensure
     /// Raft has elected a leader before running workloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ExecutorError::InvalidConfig` if the Kafka client cannot be created.
+    /// Returns `ExecutorError::Timeout` if no leader is elected within the timeout.
     pub async fn wait_for_leader(
         &self,
         topic: &str,
@@ -750,6 +755,8 @@ impl WorkloadExecutor for RealExecutor {
     ) -> Result<Vec<(u64, Bytes)>, ExecutorError> {
         use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 
+        const MAX_BACKOFF_MS: u64 = 2000;
+
         // One-time metadata discovery: ensure consumer knows about the topic.
         // rdkafka handles connection/retry internally with configured backoff.
         self.consumer
@@ -787,7 +794,6 @@ impl WorkloadExecutor for RealExecutor {
         let poll_timeout = std::time::Duration::from_secs(10);
         let deadline = std::time::Instant::now() + poll_timeout;
         let mut backoff_ms: u64 = 100;
-        const MAX_BACKOFF_MS: u64 = 2000;
 
         while messages.len() < max_messages as usize {
             match self.consumer.poll(std::time::Duration::from_millis(500)) {
@@ -821,7 +827,6 @@ impl WorkloadExecutor for RealExecutor {
                     eprintln!("[POLL] topic={topic} partition={partition} transient error {code:?}, backoff {jitter}ms");
                     std::thread::sleep(std::time::Duration::from_millis(jitter));
                     backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
-                    continue;
                 }
                 Some(Err(e)) => {
                     eprintln!("[POLL] topic={topic} partition={partition} error: {e:?}");
@@ -876,8 +881,10 @@ impl WorkloadExecutor for RealExecutor {
     ) -> Result<Option<u64>, ExecutorError> {
         // Non-blocking check - if data isn't immediately available, return None.
         // Caller can retry if needed. No timing assumptions.
-        match self.consumer.committed(Duration::ZERO) {
-            Ok(committed) => {
+        // With Duration::ZERO, timeout/error is expected - return None in that case.
+        self.consumer.committed(Duration::ZERO).map_or_else(
+            |_| Ok(None),
+            |committed| {
                 let offset = committed
                     .elements()
                     .iter()
@@ -890,10 +897,8 @@ impl WorkloadExecutor for RealExecutor {
                         }
                     });
                 Ok(offset)
-            }
-            // With Duration::ZERO, timeout/error is expected - return None
-            Err(_) => Ok(None),
-        }
+            },
+        )
     }
 
     fn bootstrap_servers(&self) -> &str {
@@ -948,7 +953,7 @@ impl WorkloadExecutor for RealExecutor {
         );
         Err(ExecutorError::Generic {
             code: -1,
-            message: format!("cluster not ready after {:?}", timeout),
+            message: format!("cluster not ready after {timeout:?}"),
         })
     }
 }
@@ -956,7 +961,7 @@ impl WorkloadExecutor for RealExecutor {
 /// Waits for a port to become available for binding.
 ///
 /// This is used before starting servers to ensure no leftover processes
-/// or TIME_WAIT sockets are holding the port.
+/// or `TIME_WAIT` sockets are holding the port.
 fn wait_for_port_available(port: u16, timeout: Duration) -> Result<(), ExecutorError> {
     let addr = format!("127.0.0.1:{port}");
     let deadline = std::time::Instant::now() + timeout;

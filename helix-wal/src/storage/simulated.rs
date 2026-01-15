@@ -193,7 +193,7 @@ pub struct FaultStats {
     pub write_failures: u64,
     /// Number of exists check failures injected.
     pub exists_failures: u64,
-    /// Number of list_files failures injected.
+    /// Number of `list_files` failures injected.
     pub list_files_failures: u64,
     /// Number of open failures injected.
     pub open_failures: u64,
@@ -206,7 +206,7 @@ pub struct FaultStats {
 impl FaultStats {
     /// Returns the total number of faults injected.
     #[must_use]
-    pub fn total_faults(&self) -> u64 {
+    pub const fn total_faults(&self) -> u64 {
         self.torn_writes
             + self.fsync_failures
             + self.read_corruptions
@@ -245,7 +245,7 @@ pub struct SimulatedStorage {
     fault_stats: Arc<Mutex<FaultStats>>,
 }
 
-#[allow(clippy::missing_panics_doc)]
+#[allow(clippy::missing_panics_doc, clippy::significant_drop_tightening)]
 impl SimulatedStorage {
     /// Creates a new simulated storage with the given seed.
     #[must_use]
@@ -428,6 +428,9 @@ impl SimulatedStorage {
     }
 
     /// Checks if a file exists at the given path (sync version).
+    ///
+    /// # Errors
+    /// Returns an error if the exists check fails due to simulated fault.
     pub fn exists_sync(&self, path: &Path) -> WalResult<bool> {
         self.record_op();
         {
@@ -502,6 +505,9 @@ impl SimulatedStorage {
 
     /// Creates a directory and all parent directories (sync version).
     /// No-op for in-memory storage.
+    ///
+    /// # Errors
+    /// This method always succeeds for simulated storage.
     pub fn create_dir_all_sync(&self, _path: &Path) -> WalResult<()> {
         self.record_op();
         Ok(())
@@ -657,7 +663,11 @@ pub struct SimulatedFile {
     read_counter: AtomicU64,
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::missing_panics_doc,
+    clippy::significant_drop_tightening
+)]
 impl SimulatedFile {
     /// Simple deterministic RNG based on seed and counter.
     fn should_inject_fault(&self, rate: f64, counter: u64) -> bool {
@@ -784,6 +794,7 @@ impl SimulatedFile {
     ///
     /// # Errors
     /// Returns an error if the read fails.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn read_at_sync(&self, offset: u64, len: usize) -> WalResult<Bytes> {
         // Check for read failure.
         {
@@ -899,6 +910,8 @@ impl SimulatedFile {
             operation: "truncate",
             message: "file not found".to_string(),
         })?;
+        // Truncation is bounded by simulated storage limits.
+        #[allow(clippy::cast_possible_truncation)]
         content.truncate(len as usize);
         Ok(())
     }

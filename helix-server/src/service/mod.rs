@@ -304,6 +304,7 @@ impl HelixService {
     /// Unlike other controller state, heartbeats are **soft state** (not Raft-replicated).
     /// Each broker sends heartbeats via transport to all peers, and each node maintains
     /// its own local view of broker liveness based on received heartbeats.
+    #[allow(clippy::significant_drop_tightening)]
     pub async fn live_brokers(&self) -> Vec<NodeId> {
         // In single-node mode, all brokers are "live".
         if !self.is_multi_node() {
@@ -311,6 +312,8 @@ impl HelixService {
         }
 
         // Get current time in milliseconds.
+        // Safe truncation: milliseconds won't overflow u64 for ~584 million years.
+        #[allow(clippy::cast_possible_truncation)]
         let current_time_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64);

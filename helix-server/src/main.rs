@@ -226,6 +226,7 @@ fn parse_peer(s: &str) -> Result<ExtendedPeerInfo, String> {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)] // Main entry point with CLI handling.
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Diagnostic: confirm process is actually running (before any initialization).
     eprintln!("[SERVER_START] pid={}", std::process::id());
@@ -313,7 +314,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Pre-create topics specified via --topic flags.
     // In multi-node mode, use controller partition for coordination.
     for topic in &args.topics {
-        #[allow(clippy::cast_sign_loss)]
+        // Safe truncation: cluster size is always small (max 3 for replication factor).
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let result = if service.is_multi_node() {
             // Multi-node: use controller to coordinate topic creation across cluster.
             // Default replication factor to cluster size (max 3).

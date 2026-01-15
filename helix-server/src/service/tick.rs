@@ -185,6 +185,8 @@ async fn send_broker_heartbeats_to_peers(
     transport_handle: &TransportHandle,
 ) {
     // Get current time in milliseconds.
+    // Safe truncation: milliseconds won't overflow u64 for ~584 million years.
+    #[allow(clippy::cast_possible_truncation)]
     let timestamp_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
@@ -223,6 +225,7 @@ async fn send_broker_heartbeats_to_peers(
 }
 
 /// Processes Multi-Raft outputs (single-node).
+#[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
 async fn process_outputs(
     outputs: &[MultiRaftOutput],
     partition_storage: &Arc<RwLock<HashMap<GroupId, ProductionPartitionStorage>>>,
@@ -279,10 +282,12 @@ async fn process_outputs(
                             Ok(Some(offset)) => Ok(*offset),
                             Ok(None) => {
                                 // No offset returned (e.g., empty entry), use current log end.
-                                let storage = partition_storage.read().await;
-                                let offset = storage
-                                    .get(group_id)
-                                    .map_or(Offset::new(0), |ps| ps.log_end_offset());
+                                let offset = {
+                                    let storage = partition_storage.read().await;
+                                    storage
+                                        .get(group_id)
+                                        .map_or(Offset::new(0), ProductionPartitionStorage::log_end_offset)
+                                };
                                 Ok(offset)
                             }
                             Err(e) => Err(ServerError::Internal {
@@ -334,7 +339,12 @@ async fn process_outputs(
 }
 
 /// Processes Multi-Raft outputs with transport for sending messages.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::ref_option,
+    clippy::significant_drop_tightening
+)]
 async fn process_outputs_multi_node(
     outputs: &[MultiRaftOutput],
     multi_raft: &Arc<RwLock<MultiRaft>>,
