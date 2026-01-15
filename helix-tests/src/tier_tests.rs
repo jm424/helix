@@ -636,7 +636,7 @@ async fn test_e2e_durable_partition_tiering_init() {
     let partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
 
     // Tiering should be enabled.
-    assert!(partition.tiering_manager().is_some());
+    assert!(partition.tiering_backend().is_some());
 }
 
 /// Tests writing records and calling tiering hooks (no sealed segments yet).
@@ -705,7 +705,7 @@ async fn test_e2e_partition_without_tiering() {
     let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
 
     // Tiering should be disabled.
-    assert!(partition.tiering_manager().is_none());
+    assert!(partition.tiering_backend().is_none());
 
     // Write records.
     for i in 0..5 {

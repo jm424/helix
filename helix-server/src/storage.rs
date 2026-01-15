@@ -76,8 +76,8 @@ use helix_progress::{
     Lease, ProgressConfig, ProgressError, ProgressManager, SimulatedProgressStore,
 };
 use helix_tier::{
-    InMemoryMetadataStore, IntegratedTieringManager, SegmentMetadata, SegmentReader,
-    SimulatedObjectStorage, TierError, TierResult, TieringConfig,
+    FilesystemConfig, FilesystemObjectStorage, InMemoryMetadataStore, IntegratedTieringManager,
+    SegmentMetadata, SegmentReader, SimulatedObjectStorage, TierError, TierResult, TieringConfig,
 };
 use helix_wal::{Entry, SegmentId, Storage, TokioStorage, Wal, WalConfig};
 use tokio::sync::RwLock;
@@ -141,8 +141,104 @@ impl<S: Storage + 'static> SegmentReader for WalSegmentReader<S> {
 pub type SimulatedTieringManager<S> =
     IntegratedTieringManager<SimulatedObjectStorage, InMemoryMetadataStore, WalSegmentReader<S>>;
 
+/// Type alias for the tiering manager with filesystem storage (for development/production).
+pub type FilesystemTieringManager<S> =
+    IntegratedTieringManager<FilesystemObjectStorage, InMemoryMetadataStore, WalSegmentReader<S>>;
+
 /// Type alias for the progress manager with simulated storage (for testing).
 pub type SimulatedProgressManager = ProgressManager<SimulatedProgressStore>;
+
+// -----------------------------------------------------------------------------
+// TieringBackend
+// -----------------------------------------------------------------------------
+
+/// Enum to hold either simulated or filesystem-based tiering manager.
+///
+/// This allows runtime selection of the object storage backend while
+/// maintaining compile-time type safety for each variant.
+pub enum TieringBackend<S: Storage + 'static> {
+    /// Simulated object storage (for testing/DST).
+    Simulated(SimulatedTieringManager<S>),
+    /// Filesystem object storage (for development/production).
+    Filesystem(FilesystemTieringManager<S>),
+}
+
+impl<S: Storage + 'static> TieringBackend<S> {
+    /// Registers a segment with the tiering manager.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata store operation fails.
+    pub async fn register_segment(&self, metadata: SegmentMetadata) -> TierResult<()> {
+        match self {
+            Self::Simulated(m) => m.register_segment(metadata).await,
+            Self::Filesystem(m) => m.register_segment(metadata).await,
+        }
+    }
+
+    /// Marks a segment as sealed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the segment doesn't exist or metadata update fails.
+    pub async fn mark_sealed(&self, segment_id: SegmentId) -> TierResult<()> {
+        match self {
+            Self::Simulated(m) => m.mark_sealed(segment_id).await,
+            Self::Filesystem(m) => m.mark_sealed(segment_id).await,
+        }
+    }
+
+    /// Marks a segment as committed (ready for tiering).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the segment doesn't exist or metadata update fails.
+    pub async fn mark_committed(&self, segment_id: SegmentId) -> TierResult<()> {
+        match self {
+            Self::Simulated(m) => m.mark_committed(segment_id).await,
+            Self::Filesystem(m) => m.mark_committed(segment_id).await,
+        }
+    }
+
+    /// Finds segments eligible for tiering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata store query fails.
+    pub async fn find_eligible_segments(&self) -> TierResult<Vec<SegmentMetadata>> {
+        match self {
+            Self::Simulated(m) => m.find_eligible_segments().await,
+            Self::Filesystem(m) => m.find_eligible_segments().await,
+        }
+    }
+
+    /// Tiers a segment to object storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the upload fails or metadata update fails.
+    pub async fn tier_segment(&self, segment_id: SegmentId) -> TierResult<()> {
+        match self {
+            Self::Simulated(m) => m.tier_segment(segment_id).await,
+            Self::Filesystem(m) => m.tier_segment(segment_id).await,
+        }
+    }
+
+    /// Evicts segments considering consumer progress.
+    ///
+    /// Only evicts segments where all offsets have been processed by all consumers.
+    /// The `safe_offset` is the minimum offset that all consumers have processed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata store operation fails.
+    pub async fn evict_with_progress(&self, safe_offset: Option<Offset>) -> TierResult<u32> {
+        match self {
+            Self::Simulated(m) => m.evict_with_progress(safe_offset).await,
+            Self::Filesystem(m) => m.evict_with_progress(safe_offset).await,
+        }
+    }
+}
 
 // -----------------------------------------------------------------------------
 // BlobFormat
@@ -671,6 +767,9 @@ pub struct DurablePartitionConfig {
     pub tiering: Option<TieringConfig>,
     /// Optional progress tracking configuration. If `Some`, consumer progress is tracked.
     pub progress: Option<ProgressConfig>,
+    /// Directory for object storage (filesystem backend).
+    /// If `Some`, uses `FilesystemObjectStorage`; otherwise uses `SimulatedObjectStorage`.
+    pub object_storage_dir: Option<PathBuf>,
 }
 
 #[allow(dead_code)] // Used in tests and will be used in service.rs integration.
@@ -685,6 +784,7 @@ impl DurablePartitionConfig {
             sync_on_write: false, // Default to batched syncs for performance.
             tiering: None,
             progress: None,
+            object_storage_dir: None,
         }
     }
 
@@ -706,6 +806,15 @@ impl DurablePartitionConfig {
     #[must_use]
     pub const fn with_progress(mut self, config: ProgressConfig) -> Self {
         self.progress = Some(config);
+        self
+    }
+
+    /// Sets the object storage directory for filesystem-based tiering.
+    ///
+    /// When set, uses `FilesystemObjectStorage` instead of `SimulatedObjectStorage`.
+    #[must_use]
+    pub fn with_object_storage_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.object_storage_dir = Some(dir.into());
         self
     }
 
@@ -749,8 +858,8 @@ pub struct DurablePartition<S: Storage + 'static> {
     cache: Partition,
     /// Last applied WAL index.
     last_applied_index: u64,
-    /// Tiering manager for S3 uploads (optional).
-    tiering: Option<SimulatedTieringManager<S>>,
+    /// Tiering manager for object storage uploads (optional).
+    tiering: Option<TieringBackend<S>>,
     /// Set of segment IDs that have been registered with tiering.
     tiered_segments: std::collections::HashSet<u64>,
     /// Progress manager for consumer offset tracking (optional).
@@ -773,7 +882,14 @@ impl<S: Storage + 'static> DurablePartition<S> {
     /// * `config` - Partition configuration
     ///
     /// # Errors
+    ///
     /// Returns an error if the WAL cannot be opened or recovery fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if filesystem object storage creation fails when `object_storage_dir`
+    /// is configured (e.g., if the directory cannot be created).
+    #[allow(clippy::too_many_lines)]
     pub async fn open(storage: S, config: DurablePartitionConfig) -> Result<Self, DurablePartitionError> {
         let wal_dir = config.wal_dir();
         let wal_config = WalConfig::new(&wal_dir).with_sync_on_write(config.sync_on_write);
@@ -830,25 +946,56 @@ impl<S: Storage + 'static> DurablePartition<S> {
         let wal = Arc::new(RwLock::new(wal));
 
         // Initialize tiering if configured.
-        let tiering = config.tiering.as_ref().map(|tiering_config| {
+        let tiering = if let Some(tiering_config) = config.tiering.as_ref() {
             let segment_reader = WalSegmentReader::new(wal.clone());
-            // Use simulated storage for now - production would use S3.
-            let object_storage = SimulatedObjectStorage::new(42);
             let metadata_store = InMemoryMetadataStore::new();
 
-            info!(
-                min_age_secs = tiering_config.min_age_secs,
-                max_concurrent = tiering_config.max_concurrent_uploads,
-                "Tiering enabled"
-            );
+            let backend = if let Some(object_dir) = &config.object_storage_dir {
+                // Use filesystem storage for development/production.
+                let fs_config = FilesystemConfig {
+                    base_path: object_dir.clone(),
+                    sync_on_write: config.sync_on_write,
+                    create_if_missing: true,
+                };
+                let object_storage = FilesystemObjectStorage::new(fs_config)
+                    .await
+                    .expect("failed to create filesystem object storage");
 
-            IntegratedTieringManager::new(
-                object_storage,
-                metadata_store,
-                segment_reader,
-                tiering_config.clone(),
-            )
-        });
+                info!(
+                    object_storage_dir = ?object_dir,
+                    min_age_secs = tiering_config.min_age_secs,
+                    max_concurrent = tiering_config.max_concurrent_uploads,
+                    "Tiering enabled with filesystem storage"
+                );
+
+                TieringBackend::Filesystem(IntegratedTieringManager::new(
+                    object_storage,
+                    metadata_store,
+                    segment_reader,
+                    tiering_config.clone(),
+                ))
+            } else {
+                // Use simulated storage for testing.
+                let object_storage = SimulatedObjectStorage::new(42);
+
+                info!(
+                    min_age_secs = tiering_config.min_age_secs,
+                    max_concurrent = tiering_config.max_concurrent_uploads,
+                    "Tiering enabled with simulated storage"
+                );
+
+                TieringBackend::Simulated(IntegratedTieringManager::new(
+                    object_storage,
+                    metadata_store,
+                    segment_reader,
+                    tiering_config.clone(),
+                ))
+            };
+
+            Some(backend)
+        } else {
+            None
+        };
 
         // Initialize progress tracking if configured.
         let progress = config.progress.as_ref().map(|progress_config| {
@@ -1332,9 +1479,9 @@ impl<S: Storage + 'static> DurablePartition<S> {
         self.tiering.is_some()
     }
 
-    /// Returns the tiering manager for testing purposes.
+    /// Returns the tiering backend for testing purposes.
     #[must_use]
-    pub const fn tiering_manager(&self) -> Option<&SimulatedTieringManager<S>> {
+    pub const fn tiering_backend(&self) -> Option<&TieringBackend<S>> {
         self.tiering.as_ref()
     }
 
@@ -1694,7 +1841,7 @@ mod tests {
         let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
 
         // Verify tiering is enabled.
-        assert!(partition.tiering_manager().is_some());
+        assert!(partition.tiering_backend().is_some());
 
         // Write some records.
         let records = vec![

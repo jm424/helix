@@ -104,6 +104,12 @@ struct Args {
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
+    /// Directory for object storage (tiered storage backend).
+    /// When specified, enables filesystem-based object storage for tiering.
+    /// If not specified, uses simulated in-memory storage.
+    #[arg(long)]
+    object_storage_dir: Option<PathBuf>,
+
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info")]
     log_level: Level,
@@ -289,6 +295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             raft_addr,
             raft_peers,
             args.data_dir,
+            args.object_storage_dir,
             kafka_addr,
             kafka_peer_addrs,
         )
@@ -296,10 +303,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         // Single-node mode (for development/testing).
         info!("Starting in single-node mode");
-        if let Some(data_dir) = args.data_dir {
-            HelixService::with_data_dir(args.cluster_id, args.node_id, data_dir)
-        } else {
-            HelixService::new(args.cluster_id, args.node_id)
+        match (args.data_dir, args.object_storage_dir) {
+            (Some(data_dir), Some(object_storage_dir)) => {
+                HelixService::with_data_and_object_storage(
+                    args.cluster_id,
+                    args.node_id,
+                    data_dir,
+                    object_storage_dir,
+                )
+            }
+            (Some(data_dir), None) => {
+                HelixService::with_data_dir(args.cluster_id, args.node_id, data_dir)
+            }
+            (None, _) => HelixService::new(args.cluster_id, args.node_id),
         }
     };
 

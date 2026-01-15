@@ -74,6 +74,7 @@ pub async fn tick_task_multi_node(
     cluster_nodes: Vec<NodeId>,
     transport_handle: TransportHandle,
     data_dir: Option<PathBuf>,
+    object_storage_dir: Option<PathBuf>,
     mut incoming_rx: mpsc::Receiver<IncomingMessage>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
@@ -110,6 +111,7 @@ pub async fn tick_task_multi_node(
                     &cluster_nodes,
                     &transport_handle,
                     &data_dir,
+                    &object_storage_dir,
                 ).await;
             }
             _ = heartbeat_interval.tick() => {
@@ -164,6 +166,7 @@ pub async fn tick_task_multi_node(
                     &cluster_nodes,
                     &transport_handle,
                     &data_dir,
+                    &object_storage_dir,
                 ).await;
             }
         }
@@ -356,6 +359,7 @@ async fn process_outputs_multi_node(
     cluster_nodes: &[NodeId],
     transport_handle: &TransportHandle,
     data_dir: &Option<PathBuf>,
+    object_storage_dir: &Option<PathBuf>,
 ) {
     for output in outputs {
         match output {
@@ -464,7 +468,13 @@ async fn process_outputs_multi_node(
                                 let mut storage = partition_storage.write().await;
                                 if let std::collections::hash_map::Entry::Vacant(e) = storage.entry(data_group_id) {
                                     let ps = if let Some(dir) = data_dir {
-                                        match ProductionPartitionStorage::new_durable(TokioStorage::new(), dir, topic_id, partition_id).await {
+                                        match ProductionPartitionStorage::new_durable(
+                                            TokioStorage::new(),
+                                            dir,
+                                            object_storage_dir.as_ref(),
+                                            topic_id,
+                                            partition_id,
+                                        ).await {
                                             Ok(durable) => durable,
                                             Err(e) => {
                                                 error!(

@@ -74,6 +74,7 @@ impl<S: Storage + 'static> PartitionStorage<S> {
     ///
     /// * `storage` - Storage backend to use for WAL operations
     /// * `data_dir` - Base directory for partition data
+    /// * `object_storage_dir` - Optional directory for object storage (tiering)
     /// * `topic_id` - Topic identifier
     /// * `partition_id` - Partition identifier
     ///
@@ -82,10 +83,14 @@ impl<S: Storage + 'static> PartitionStorage<S> {
     pub async fn new_durable(
         storage: S,
         data_dir: &PathBuf,
+        object_storage_dir: Option<&PathBuf>,
         topic_id: TopicId,
         partition_id: PartitionId,
     ) -> Result<Self, DurablePartitionError> {
-        let config = DurablePartitionConfig::new(data_dir, topic_id, partition_id);
+        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id);
+        if let Some(object_dir) = object_storage_dir {
+            config = config.with_object_storage_dir(object_dir);
+        }
         let durable = DurablePartition::open(storage, config).await?;
         Ok(Self {
             topic_id,

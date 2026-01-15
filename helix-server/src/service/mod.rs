@@ -96,6 +96,8 @@ pub struct HelixService {
     pub(crate) _shutdown_tx: mpsc::Sender<()>,
     /// Data directory for durable storage (None = in-memory only).
     pub(crate) data_dir: Option<PathBuf>,
+    /// Object storage directory for tiering (None = simulated storage).
+    pub(crate) object_storage_dir: Option<PathBuf>,
     /// Transport handle for sending Raft messages (multi-node only).
     #[allow(dead_code)]
     pub(crate) transport_handle: Option<TransportHandle>,
@@ -121,7 +123,7 @@ impl HelixService {
     /// This starts a background task to handle Raft ticks for all groups.
     #[must_use]
     pub fn new(cluster_id: String, node_id: u64) -> Self {
-        Self::new_internal(cluster_id, node_id, None)
+        Self::new_internal(cluster_id, node_id, None, None)
     }
 
     /// Creates a new Helix service with durable WAL-backed storage.
@@ -130,11 +132,31 @@ impl HelixService {
     /// Partition data is persisted to the specified directory.
     #[must_use]
     pub fn with_data_dir(cluster_id: String, node_id: u64, data_dir: PathBuf) -> Self {
-        Self::new_internal(cluster_id, node_id, Some(data_dir))
+        Self::new_internal(cluster_id, node_id, Some(data_dir), None)
+    }
+
+    /// Creates a new Helix service with durable storage and object storage for tiering.
+    ///
+    /// This starts a background task to handle Raft ticks for all groups.
+    /// Partition data is persisted to `data_dir`, and tiered segments are stored
+    /// in `object_storage_dir`.
+    #[must_use]
+    pub fn with_data_and_object_storage(
+        cluster_id: String,
+        node_id: u64,
+        data_dir: PathBuf,
+        object_storage_dir: PathBuf,
+    ) -> Self {
+        Self::new_internal(cluster_id, node_id, Some(data_dir), Some(object_storage_dir))
     }
 
     /// Internal constructor.
-    fn new_internal(cluster_id: String, node_id: u64, data_dir: Option<PathBuf>) -> Self {
+    fn new_internal(
+        cluster_id: String,
+        node_id: u64,
+        data_dir: Option<PathBuf>,
+        object_storage_dir: Option<PathBuf>,
+    ) -> Self {
         let node_id = NodeId::new(node_id);
         let cluster_nodes = vec![node_id]; // Single node for now.
 
@@ -171,6 +193,7 @@ impl HelixService {
             peer_addrs: HashMap::new(),
             _shutdown_tx: shutdown_tx,
             data_dir,
+            object_storage_dir,
             transport_handle: None,
             progress_manager,
             controller_state: Arc::new(RwLock::new(ControllerState::new())),
@@ -187,12 +210,14 @@ impl HelixService {
     ///
     /// # Errors
     /// Returns an error if the transport cannot be started.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new_multi_node(
         cluster_id: String,
         node_id: u64,
         listen_addr: SocketAddr,
         peers: Vec<PeerInfo>,
         data_dir: Option<PathBuf>,
+        object_storage_dir: Option<PathBuf>,
         kafka_addr: String,
         kafka_peer_addrs: HashMap<NodeId, String>,
     ) -> Result<Self, TransportError> {
@@ -252,6 +277,7 @@ impl HelixService {
             cluster_nodes.clone(),
             transport_handle.clone(),
             data_dir.clone(),
+            object_storage_dir.clone(),
             incoming_rx,
             shutdown_rx,
         ));
@@ -279,6 +305,7 @@ impl HelixService {
             peer_addrs,
             _shutdown_tx: shutdown_tx,
             data_dir,
+            object_storage_dir,
             transport_handle: Some(transport_handle),
             progress_manager,
             controller_state,
