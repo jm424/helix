@@ -28,7 +28,7 @@ async fn start_test_server() -> (HelixClient<tonic::transport::Channel>, SocketA
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let service = HelixService::new("test-cluster".to_string(), 1);
+    let service = HelixService::new("test-cluster".to_string(), 1).await;
 
     // Create a default topic.
     service

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use bytes::Bytes;
 use helix_core::{LogIndex, Offset, PartitionId, ProducerEpoch, ProducerId, Record, SequenceNum, TopicId};
-use helix_wal::{Storage, TokioStorage};
+use helix_wal::{SharedEntry, SharedWalHandle, Storage, TokioStorage};
 use tracing::warn;
 
 use crate::error::{ServerError, ServerResult};
@@ -24,7 +24,7 @@ use helix_tier::S3Config;
 /// # Type Parameters
 ///
 /// * `S` - Storage backend (e.g., `TokioStorage` for production, `SimulatedStorage` for DST)
-pub enum PartitionStorageInner<S: Storage + 'static> {
+pub enum PartitionStorageInner<S: Storage + Clone + Send + Sync + 'static> {
     /// In-memory storage (for testing).
     InMemory(Partition),
     /// Durable WAL-backed storage (for production).
@@ -37,7 +37,7 @@ pub enum PartitionStorageInner<S: Storage + 'static> {
 /// # Type Parameters
 ///
 /// * `S` - Storage backend (e.g., `TokioStorage` for production, `SimulatedStorage` for DST)
-pub struct PartitionStorage<S: Storage + 'static> {
+pub struct PartitionStorage<S: Storage + Clone + Send + Sync + 'static> {
     /// Topic ID.
     #[allow(dead_code)]
     topic_id: TopicId,
@@ -54,9 +54,9 @@ pub struct PartitionStorage<S: Storage + 'static> {
 }
 
 /// Type alias for production partition storage using Tokio filesystem.
-pub type ProductionPartitionStorage = PartitionStorage<TokioStorage>;
+pub type ServerPartitionStorage = PartitionStorage<TokioStorage>;
 
-impl<S: Storage + 'static> PartitionStorage<S> {
+impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     /// Creates new in-memory partition storage.
     #[must_use] 
     pub fn new_in_memory(topic_id: TopicId, partition_id: PartitionId) -> Self {
@@ -133,6 +133,38 @@ impl<S: Storage + 'static> PartitionStorage<S> {
             config = config.with_object_storage_dir(object_dir);
         }
         let durable = DurablePartition::open(storage, config).await?;
+        Ok(Self {
+            topic_id,
+            partition_id,
+            inner: PartitionStorageInner::Durable(Box::new(durable)),
+            last_applied: LogIndex::new(0),
+            producer_state: PartitionProducerState::new(),
+        })
+    }
+
+    /// Creates new durable partition storage with a shared WAL handle.
+    ///
+    /// This is used when partitions share a WAL pool for fsync amortization.
+    ///
+    /// # Arguments
+    ///
+    /// * `data_dir` - Base directory for partition data
+    /// * `topic_id` - Topic identifier
+    /// * `partition_id` - Partition identifier
+    /// * `wal_handle` - Shared WAL handle from the pool
+    /// * `recovered_entries` - Entries recovered from the shared WAL for this partition
+    ///
+    /// # Errors
+    /// Returns an error if the partition cannot be opened.
+    pub fn new_durable_with_shared_wal(
+        data_dir: &PathBuf,
+        topic_id: TopicId,
+        partition_id: PartitionId,
+        wal_handle: SharedWalHandle<S>,
+        recovered_entries: Vec<SharedEntry>,
+    ) -> Result<Self, DurablePartitionError> {
+        let config = DurablePartitionConfig::new(data_dir, topic_id, partition_id);
+        let durable = DurablePartition::open_with_shared_wal(config, wal_handle, recovered_entries)?;
         Ok(Self {
             topic_id,
             partition_id,

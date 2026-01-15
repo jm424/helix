@@ -10,7 +10,7 @@ use helix_wal::TokioStorage;
 
 use crate::controller::{ControllerCommand, CONTROLLER_GROUP_ID};
 use crate::error::{ServerError, ServerResult};
-use crate::partition_storage::ProductionPartitionStorage;
+use crate::partition_storage::ServerPartitionStorage;
 
 use super::super::{HelixService, PendingControllerProposal, TopicMetadata};
 
@@ -22,7 +22,7 @@ impl HelixService {
     ///
     /// # Panics
     /// Panics if `partition_count` is not in the range (0, 256].
-    #[allow(clippy::significant_drop_tightening)]
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     pub async fn create_topic(&self, name: String, partition_count: i32) -> ServerResult<()> {
         assert!(partition_count > 0, "partition_count must be positive");
         assert!(partition_count <= 256, "partition_count exceeds limit");
@@ -59,38 +59,63 @@ impl HelixService {
                 })?;
 
             // Create partition storage (durable or in-memory based on config).
-            #[cfg(feature = "s3")]
-            let ps = if let Some(data_dir) = &self.data_dir {
-                ProductionPartitionStorage::new_durable(
-                    TokioStorage::new(),
+            let ps = if let Some(ref pool) = self.shared_wal_pool {
+                // Shared WAL mode: get handle from pool and recovered entries.
+                let data_dir = self.data_dir.as_ref().expect("data_dir must be set with shared_wal_pool");
+                let wal_handle = pool.handle(partition_id);
+                let recovered = self
+                    .recovered_entries
+                    .write()
+                    .await
+                    .remove(&partition_id)
+                    .unwrap_or_default();
+
+                ServerPartitionStorage::new_durable_with_shared_wal(
                     data_dir,
-                    self.object_storage_dir.as_ref(),
-                    self.s3_config.as_ref(),
                     topic_id,
                     partition_id,
+                    wal_handle,
+                    recovered,
                 )
-                .await
                 .map_err(|e| ServerError::Internal {
-                    message: format!("failed to create durable partition: {e}"),
+                    message: format!("failed to create partition with shared WAL: {e}"),
                 })?
             } else {
-                ProductionPartitionStorage::new_in_memory(topic_id, partition_id)
-            };
-            #[cfg(not(feature = "s3"))]
-            let ps = if let Some(data_dir) = &self.data_dir {
-                ProductionPartitionStorage::new_durable(
-                    TokioStorage::new(),
-                    data_dir,
-                    self.object_storage_dir.as_ref(),
-                    topic_id,
-                    partition_id,
-                )
-                .await
-                .map_err(|e| ServerError::Internal {
-                    message: format!("failed to create durable partition: {e}"),
-                })?
-            } else {
-                ProductionPartitionStorage::new_in_memory(topic_id, partition_id)
+                // Dedicated WAL mode (used when shared WAL is not available).
+                #[cfg(feature = "s3")]
+                let ps_inner = if let Some(data_dir) = &self.data_dir {
+                    ServerPartitionStorage::new_durable(
+                        TokioStorage::new(),
+                        data_dir,
+                        self.object_storage_dir.as_ref(),
+                        self.s3_config.as_ref(),
+                        topic_id,
+                        partition_id,
+                    )
+                    .await
+                    .map_err(|e| ServerError::Internal {
+                        message: format!("failed to create durable partition: {e}"),
+                    })?
+                } else {
+                    ServerPartitionStorage::new_in_memory(topic_id, partition_id)
+                };
+                #[cfg(not(feature = "s3"))]
+                let ps_inner = if let Some(data_dir) = &self.data_dir {
+                    ServerPartitionStorage::new_durable(
+                        TokioStorage::new(),
+                        data_dir,
+                        self.object_storage_dir.as_ref(),
+                        topic_id,
+                        partition_id,
+                    )
+                    .await
+                    .map_err(|e| ServerError::Internal {
+                        message: format!("failed to create durable partition: {e}"),
+                    })?
+                } else {
+                    ServerPartitionStorage::new_in_memory(topic_id, partition_id)
+                };
+                ps_inner
             };
             partition_storage.insert(group_id, ps);
 

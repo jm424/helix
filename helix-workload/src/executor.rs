@@ -687,6 +687,8 @@ impl RealExecutor {
             // Connection timeout settings for multi-broker clusters.
             .set("socket.timeout.ms", "30000")
             .set("fetch.wait.max.ms", "500")
+            // Debug logging for librdkafka internals.
+            .set("debug", "fetch,broker,topic,msg,protocol")
             .create()?;
 
         Ok(Self {
@@ -814,14 +816,18 @@ impl WorkloadExecutor for RealExecutor {
                     break;
                 }
                 Some(Err(KafkaError::MessageConsumption(code)))
-                    if std::time::Instant::now() < deadline
-                        && matches!(
-                            code,
-                            rdkafka::error::RDKafkaErrorCode::BrokerTransportFailure
-                                | rdkafka::error::RDKafkaErrorCode::AllBrokersDown
-                        ) =>
+                    if matches!(
+                        code,
+                        rdkafka::error::RDKafkaErrorCode::BrokerTransportFailure
+                            | rdkafka::error::RDKafkaErrorCode::AllBrokersDown
+                    ) =>
                 {
-                    // Transient connection error - exponential backoff with jitter until deadline.
+                    // Transient connection error - check deadline first.
+                    if std::time::Instant::now() >= deadline {
+                        eprintln!("[POLL] topic={topic} partition={partition} transient error {code:?} after deadline, returning partial");
+                        break;
+                    }
+                    // Exponential backoff with jitter until deadline.
                     // Jitter: random value in [0.5 * backoff, 1.5 * backoff] to prevent thundering herd.
                     let jitter = (backoff_ms / 2) + (rand::random::<u64>() % (backoff_ms + 1));
                     eprintln!("[POLL] topic={topic} partition={partition} transient error {code:?}, backoff {jitter}ms");

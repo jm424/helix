@@ -66,4 +66,6 @@ mod server_tests;
 #[cfg(test)]
 mod shard_transfer_tests;
 #[cfg(test)]
+mod shared_wal_integration_tests;
+#[cfg(test)]
 mod tier_tests;

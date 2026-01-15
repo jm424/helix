@@ -493,6 +493,33 @@ impl<S: Storage> SharedWal<S> {
     pub fn partition_ids(&self) -> impl Iterator<Item = PartitionId> + '_ {
         self.partition_state.keys().copied()
     }
+
+    /// Returns the list of sealed segment IDs.
+    ///
+    /// Sealed segments are immutable and can be safely uploaded to tiering storage.
+    #[must_use]
+    pub fn sealed_segment_ids(&self) -> Vec<crate::SegmentId> {
+        self.wal.sealed_segment_ids()
+    }
+
+    /// Reads the raw bytes of a sealed segment.
+    ///
+    /// This is used by the tiering manager to upload segments to S3.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the segment does not exist or cannot be read.
+    pub fn read_segment_bytes(&self, segment_id: crate::SegmentId) -> WalResult<Bytes> {
+        self.wal.read_segment_bytes(segment_id)
+    }
+
+    /// Returns information about a sealed segment.
+    ///
+    /// Returns `None` if the segment doesn't exist or is the active segment.
+    #[must_use]
+    pub fn segment_info(&self, segment_id: crate::SegmentId) -> Option<crate::wal::SegmentInfo> {
+        self.wal.segment_info(segment_id)
+    }
 }
 
 // ============================================================================
@@ -651,6 +678,36 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
     #[must_use]
     pub const fn partition_id(&self) -> PartitionId {
         self.partition_id
+    }
+
+    /// Returns the list of sealed segment IDs.
+    ///
+    /// Sealed segments are immutable and can be safely uploaded to tiering storage.
+    /// This method is provided for compatibility with tiering infrastructure that
+    /// needs to query segment state.
+    pub async fn sealed_segment_ids(&self) -> Vec<crate::SegmentId> {
+        let wal = self.inner.wal.lock().await;
+        wal.sealed_segment_ids()
+    }
+
+    /// Reads the raw bytes of a sealed segment.
+    ///
+    /// This is used by the tiering manager to upload segments to S3.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the segment does not exist or cannot be read.
+    pub async fn read_segment_bytes(&self, segment_id: crate::SegmentId) -> WalResult<Bytes> {
+        let wal = self.inner.wal.lock().await;
+        wal.read_segment_bytes(segment_id)
+    }
+
+    /// Returns information about a sealed segment.
+    ///
+    /// Returns `None` if the segment doesn't exist or is the active segment.
+    pub async fn segment_info(&self, segment_id: crate::SegmentId) -> Option<crate::wal::SegmentInfo> {
+        let wal = self.inner.wal.lock().await;
+        wal.segment_info(segment_id)
     }
 }
 
@@ -876,6 +933,34 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
     pub async fn entry_count(&self) -> u64 {
         let wal = self.inner.wal.lock().await;
         wal.entry_count()
+    }
+
+    /// Returns the list of sealed segment IDs.
+    ///
+    /// Sealed segments are immutable and can be safely uploaded to tiering storage.
+    pub async fn sealed_segment_ids(&self) -> Vec<crate::SegmentId> {
+        let wal = self.inner.wal.lock().await;
+        wal.sealed_segment_ids()
+    }
+
+    /// Reads the raw bytes of a sealed segment.
+    ///
+    /// This is used by the tiering manager to upload segments to S3.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the segment does not exist or cannot be read.
+    pub async fn read_segment_bytes(&self, segment_id: crate::SegmentId) -> WalResult<Bytes> {
+        let wal = self.inner.wal.lock().await;
+        wal.read_segment_bytes(segment_id)
+    }
+
+    /// Returns information about a sealed segment.
+    ///
+    /// Returns `None` if the segment doesn't exist or is the active segment.
+    pub async fn segment_info(&self, segment_id: crate::SegmentId) -> Option<crate::wal::SegmentInfo> {
+        let wal = self.inner.wal.lock().await;
+        wal.segment_info(segment_id)
     }
 }
 

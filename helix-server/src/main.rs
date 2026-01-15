@@ -135,6 +135,12 @@ struct Args {
     #[arg(long)]
     s3_force_path_style: bool,
 
+    /// Number of shared WALs to use for fsync amortization (1-16).
+    /// Only applies when --data-dir is specified.
+    /// If not specified, defaults to 4.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=16))]
+    shared_wal_count: Option<u32>,
+
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info")]
     log_level: Level,
@@ -340,6 +346,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             s3_config,
             kafka_addr,
             kafka_peer_addrs,
+            args.shared_wal_count,
         )
         .await?;
         #[cfg(not(feature = "s3"))]
@@ -352,6 +359,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.object_storage_dir,
             kafka_addr,
             kafka_peer_addrs,
+            args.shared_wal_count,
         )
         .await?;
         service
@@ -365,12 +373,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     args.node_id,
                     data_dir,
                     object_storage_dir,
+                    args.shared_wal_count,
                 )
+                .await
             }
             (Some(data_dir), None) => {
-                HelixService::with_data_dir(args.cluster_id, args.node_id, data_dir)
+                HelixService::with_data_dir(args.cluster_id, args.node_id, data_dir, args.shared_wal_count)
+                    .await
             }
-            (None, _) => HelixService::new(args.cluster_id, args.node_id),
+            (None, _) => HelixService::new(args.cluster_id, args.node_id).await,
         }
     };
 

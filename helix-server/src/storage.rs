@@ -81,57 +81,100 @@ use helix_tier::{
 };
 #[cfg(feature = "s3")]
 use helix_tier::{S3Config, S3ObjectStorage};
-use helix_wal::{Entry, SegmentId, Storage, TokioStorage, Wal, WalConfig};
+use helix_wal::{Entry, SegmentId, SharedEntry, SharedWalHandle, Storage, TokioStorage, Wal, WalConfig};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+
+// -----------------------------------------------------------------------------
+// WalBackend
+// -----------------------------------------------------------------------------
+
+/// WAL backend for durable partitions.
+///
+/// Supports both dedicated WAL (one per partition) and shared WAL (pooled).
+pub enum WalBackend<S: Storage> {
+    /// Dedicated WAL for a single partition.
+    Dedicated(Arc<RwLock<Wal<S>>>),
+    /// Shared WAL handle from a pool.
+    Shared(SharedWalHandle<S>),
+}
 
 // -----------------------------------------------------------------------------
 // WalSegmentReader
 // -----------------------------------------------------------------------------
 
-/// Wrapper that implements `SegmentReader` for a WAL reference.
+/// Wrapper that implements `SegmentReader` for a WAL backend.
 ///
 /// This allows the `IntegratedTieringManager` to read segment bytes directly
 /// from the WAL when tiering to S3.
 ///
-/// Uses `RwLock` to allow concurrent reads while writes are exclusive.
+/// Supports both dedicated and shared WAL backends.
 pub struct WalSegmentReader<S: Storage> {
-    /// Shared reference to the WAL (behind `RwLock` for concurrent access).
-    wal: Arc<RwLock<Wal<S>>>,
+    /// WAL backend (dedicated or shared).
+    wal: WalBackend<S>,
 }
 
-impl<S: Storage> WalSegmentReader<S> {
-    /// Creates a new segment reader for the given WAL.
+impl<S: Storage + Clone + Send + Sync + 'static> WalSegmentReader<S> {
+    /// Creates a new segment reader for a dedicated WAL.
     #[must_use]
-    pub const fn new(wal: Arc<RwLock<Wal<S>>>) -> Self {
-        Self { wal }
+    pub const fn new_dedicated(wal: Arc<RwLock<Wal<S>>>) -> Self {
+        Self {
+            wal: WalBackend::Dedicated(wal),
+        }
+    }
+
+    /// Creates a new segment reader for a shared WAL handle.
+    #[must_use]
+    pub const fn new_shared(handle: SharedWalHandle<S>) -> Self {
+        Self {
+            wal: WalBackend::Shared(handle),
+        }
     }
 }
 
 #[async_trait]
-impl<S: Storage + 'static> SegmentReader for WalSegmentReader<S> {
+impl<S: Storage + Clone + Send + Sync + 'static> SegmentReader for WalSegmentReader<S> {
     async fn read_segment_bytes(&self, segment_id: SegmentId) -> TierResult<Bytes> {
-        let wal = self.wal.read().await;
+        match &self.wal {
+            WalBackend::Dedicated(wal) => {
+                let wal = wal.read().await;
 
-        // TigerStyle: Assert precondition.
-        assert!(
-            wal.segment_info(segment_id).is_some(),
-            "segment must exist before reading"
-        );
+                // TigerStyle: Assert precondition.
+                assert!(
+                    wal.segment_info(segment_id).is_some(),
+                    "segment must exist before reading"
+                );
 
-        wal.read_segment_bytes(segment_id).map_err(|e| TierError::Io {
-            operation: "read_segment_bytes",
-            message: e.to_string(),
-        })
+                wal.read_segment_bytes(segment_id).map_err(|e| TierError::Io {
+                    operation: "read_segment_bytes",
+                    message: e.to_string(),
+                })
+            }
+            WalBackend::Shared(handle) => handle
+                .read_segment_bytes(segment_id)
+                .await
+                .map_err(|e| TierError::Io {
+                    operation: "read_segment_bytes",
+                    message: e.to_string(),
+                }),
+        }
     }
 
     fn is_segment_sealed(&self, segment_id: SegmentId) -> bool {
-        // Use try_read to avoid blocking; if we can't get the lock, assume not sealed.
-        // This is safe because is_segment_sealed is only used as a precondition check.
-        self.wal
-            .try_read()
-            .map(|wal| wal.segment_info(segment_id).is_some_and(|info| info.is_sealed))
-            .unwrap_or(false)
+        match &self.wal {
+            WalBackend::Dedicated(wal) => {
+                // Use try_read to avoid blocking; if we can't get the lock, assume not sealed.
+                // This is safe because is_segment_sealed is only used as a precondition check.
+                wal.try_read()
+                    .map(|wal| wal.segment_info(segment_id).is_some_and(|info| info.is_sealed))
+                    .unwrap_or(false)
+            }
+            WalBackend::Shared(_handle) => {
+                // For shared WAL, we don't have immediate access to segment info.
+                // Return true optimistically - the actual read will fail if not sealed.
+                true
+            }
+        }
     }
 }
 
@@ -163,7 +206,7 @@ pub type SimulatedProgressManager = ProgressManager<SimulatedProgressStore>;
 ///
 /// This allows runtime selection of the object storage backend while
 /// maintaining compile-time type safety for each variant.
-pub enum TieringBackend<S: Storage + 'static> {
+pub enum TieringBackend<S: Storage + Clone + 'static> {
     /// Simulated object storage (for testing/DST).
     Simulated(SimulatedTieringManager<S>),
     /// Filesystem object storage (for development).
@@ -173,7 +216,7 @@ pub enum TieringBackend<S: Storage + 'static> {
     S3(S3TieringManager<S>),
 }
 
-impl<S: Storage + 'static> TieringBackend<S> {
+impl<S: Storage + Clone + 'static> TieringBackend<S> {
     /// Registers a segment with the tiering manager.
     ///
     /// # Errors
@@ -889,11 +932,11 @@ impl DurablePartitionConfig {
 ///
 /// * `S` - Storage backend (e.g., `TokioStorage` for production, `SimulatedStorage` for DST)
 #[allow(dead_code)] // Used in tests and will be used in service.rs integration.
-pub struct DurablePartition<S: Storage + 'static> {
+pub struct DurablePartition<S: Storage + Clone + Send + Sync + 'static> {
     /// Configuration.
     config: DurablePartitionConfig,
-    /// WAL for durable storage (shared with tiering manager via `RwLock`).
-    wal: Arc<RwLock<Wal<S>>>,
+    /// WAL backend (dedicated or shared).
+    wal: WalBackend<S>,
     /// In-memory cache for fast reads.
     cache: Partition,
     /// Last applied WAL index.
@@ -910,7 +953,7 @@ pub struct DurablePartition<S: Storage + 'static> {
 pub type ProductionPartition = DurablePartition<TokioStorage>;
 
 #[allow(dead_code)] // Used in tests and will be used in service.rs integration.
-impl<S: Storage + 'static> DurablePartition<S> {
+impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
     /// Opens or creates a durable partition with the given storage backend.
     ///
     /// If the WAL exists, entries are recovered and replayed to rebuild
@@ -983,11 +1026,12 @@ impl<S: Storage + 'static> DurablePartition<S> {
         }
 
         // Wrap WAL in Arc<RwLock> for shared access with tiering.
-        let wal = Arc::new(RwLock::new(wal));
+        let wal_ref = Arc::new(RwLock::new(wal));
+        let wal = WalBackend::Dedicated(wal_ref.clone());
 
         // Initialize tiering if configured.
         let tiering = if let Some(tiering_config) = config.tiering.as_ref() {
-            let segment_reader = WalSegmentReader::new(wal.clone());
+            let segment_reader = WalSegmentReader::new_dedicated(wal_ref.clone());
             let metadata_store = InMemoryMetadataStore::new();
 
             // Select backend: S3 (if configured) > Filesystem > Simulated
@@ -1127,6 +1171,105 @@ impl<S: Storage + 'static> DurablePartition<S> {
         })
     }
 
+    /// Opens or creates a durable partition with a shared WAL handle.
+    ///
+    /// This is used when partitions share a WAL pool for fsync amortization.
+    /// Recovered entries from the shared WAL are replayed to rebuild the cache.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Partition configuration
+    /// * `wal_handle` - Shared WAL handle from the pool
+    /// * `recovered_entries` - Entries recovered from the shared WAL for this partition
+    ///
+    /// # Errors
+    /// Returns an error if recovery fails or tiering/progress cannot be initialized.
+    #[allow(clippy::needless_pass_by_value)] // API consumes handle and entries for cleaner ownership.
+    pub fn open_with_shared_wal(
+        config: DurablePartitionConfig,
+        wal_handle: SharedWalHandle<S>,
+        recovered_entries: Vec<SharedEntry>,
+    ) -> Result<Self, DurablePartitionError> {
+        info!(
+            topic = config.topic_id.get(),
+            partition = config.partition_id.get(),
+            entries = recovered_entries.len(),
+            "Opening durable partition with shared WAL"
+        );
+
+        // Build cache from recovered entries.
+        let partition_config = PartitionConfig::new(config.topic_id, config.partition_id);
+        let mut cache = Partition::new(partition_config);
+        let mut last_applied_index = 0u64;
+
+        for entry in &recovered_entries {
+            if let Err(e) = Self::apply_shared_entry_to_cache(&mut cache, entry) {
+                warn!(
+                    index = entry.index(),
+                    error = %e,
+                    "Failed to apply entry during recovery"
+                );
+            }
+            last_applied_index = entry.index();
+        }
+
+        info!(
+            entries = recovered_entries.len(),
+            last_index = last_applied_index,
+            "Recovery complete"
+        );
+
+        // Wrap handle in WalBackend.
+        let wal = WalBackend::Shared(wal_handle.clone());
+
+        // Initialize tiering if configured.
+        let tiering = config.tiering.as_ref().map(|tiering_config| {
+            let segment_reader = WalSegmentReader::new_shared(wal_handle.clone());
+            let metadata_store = InMemoryMetadataStore::new();
+
+            // For shared WAL, always use simulated storage for now.
+            // TODO: Support object_storage_dir and S3 for shared WAL mode.
+            let object_storage = SimulatedObjectStorage::new(42);
+
+            info!(
+                min_age_secs = tiering_config.min_age_secs,
+                max_concurrent = tiering_config.max_concurrent_uploads,
+                "Tiering enabled with shared WAL (simulated storage)"
+            );
+
+            TieringBackend::Simulated(IntegratedTieringManager::new(
+                object_storage,
+                metadata_store,
+                segment_reader,
+                tiering_config.clone(),
+            ))
+        });
+
+        // Initialize progress tracking if configured.
+        let progress = config.progress.as_ref().map(|progress_config| {
+            // Use simulated storage for now - production would use Raft-backed storage.
+            let store = SimulatedProgressStore::new(42);
+
+            info!(
+                max_lease_duration_us = progress_config.max_lease_duration_us,
+                max_consumers = progress_config.max_consumers_per_group,
+                "Progress tracking enabled"
+            );
+
+            ProgressManager::new(store, progress_config.clone())
+        });
+
+        Ok(Self {
+            config,
+            wal,
+            cache,
+            last_applied_index,
+            tiering,
+            tiered_segments: std::collections::HashSet::new(),
+            progress,
+        })
+    }
+
     /// Returns the log start offset.
     #[must_use]
     pub const fn log_start_offset(&self) -> Offset {
@@ -1170,19 +1313,33 @@ impl<S: Storage + 'static> DurablePartition<S> {
         let data = command.encode();
 
         let next_index = self.last_applied_index + 1;
-        let entry = Entry::new(0, next_index, data).map_err(|e| DurablePartitionError::WalWrite {
-            message: format!("failed to create WAL entry: {e}"),
-        })?;
+        let term = 0; // Terms managed by Raft layer.
 
         // Write to WAL first (durability).
-        self.wal
-            .write()
-            .await
-            .append(entry)
-            .await
-            .map_err(|e| DurablePartitionError::WalWrite {
-                message: e.to_string(),
-            })?;
+        match &self.wal {
+            WalBackend::Dedicated(wal) => {
+                let entry = Entry::new(term, next_index, data).map_err(|e| {
+                    DurablePartitionError::WalWrite {
+                        message: format!("failed to create WAL entry: {e}"),
+                    }
+                })?;
+                wal.write()
+                    .await
+                    .append(entry)
+                    .await
+                    .map_err(|e| DurablePartitionError::WalWrite {
+                        message: e.to_string(),
+                    })?;
+            }
+            WalBackend::Shared(handle) => {
+                handle
+                    .append(term, next_index, data)
+                    .await
+                    .map_err(|e| DurablePartitionError::WalWrite {
+                        message: e.to_string(),
+                    })?;
+            }
+        }
 
         // Update in-memory cache.
         self.cache.append(records).map_err(|e| {
@@ -1267,19 +1424,33 @@ impl<S: Storage + 'static> DurablePartition<S> {
         let data = command.encode();
 
         let next_index = self.last_applied_index + 1;
-        let entry = Entry::new(0, next_index, data).map_err(|e| DurablePartitionError::WalWrite {
-            message: format!("failed to create WAL entry: {e}"),
-        })?;
+        let term = 0; // Terms managed by Raft layer.
 
         // Write to WAL first (durability).
-        self.wal
-            .write()
-            .await
-            .append(entry)
-            .await
-            .map_err(|e| DurablePartitionError::WalWrite {
-                message: e.to_string(),
-            })?;
+        match &self.wal {
+            WalBackend::Dedicated(wal) => {
+                let entry = Entry::new(term, next_index, data).map_err(|e| {
+                    DurablePartitionError::WalWrite {
+                        message: format!("failed to create WAL entry: {e}"),
+                    }
+                })?;
+                wal.write()
+                    .await
+                    .append(entry)
+                    .await
+                    .map_err(|e| DurablePartitionError::WalWrite {
+                        message: e.to_string(),
+                    })?;
+            }
+            WalBackend::Shared(handle) => {
+                handle
+                    .append(term, next_index, data)
+                    .await
+                    .map_err(|e| DurablePartitionError::WalWrite {
+                        message: e.to_string(),
+                    })?;
+            }
+        }
 
         // Update in-memory cache.
         self.cache.append_blob(blob, record_count).map_err(|e| {
@@ -1330,16 +1501,24 @@ impl<S: Storage + 'static> DurablePartition<S> {
 
     /// Syncs the WAL to disk.
     ///
-    /// Call this periodically for group commit, or rely on `sync_on_write`
-    /// for per-entry durability.
+    /// For dedicated WAL: Explicitly syncs to disk.
+    /// For shared WAL: No-op (append already waits for durability via background flush).
     ///
     /// # Errors
-    /// Returns an error if the sync fails.
+    /// Returns an error if the sync fails (dedicated WAL only).
     pub async fn sync(&self) -> Result<(), DurablePartitionError> {
-        let mut wal = self.wal.write().await;
-        wal.sync().await.map_err(|e| DurablePartitionError::WalSync {
-            message: e.to_string(),
-        })
+        match &self.wal {
+            WalBackend::Dedicated(wal) => {
+                let mut wal = wal.write().await;
+                wal.sync().await.map_err(|e| DurablePartitionError::WalSync {
+                    message: e.to_string(),
+                })
+            }
+            WalBackend::Shared(_) => {
+                // Shared WAL auto-syncs via background flush. Append already waits for durability.
+                Ok(())
+            }
+        }
     }
 
     /// Applies a WAL entry to the cache during recovery.
@@ -1376,6 +1555,48 @@ impl<S: Storage + 'static> DurablePartition<S> {
         Ok(())
     }
 
+    /// Applies a `SharedEntry` from shared WAL to the cache during recovery.
+    ///
+    /// `SharedEntry` payloads contain serialized `PartitionCommand` data.
+    fn apply_shared_entry_to_cache(
+        cache: &mut Partition,
+        entry: &SharedEntry,
+    ) -> Result<(), PartitionError> {
+        let data = entry.payload.clone();
+
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let command = PartitionCommand::decode(&data).ok_or_else(|| PartitionError::OffsetOutOfRange {
+            offset: Offset::new(0),
+            first: Offset::new(0),
+            last: Offset::new(0),
+        })?;
+
+        match command {
+            PartitionCommand::Append { records } => {
+                cache.append(records)?;
+            }
+            PartitionCommand::AppendBlob {
+                blob,
+                record_count,
+                format: _,
+            } => {
+                // During WAL recovery, blobs are already in the correct format.
+                cache.append_blob(blob, record_count)?;
+            }
+            PartitionCommand::Truncate { from_offset } => {
+                cache.truncate(from_offset)?;
+            }
+            PartitionCommand::UpdateHighWatermark { high_watermark } => {
+                cache.set_high_watermark(high_watermark);
+            }
+        }
+
+        Ok(())
+    }
+
     // -------------------------------------------------------------------------
     // Tiering Hooks
     // -------------------------------------------------------------------------
@@ -1397,11 +1618,16 @@ impl<S: Storage + 'static> DurablePartition<S> {
             return Ok(0);
         };
 
-        // Read WAL state under lock.
-        let wal = self.wal.read().await;
-        let sealed_ids = wal.sealed_segment_ids();
+        // Read WAL state.
+        let sealed_ids = match &self.wal {
+            WalBackend::Dedicated(wal) => {
+                let wal = wal.read().await;
+                wal.sealed_segment_ids()
+            }
+            WalBackend::Shared(handle) => handle.sealed_segment_ids().await,
+        };
 
-        // Collect segment info while holding the lock.
+        // Collect segment info.
         let mut segments_to_register = Vec::new();
         for segment_id in sealed_ids.iter().take(100) {
             let segment_id_raw = segment_id.get();
@@ -1412,7 +1638,15 @@ impl<S: Storage + 'static> DurablePartition<S> {
             }
 
             // Get segment info for metadata.
-            if let Some(info) = wal.segment_info(*segment_id) {
+            let info_opt = match &self.wal {
+                WalBackend::Dedicated(wal) => {
+                    let wal = wal.read().await;
+                    wal.segment_info(*segment_id)
+                }
+                WalBackend::Shared(handle) => handle.segment_info(*segment_id).await,
+            };
+
+            if let Some(info) = info_opt {
                 segments_to_register.push((
                     *segment_id,
                     segment_id_raw,
@@ -1423,7 +1657,6 @@ impl<S: Storage + 'static> DurablePartition<S> {
                 warn!(segment_id = segment_id_raw, "Segment info not found");
             }
         }
-        drop(wal); // Release lock before async operations.
 
         let mut registered_count = 0u32;
 
@@ -1491,14 +1724,27 @@ impl<S: Storage + 'static> DurablePartition<S> {
             return Ok(0);
         };
 
-        // Read WAL state under lock.
-        let wal = self.wal.read().await;
-        let sealed_ids = wal.sealed_segment_ids();
+        // Read WAL state.
+        let sealed_ids = match &self.wal {
+            WalBackend::Dedicated(wal) => {
+                let wal = wal.read().await;
+                wal.sealed_segment_ids()
+            }
+            WalBackend::Shared(handle) => handle.sealed_segment_ids().await,
+        };
 
-        // Collect segments to commit while holding the lock.
+        // Collect segments to commit.
         let mut segments_to_commit = Vec::new();
         for segment_id in sealed_ids.iter().take(100) {
-            if let Some(info) = wal.segment_info(*segment_id) {
+            let info_opt = match &self.wal {
+                WalBackend::Dedicated(wal) => {
+                    let wal = wal.read().await;
+                    wal.segment_info(*segment_id)
+                }
+                WalBackend::Shared(handle) => handle.segment_info(*segment_id).await,
+            };
+
+            if let Some(info) = info_opt {
                 // Check if all entries in this segment are committed.
                 let segment_last_index = info.last_index.unwrap_or(info.first_index);
                 if segment_last_index <= committed_index {
@@ -1506,7 +1752,6 @@ impl<S: Storage + 'static> DurablePartition<S> {
                 }
             }
         }
-        drop(wal); // Release lock before async operations.
 
         let mut committed_count = 0u32;
 

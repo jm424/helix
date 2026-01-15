@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 use crate::controller::{ControllerCommand, ControllerState, CONTROLLER_GROUP_ID};
 use crate::error::ServerError;
 use crate::group_map::GroupMap;
-use crate::partition_storage::ProductionPartitionStorage;
+use crate::partition_storage::ServerPartitionStorage;
 #[cfg(feature = "s3")]
 use helix_tier::S3Config;
 
@@ -32,7 +32,7 @@ pub const HEARTBEAT_INTERVAL_MS: u64 = 3_000; // 3 seconds.
 #[allow(clippy::significant_drop_tightening)]
 pub async fn tick_task(
     multi_raft: Arc<RwLock<MultiRaft>>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, ProductionPartitionStorage>>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
     group_map: Arc<RwLock<GroupMap>>,
     pending_proposals: Arc<RwLock<HashMap<GroupId, Vec<PendingProposal>>>>,
     mut shutdown_rx: mpsc::Receiver<()>,
@@ -64,10 +64,10 @@ pub async fn tick_task(
 
 /// Background task for multi-node operation.
 #[allow(clippy::significant_drop_tightening)]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn tick_task_multi_node(
     multi_raft: Arc<RwLock<MultiRaft>>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, ProductionPartitionStorage>>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
     group_map: Arc<RwLock<GroupMap>>,
     controller_state: Arc<RwLock<ControllerState>>,
     pending_proposals: Arc<RwLock<HashMap<GroupId, Vec<PendingProposal>>>>,
@@ -78,6 +78,8 @@ pub async fn tick_task_multi_node(
     data_dir: Option<PathBuf>,
     object_storage_dir: Option<PathBuf>,
     #[cfg(feature = "s3")] s3_config: Option<S3Config>,
+    shared_wal_pool: Option<Arc<helix_wal::SharedWalPool<helix_wal::TokioStorage>>>,
+    recovered_entries: Arc<RwLock<HashMap<helix_core::PartitionId, Vec<helix_wal::SharedEntry>>>>,
     mut incoming_rx: mpsc::Receiver<IncomingMessage>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
@@ -117,6 +119,8 @@ pub async fn tick_task_multi_node(
                     &data_dir,
                     &object_storage_dir,
                     &s3_config,
+                    &shared_wal_pool,
+                    &recovered_entries,
                 ).await;
                 #[cfg(not(feature = "s3"))]
                 process_outputs_multi_node(
@@ -131,6 +135,8 @@ pub async fn tick_task_multi_node(
                     &transport_handle,
                     &data_dir,
                     &object_storage_dir,
+                    &shared_wal_pool,
+                    &recovered_entries,
                 ).await;
             }
             _ = heartbeat_interval.tick() => {
@@ -188,6 +194,8 @@ pub async fn tick_task_multi_node(
                     &data_dir,
                     &object_storage_dir,
                     &s3_config,
+                    &shared_wal_pool,
+                    &recovered_entries,
                 ).await;
                 #[cfg(not(feature = "s3"))]
                 process_outputs_multi_node(
@@ -202,6 +210,8 @@ pub async fn tick_task_multi_node(
                     &transport_handle,
                     &data_dir,
                     &object_storage_dir,
+                    &shared_wal_pool,
+                    &recovered_entries,
                 ).await;
             }
         }
@@ -266,7 +276,7 @@ async fn send_broker_heartbeats_to_peers(
 #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
 async fn process_outputs(
     outputs: &[MultiRaftOutput],
-    partition_storage: &Arc<RwLock<HashMap<GroupId, ProductionPartitionStorage>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
     group_map: &Arc<RwLock<GroupMap>>,
     pending_proposals: &Arc<RwLock<HashMap<GroupId, Vec<PendingProposal>>>>,
 ) {
@@ -324,7 +334,7 @@ async fn process_outputs(
                                     let storage = partition_storage.read().await;
                                     storage
                                         .get(group_id)
-                                        .map_or(Offset::new(0), ProductionPartitionStorage::log_end_offset)
+                                        .map_or(Offset::new(0), ServerPartitionStorage::log_end_offset)
                                 };
                                 Ok(offset)
                             }
@@ -383,11 +393,10 @@ async fn process_outputs(
     clippy::ref_option,
     clippy::significant_drop_tightening
 )]
-#[allow(clippy::too_many_arguments)]
 async fn process_outputs_multi_node(
     outputs: &[MultiRaftOutput],
     multi_raft: &Arc<RwLock<MultiRaft>>,
-    partition_storage: &Arc<RwLock<HashMap<GroupId, ProductionPartitionStorage>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
     group_map: &Arc<RwLock<GroupMap>>,
     controller_state: &Arc<RwLock<ControllerState>>,
     pending_proposals: &Arc<RwLock<HashMap<GroupId, Vec<PendingProposal>>>>,
@@ -397,6 +406,8 @@ async fn process_outputs_multi_node(
     data_dir: &Option<PathBuf>,
     object_storage_dir: &Option<PathBuf>,
     #[cfg(feature = "s3")] s3_config: &Option<S3Config>,
+    shared_wal_pool: &Option<Arc<helix_wal::SharedWalPool<helix_wal::TokioStorage>>>,
+    recovered_entries: &Arc<RwLock<HashMap<helix_core::PartitionId, Vec<helix_wal::SharedEntry>>>>,
 ) {
     for output in outputs {
         match output {
@@ -504,52 +515,84 @@ async fn process_outputs_multi_node(
                             {
                                 let mut storage = partition_storage.write().await;
                                 if let std::collections::hash_map::Entry::Vacant(e) = storage.entry(data_group_id) {
-                                    #[cfg(feature = "s3")]
-                                    let ps = if let Some(dir) = data_dir {
-                                        match ProductionPartitionStorage::new_durable(
-                                            TokioStorage::new(),
+                                    let ps = if let Some(ref pool) = shared_wal_pool {
+                                        // Shared WAL mode: get handle from pool and recovered entries.
+                                        let dir = data_dir.as_ref().expect("data_dir must be set with shared_wal_pool");
+                                        let wal_handle = pool.handle(partition_id);
+                                        let recovered = recovered_entries
+                                            .write()
+                                            .await
+                                            .remove(&partition_id)
+                                            .unwrap_or_default();
+
+                                        match ServerPartitionStorage::new_durable_with_shared_wal(
                                             dir,
-                                            object_storage_dir.as_ref(),
-                                            s3_config.as_ref(),
                                             topic_id,
                                             partition_id,
-                                        ).await {
+                                            wal_handle,
+                                            recovered,
+                                        ) {
                                             Ok(durable) => durable,
                                             Err(e) => {
                                                 error!(
                                                     topic = topic_id.get(),
                                                     partition = partition_id.get(),
                                                     error = %e,
-                                                    "Failed to create durable partition, falling back to in-memory"
+                                                    "Failed to create partition with shared WAL, falling back to in-memory"
                                                 );
-                                                ProductionPartitionStorage::new_in_memory(topic_id, partition_id)
+                                                ServerPartitionStorage::new_in_memory(topic_id, partition_id)
                                             }
                                         }
                                     } else {
-                                        ProductionPartitionStorage::new_in_memory(topic_id, partition_id)
-                                    };
-                                    #[cfg(not(feature = "s3"))]
-                                    let ps = if let Some(dir) = data_dir {
-                                        match ProductionPartitionStorage::new_durable(
-                                            TokioStorage::new(),
-                                            dir,
-                                            object_storage_dir.as_ref(),
-                                            topic_id,
-                                            partition_id,
-                                        ).await {
-                                            Ok(durable) => durable,
-                                            Err(e) => {
-                                                error!(
-                                                    topic = topic_id.get(),
-                                                    partition = partition_id.get(),
-                                                    error = %e,
-                                                    "Failed to create durable partition, falling back to in-memory"
-                                                );
-                                                ProductionPartitionStorage::new_in_memory(topic_id, partition_id)
+                                        // Dedicated WAL mode (used when shared WAL is not available).
+                                        #[cfg(feature = "s3")]
+                                        let ps_inner = if let Some(dir) = data_dir {
+                                            match ServerPartitionStorage::new_durable(
+                                                TokioStorage::new(),
+                                                dir,
+                                                object_storage_dir.as_ref(),
+                                                s3_config.as_ref(),
+                                                topic_id,
+                                                partition_id,
+                                            ).await {
+                                                Ok(durable) => durable,
+                                                Err(e) => {
+                                                    error!(
+                                                        topic = topic_id.get(),
+                                                        partition = partition_id.get(),
+                                                        error = %e,
+                                                        "Failed to create durable partition, falling back to in-memory"
+                                                    );
+                                                    ServerPartitionStorage::new_in_memory(topic_id, partition_id)
+                                                }
                                             }
-                                        }
-                                    } else {
-                                        ProductionPartitionStorage::new_in_memory(topic_id, partition_id)
+                                        } else {
+                                            ServerPartitionStorage::new_in_memory(topic_id, partition_id)
+                                        };
+                                        #[cfg(not(feature = "s3"))]
+                                        let ps_inner = if let Some(dir) = data_dir {
+                                            match ServerPartitionStorage::new_durable(
+                                                TokioStorage::new(),
+                                                dir,
+                                                object_storage_dir.as_ref(),
+                                                topic_id,
+                                                partition_id,
+                                            ).await {
+                                                Ok(durable) => durable,
+                                                Err(e) => {
+                                                    error!(
+                                                        topic = topic_id.get(),
+                                                        partition = partition_id.get(),
+                                                        error = %e,
+                                                        "Failed to create durable partition, falling back to in-memory"
+                                                    );
+                                                    ServerPartitionStorage::new_in_memory(topic_id, partition_id)
+                                                }
+                                            }
+                                        } else {
+                                            ServerPartitionStorage::new_in_memory(topic_id, partition_id)
+                                        };
+                                        ps_inner
                                     };
                                     e.insert(ps);
                                 }
@@ -595,7 +638,7 @@ async fn process_outputs_multi_node(
                                     let storage = partition_storage.read().await;
                                     let offset = storage
                                         .get(group_id)
-                                        .map_or(Offset::new(0), ProductionPartitionStorage::blob_log_end_offset);
+                                        .map_or(Offset::new(0), ServerPartitionStorage::blob_log_end_offset);
                                     eprintln!("[NOTIFY] topic={topic_id} partition={partition_id} group_id={group_id} index={index} apply_result=None -> sending blob_log_end_offset={offset}");
                                     Ok(offset)
                                 }

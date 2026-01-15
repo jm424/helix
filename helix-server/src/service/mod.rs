@@ -15,16 +15,17 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use helix_core::{GroupId, NodeId, Offset, TopicId};
+use helix_core::{GroupId, NodeId, Offset, PartitionId, TopicId};
 use helix_progress::{ProgressConfig, ProgressManager, SimulatedProgressStore};
 use helix_raft::multi::MultiRaft;
 use helix_runtime::{PeerInfo, TransportConfig, TransportError, TransportHandle};
+use helix_wal::{PoolConfig, SharedEntry, SharedWalPool, TokioStorage};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{error, info};
 
 use crate::controller::{ControllerState, BROKER_HEARTBEAT_TIMEOUT_MS, CONTROLLER_GROUP_ID};
 use crate::group_map::GroupMap;
-use crate::partition_storage::ProductionPartitionStorage;
+use crate::partition_storage::ServerPartitionStorage;
 
 /// Maximum records per write request.
 pub const MAX_RECORDS_PER_WRITE: usize = 1000;
@@ -81,7 +82,7 @@ pub struct HelixService {
     /// Multi-Raft engine for consensus.
     pub(crate) multi_raft: Arc<RwLock<MultiRaft>>,
     /// Partition storage indexed by `GroupId`.
-    pub(crate) partition_storage: Arc<RwLock<HashMap<GroupId, ProductionPartitionStorage>>>,
+    pub(crate) partition_storage: Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
     /// Group ID mapping.
     pub(crate) group_map: Arc<RwLock<GroupMap>>,
     /// Topic name to metadata mapping.
@@ -118,24 +119,39 @@ pub struct HelixService {
     /// on each node. Each broker sends heartbeats via transport to all peers,
     /// and each node maintains its own view of broker liveness.
     pub(crate) local_broker_heartbeats: Arc<RwLock<HashMap<NodeId, u64>>>,
+    /// Shared WAL pool for fsync amortization. Present when `data_dir` is set.
+    pub(crate) shared_wal_pool: Option<Arc<SharedWalPool<TokioStorage>>>,
+    /// Recovered entries from shared WAL, indexed by `PartitionId`.
+    /// Used during partition creation to restore state (Phase 3).
+    #[allow(dead_code)] // Used in Phase 3 of SharedWAL integration.
+    pub(crate) recovered_entries: Arc<RwLock<HashMap<PartitionId, Vec<SharedEntry>>>>,
 }
 
 impl HelixService {
     /// Creates a new Helix service with in-memory storage (for testing).
     ///
     /// This starts a background task to handle Raft ticks for all groups.
-    #[must_use]
-    pub fn new(cluster_id: String, node_id: u64) -> Self {
-        Self::new_internal(cluster_id, node_id, None, None)
+    pub async fn new(cluster_id: String, node_id: u64) -> Self {
+        Self::new_internal(cluster_id, node_id, None, None, None).await
     }
 
     /// Creates a new Helix service with durable WAL-backed storage.
     ///
     /// This starts a background task to handle Raft ticks for all groups.
     /// Partition data is persisted to the specified directory.
-    #[must_use]
-    pub fn with_data_dir(cluster_id: String, node_id: u64, data_dir: PathBuf) -> Self {
-        Self::new_internal(cluster_id, node_id, Some(data_dir), None)
+    ///
+    /// # Arguments
+    /// * `cluster_id` - Unique cluster identifier
+    /// * `node_id` - This node's ID
+    /// * `data_dir` - Directory for durable storage
+    /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
+    pub async fn with_data_dir(
+        cluster_id: String,
+        node_id: u64,
+        data_dir: PathBuf,
+        shared_wal_count: Option<u32>,
+    ) -> Self {
+        Self::new_internal(cluster_id, node_id, Some(data_dir), None, shared_wal_count).await
     }
 
     /// Creates a new Helix service with durable storage and object storage for tiering.
@@ -143,22 +159,33 @@ impl HelixService {
     /// This starts a background task to handle Raft ticks for all groups.
     /// Partition data is persisted to `data_dir`, and tiered segments are stored
     /// in `object_storage_dir`.
-    #[must_use]
-    pub fn with_data_and_object_storage(
+    ///
+    /// # Arguments
+    /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
+    pub async fn with_data_and_object_storage(
         cluster_id: String,
         node_id: u64,
         data_dir: PathBuf,
         object_storage_dir: PathBuf,
+        shared_wal_count: Option<u32>,
     ) -> Self {
-        Self::new_internal(cluster_id, node_id, Some(data_dir), Some(object_storage_dir))
+        Self::new_internal(
+            cluster_id,
+            node_id,
+            Some(data_dir),
+            Some(object_storage_dir),
+            shared_wal_count,
+        )
+        .await
     }
 
     /// Internal constructor.
-    fn new_internal(
+    async fn new_internal(
         cluster_id: String,
         node_id: u64,
         data_dir: Option<PathBuf>,
         object_storage_dir: Option<PathBuf>,
+        shared_wal_count: Option<u32>,
     ) -> Self {
         let node_id = NodeId::new(node_id);
         let cluster_nodes = vec![node_id]; // Single node for now.
@@ -172,6 +199,45 @@ impl HelixService {
         let progress_store = SimulatedProgressStore::new(node_id.get());
         let progress_config = ProgressConfig::for_testing();
         let progress_manager = Arc::new(ProgressManager::new(progress_store, progress_config));
+
+        // Initialize SharedWalPool if data_dir is set.
+        let (shared_wal_pool, recovered_entries) = if let Some(ref dir) = data_dir {
+            // Determine WAL count (default 4, or user override).
+            let wal_count = shared_wal_count.unwrap_or(4);
+            assert!(
+                (1..=16).contains(&wal_count),
+                "shared_wal_count must be in range [1, 16]"
+            );
+
+            info!(
+                wal_count,
+                data_dir = ?dir,
+                "Initializing SharedWalPool"
+            );
+
+            // Create pool config.
+            let pool_config = PoolConfig::new(dir.join("shared-wal"), wal_count)
+                .with_flush_interval(std::time::Duration::from_millis(1))
+                .with_max_buffer_entries(1000);
+
+            // Open pool.
+            let pool = SharedWalPool::open(TokioStorage::new(), pool_config)
+                .await
+                .expect("Failed to open SharedWalPool");
+
+            // Recover all partitions.
+            let recovered = pool.recover().await.expect("Failed to recover from SharedWalPool");
+
+            info!(
+                partitions = recovered.len(),
+                "SharedWalPool recovery complete"
+            );
+
+            (Some(Arc::new(pool)), Arc::new(RwLock::new(recovered)))
+        } else {
+            // In-memory mode.
+            (None, Arc::new(RwLock::new(HashMap::new())))
+        };
 
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
@@ -205,6 +271,8 @@ impl HelixService {
             pending_proposals,
             pending_controller_proposals: Arc::new(RwLock::new(Vec::new())),
             local_broker_heartbeats: Arc::new(RwLock::new(HashMap::new())),
+            shared_wal_pool,
+            recovered_entries,
         }
     }
 
@@ -213,9 +281,17 @@ impl HelixService {
     /// This starts both the Raft tick task and the transport for peer
     /// communication. Partition data is persisted to the specified directory.
     ///
+    /// # Arguments
+    /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
+    ///
     /// # Errors
     /// Returns an error if the transport cannot be started.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// # Panics
+    /// Panics if `shared_wal_count` is not in range [1, 16], or if the `SharedWalPool`
+    /// fails to open or recover (indicates filesystem or corruption issues).
+    #[allow(clippy::too_many_arguments)] // Constructor naturally needs many parameters.
+    #[allow(clippy::too_many_lines)] // Constructor with initialization logic.
     #[cfg(feature = "s3")]
     pub async fn new_multi_node(
         cluster_id: String,
@@ -227,6 +303,7 @@ impl HelixService {
         s3_config: Option<helix_tier::S3Config>,
         kafka_addr: String,
         kafka_peer_addrs: HashMap<NodeId, String>,
+        shared_wal_count: Option<u32>,
     ) -> Result<Self, TransportError> {
         Self::new_multi_node_internal(
             cluster_id,
@@ -238,6 +315,7 @@ impl HelixService {
             s3_config,
             kafka_addr,
             kafka_peer_addrs,
+            shared_wal_count,
         )
         .await
     }
@@ -247,8 +325,15 @@ impl HelixService {
     /// This starts both the Raft tick task and the transport for peer
     /// communication. Partition data is persisted to the specified directory.
     ///
+    /// # Arguments
+    /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
+    ///
     /// # Errors
     /// Returns an error if the transport cannot be started.
+    ///
+    /// # Panics
+    /// Panics if `shared_wal_count` is not in range [1, 16], or if the `SharedWalPool`
+    /// fails to open or recover (indicates filesystem or corruption issues).
     #[allow(clippy::too_many_arguments)]
     #[cfg(not(feature = "s3"))]
     pub async fn new_multi_node(
@@ -260,6 +345,7 @@ impl HelixService {
         object_storage_dir: Option<PathBuf>,
         kafka_addr: String,
         kafka_peer_addrs: HashMap<NodeId, String>,
+        shared_wal_count: Option<u32>,
     ) -> Result<Self, TransportError> {
         Self::new_multi_node_internal(
             cluster_id,
@@ -270,11 +356,12 @@ impl HelixService {
             object_storage_dir,
             kafka_addr,
             kafka_peer_addrs,
+            shared_wal_count,
         )
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn new_multi_node_internal(
         cluster_id: String,
         node_id: u64,
@@ -285,6 +372,7 @@ impl HelixService {
         #[cfg(feature = "s3")] s3_config: Option<helix_tier::S3Config>,
         kafka_addr: String,
         kafka_peer_addrs: HashMap<NodeId, String>,
+        shared_wal_count: Option<u32>,
     ) -> Result<Self, TransportError> {
         let node_id = NodeId::new(node_id);
 
@@ -328,6 +416,45 @@ impl HelixService {
         let progress_config = ProgressConfig::for_testing();
         let progress_manager = Arc::new(ProgressManager::new(progress_store, progress_config));
 
+        // Initialize SharedWalPool if data_dir is set.
+        let (shared_wal_pool, recovered_entries) = if let Some(ref dir) = data_dir {
+            // Determine WAL count (default 4, or user override).
+            let wal_count = shared_wal_count.unwrap_or(4);
+            assert!(
+                (1..=16).contains(&wal_count),
+                "shared_wal_count must be in range [1, 16]"
+            );
+
+            info!(
+                wal_count,
+                data_dir = ?dir,
+                "Initializing SharedWalPool for multi-node"
+            );
+
+            // Create pool config.
+            let pool_config = PoolConfig::new(dir.join("shared-wal"), wal_count)
+                .with_flush_interval(std::time::Duration::from_millis(1))
+                .with_max_buffer_entries(1000);
+
+            // Open pool.
+            let pool = SharedWalPool::open(TokioStorage::new(), pool_config)
+                .await
+                .expect("Failed to open SharedWalPool");
+
+            // Recover all partitions.
+            let recovered = pool.recover().await.expect("Failed to recover from SharedWalPool");
+
+            info!(
+                partitions = recovered.len(),
+                "SharedWalPool recovery complete for multi-node"
+            );
+
+            (Some(Arc::new(pool)), Arc::new(RwLock::new(recovered)))
+        } else {
+            // In-memory mode.
+            (None, Arc::new(RwLock::new(HashMap::new())))
+        };
+
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
         // Start background tick task with transport.
@@ -345,6 +472,8 @@ impl HelixService {
             data_dir.clone(),
             object_storage_dir.clone(),
             s3_config.clone(),
+            shared_wal_pool.clone(),
+            Arc::clone(&recovered_entries),
             incoming_rx,
             shutdown_rx,
         ));
@@ -361,6 +490,8 @@ impl HelixService {
             transport_handle.clone(),
             data_dir.clone(),
             object_storage_dir.clone(),
+            shared_wal_pool.clone(),
+            Arc::clone(&recovered_entries),
             incoming_rx,
             shutdown_rx,
         ));
@@ -397,6 +528,8 @@ impl HelixService {
             pending_proposals,
             pending_controller_proposals,
             local_broker_heartbeats,
+            shared_wal_pool,
+            recovered_entries,
         })
     }
 
@@ -406,6 +539,20 @@ impl HelixService {
     #[cfg(feature = "s3")]
     pub fn set_s3_config(&mut self, config: helix_tier::S3Config) {
         self.s3_config = Some(config);
+    }
+
+    /// Shuts down the service gracefully.
+    ///
+    /// Flushes and closes the `SharedWalPool` if present.
+    ///
+    /// # Errors
+    /// Returns an error if the pool shutdown fails.
+    pub async fn shutdown(self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(pool) = self.shared_wal_pool {
+            info!("Shutting down SharedWalPool");
+            pool.shutdown().await?;
+        }
+        Ok(())
     }
 
     /// Returns the cluster nodes.
