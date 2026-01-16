@@ -518,6 +518,22 @@ impl RealCluster {
         Ok(())
     }
 
+    /// Restarts all nodes in the cluster after a full stop.
+    ///
+    /// This is used for testing full cluster restart scenarios where all nodes
+    /// are stopped and then restarted. Data directories are preserved, so
+    /// `SharedWAL` recovery is exercised.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any node cannot be restarted.
+    pub fn restart_all(&mut self) -> Result<(), ExecutorError> {
+        for node_id in 1..=self.config.node_count {
+            self.restart_node(u64::from(node_id))?;
+        }
+        Ok(())
+    }
+
     /// Creates a topic on all nodes in the cluster.
     ///
     /// This simulates what a control plane would do: tell each node about the topic.

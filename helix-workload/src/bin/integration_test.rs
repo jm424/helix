@@ -374,6 +374,129 @@ async fn test_multi_node() -> bool {
     stats.violations.is_empty() && stats.operations_failed == 0
 }
 
+/// Tests that data survives a full cluster restart (all nodes stopped and restarted).
+///
+/// This exercises `SharedWAL` recovery on all nodes simultaneously, which is different
+/// from the leader failover test where only one node restarts at a time.
+async fn test_full_cluster_restart() -> bool {
+    eprintln!("\n=== Full Cluster Restart Test (3 nodes) ===\n");
+
+    // Clean up any previous data.
+    let _ = std::fs::remove_dir_all("/tmp/helix-test-restart");
+
+    eprintln!("Starting 3-node cluster...");
+    let mut cluster = match RealCluster::builder()
+        .nodes(3)
+        .base_port(9592) // Use different ports to avoid conflict with other tests.
+        .raft_base_port(50400)
+        .binary_path(HELIX_BINARY)
+        .data_dir("/tmp/helix-test-restart")
+        .topic("restart-topic", 1)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("ERROR: Failed to start cluster: {e}");
+            return false;
+        }
+    };
+
+    let executor = match RealExecutor::new(&cluster) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("ERROR: Failed to create executor: {e}");
+            return false;
+        }
+    };
+
+    eprintln!("Waiting for cluster to be ready...");
+    if let Err(e) = executor.wait_ready(Duration::from_secs(30)).await {
+        eprintln!("ERROR: Cluster not ready: {e}");
+        return false;
+    }
+
+    eprintln!("Waiting for leader election...");
+    if let Err(e) = cluster
+        .wait_for_leader("restart-topic", 0, Duration::from_secs(30))
+        .await
+    {
+        eprintln!("ERROR: No leader elected: {e}");
+        return false;
+    }
+
+    let topic = "restart-topic";
+    let partition = 0;
+    let mut acknowledged_offsets: Vec<u64> = Vec::new();
+    let mut payloads: std::collections::HashMap<u64, bytes::Bytes> =
+        std::collections::HashMap::new();
+
+    // Phase 1: Write data before restart.
+    eprintln!("\nPhase 1: Sending 20 messages before full cluster restart...");
+    send_messages(
+        &executor,
+        topic,
+        partition,
+        "message-before-restart",
+        20,
+        &mut acknowledged_offsets,
+        &mut payloads,
+    )
+    .await;
+
+    if acknowledged_offsets.is_empty() {
+        eprintln!("ERROR: No messages were acknowledged before restart");
+        return false;
+    }
+    eprintln!("  Acknowledged {} messages", acknowledged_offsets.len());
+
+    // Phase 2: Stop ALL nodes (full cluster shutdown).
+    eprintln!("\nPhase 2: Stopping ALL nodes (full cluster shutdown)...");
+    cluster.stop();
+    eprintln!("  All nodes stopped");
+
+    // Wait a moment to ensure clean shutdown.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Phase 3: Restart ALL nodes.
+    eprintln!("\nPhase 3: Restarting ALL nodes...");
+    if let Err(e) = cluster.restart_all() {
+        eprintln!("ERROR: Failed to restart cluster: {e}");
+        return false;
+    }
+    eprintln!("  All nodes restarted");
+
+    // Wait for cluster to recover.
+    eprintln!("Waiting for cluster to recover...");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Create new executor (old connections are stale).
+    let executor = match RealExecutor::new(&cluster) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("ERROR: Failed to create executor after restart: {e}");
+            return false;
+        }
+    };
+
+    if let Err(e) = executor.wait_ready(Duration::from_secs(60)).await {
+        eprintln!("ERROR: Cluster not ready after restart: {e}");
+        return false;
+    }
+
+    eprintln!("Waiting for leader election after restart...");
+    if let Err(e) = cluster
+        .wait_for_leader(topic, partition, Duration::from_secs(60))
+        .await
+    {
+        eprintln!("ERROR: No leader elected after restart: {e}");
+        return false;
+    }
+    eprintln!("  Leader elected after restart");
+
+    // Phase 4: Verify all data survived the restart.
+    verify_and_report_results(&executor, topic, partition, &acknowledged_offsets, &payloads).await
+}
+
 #[tokio::main]
 async fn main() {
     eprintln!("=== Helix Workload Integration Test ===\n");
@@ -408,6 +531,14 @@ async fn main() {
         eprintln!("\nPASSED: Leader failover test");
     } else {
         eprintln!("\nFAILED: Leader failover test");
+        all_passed = false;
+    }
+
+    // Test 4: Full cluster restart
+    if test_full_cluster_restart().await {
+        eprintln!("\nPASSED: Full cluster restart test");
+    } else {
+        eprintln!("\nFAILED: Full cluster restart test");
         all_passed = false;
     }
 
