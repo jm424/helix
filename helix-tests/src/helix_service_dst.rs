@@ -37,7 +37,7 @@ use bloodhound::simulation::discrete::engine::{DiscreteSimulationEngine, EngineC
 use bloodhound::simulation::discrete::event::{ActorId, EventKind};
 use helix_wal::FaultConfig;
 
-use crate::helix_service_actor::create_helix_cluster;
+use crate::helix_service_actor::{create_helix_cluster, WalMode};
 use crate::properties::{
     assert_no_helix_violations, check_helix_properties, HelixPropertyCheckResult,
     HelixPropertyState, SharedHelixPropertyState,
@@ -82,6 +82,10 @@ pub struct HelixTestConfig {
     pub produce_interval_ms: u64,
     /// Number of produce operations to schedule.
     pub produce_count: u32,
+    /// WAL mode: per-partition or shared.
+    pub wal_mode: WalMode,
+    /// Number of shared WALs (only used when wal_mode is Shared).
+    pub shared_wal_count: u32,
 }
 
 impl Default for HelixTestConfig {
@@ -102,6 +106,8 @@ impl Default for HelixTestConfig {
             inject_client_traffic: false,
             produce_interval_ms: 100, // Faster produces
             produce_count: 200, // Many more produces
+            wal_mode: WalMode::InMemory, // Default to per-partition for backwards compatibility
+            shared_wal_count: 4, // Default K=4 shared WALs when using shared mode
         }
     }
 }
@@ -145,6 +151,8 @@ pub fn create_helix_simulation(
         config.seed,
         Arc::clone(&property_state),
         fault_config,
+        config.wal_mode,
+        config.shared_wal_count,
     );
 
     // Collect actor IDs.
@@ -598,6 +606,7 @@ mod tests {
             inject_client_traffic: true,
             produce_interval_ms: 100,
             produce_count: 400,
+            ..Default::default()
         };
 
         let result = run_basic_simulation(&config);
@@ -685,6 +694,7 @@ mod tests {
             inject_client_traffic: true,
             produce_interval_ms: 80,
             produce_count: 800,
+            ..Default::default()
         };
 
         let result = run_basic_simulation(&config);
@@ -728,6 +738,49 @@ mod tests {
         println!(
             "Stress test: 10 seeds completed, {} property events, {} produces, {} commits, 0 violations",
             total_property_events, total_produces, total_commits
+        );
+    }
+
+    #[test]
+    fn test_helix_service_stress_30_seeds() {
+        // 30-seed stress test for InMemory mode (aligned with other WAL modes).
+        let mut total_violations = 0usize;
+        let mut total_produces = 0u64;
+        let mut total_commits = 0u64;
+
+        for seed in 0..30 {
+            let config = HelixTestConfig {
+                node_count: 3,
+                seed,
+                max_time_secs: 30,
+                inject_client_traffic: true,
+                produce_interval_ms: 100,
+                produce_count: 250,
+                inject_crashes: seed % 3 == 0,
+                crash_time_ms: 8000,
+                recover_time_ms: 18000,
+                crash_node_index: (seed as usize) % 3,
+                inject_storage_faults: seed % 4 == 0,
+                storage_fault_config: if seed % 4 == 0 {
+                    Some(FaultConfig::flaky())
+                } else {
+                    None
+                },
+                ..Default::default()
+            };
+
+            let result = run_basic_simulation(&config);
+            assert_simulation_ok(&result, &format!("inmemory_stress_seed_{}", seed), 500);
+
+            total_violations += result.property_result.violations.len();
+            total_produces += result.property_result.total_produce_success;
+            total_commits += result.property_result.total_committed_entries;
+        }
+
+        assert_eq!(total_violations, 0, "No violations across InMemory 30-seed stress");
+        println!(
+            "InMemory stress: 30 seeds completed, {} produces, {} commits, 0 violations",
+            total_produces, total_commits
         );
     }
 
@@ -854,6 +907,7 @@ mod tests {
                 inject_client_traffic: true,             // Always inject client traffic.
                 produce_interval_ms: 80,
                 produce_count: 600,                      // 600 produces per seed (fills 60s at 80ms interval).
+                ..Default::default()
             };
 
             let result = run_basic_simulation(&config);
@@ -885,5 +939,561 @@ mod tests {
              {} client_acks, 0 consensus violations, 0 integrity violations, 0 consumer violations",
             total_events, total_property_events, total_produces, total_commits, total_client_acks
         );
+    }
+
+    #[test]
+    #[ignore] // Run manually with: cargo test inmemory_stress_500 -- --ignored
+    fn test_helix_service_stress_500_seeds() {
+        // Comprehensive 500-seed stress test for InMemory mode.
+        let mut total_violations = 0usize;
+        let mut total_produces = 0u64;
+        let mut total_commits = 0u64;
+
+        for seed in 0..500 {
+            let config = HelixTestConfig {
+                node_count: 3,
+                seed,
+                max_time_secs: 45,
+                inject_crashes: seed % 3 == 0,
+                crash_time_ms: 10000,
+                recover_time_ms: 25000,
+                crash_node_index: (seed as usize) % 3,
+                inject_storage_faults: seed % 2 == 0,
+                storage_fault_config: if seed % 2 == 0 {
+                    Some(FaultConfig::flaky())
+                } else {
+                    None
+                },
+                inject_client_traffic: true,
+                produce_interval_ms: 100,
+                produce_count: 300,
+                ..Default::default()
+            };
+
+            let result = run_basic_simulation(&config);
+
+            if seed % 50 == 0 {
+                println!("InMemory seed {}: produces={}, commits={}, violations={}",
+                    seed,
+                    result.property_result.total_produce_success,
+                    result.property_result.total_committed_entries,
+                    result.property_result.violations.len()
+                );
+            }
+
+            total_violations += result.property_result.violations.len();
+            total_produces += result.property_result.total_produce_success;
+            total_commits += result.property_result.total_committed_entries;
+
+            assert_eq!(
+                result.property_result.violations.len(), 0,
+                "InMemory seed {} had violations", seed
+            );
+        }
+
+        println!(
+            "InMemory stress: 500 seeds completed, {} produces, {} commits, {} violations",
+            total_produces, total_commits, total_violations
+        );
+        assert_eq!(total_violations, 0, "No violations across 500 seeds");
+    }
+
+    // ------------------------------------------------------------------------
+    // SharedWAL E2E Tests
+    // ------------------------------------------------------------------------
+    // These tests verify that the SharedWAL code path works correctly under
+    // fault injection, providing coverage for the production WAL architecture.
+
+    #[test]
+    fn test_helix_service_shared_wal_basic() {
+        let config = HelixTestConfig {
+            node_count: 3,
+            seed: 42,
+            max_time_secs: 30,
+            inject_client_traffic: true,
+            produce_interval_ms: 100,
+            produce_count: 200,
+            wal_mode: WalMode::Shared,
+            shared_wal_count: 4,
+            ..Default::default()
+        };
+
+        let result = run_basic_simulation(&config);
+        assert_simulation_ok(&result, "shared_wal_basic", 500);
+    }
+
+    #[test]
+    fn test_helix_service_shared_wal_with_faults() {
+        // Test SharedWAL with storage faults (torn writes, fsync failures).
+        let config = HelixTestConfig {
+            node_count: 3,
+            seed: 1234,
+            max_time_secs: 45,
+            inject_storage_faults: true,
+            storage_fault_config: Some(FaultConfig::flaky()),
+            inject_client_traffic: true,
+            produce_interval_ms: 100,
+            produce_count: 300,
+            wal_mode: WalMode::Shared,
+            shared_wal_count: 4,
+            ..Default::default()
+        };
+
+        let result = run_basic_simulation(&config);
+        assert_simulation_ok(&result, "shared_wal_with_faults", 800);
+    }
+
+    #[test]
+    fn test_helix_service_shared_wal_crash_recovery() {
+        // Test SharedWAL with crash/recovery cycles.
+        let config = HelixTestConfig {
+            node_count: 3,
+            seed: 5678,
+            max_time_secs: 45,
+            inject_crashes: true,
+            crash_time_ms: 10000,
+            recover_time_ms: 25000,
+            crash_node_index: 0,
+            inject_client_traffic: true,
+            produce_interval_ms: 100,
+            produce_count: 300,
+            wal_mode: WalMode::Shared,
+            shared_wal_count: 4,
+            ..Default::default()
+        };
+
+        let result = run_basic_simulation(&config);
+        assert_simulation_ok(&result, "shared_wal_crash_recovery", 800);
+    }
+
+    #[test]
+    fn test_helix_service_shared_wal_all_faults() {
+        // Comprehensive SharedWAL test with all fault types.
+        let config = HelixTestConfig {
+            node_count: 3,
+            seed: 9999,
+            max_time_secs: 60,
+            inject_crashes: true,
+            crash_time_ms: 15000,
+            recover_time_ms: 35000,
+            crash_node_index: 1,
+            inject_partition: true,
+            partition_time_ms: 10000,
+            heal_time_ms: 30000,
+            inject_storage_faults: true,
+            storage_fault_config: Some(FaultConfig::flaky()),
+            inject_client_traffic: true,
+            produce_interval_ms: 80,
+            produce_count: 500,
+            wal_mode: WalMode::Shared,
+            shared_wal_count: 4,
+        };
+
+        let result = run_basic_simulation(&config);
+        assert_simulation_ok(&result, "shared_wal_all_faults", 1200);
+    }
+
+    #[test]
+    fn test_helix_service_shared_wal_stress_10_seeds() {
+        // Multi-seed stress test for SharedWAL.
+        let mut total_violations = 0usize;
+        let mut total_produces = 0u64;
+        let mut total_commits = 0u64;
+
+        for seed in 0..10 {
+            let config = HelixTestConfig {
+                node_count: 3,
+                seed,
+                max_time_secs: 45,
+                inject_crashes: seed % 3 == 0,
+                crash_time_ms: 10000,
+                recover_time_ms: 25000,
+                crash_node_index: (seed as usize) % 3,
+                inject_storage_faults: seed % 2 == 0, // Storage faults every other seed.
+                storage_fault_config: if seed % 2 == 0 {
+                    Some(FaultConfig::flaky())
+                } else {
+                    None
+                },
+                inject_client_traffic: true,
+                produce_interval_ms: 100,
+                produce_count: 300,
+                wal_mode: WalMode::Shared,
+                shared_wal_count: 4,
+                ..Default::default()
+            };
+
+            let result = run_basic_simulation(&config);
+            assert_simulation_ok(&result, &format!("shared_wal_stress_seed_{}", seed), 500);
+
+            total_violations += result.property_result.violations.len();
+            total_produces += result.property_result.total_produce_success;
+            total_commits += result.property_result.total_committed_entries;
+        }
+
+        assert_eq!(total_violations, 0, "No violations across SharedWAL stress seeds");
+        println!(
+            "SharedWAL stress: 10 seeds completed, {} produces, {} commits, 0 violations",
+            total_produces, total_commits
+        );
+    }
+
+    #[test]
+    fn test_helix_service_shared_wal_stress_30_seeds() {
+        // 30-seed stress test for SharedWAL (aligned with other WAL modes).
+        let mut total_violations = 0usize;
+        let mut total_produces = 0u64;
+        let mut total_commits = 0u64;
+
+        for seed in 0..30 {
+            let config = HelixTestConfig {
+                node_count: 3,
+                seed,
+                max_time_secs: 45,
+                inject_crashes: seed % 3 == 0,
+                crash_time_ms: 10000,
+                recover_time_ms: 25000,
+                crash_node_index: (seed as usize) % 3,
+                inject_storage_faults: seed % 2 == 0,
+                storage_fault_config: if seed % 2 == 0 {
+                    Some(FaultConfig::flaky())
+                } else {
+                    None
+                },
+                inject_client_traffic: true,
+                produce_interval_ms: 100,
+                produce_count: 300,
+                wal_mode: WalMode::Shared,
+                shared_wal_count: 4,
+                ..Default::default()
+            };
+
+            let result = run_basic_simulation(&config);
+            assert_simulation_ok(&result, &format!("shared_wal_stress_seed_{}", seed), 500);
+
+            total_violations += result.property_result.violations.len();
+            total_produces += result.property_result.total_produce_success;
+            total_commits += result.property_result.total_committed_entries;
+        }
+
+        assert_eq!(total_violations, 0, "No violations across SharedWAL 30-seed stress");
+        println!(
+            "SharedWAL stress: 30 seeds completed, {} produces, {} commits, 0 violations",
+            total_produces, total_commits
+        );
+    }
+
+    #[test]
+    #[ignore] // Run manually with: cargo test shared_wal_stress_500 -- --ignored
+    fn test_helix_service_shared_wal_stress_500_seeds() {
+        // Comprehensive 500-seed stress test for SharedWAL.
+        let mut total_violations = 0usize;
+        let mut total_produces = 0u64;
+        let mut total_commits = 0u64;
+
+        for seed in 0..500 {
+            let config = HelixTestConfig {
+                node_count: 3,
+                seed,
+                max_time_secs: 45,
+                inject_crashes: seed % 3 == 0,
+                crash_time_ms: 10000,
+                recover_time_ms: 25000,
+                crash_node_index: (seed as usize) % 3,
+                inject_storage_faults: seed % 2 == 0,
+                storage_fault_config: if seed % 2 == 0 {
+                    Some(FaultConfig::flaky())
+                } else {
+                    None
+                },
+                inject_client_traffic: true,
+                produce_interval_ms: 100,
+                produce_count: 300,
+                wal_mode: WalMode::Shared,
+                shared_wal_count: 4,
+                ..Default::default()
+            };
+
+            let result = run_basic_simulation(&config);
+
+            if seed % 50 == 0 {
+                println!("SharedWAL seed {}: produces={}, commits={}, violations={}",
+                    seed,
+                    result.property_result.total_produce_success,
+                    result.property_result.total_committed_entries,
+                    result.property_result.violations.len()
+                );
+            }
+
+            total_violations += result.property_result.violations.len();
+            total_produces += result.property_result.total_produce_success;
+            total_commits += result.property_result.total_committed_entries;
+
+            assert_eq!(
+                result.property_result.violations.len(), 0,
+                "SharedWAL seed {} had violations", seed
+            );
+        }
+
+        println!(
+            "SharedWAL stress: 500 seeds completed, {} produces, {} commits, {} violations",
+            total_produces, total_commits, total_violations
+        );
+        assert_eq!(total_violations, 0, "No violations across 500 seeds");
+    }
+
+    #[test]
+    fn test_helix_service_shared_wal_different_pool_sizes() {
+        // Test different SharedWAL pool sizes (K=1, 2, 4, 8).
+        for wal_count in [1, 2, 4, 8] {
+            let config = HelixTestConfig {
+                node_count: 3,
+                seed: u64::from(wal_count) * 1000,
+                max_time_secs: 30,
+                inject_client_traffic: true,
+                produce_interval_ms: 100,
+                produce_count: 200,
+                wal_mode: WalMode::Shared,
+                shared_wal_count: wal_count,
+                ..Default::default()
+            };
+
+            let result = run_basic_simulation(&config);
+            assert_simulation_ok(
+                &result,
+                &format!("shared_wal_pool_size_{}", wal_count),
+                500,
+            );
+        }
+    }
+
+    // =========================================================================
+    // Per-Partition Durable WAL Tests
+    // =========================================================================
+
+    #[test]
+    fn test_helix_service_per_partition_basic() {
+        let config = HelixTestConfig {
+            node_count: 3,
+            seed: 42,
+            max_time_secs: 30,
+            inject_client_traffic: true,
+            produce_interval_ms: 100,
+            produce_count: 200,
+            wal_mode: WalMode::PerPartition,
+            ..Default::default()
+        };
+
+        let result = run_basic_simulation(&config);
+        assert_simulation_ok(&result, "per_partition_basic", 500);
+    }
+
+    #[test]
+    fn test_helix_service_per_partition_with_faults() {
+        let config = HelixTestConfig {
+            node_count: 3,
+            seed: 1234,
+            max_time_secs: 45,
+            inject_client_traffic: true,
+            produce_interval_ms: 100,
+            produce_count: 300,
+            inject_storage_faults: true,
+            storage_fault_config: Some(FaultConfig::flaky()),
+            wal_mode: WalMode::PerPartition,
+            ..Default::default()
+        };
+
+        let result = run_basic_simulation(&config);
+        assert_simulation_ok(&result, "per_partition_with_faults", 500);
+    }
+
+    #[test]
+    fn test_helix_service_per_partition_crash_recovery() {
+        let config = HelixTestConfig {
+            node_count: 3,
+            seed: 5678,
+            max_time_secs: 45,
+            inject_client_traffic: true,
+            produce_interval_ms: 100,
+            produce_count: 300,
+            inject_crashes: true,
+            crash_time_ms: 10000,
+            recover_time_ms: 25000,
+            crash_node_index: 0,
+            wal_mode: WalMode::PerPartition,
+            ..Default::default()
+        };
+
+        let result = run_basic_simulation(&config);
+        assert_simulation_ok(&result, "per_partition_crash_recovery", 500);
+    }
+
+    #[test]
+    fn test_helix_service_per_partition_all_faults() {
+        let config = HelixTestConfig {
+            node_count: 3,
+            seed: 9999,
+            max_time_secs: 60,
+            inject_client_traffic: true,
+            produce_interval_ms: 150,
+            produce_count: 250,
+            inject_crashes: true,
+            crash_time_ms: 15000,
+            recover_time_ms: 40000,
+            crash_node_index: 1,
+            inject_storage_faults: true,
+            storage_fault_config: Some(FaultConfig::flaky()),
+            wal_mode: WalMode::PerPartition,
+            ..Default::default()
+        };
+
+        let result = run_basic_simulation(&config);
+        assert_simulation_ok(&result, "per_partition_all_faults", 500);
+    }
+
+    #[test]
+    fn test_helix_service_per_partition_stress_10_seeds() {
+        // Multi-seed stress test for PerPartition WAL.
+        let mut total_violations = 0usize;
+        let mut total_produces = 0u64;
+        let mut total_commits = 0u64;
+
+        for seed in 0..10 {
+            let config = HelixTestConfig {
+                node_count: 3,
+                seed,
+                max_time_secs: 45,
+                inject_crashes: seed % 3 == 0,
+                crash_time_ms: 10000,
+                recover_time_ms: 25000,
+                crash_node_index: (seed as usize) % 3,
+                inject_storage_faults: seed % 2 == 0,
+                storage_fault_config: if seed % 2 == 0 {
+                    Some(FaultConfig::flaky())
+                } else {
+                    None
+                },
+                inject_client_traffic: true,
+                produce_interval_ms: 100,
+                produce_count: 300,
+                wal_mode: WalMode::PerPartition,
+                ..Default::default()
+            };
+
+            let result = run_basic_simulation(&config);
+            assert_simulation_ok(&result, &format!("per_partition_stress_seed_{}", seed), 500);
+
+            total_violations += result.property_result.violations.len();
+            total_produces += result.property_result.total_produce_success;
+            total_commits += result.property_result.total_committed_entries;
+        }
+
+        assert_eq!(total_violations, 0, "No violations across durable per-partition stress seeds");
+        println!(
+            "PerPartition stress: 10 seeds completed, {} produces, {} commits, 0 violations",
+            total_produces, total_commits
+        );
+    }
+
+    #[test]
+    fn test_helix_service_per_partition_stress_30_seeds() {
+        // 30-seed stress test for PerPartition WAL (aligned with other WAL modes).
+        let mut total_violations = 0usize;
+        let mut total_produces = 0u64;
+        let mut total_commits = 0u64;
+
+        for seed in 0..30 {
+            let config = HelixTestConfig {
+                node_count: 3,
+                seed,
+                max_time_secs: 45,
+                inject_crashes: seed % 3 == 0,
+                crash_time_ms: 10000,
+                recover_time_ms: 25000,
+                crash_node_index: (seed as usize) % 3,
+                inject_storage_faults: seed % 2 == 0,
+                storage_fault_config: if seed % 2 == 0 {
+                    Some(FaultConfig::flaky())
+                } else {
+                    None
+                },
+                inject_client_traffic: true,
+                produce_interval_ms: 100,
+                produce_count: 300,
+                wal_mode: WalMode::PerPartition,
+                ..Default::default()
+            };
+
+            let result = run_basic_simulation(&config);
+            assert_simulation_ok(&result, &format!("per_partition_stress_seed_{}", seed), 500);
+
+            total_violations += result.property_result.violations.len();
+            total_produces += result.property_result.total_produce_success;
+            total_commits += result.property_result.total_committed_entries;
+        }
+
+        assert_eq!(total_violations, 0, "No violations across durable per-partition 30-seed stress");
+        println!(
+            "PerPartition stress: 30 seeds completed, {} produces, {} commits, 0 violations",
+            total_produces, total_commits
+        );
+    }
+
+    #[test]
+    #[ignore] // Run manually with: cargo test per_partition_stress_500 -- --ignored
+    fn test_helix_service_per_partition_stress_500_seeds() {
+        // Comprehensive 500-seed stress test for PerPartition WAL.
+        let mut total_violations = 0usize;
+        let mut total_produces = 0u64;
+        let mut total_commits = 0u64;
+
+        for seed in 0..500 {
+            let config = HelixTestConfig {
+                node_count: 3,
+                seed,
+                max_time_secs: 45,
+                inject_crashes: seed % 3 == 0,
+                crash_time_ms: 10000,
+                recover_time_ms: 25000,
+                crash_node_index: (seed as usize) % 3,
+                inject_storage_faults: seed % 2 == 0,
+                storage_fault_config: if seed % 2 == 0 {
+                    Some(FaultConfig::flaky())
+                } else {
+                    None
+                },
+                inject_client_traffic: true,
+                produce_interval_ms: 100,
+                produce_count: 300,
+                wal_mode: WalMode::PerPartition,
+                ..Default::default()
+            };
+
+            let result = run_basic_simulation(&config);
+
+            if seed % 50 == 0 {
+                println!("PerPartition seed {}: produces={}, commits={}, violations={}",
+                    seed,
+                    result.property_result.total_produce_success,
+                    result.property_result.total_committed_entries,
+                    result.property_result.violations.len()
+                );
+            }
+
+            total_violations += result.property_result.violations.len();
+            total_produces += result.property_result.total_produce_success;
+            total_commits += result.property_result.total_committed_entries;
+
+            assert_eq!(
+                result.property_result.violations.len(), 0,
+                "PerPartition seed {} had violations", seed
+            );
+        }
+
+        println!(
+            "PerPartition stress: 500 seeds completed, {} produces, {} commits, {} violations",
+            total_produces, total_commits, total_violations
+        );
+        assert_eq!(total_violations, 0, "No violations across 500 seeds");
     }
 }

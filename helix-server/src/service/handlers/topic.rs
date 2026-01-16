@@ -77,6 +77,7 @@ impl HelixService {
                     wal_handle,
                     recovered,
                 )
+                .await
                 .map_err(|e| ServerError::Internal {
                     message: format!("failed to create partition with shared WAL: {e}"),
                 })?

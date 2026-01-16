@@ -1185,7 +1185,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
     /// # Errors
     /// Returns an error if recovery fails or tiering/progress cannot be initialized.
     #[allow(clippy::needless_pass_by_value)] // API consumes handle and entries for cleaner ownership.
-    pub fn open_with_shared_wal(
+    pub async fn open_with_shared_wal(
         config: DurablePartitionConfig,
         wal_handle: SharedWalHandle<S>,
         recovered_entries: Vec<SharedEntry>,
@@ -1211,6 +1211,20 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                 );
             }
             last_applied_index = entry.index();
+        }
+
+        // Query the SharedWal for any pending/durable entries we might have missed.
+        // This handles the case where the DurablePartition is recreated but the
+        // SharedWal has entries that weren't included in recovered_entries.
+        if let Some(wal_last_index) = wal_handle.last_index().await {
+            if wal_last_index > last_applied_index {
+                warn!(
+                    recovered_last = last_applied_index,
+                    wal_last = wal_last_index,
+                    "SharedWal has entries beyond recovered entries, adjusting last_applied_index"
+                );
+                last_applied_index = wal_last_index;
+            }
         }
 
         info!(
@@ -1312,12 +1326,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         };
         let data = command.encode();
 
-        let next_index = self.last_applied_index + 1;
         let term = 0; // Terms managed by Raft layer.
 
         // Write to WAL first (durability).
-        match &self.wal {
+        let assigned_index = match &self.wal {
             WalBackend::Dedicated(wal) => {
+                let next_index = self.last_applied_index + 1;
                 let entry = Entry::new(term, next_index, data).map_err(|e| {
                     DurablePartitionError::WalWrite {
                         message: format!("failed to create WAL entry: {e}"),
@@ -1330,16 +1344,19 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                     .map_err(|e| DurablePartitionError::WalWrite {
                         message: e.to_string(),
                     })?;
+                next_index
             }
             WalBackend::Shared(handle) => {
-                handle
-                    .append(term, next_index, data)
+                // Use auto-index assignment to eliminate TOCTOU races.
+                let ack = handle
+                    .append_auto(term, data)
                     .await
                     .map_err(|e| DurablePartitionError::WalWrite {
                         message: e.to_string(),
                     })?;
+                ack.index
             }
-        }
+        };
 
         // Update in-memory cache.
         self.cache.append(records).map_err(|e| {
@@ -1348,7 +1365,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             }
         })?;
 
-        self.last_applied_index = next_index;
+        self.last_applied_index = assigned_index;
 
         // Update high watermark (entry is durable).
         let new_hwm = self.cache.log_end_offset();
@@ -1358,7 +1375,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             topic = self.config.topic_id.get(),
             partition = self.config.partition_id.get(),
             base_offset = base_offset.get(),
-            wal_index = next_index,
+            wal_index = assigned_index,
             "Appended records to durable partition"
         );
 
@@ -1423,12 +1440,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         };
         let data = command.encode();
 
-        let next_index = self.last_applied_index + 1;
         let term = 0; // Terms managed by Raft layer.
 
         // Write to WAL first (durability).
-        match &self.wal {
+        let assigned_index = match &self.wal {
             WalBackend::Dedicated(wal) => {
+                let next_index = self.last_applied_index + 1;
                 let entry = Entry::new(term, next_index, data).map_err(|e| {
                     DurablePartitionError::WalWrite {
                         message: format!("failed to create WAL entry: {e}"),
@@ -1441,16 +1458,19 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                     .map_err(|e| DurablePartitionError::WalWrite {
                         message: e.to_string(),
                     })?;
+                next_index
             }
             WalBackend::Shared(handle) => {
-                handle
-                    .append(term, next_index, data)
+                // Use auto-index assignment to eliminate TOCTOU races.
+                let ack = handle
+                    .append_auto(term, data)
                     .await
                     .map_err(|e| DurablePartitionError::WalWrite {
                         message: e.to_string(),
                     })?;
+                ack.index
             }
-        }
+        };
 
         // Update in-memory cache.
         self.cache.append_blob(blob, record_count).map_err(|e| {
@@ -1459,7 +1479,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             }
         })?;
 
-        self.last_applied_index = next_index;
+        self.last_applied_index = assigned_index;
 
         // Update high watermark (entry is durable).
         let new_hwm = self.cache.blob_log_end_offset();
@@ -1471,7 +1491,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             base_offset = base_offset.get(),
             record_count,
             blob_size,
-            wal_index = next_index,
+            wal_index = assigned_index,
             "Appended blob to durable partition"
         );
 

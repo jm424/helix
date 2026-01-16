@@ -200,7 +200,7 @@ The plan requires:
 | Election staggering | ✅ Done | Internal randomized timeouts prevent thundering herd |
 | Leadership transfer | ✅ Done | Via MultiRaft::transfer_leadership() |
 | Group lifecycle (create/delete) | ✅ Done | create_group(), delete_group() |
-| Shared WAL across groups | ❌ Not Started | Each group has separate log |
+| Shared WAL across groups | ✅ Done | SharedWalPool with K=4 default, `--shared-wal-count` CLI flag |
 
 #### 2.2 Shard Routing
 

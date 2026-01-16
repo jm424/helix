@@ -534,7 +534,7 @@ async fn process_outputs_multi_node(
                                             partition_id,
                                             wal_handle,
                                             recovered,
-                                        ) {
+                                        ).await {
                                             Ok(durable) => durable,
                                             Err(e) => {
                                                 error!(

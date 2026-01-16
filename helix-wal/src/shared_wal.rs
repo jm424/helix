@@ -149,6 +149,15 @@ impl<S: Storage> SharedWal<S> {
         self.wal.entry_count()
     }
 
+    /// Returns the last index for a specific partition from internal state.
+    ///
+    /// This reflects entries that have been processed by `append_batch`,
+    /// even if they haven't been synced yet.
+    #[must_use]
+    pub fn partition_last_index(&self, partition_id: PartitionId) -> Option<u64> {
+        self.partition_state.get(&partition_id).map(|s| s.last_index)
+    }
+
     /// Appends an entry for a partition.
     ///
     /// # Panics
@@ -674,6 +683,89 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
         Ok(rx)
     }
 
+    /// Appends an entry with auto-assigned index.
+    ///
+    /// The index is assigned atomically while holding the buffer lock, eliminating
+    /// TOCTOU races between computing the next index and adding to the buffer.
+    ///
+    /// Returns when the entry is durable (fsync'd to disk).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the append or sync fails.
+    pub async fn append_auto(&self, term: u64, payload: Bytes) -> WalResult<DurableAck> {
+        let rx = self.append_auto_async(term, payload).await?;
+        rx.await.map_err(|_| crate::WalError::Shutdown)?
+    }
+
+    /// Appends an entry with auto-assigned index without waiting for durability.
+    ///
+    /// The index is assigned atomically while holding the buffer lock, eliminating
+    /// TOCTOU races. This is the recommended method for new code.
+    ///
+    /// Returns a receiver that will be notified when the entry is durable.
+    /// The `DurableAck` contains the assigned index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the coordinator is shut down.
+    pub async fn append_auto_async(
+        &self,
+        term: u64,
+        payload: Bytes,
+    ) -> WalResult<oneshot::Receiver<WalResult<DurableAck>>> {
+        if self.inner.shutdown.load(Ordering::Acquire) {
+            return Err(crate::WalError::Shutdown);
+        }
+
+        let (tx, rx) = oneshot::channel();
+
+        // Add to buffer with atomically assigned index.
+        {
+            let mut buffer = self.inner.buffer.lock().await;
+
+            // Determine the next index atomically while holding buffer lock.
+            let last_index = if let Some(idx) = buffer.last_index_for(self.partition_id) {
+                idx
+            } else {
+                // First append for this partition - check WAL state for initialization.
+                // This only happens once per partition per coordinator lifetime.
+                let wal = self.inner.wal.lock().await;
+                let wal_last = wal.partition_last_index(self.partition_id).unwrap_or(0);
+                drop(wal);
+                // Initialize buffer tracking.
+                buffer.update_last_index(self.partition_id, wal_last);
+                wal_last
+            };
+
+            let next_index = last_index + 1;
+
+            // Create entry with assigned index.
+            let entry = SharedEntry::new(self.partition_id, term, next_index, payload.clone())?;
+
+            // Update buffer tracking BEFORE adding entry (atomic with lock).
+            buffer.update_last_index(self.partition_id, next_index);
+
+            let pending = PendingWrite {
+                entry,
+                durable_tx: tx,
+            };
+
+            let entry_bytes = payload.len() + crate::SHARED_ENTRY_HEADER_SIZE;
+            buffer.entries.push_back(pending);
+            buffer.bytes += entry_bytes;
+
+            // Check if we should trigger immediate flush.
+            if buffer.entries.len() >= self.inner.config.max_buffer_entries
+                || buffer.bytes >= self.inner.config.max_buffer_bytes
+            {
+                self.inner.flush_notify.notify_one();
+            }
+        }
+
+        Ok(rx)
+    }
+
     /// Returns the partition ID for this handle.
     #[must_use]
     pub const fn partition_id(&self) -> PartitionId {
@@ -709,6 +801,47 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
         let wal = self.inner.wal.lock().await;
         wal.segment_info(segment_id)
     }
+
+    /// Returns the last known index for this partition.
+    ///
+    /// This checks all sources of index information:
+    /// 1. The WAL's `partition_state` (updated during batch processing)
+    /// 2. The durable index (entries that have been synced to disk)
+    /// 3. The buffer (entries that are pending flush)
+    ///
+    /// Returns `None` if no entries have been written for this partition.
+    /// This is useful for initializing a `DurablePartition` to continue
+    /// from the correct index after recovery.
+    pub async fn last_index(&self) -> Option<u64> {
+        // Check WAL's partition_state (source of truth for in-progress batches).
+        let wal_state_index = {
+            let wal = self.inner.wal.lock().await;
+            wal.partition_last_index(self.partition_id)
+        };
+
+        // Check durable index (synced entries).
+        let durable_index = {
+            let last_index = self.inner.partition_last_index.read().await;
+            last_index.get(&self.partition_id).copied()
+        };
+
+        // Check buffer for pending entries.
+        let buffer_index = {
+            let buffer = self.inner.buffer.lock().await;
+            buffer
+                .entries
+                .iter()
+                .filter(|pw| pw.entry.partition_id() == self.partition_id)
+                .map(|pw| pw.entry.index())
+                .max()
+        };
+
+        // Return the maximum of all sources.
+        [wal_state_index, durable_index, buffer_index]
+            .into_iter()
+            .flatten()
+            .max()
+    }
 }
 
 /// A pending write waiting to be flushed.
@@ -722,6 +855,9 @@ struct PendingWrite {
 struct WriteBuffer {
     entries: VecDeque<PendingWrite>,
     bytes: usize,
+    /// Per-partition last buffered index (for tracking expected next index).
+    /// This is updated atomically with adding entries to prevent TOCTOU races.
+    partition_last_buffered: HashMap<PartitionId, u64>,
 }
 
 impl WriteBuffer {
@@ -730,16 +866,28 @@ impl WriteBuffer {
         Self {
             entries: VecDeque::new(),
             bytes: 0,
+            partition_last_buffered: HashMap::new(),
         }
     }
 
     fn drain(&mut self) -> Vec<PendingWrite> {
         self.bytes = 0;
+        // Don't clear partition_last_buffered - it tracks cumulative state.
         std::mem::take(&mut self.entries).into()
     }
 
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Returns the last buffered index for a partition.
+    fn last_index_for(&self, partition_id: PartitionId) -> Option<u64> {
+        self.partition_last_buffered.get(&partition_id).copied()
+    }
+
+    /// Updates the last buffered index for a partition.
+    fn update_last_index(&mut self, partition_id: PartitionId, index: u64) {
+        self.partition_last_buffered.insert(partition_id, index);
     }
 }
 

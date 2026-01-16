@@ -314,6 +314,7 @@ pub struct PartitionAssignment {
 }
 
 /// Broker heartbeat timeout in milliseconds.
+///
 /// Brokers that haven't sent a heartbeat within this period are considered dead.
 /// Set to 5 seconds (5x heartbeat interval of 1s) for fast detection while
 /// allowing tolerance for transient network issues.

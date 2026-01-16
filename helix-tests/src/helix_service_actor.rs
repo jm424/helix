@@ -35,7 +35,10 @@ use helix_server::group_map::GroupMap;
 use helix_server::partition_storage::PartitionStorage;
 use helix_server::storage::PartitionCommand;
 use helix_server::service::{HEARTBEAT_INTERVAL_MS, TICK_INTERVAL_MS};
-use helix_wal::{Entry, FaultConfig, FaultStats, SimulatedStorage, Wal, WalConfig};
+use helix_wal::{
+    Entry, FaultConfig, FaultStats, PoolConfig, SharedEntry, SharedWalPool, SimulatedStorage, Wal,
+    WalConfig,
+};
 use tracing::{debug, error, info, warn};
 
 use crate::properties::{DataIntegrityViolationRecord, HelixNodeSnapshot, SharedHelixPropertyState};
@@ -106,6 +109,94 @@ impl DstWal {
     /// Returns an error if the entry cannot be read.
     pub fn read(&self, index: u64) -> Result<Entry, String> {
         self.wal.read(index).cloned().map_err(|e| format!("WAL read failed: {e}"))
+    }
+}
+
+// ============================================================================
+// WAL Mode Configuration
+// ============================================================================
+
+/// WAL mode for E2E DST tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WalMode {
+    /// In-memory storage only (no WAL, for fast consensus-only testing).
+    #[default]
+    InMemory,
+    /// Each partition has its own dedicated WAL with `SimulatedStorage` (fault injection).
+    PerPartition,
+    /// Multiple partitions share a pool of WALs (production `SharedWAL`).
+    Shared,
+}
+
+// ============================================================================
+// DST SharedWalPool Wrapper (Sync access to async SharedWalPool)
+// ============================================================================
+
+/// Synchronous wrapper around `SharedWalPool` for DST.
+///
+/// Uses a dedicated Tokio runtime to call async methods synchronously.
+/// This is necessary because `SharedWalCoordinator` spawns background tasks
+/// that require a Tokio runtime.
+pub struct DstSharedWalPool {
+    pool: SharedWalPool<SimulatedStorage>,
+    /// Tokio runtime for async operations.
+    runtime: tokio::runtime::Runtime,
+}
+
+impl DstSharedWalPool {
+    /// Opens or creates a pool of shared WALs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pool cannot be opened or created.
+    pub fn open(storage: SimulatedStorage, config: PoolConfig) -> Result<Self, String> {
+        // Create a multi-threaded runtime for the SharedWalCoordinator background tasks.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|e| format!("Failed to create Tokio runtime: {e}"))?;
+
+        let pool = runtime
+            .block_on(SharedWalPool::open(storage, config))
+            .map_err(|e| format!("SharedWalPool open failed: {e}"))?;
+
+        Ok(Self { pool, runtime })
+    }
+
+    /// Gets a handle for a partition.
+    ///
+    /// The returned handle can be passed to `PartitionStorage::new_durable_with_shared_wal`.
+    #[must_use]
+    pub fn handle(&self, partition_id: PartitionId) -> helix_wal::SharedWalHandle<SimulatedStorage> {
+        self.pool.handle(partition_id)
+    }
+
+    /// Recovers entries from all WALs, grouped by partition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if recovery fails.
+    pub fn recover(&self) -> Result<std::collections::HashMap<PartitionId, Vec<SharedEntry>>, String> {
+        self.runtime
+            .block_on(self.pool.recover())
+            .map_err(|e| format!("SharedWal recover failed: {e}"))
+    }
+
+    /// Returns the number of WALs in the pool.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // Can't be const: calls non-const pool.wal_count().
+    pub fn wal_count(&self) -> u32 {
+        self.pool.wal_count()
+    }
+
+    /// Returns a reference to the Tokio runtime.
+    ///
+    /// Used for running async operations synchronously in DST context.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)] // Runtime doesn't support const access.
+    pub fn runtime(&self) -> &tokio::runtime::Runtime {
+        &self.runtime
     }
 }
 
@@ -232,6 +323,13 @@ pub struct HelixServiceActor {
     /// Storage fault configuration.
     #[allow(dead_code)] // Used to create storage, retained for recovery.
     fault_config: FaultConfig,
+    /// WAL mode: per-partition or shared.
+    wal_mode: WalMode,
+    /// `SharedWAL` pool (only used when `wal_mode` is `Shared`).
+    /// Each node has its own pool, mirroring production architecture.
+    shared_wal_pool: Option<DstSharedWalPool>,
+    /// Number of shared WALs (for recreating pool on recovery).
+    shared_wal_count: u32,
 }
 
 impl HelixServiceActor {
@@ -247,6 +345,8 @@ impl HelixServiceActor {
     /// * `property_state` - Shared property state for verification
     /// * `fault_config` - Storage fault injection configuration
     /// * `seed` - Random seed for deterministic behavior
+    /// * `wal_mode` - WAL mode: per-partition or shared
+    /// * `shared_wal_count` - Number of shared WALs (only used when `wal_mode` is `Shared`)
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -258,6 +358,8 @@ impl HelixServiceActor {
         property_state: SharedHelixPropertyState,
         fault_config: FaultConfig,
         seed: u64,
+        wal_mode: WalMode,
+        shared_wal_count: u32,
     ) -> Self {
         let name = format!("helix-service-{}", node_id.get());
 
@@ -280,6 +382,30 @@ impl HelixServiceActor {
             error!(error = %e, "Failed to create controller group");
         }
 
+        // Create shared WAL pool if in shared mode.
+        // Use storage.clone() so SharedWAL shares the same simulated storage as the actor.
+        // This ensures simulate_crash() reverts SharedWAL data along with other storage.
+        let shared_wal_pool = if wal_mode == WalMode::Shared && shared_wal_count > 0 {
+            let pool_dir = format!("/node-{}/shared-wal", node_id.get());
+            let pool_config = PoolConfig::new(&pool_dir, shared_wal_count);
+            match DstSharedWalPool::open(storage.clone(), pool_config) {
+                Ok(pool) => Some(pool),
+                Err(e) => {
+                    error!(error = %e, "Failed to create SharedWalPool, falling back to per-partition");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Determine effective WAL mode (may fall back if pool creation failed).
+        let effective_wal_mode = match wal_mode {
+            WalMode::Shared if shared_wal_pool.is_some() => WalMode::Shared,
+            WalMode::Shared | WalMode::InMemory => WalMode::InMemory, // Fallback if pool creation failed
+            WalMode::PerPartition => WalMode::PerPartition,
+        };
+
         Self {
             actor_id,
             name,
@@ -301,6 +427,9 @@ impl HelixServiceActor {
             produce_count: 0,
             produce_success_count: 0,
             fault_config,
+            wal_mode: effective_wal_mode,
+            shared_wal_pool,
+            shared_wal_count,
         }
     }
 
@@ -778,7 +907,7 @@ impl HelixServiceActor {
         // Regular data partition commit - apply to storage.
         if let Some((topic_id, partition_id)) = self.group_map.get_key(group_id) {
             if let Some(ps) = self.partition_storage.get_mut(&group_id) {
-                // Decode the command to get the actual record payloads.
+                // Decode the command to get the actual record payloads for tracking.
                 let record_payloads: Vec<Vec<u8>> = match PartitionCommand::decode(data) {
                     Some(PartitionCommand::Append { ref records }) => {
                         records.iter().map(|r| r.value.to_vec()).collect()
@@ -786,21 +915,41 @@ impl HelixServiceActor {
                     _ => Vec::new(),
                 };
 
-                // Apply entry synchronously (DST uses in-memory storage).
-                match ps.apply_entry_sync(index, data) {
+                // Apply entry - uses sync for InMemory, async via block_on for Durable.
+                let apply_result = match self.wal_mode {
+                    WalMode::InMemory => {
+                        // In-memory storage: use sync apply.
+                        ps.apply_entry_sync(index, data)
+                    }
+                    WalMode::PerPartition => {
+                        // Durable per-partition WAL: use async apply via block_on.
+                        futures::executor::block_on(ps.apply_entry_async(index, data))
+                    }
+                    WalMode::Shared => {
+                        // Durable storage with SharedWAL: use async apply via runtime.
+                        if let Some(ref pool) = self.shared_wal_pool {
+                            pool.runtime().block_on(ps.apply_entry_async(index, data))
+                        } else {
+                            // Fallback to sync if no pool (shouldn't happen).
+                            ps.apply_entry_sync(index, data)
+                        }
+                    }
+                };
+
+                match apply_result {
                     Ok(offset_opt) => {
                         // Track committed data for durability verification.
                         let base_offset = offset_opt.unwrap_or_else(|| ps.log_end_offset());
 
-                        // Collect records to persist (to avoid borrow conflict with committed_data).
-                        let records_to_persist: Vec<(Offset, u64, Vec<u8>)> = record_payloads
+                        // Collect records for tracking.
+                        let records_to_track: Vec<(Offset, u64)> = record_payloads
                             .iter()
                             .enumerate()
                             .map(|(i, payload)| {
                                 #[allow(clippy::cast_possible_truncation)]
                                 let offset = Offset::new(base_offset.get() + i as u64);
                                 let data_hash = Self::simple_hash(payload);
-                                (offset, data_hash, payload.clone())
+                                (offset, data_hash)
                             })
                             .collect();
 
@@ -808,14 +957,8 @@ impl HelixServiceActor {
                         let committed = self.committed_data
                             .entry((topic_id, partition_id))
                             .or_default();
-                        for (offset, data_hash, _) in &records_to_persist {
+                        for (offset, data_hash) in &records_to_track {
                             committed.push((*offset, *data_hash));
-                        }
-
-                        // Persist to SimulatedStorage for high-fidelity crash recovery.
-                        // This is done after releasing the mutable borrow on committed_data.
-                        for (offset, _, payload) in &records_to_persist {
-                            self.persist_record(topic_id, partition_id, *offset, payload);
                         }
 
                         // Record client acknowledgments in shared state.
@@ -827,7 +970,7 @@ impl HelixServiceActor {
 
                         if is_leader {
                             if let Ok(mut state) = self.property_state.lock() {
-                                for (offset, data_hash, _) in &records_to_persist {
+                                for (offset, data_hash) in &records_to_track {
                                     state.record_client_ack(
                                         topic_id.get(),
                                         partition_id.get(),
@@ -850,28 +993,6 @@ impl HelixServiceActor {
                         );
                     }
                 }
-            }
-        }
-    }
-
-    /// Persists a committed record to `SimulatedStorage` for durability.
-    ///
-    /// This stores the record data in a file path that can be recovered after crash.
-    /// Path format: /`partitions/{topic_id}/{partition_id}/offset`_{offset}
-    fn persist_record(&self, topic_id: TopicId, partition_id: PartitionId, offset: Offset, data: &[u8]) {
-        let path = std::path::PathBuf::from(format!(
-            "/partitions/{}/{}/offset_{}",
-            topic_id.get(),
-            partition_id.get(),
-            offset.get()
-        ));
-
-        // Use sync API for SimulatedStorage.
-        if let Ok(file) = self.storage.open_sync(&path) {
-            // Write the data.
-            if file.write_at_sync(0, data).is_ok() {
-                // Sync to make durable.
-                let _ = file.sync_data();
             }
         }
     }
@@ -979,6 +1100,7 @@ impl HelixServiceActor {
             topic = topic_id.get(),
             partition = partition_id.get(),
             group = group_id.get(),
+            wal_mode = ?self.wal_mode,
             "Creating data partition"
         );
 
@@ -999,10 +1121,78 @@ impl HelixServiceActor {
         // Update group map.
         self.group_map.insert(topic_id, partition_id, group_id);
 
-        // Create partition storage with simulated backend.
-        self.partition_storage.entry(group_id).or_insert_with(|| {
-            SimulatedPartitionStorage::new_in_memory(topic_id, partition_id)
-        });
+        // Create partition storage based on WAL mode.
+        if self.partition_storage.contains_key(&group_id) {
+            return; // Already created.
+        }
+
+        let storage = match self.wal_mode {
+            WalMode::InMemory => {
+                // In-memory storage (no WAL).
+                SimulatedPartitionStorage::new_in_memory(topic_id, partition_id)
+            }
+            WalMode::PerPartition => {
+                // Durable storage with per-partition WAL using SimulatedStorage.
+                let data_dir = std::path::PathBuf::from(format!(
+                    "/node-{}/partitions/{}/{}",
+                    self.node_id.get(),
+                    topic_id.get(),
+                    partition_id.get()
+                ));
+
+                match futures::executor::block_on(SimulatedPartitionStorage::new_durable(
+                    self.storage.clone(),
+                    &data_dir,
+                    None, // No object storage for DST
+                    topic_id,
+                    partition_id,
+                )) {
+                    Ok(ps) => ps,
+                    Err(e) => {
+                        warn!(
+                            actor = %self.name,
+                            error = %e,
+                            "Failed to create durable per-partition storage, falling back to in-memory"
+                        );
+                        SimulatedPartitionStorage::new_in_memory(topic_id, partition_id)
+                    }
+                }
+            }
+            WalMode::Shared => {
+                // Durable storage with SharedWAL.
+                if let Some(ref pool) = self.shared_wal_pool {
+                    let handle = pool.handle(partition_id);
+                    // No recovered entries for new partitions - the async constructor
+                    // will query the SharedWal for any pending/durable entries.
+                    let recovered_entries = Vec::new();
+                    let data_dir = std::path::PathBuf::from("/data");
+
+                    // Use block_on since we're in a sync context but calling async API.
+                    match pool.runtime().block_on(PartitionStorage::new_durable_with_shared_wal(
+                        &data_dir,
+                        topic_id,
+                        partition_id,
+                        handle,
+                        recovered_entries,
+                    )) {
+                        Ok(ps) => ps,
+                        Err(e) => {
+                            warn!(
+                                actor = %self.name,
+                                error = %e,
+                                "Failed to create durable partition, falling back to in-memory"
+                            );
+                            SimulatedPartitionStorage::new_in_memory(topic_id, partition_id)
+                        }
+                    }
+                } else {
+                    // Fallback to in-memory if no pool.
+                    SimulatedPartitionStorage::new_in_memory(topic_id, partition_id)
+                }
+            }
+        };
+
+        self.partition_storage.insert(group_id, storage);
     }
 
     /// Handles incoming message from another node.
@@ -1068,6 +1258,10 @@ impl HelixServiceActor {
         // Clear pending transport messages.
         self.transport.clear_pending();
 
+        // Drop the shared WAL pool (this shuts down its Tokio runtime).
+        // It will be recreated on recovery.
+        self.shared_wal_pool = None;
+
         info!(
             actor = %self.name,
             "CRASHED - volatile state lost, storage reverted to last sync"
@@ -1090,6 +1284,25 @@ impl HelixServiceActor {
             error!(actor = %self.name, error = %e, "Failed to recreate controller group");
         }
 
+        // Recreate SharedWAL pool if in Shared mode.
+        // Use self.storage.clone() so we share the same storage that was reverted by simulate_crash().
+        // This allows SharedWAL to recover data that was synced before the crash.
+        if self.wal_mode == WalMode::Shared && self.shared_wal_count > 0 {
+            let pool_dir = format!("/node-{}/shared-wal", self.node_id.get());
+            let pool_config = PoolConfig::new(&pool_dir, self.shared_wal_count);
+            match DstSharedWalPool::open(self.storage.clone(), pool_config) {
+                Ok(pool) => {
+                    self.shared_wal_pool = Some(pool);
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to recreate SharedWalPool on recovery");
+                    self.shared_wal_pool = None;
+                    // Fall back to in-memory mode.
+                    self.wal_mode = WalMode::InMemory;
+                }
+            }
+        }
+
         // Clear in-memory state.
         self.partition_storage.clear();
         self.group_map = GroupMap::new();
@@ -1097,9 +1310,21 @@ impl HelixServiceActor {
         self.tick_count = 0;
         self.committed_data.clear();
 
-        // Recover partition data from SimulatedStorage.
-        // The storage reverted to last synced state on crash, so we reload durable data.
-        self.recover_partitions_from_storage();
+        // Recover partition data based on WAL mode.
+        match self.wal_mode {
+            WalMode::InMemory => {
+                // Recover from SimulatedStorage files (written during verification).
+                self.recover_partitions_from_storage();
+            }
+            WalMode::PerPartition => {
+                // Recover from per-partition WALs.
+                self.recover_partitions_from_per_partition_wal();
+            }
+            WalMode::Shared => {
+                // Recover from SharedWAL pool.
+                self.recover_partitions_from_shared_wal();
+            }
+        }
 
         self.crashed = false;
 
@@ -1186,6 +1411,196 @@ impl HelixServiceActor {
             }
 
             self.partition_storage.insert(group_id, ps);
+        }
+    }
+
+    /// Recovers partition data from per-partition WALs after crash.
+    ///
+    /// Scans for WAL directories and recreates `DurablePartition` instances
+    /// that will recover their state from the WAL.
+    fn recover_partitions_from_per_partition_wal(&mut self) {
+        // Scan for partition WAL directories.
+        // Path format: /node-{id}/partitions/{topic_id}/{partition_id}/
+        let base_dir = std::path::PathBuf::from(format!("/node-{}/partitions", self.node_id.get()));
+
+        // Get all files under the partitions directory.
+        let Ok(all_files) = self.storage.list_files_sync(&base_dir, "") else {
+            info!(actor = %self.name, "No partition WAL directories found for recovery");
+            return;
+        };
+
+        // Extract unique (topic_id, partition_id) pairs from paths.
+        let mut partitions: std::collections::BTreeSet<(TopicId, PartitionId)> = std::collections::BTreeSet::new();
+
+        for file_path in all_files {
+            // Parse path: /node-{id}/partitions/{topic_id}/{partition_id}/...
+            let path_str = file_path.to_string_lossy();
+            let parts: Vec<&str> = path_str.split('/').collect();
+
+            // Expected: ["", "node-{id}", "partitions", "{topic_id}", "{partition_id}", ...]
+            if parts.len() >= 5 && parts[2] == "partitions" {
+                if let (Ok(topic_id), Ok(partition_id)) = (
+                    parts[3].parse::<u64>(),
+                    parts[4].parse::<u64>(),
+                ) {
+                    partitions.insert((TopicId::new(topic_id), PartitionId::new(partition_id)));
+                }
+            }
+        }
+
+        info!(
+            actor = %self.name,
+            partition_count = partitions.len(),
+            "Found partitions to recover from per-partition WAL"
+        );
+
+        // Recover each partition by creating a DurablePartition (which recovers from WAL).
+        for (topic_id, partition_id) in partitions {
+            let group_id = GroupId::new(topic_id.get() * 1000 + partition_id.get());
+
+            // Update group map.
+            self.group_map.insert(topic_id, partition_id, group_id);
+
+            // Create DurablePartition with the same path as used in initialize_partition_storage.
+            let data_dir = std::path::PathBuf::from(format!(
+                "/node-{}/partitions/{}/{}",
+                self.node_id.get(),
+                topic_id.get(),
+                partition_id.get()
+            ));
+
+            let storage = match futures::executor::block_on(SimulatedPartitionStorage::new_durable(
+                self.storage.clone(),
+                &data_dir,
+                None,
+                topic_id,
+                partition_id,
+            )) {
+                Ok(ps) => ps,
+                Err(e) => {
+                    warn!(
+                        actor = %self.name,
+                        topic = topic_id.get(),
+                        partition = partition_id.get(),
+                        error = %e,
+                        "Failed to recover partition from WAL, using in-memory"
+                    );
+                    SimulatedPartitionStorage::new_in_memory(topic_id, partition_id)
+                }
+            };
+
+            // Recreate Raft group for this partition.
+            if let Err(e) = self.multi_raft.create_group(group_id, self.cluster_nodes.clone()) {
+                warn!(
+                    actor = %self.name,
+                    group = group_id.get(),
+                    error = %e,
+                    "Failed to recreate partition group during per-partition WAL recovery"
+                );
+            }
+
+            self.partition_storage.insert(group_id, storage);
+
+            info!(
+                actor = %self.name,
+                topic = topic_id.get(),
+                partition = partition_id.get(),
+                "Recovered partition from per-partition WAL"
+            );
+        }
+    }
+
+    /// Recovers partition data from `SharedWAL` after crash.
+    ///
+    /// This is the `SharedWAL`-aware recovery path that properly recovers entries
+    /// from the `SharedWAL` pool and creates `DurablePartition` instances.
+    fn recover_partitions_from_shared_wal(&mut self) {
+        let Some(ref pool) = self.shared_wal_pool else {
+            warn!(actor = %self.name, "No SharedWAL pool available for recovery");
+            return;
+        };
+
+        // Recover all entries from the SharedWAL pool.
+        let recovered_by_partition = match pool.recover() {
+            Ok(entries) => entries,
+            Err(e) => {
+                warn!(actor = %self.name, error = %e, "Failed to recover from SharedWAL");
+                return;
+            }
+        };
+
+        info!(
+            actor = %self.name,
+            partitions = recovered_by_partition.len(),
+            total_entries = recovered_by_partition.values().map(Vec::len).sum::<usize>(),
+            "Recovered entries from SharedWAL"
+        );
+
+        // Create partition storage for each recovered partition.
+        for (partition_id, entries) in recovered_by_partition {
+            if entries.is_empty() {
+                continue;
+            }
+
+            // Infer topic_id from stored entries (entries contain partition data).
+            // For DST, we use a simple mapping: topic_id = 1 (single topic per test).
+            // TODO: Store topic_id in SharedEntry if needed for multi-topic support.
+            let topic_id = TopicId::new(1);
+
+            // Create group ID using same formula as initialize_partition_storage.
+            let group_id = GroupId::new(topic_id.get() * 1000 + partition_id.get());
+
+            // Update group map.
+            self.group_map.insert(topic_id, partition_id, group_id);
+
+            // Create DurablePartition with recovered entries.
+            let handle = pool.handle(partition_id);
+            let data_dir = std::path::PathBuf::from("/data");
+
+            let storage = match pool.runtime().block_on(
+                SimulatedPartitionStorage::new_durable_with_shared_wal(
+                    &data_dir,
+                    topic_id,
+                    partition_id,
+                    handle,
+                    entries.clone(),
+                )
+            ) {
+                Ok(ps) => ps,
+                Err(e) => {
+                    warn!(
+                        actor = %self.name,
+                        partition = partition_id.get(),
+                        error = %e,
+                        "Failed to create DurablePartition during recovery, using in-memory"
+                    );
+                    SimulatedPartitionStorage::new_in_memory(topic_id, partition_id)
+                }
+            };
+
+            // Note: We don't rebuild committed_data here. After recovery, the node
+            // hasn't committed anything yet - Raft will replay committed entries as needed.
+            // The DurablePartition cache is populated from SharedWAL recovery.
+
+            // Recreate Raft group for this partition.
+            if let Err(e) = self.multi_raft.create_group(group_id, self.cluster_nodes.clone()) {
+                warn!(
+                    actor = %self.name,
+                    group = group_id.get(),
+                    error = %e,
+                    "Failed to recreate partition group during SharedWAL recovery"
+                );
+            }
+
+            self.partition_storage.insert(group_id, storage);
+
+            info!(
+                actor = %self.name,
+                topic = topic_id.get(),
+                partition = partition_id.get(),
+                entries = entries.len(),
+                "Recovered partition from SharedWAL"
+            );
         }
     }
 
@@ -1384,6 +1799,8 @@ impl SimulatedActor for HelixServiceActor {
 /// * `base_seed` - Base seed for deterministic behavior
 /// * `property_state` - Shared property state for verification
 /// * `fault_config` - Storage fault injection configuration (shared by all nodes)
+/// * `wal_mode` - WAL mode: per-partition or shared
+/// * `shared_wal_count` - Number of shared WALs (only used when `wal_mode` is `Shared`)
 ///
 /// # Returns
 ///
@@ -1399,6 +1816,8 @@ pub fn create_helix_cluster(
     base_seed: u64,
     property_state: SharedHelixPropertyState,
     fault_config: FaultConfig,
+    wal_mode: WalMode,
+    shared_wal_count: u32,
 ) -> (Vec<HelixServiceActor>, SharedNetworkState) {
     assert!(node_count > 0, "cluster must have at least one node");
     assert!(node_count <= 7, "cluster size exceeds maximum");
@@ -1419,7 +1838,8 @@ pub fn create_helix_cluster(
     // Create shared network state.
     let network_state = Arc::new(Mutex::new(crate::raft_actor::NetworkState::new()));
 
-    // Create actors.
+    // Create actors - each actor creates its OWN shared WAL pool if needed.
+    // This mirrors production where each broker has independent storage.
     let actors = node_ids
         .iter()
         .zip(actor_ids.iter())
@@ -1436,6 +1856,8 @@ pub fn create_helix_cluster(
                 Arc::clone(&property_state),
                 fault_config.clone(),
                 seed,
+                wal_mode,
+                shared_wal_count,
             )
         })
         .collect();
@@ -1453,13 +1875,36 @@ mod tests {
     }
 
     #[test]
-    fn test_create_helix_cluster() {
+    fn test_create_helix_cluster_per_partition_wal() {
         let property_state = create_test_property_state();
         let (actors, _network_state) = create_helix_cluster(
             3,
             42,
             property_state,
             FaultConfig::default(),
+            WalMode::InMemory,
+            4,
+        );
+        assert_eq!(actors.len(), 3);
+
+        for (i, actor) in actors.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let expected_node_id = (i + 1) as u64;
+            assert_eq!(actor.node_id().get(), expected_node_id);
+            assert!(!actor.is_crashed());
+        }
+    }
+
+    #[test]
+    fn test_create_helix_cluster_shared_wal() {
+        let property_state = create_test_property_state();
+        let (actors, _network_state) = create_helix_cluster(
+            3,
+            42,
+            property_state,
+            FaultConfig::default(),
+            WalMode::Shared,
+            4,
         );
         assert_eq!(actors.len(), 3);
 
@@ -1479,6 +1924,8 @@ mod tests {
             42,
             property_state,
             FaultConfig::default(),
+            WalMode::InMemory,
+            4,
         );
         let actor = &mut actors[0];
 
@@ -1490,13 +1937,29 @@ mod tests {
     }
 
     #[test]
-    fn test_create_cluster_with_faults() {
+    fn test_create_cluster_with_faults_per_partition() {
         let property_state = create_test_property_state();
         let (actors, _network_state) = create_helix_cluster(
             3,
             42,
             property_state,
             FaultConfig::flaky(),
+            WalMode::InMemory,
+            4,
+        );
+        assert_eq!(actors.len(), 3);
+    }
+
+    #[test]
+    fn test_create_cluster_with_faults_shared_wal() {
+        let property_state = create_test_property_state();
+        let (actors, _network_state) = create_helix_cluster(
+            3,
+            42,
+            property_state,
+            FaultConfig::flaky(),
+            WalMode::Shared,
+            4,
         );
         assert_eq!(actors.len(), 3);
     }

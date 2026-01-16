@@ -156,7 +156,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     ///
     /// # Errors
     /// Returns an error if the partition cannot be opened.
-    pub fn new_durable_with_shared_wal(
+    pub async fn new_durable_with_shared_wal(
         data_dir: &PathBuf,
         topic_id: TopicId,
         partition_id: PartitionId,
@@ -164,7 +164,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         recovered_entries: Vec<SharedEntry>,
     ) -> Result<Self, DurablePartitionError> {
         let config = DurablePartitionConfig::new(data_dir, topic_id, partition_id);
-        let durable = DurablePartition::open_with_shared_wal(config, wal_handle, recovered_entries)?;
+        let durable = DurablePartition::open_with_shared_wal(config, wal_handle, recovered_entries).await?;
         Ok(Self {
             topic_id,
             partition_id,
