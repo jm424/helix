@@ -1024,14 +1024,20 @@ impl RaftNode {
                 state.match_index = new_match;
             }
 
+            // Copy next_index before dropping the borrow.
+            let next_index = state.next_index;
+
             // Try to advance commit index with the new match_index.
             outputs.extend(self.try_advance_commit_index());
 
-            // Try to send more entries now that we have a free inflight slot.
-            outputs.extend(self.send_append_entries(resp.from));
+            // Only send more entries if there are actually entries to replicate.
+            // Don't send empty heartbeats here - that happens on tick().
+            // This prevents exponential message growth under message duplication.
+            if next_index <= self.log.last_index() {
+                outputs.extend(self.send_append_entries(resp.from));
+            }
 
             // Check if leadership transfer can complete.
-            // Re-fetch state since send_append_entries may have modified it.
             let state = self.replication_state.get(&resp.from);
             if self.transfer_target == Some(resp.from) {
                 if let Some(s) = state {
