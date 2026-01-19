@@ -119,7 +119,7 @@ pub struct WalSegmentReader<S: Storage + Send + Sync + 'static> {
 impl<S: Storage + Clone + Send + Sync + 'static> WalSegmentReader<S> {
     /// Creates a new segment reader for a dedicated WAL.
     #[must_use]
-    pub fn new_dedicated(wal: BufferedWal<S>) -> Self {
+    pub const fn new_dedicated(wal: BufferedWal<S>) -> Self {
         Self {
             wal: WalBackend::Dedicated(wal),
         }
@@ -386,9 +386,9 @@ impl PartitionCommand {
     /// Command types:
     /// - 0: Append
     /// - 1: Truncate
-    /// - 2: UpdateHighWatermark
-    /// - 3: AppendBlob
-    /// - 4: AppendBlobBatch
+    /// - 2: `UpdateHighWatermark`
+    /// - 3: `AppendBlob`
+    /// - 4: `AppendBlobBatch`
     #[must_use]
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
@@ -964,7 +964,7 @@ impl DurablePartitionConfig {
     ///
     /// Prefer using `with_flush_interval(Duration::ZERO)` for explicit control.
     #[must_use]
-    pub fn with_sync_on_write(mut self, sync: bool) -> Self {
+    pub const fn with_sync_on_write(mut self, sync: bool) -> Self {
         self.sync_on_write = sync;
         if sync {
             self.flush_interval = Duration::ZERO;

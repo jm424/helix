@@ -579,6 +579,7 @@ impl Transport {
     /// Loop that receives messages from a connection.
     ///
     /// Handles both single messages and batched `GroupMessage`s.
+    #[allow(clippy::too_many_lines)] // Complex message handling requires extended logic.
     async fn receive_loop(
         mut stream: TcpStream,
         incoming_tx: mpsc::Sender<IncomingMessage>,

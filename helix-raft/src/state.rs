@@ -93,7 +93,7 @@ pub enum RaftOutput {
     BecameLeader,
     /// This node stepped down from leader.
     SteppedDown,
-    /// Vote state changed (term or voted_for).
+    /// Vote state changed (term or `voted_for`).
     ///
     /// This output is emitted whenever the node's `term` or `voted_for` changes.
     /// The caller should persist this state to prevent double-voting on restart.
@@ -248,7 +248,7 @@ impl RaftNode {
     /// Creates a Raft node with restored vote state.
     ///
     /// Use this when recovering from persisted storage to restore the node's
-    /// term and voted_for state. This prevents double-voting after restarts.
+    /// term and `voted_for` state. This prevents double-voting after restarts.
     ///
     /// # Arguments
     ///

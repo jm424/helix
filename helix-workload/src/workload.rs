@@ -319,11 +319,34 @@ impl Workload {
                 )
                 .await;
             }
+            WorkloadPattern::ConcurrentProducers {
+                producers,
+                keys_per_producer,
+            } => {
+                self.run_concurrent_producers(
+                    executor,
+                    *producers,
+                    *keys_per_producer,
+                    &mut send_latencies,
+                    &mut poll_latencies,
+                )
+                .await;
+            }
+            WorkloadPattern::ProducerConsumer {
+                producer_rate,
+                consumer_count,
+            } => {
+                self.run_producer_consumer(
+                    executor,
+                    *producer_rate,
+                    *consumer_count,
+                    &mut send_latencies,
+                    &mut poll_latencies,
+                )
+                .await;
+            }
             // Sequential and other patterns use the sequential implementation.
-            WorkloadPattern::Sequential
-            | WorkloadPattern::ConcurrentProducers { .. }
-            | WorkloadPattern::ProducerConsumer { .. }
-            | WorkloadPattern::ConsumerResume { .. } => {
+            WorkloadPattern::Sequential | WorkloadPattern::ConsumerResume { .. } => {
                 self.run_sequential(executor, &mut send_latencies, &mut poll_latencies)
                     .await;
             }
@@ -461,6 +484,150 @@ impl Workload {
                 let count = (high_watermark - low_watermark) as u32;
                 let latency = self
                     .execute_poll(executor, &topic, *partition, low_watermark, count)
+                    .await;
+                if let Some(us) = latency {
+                    let _ = poll_latencies.record(us);
+                }
+            }
+        }
+    }
+
+    /// Runs concurrent producers pattern: multiple producers writing to assigned partitions.
+    ///
+    /// Simulates multiple producers by distributing operations across partitions.
+    /// Each "producer" writes to its assigned partitions in round-robin fashion.
+    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_sign_loss)] // partitions are positive
+    #[allow(clippy::future_not_send)] // Single-threaded context, Send not required.
+    async fn run_concurrent_producers<E: WorkloadExecutor>(
+        &mut self,
+        executor: &E,
+        producer_count: u32,
+        _keys_per_producer: u32,
+        send_latencies: &mut Histogram<u64>,
+        poll_latencies: &mut Histogram<u64>,
+    ) {
+        let topic = self
+            .config
+            .topics
+            .first()
+            .map_or_else(|| "test".to_string(), |t| t.name.clone());
+        let partitions: i32 = self.config.topics.first().map_or(1, |t| t.partitions);
+        let total_ops = self.config.operations;
+
+        // Assign partitions to producers (round-robin).
+        let mut producer_partitions: Vec<Vec<i32>> = vec![Vec::new(); producer_count as usize];
+        for p in 0..partitions {
+            producer_partitions[(p as usize) % (producer_count as usize)].push(p);
+        }
+
+        // Simulate concurrent producers by interleaving writes.
+        // Each iteration writes one message per producer (if they have ops remaining).
+        let ops_per_producer = total_ops / u64::from(producer_count);
+        let mut producer_op_counts: Vec<u64> = vec![0; producer_count as usize];
+
+        let mut ops_done = 0u64;
+        while ops_done < total_ops {
+            for producer_id in 0..producer_count as usize {
+                if producer_op_counts[producer_id] >= ops_per_producer {
+                    continue;
+                }
+
+                let assigned = &producer_partitions[producer_id];
+                let local_op = producer_op_counts[producer_id];
+                let partition = if assigned.is_empty() {
+                    0
+                } else {
+                    assigned[(local_op as usize) % assigned.len()]
+                };
+
+                let payload = self.generate_payload();
+                let latency = self
+                    .execute_send(executor, &topic, partition, payload)
+                    .await;
+                if let Some(us) = latency {
+                    let _ = send_latencies.record(us);
+                }
+
+                producer_op_counts[producer_id] += 1;
+                ops_done += 1;
+
+                if ops_done >= total_ops {
+                    break;
+                }
+            }
+        }
+
+        // Poll phase: read back all data from each partition.
+        for partition in 0..partitions {
+            let high_watermark = self.history.high_watermark(&topic, partition);
+            let low_watermark = self.history.low_watermark(&topic, partition).unwrap_or(0);
+            if high_watermark > low_watermark {
+                let count = (high_watermark - low_watermark) as u32;
+                let latency = self
+                    .execute_poll(executor, &topic, partition, low_watermark, count)
+                    .await;
+                if let Some(us) = latency {
+                    let _ = poll_latencies.record(us);
+                }
+            }
+        }
+    }
+
+    /// Runs producer-consumer pattern: produces first, then consumes all data.
+    ///
+    /// Produces messages at the specified rate (or unlimited if 0), then
+    /// reads back all data from all partitions to verify no lost writes.
+    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::future_not_send)] // Single-threaded context, Send not required.
+    async fn run_producer_consumer<E: WorkloadExecutor>(
+        &mut self,
+        executor: &E,
+        producer_rate: u32,
+        _consumer_count: u32,
+        send_latencies: &mut Histogram<u64>,
+        poll_latencies: &mut Histogram<u64>,
+    ) {
+        let topic = self
+            .config
+            .topics
+            .first()
+            .map_or_else(|| "test".to_string(), |t| t.name.clone());
+        let partitions: i32 = self.config.topics.first().map_or(1, |t| t.partitions);
+        let total_ops = self.config.operations;
+
+        // Production phase with optional rate limiting.
+        let interval = if producer_rate > 0 {
+            Duration::from_micros(1_000_000 / u64::from(producer_rate))
+        } else {
+            Duration::ZERO
+        };
+
+        for i in 0..total_ops {
+            let partition = (i as i32) % partitions;
+            let payload = self.generate_payload();
+
+            let latency = self
+                .execute_send(executor, &topic, partition, payload)
+                .await;
+            if let Some(us) = latency {
+                let _ = send_latencies.record(us);
+            }
+
+            // Rate limiting.
+            if !interval.is_zero() {
+                tokio::time::sleep(interval).await;
+            }
+        }
+
+        // Consumption phase: read back all data from all partitions.
+        for partition in 0..partitions {
+            let high_watermark = self.history.high_watermark(&topic, partition);
+            let low_watermark = self.history.low_watermark(&topic, partition).unwrap_or(0);
+            if high_watermark > low_watermark {
+                let count = (high_watermark - low_watermark) as u32;
+                let latency = self
+                    .execute_poll(executor, &topic, partition, low_watermark, count)
                     .await;
                 if let Some(us) = latency {
                     let _ = poll_latencies.record(us);

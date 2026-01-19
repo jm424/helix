@@ -44,13 +44,13 @@ use helix_tier::{ObjectKey, ObjectStorage, TierError};
 // =============================================================================
 
 /// Magic bytes for vote state file format.
-const VOTE_STATE_MAGIC: u32 = 0x564F5445; // "VOTE"
+const VOTE_STATE_MAGIC: u32 = 0x564F_5445; // "VOTE"
 
 /// Current version of the vote state format.
 const VOTE_STATE_VERSION: u32 = 1;
 
 /// Maximum number of groups in a vote state file.
-/// Matches GROUPS_PER_NODE_MAX in helix-raft.
+/// Matches `GROUPS_PER_NODE_MAX` in helix-raft.
 const MAX_GROUPS: usize = 10_000;
 
 // =============================================================================
@@ -209,7 +209,7 @@ impl VoteState {
         for group in groups {
             buf.put_u64(group.group_id.get());
             buf.put_u64(group.term.get());
-            buf.put_u64(group.voted_for.map_or(0, |n| n.get()));
+            buf.put_u64(group.voted_for.map_or(0, helix_core::NodeId::get));
         }
 
         // Checksum (over everything except the checksum itself)
@@ -290,8 +290,7 @@ impl VoteState {
         if buf.remaining() < expected_groups_size + 4 {
             // +4 for checksum
             return Err(VoteStoreError::InvalidFormat(format!(
-                "data truncated: expected {} bytes for {} groups",
-                expected_groups_size, group_count
+                "data truncated: expected {expected_groups_size} bytes for {group_count} groups",
             )));
         }
 
@@ -328,6 +327,7 @@ impl Default for VoteState {
 ///
 /// This trait enables deterministic simulation testing by allowing
 /// the local storage to be replaced with an in-memory implementation.
+#[allow(clippy::missing_errors_doc)] // Errors documented at impl level.
 pub trait VoteStorage: Send + Sync {
     /// Reads vote state from storage.
     ///
@@ -349,7 +349,7 @@ pub struct LocalFileVoteStorage {
 impl LocalFileVoteStorage {
     /// Creates a new local file storage.
     #[must_use]
-    pub fn new(path: PathBuf) -> Self {
+    pub const fn new(path: PathBuf) -> Self {
         Self { path }
     }
 }
@@ -422,6 +422,10 @@ impl SimulatedVoteStorage {
     }
 
     /// Returns a reference to the fault configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mutex is poisoned.
     pub fn fault_config(&self) -> std::sync::MutexGuard<'_, VoteStorageFaultConfig> {
         self.fault_config.lock().expect("fault config lock poisoned")
     }
@@ -458,8 +462,7 @@ impl VoteStorage for SimulatedVoteStorage {
         let mut config = self.fault_config.lock().expect("fault config lock poisoned");
         if config.force_read_fail {
             config.force_read_fail = false;
-            return Err(VoteStoreError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(VoteStoreError::Io(std::io::Error::other(
                 "simulated read failure (forced)",
             )));
         }
@@ -467,8 +470,7 @@ impl VoteStorage for SimulatedVoteStorage {
         drop(config);
 
         if self.should_inject_fault(read_fail_rate) {
-            return Err(VoteStoreError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(VoteStoreError::Io(std::io::Error::other(
                 "simulated read failure (random)",
             )));
         }
@@ -481,8 +483,7 @@ impl VoteStorage for SimulatedVoteStorage {
         let mut config = self.fault_config.lock().expect("fault config lock poisoned");
         if config.force_write_fail {
             config.force_write_fail = false;
-            return Err(VoteStoreError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(VoteStoreError::Io(std::io::Error::other(
                 "simulated write failure (forced)",
             )));
         }
@@ -490,8 +491,7 @@ impl VoteStorage for SimulatedVoteStorage {
         drop(config);
 
         if self.should_inject_fault(write_fail_rate) {
-            return Err(VoteStoreError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(VoteStoreError::Io(std::io::Error::other(
                 "simulated write failure (random)",
             )));
         }

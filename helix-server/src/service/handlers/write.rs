@@ -45,7 +45,11 @@ impl HelixService {
     /// In single-node mode, entries commit synchronously and we handle ordering
     /// directly in this handler. In multi-node mode, we rely on the tick task
     /// to process replication and notify pending proposals.
-    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
+    #[allow(
+        clippy::significant_drop_tightening,
+        clippy::too_many_lines,
+        clippy::cast_possible_truncation // record_count is bounded by MAX_RECORDS_PER_WRITE
+    )]
     pub(crate) async fn write_internal(&self, request: WriteRequest) -> ServerResult<WriteResponse> {
         // Validate request.
         assert!(!request.topic.is_empty(), "topic cannot be empty");
@@ -231,8 +235,7 @@ impl HelixService {
             // Exhausted retries - this indicates a bug or deadlock.
             return Err(ServerError::Internal {
                 message: format!(
-                    "timeout waiting for apply ordering after {} retries",
-                    MAX_CONCURRENT_APPLY_RETRIES
+                    "timeout waiting for apply ordering after {MAX_CONCURRENT_APPLY_RETRIES} retries",
                 ),
             });
         } else {

@@ -257,14 +257,19 @@ mod tests {
 
             // Schedule produce events starting at 2500ms (after topic creation).
             // Produce data format: topic_id (8 bytes) + partition_id (8 bytes) + payload
-            // We use topic_id=1 (first user topic after controller) and partition_id=0.
+            // We use topic_id=1 (first user topic after controller).
+            // Partition is round-robin across all 3 partitions to actually test multi-partition.
+            const PARTITION_COUNT: u64 = 3;
             for i in 0..config.produce_count {
                 let time_ms = 2500 + u64::from(i) * config.produce_interval_ms;
+
+                // Round-robin across partitions to test multi-partition scenarios.
+                let partition_id = u64::from(i) % PARTITION_COUNT;
 
                 // Create produce payload with sequence number for verification.
                 let mut produce_data = Vec::with_capacity(24);
                 produce_data.extend_from_slice(&1u64.to_le_bytes()); // topic_id = 1
-                produce_data.extend_from_slice(&0u64.to_le_bytes()); // partition_id = 0
+                produce_data.extend_from_slice(&partition_id.to_le_bytes()); // partition_id = round-robin
                 produce_data.extend_from_slice(&u64::from(i).to_le_bytes()); // payload = sequence number
 
                 // Round-robin across nodes (might hit non-leaders, which is realistic).
@@ -322,9 +327,18 @@ mod tests {
         let property_result = check_helix_properties(&property_state)
             .expect("property state lock should not be poisoned");
 
+        // Format per-partition ack counts for display.
+        let per_partition_str: String = property_result
+            .per_partition_ack_counts
+            .iter()
+            .map(|((t, p), count)| format!("t{}p{}={}", t, p, count))
+            .collect::<Vec<_>>()
+            .join(", ");
+
         println!(
             "Seed {}: {} events in {}ms, {} property events, leaders_by_term: {:?}, \
              partitions: {}, produces: {}, commits: {}, client_acks: {}, \
+             per_partition_acks: [{}], \
              integrity_verified: {}, integrity_violations: {}, consumer_verified: {}, consumer_violations: {}",
             config.seed,
             result.stats.events_processed,
@@ -335,6 +349,7 @@ mod tests {
             property_result.total_produce_success,
             property_result.total_committed_entries,
             property_result.total_client_acks,
+            per_partition_str,
             property_result.integrity_verified,
             property_result.data_integrity_violations.len(),
             property_result.consumer_verified,
@@ -1265,6 +1280,163 @@ mod tests {
                 500,
             );
         }
+    }
+
+    // =========================================================================
+    // Multi-Partition Leader Failure Tests
+    // =========================================================================
+    // These tests verify that partition leaders can fail over correctly when
+    // the node hosting them crashes, and that no data is lost.
+
+    #[test]
+    fn test_helix_service_multi_partition_leader_failure() {
+        // 3-node cluster with client traffic to multiple partitions.
+        // Crash node 0 (likely leader for some partitions) mid-test.
+        // Verify partitions remain accessible after failover.
+        let config = HelixTestConfig {
+            node_count: 3,
+            seed: 8888,
+            max_time_secs: 60,
+            inject_crashes: true,
+            crash_time_ms: 15000,    // Crash at 15s
+            recover_time_ms: 35000,  // Recover at 35s
+            crash_node_index: 0,     // Crash node 0
+            inject_client_traffic: true,
+            produce_interval_ms: 80,
+            produce_count: 500,      // Many produces across partitions
+            ..Default::default()
+        };
+
+        let result = run_basic_simulation(&config);
+        assert_simulation_ok(&result, "multi_partition_leader_failure", 1000);
+
+        // Verify we had client acks (data was actually written).
+        assert!(
+            result.property_result.total_client_acks > 0,
+            "Should have client acks from produces"
+        );
+
+        // Verify data went to ALL 3 partitions (not just partition 0).
+        // Topic ID 1 is the first user topic; partitions are 0, 1, 2.
+        let acks = &result.property_result.per_partition_ack_counts;
+        assert!(
+            acks.get(&(1, 0)).map_or(0, |&c| c) > 0,
+            "Should have acks for partition 0, got: {:?}",
+            acks
+        );
+        assert!(
+            acks.get(&(1, 1)).map_or(0, |&c| c) > 0,
+            "Should have acks for partition 1, got: {:?}",
+            acks
+        );
+        assert!(
+            acks.get(&(1, 2)).map_or(0, |&c| c) > 0,
+            "Should have acks for partition 2, got: {:?}",
+            acks
+        );
+
+        // Verify no data integrity violations.
+        assert!(
+            result.property_result.data_integrity_violations.is_empty(),
+            "Should have no data integrity violations"
+        );
+
+        // Verify no consumer violations (acknowledged data is consumable).
+        assert!(
+            result.property_result.consumer_violations.is_empty(),
+            "Should have no consumer violations (data loss)"
+        );
+    }
+
+    #[test]
+    fn test_helix_service_multi_partition_leader_failure_stress() {
+        // Multi-seed stress test for partition leader failure.
+        let mut total_violations = 0usize;
+        let mut total_client_acks = 0usize;
+        let mut total_data_integrity_violations = 0usize;
+        let mut total_consumer_violations = 0usize;
+
+        for seed in 0..10 {
+            let config = HelixTestConfig {
+                node_count: 3,
+                seed,
+                max_time_secs: 60,
+                inject_crashes: true,
+                crash_time_ms: 12000 + (seed % 5) * 2000,  // Vary crash time
+                recover_time_ms: 35000,
+                crash_node_index: (seed as usize) % 3,     // Rotate crash node
+                inject_client_traffic: true,
+                produce_interval_ms: 100,
+                produce_count: 400,
+                ..Default::default()
+            };
+
+            let result = run_basic_simulation(&config);
+            assert_simulation_ok(
+                &result,
+                &format!("multi_partition_leader_failure_seed_{}", seed),
+                800,
+            );
+
+            total_violations += result.property_result.violations.len();
+            total_client_acks += result.property_result.total_client_acks;
+            total_data_integrity_violations += result.property_result.data_integrity_violations.len();
+            total_consumer_violations += result.property_result.consumer_violations.len();
+        }
+
+        assert_eq!(
+            total_violations, 0,
+            "No consensus violations across multi-partition leader failure stress"
+        );
+        assert_eq!(
+            total_data_integrity_violations, 0,
+            "No data integrity violations across stress test"
+        );
+        assert_eq!(
+            total_consumer_violations, 0,
+            "No consumer violations (data loss) across stress test"
+        );
+        println!(
+            "Multi-partition leader failure stress: 10 seeds completed, {} client acks, 0 violations",
+            total_client_acks
+        );
+    }
+
+    #[test]
+    fn test_helix_service_multi_partition_cascading_failure() {
+        // Test cascading failure: crash one node, then partition another.
+        // This exercises more complex failure scenarios.
+        let config = HelixTestConfig {
+            node_count: 3,
+            seed: 9999,
+            max_time_secs: 90,
+            inject_crashes: true,
+            crash_time_ms: 15000,    // Crash node at 15s
+            recover_time_ms: 50000,  // Recover at 50s
+            crash_node_index: 1,
+            inject_partition: true,
+            partition_time_ms: 25000, // Partition at 25s (while node is crashed)
+            heal_time_ms: 45000,      // Heal partition at 45s
+            inject_storage_faults: true,
+            storage_fault_config: Some(FaultConfig::flaky()),
+            inject_client_traffic: true,
+            produce_interval_ms: 100,
+            produce_count: 600,
+            ..Default::default()
+        };
+
+        let result = run_basic_simulation(&config);
+        assert_simulation_ok(&result, "multi_partition_cascading_failure", 1500);
+
+        // Verify safety properties held under cascading failures.
+        assert!(
+            result.property_result.violations.is_empty(),
+            "No consensus violations during cascading failure"
+        );
+        assert!(
+            result.property_result.data_integrity_violations.is_empty(),
+            "No data integrity violations during cascading failure"
+        );
     }
 
     // =========================================================================

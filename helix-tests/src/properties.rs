@@ -926,6 +926,9 @@ pub struct HelixPropertyCheckResult {
     pub consumer_verified: bool,
     /// Total client-acknowledged produces.
     pub total_client_acks: usize,
+    /// Per-partition client-ack counts: (topic_id, partition_id) -> count.
+    /// Used to verify data is distributed across partitions in multi-partition tests.
+    pub per_partition_ack_counts: BTreeMap<(u64, u64), usize>,
 }
 
 impl HelixPropertyCheckResult {
@@ -969,6 +972,13 @@ pub fn check_helix_properties(
         }
     }
 
+    // Build per-partition ack counts.
+    let per_partition_ack_counts: BTreeMap<(u64, u64), usize> = state
+        .client_acked_produces
+        .iter()
+        .map(|((topic_id, partition_id), acks)| ((*topic_id, *partition_id), acks.len()))
+        .collect();
+
     Ok(HelixPropertyCheckResult {
         violations,
         data_integrity_violations: state.data_integrity_violations.clone(),
@@ -981,6 +991,7 @@ pub fn check_helix_properties(
         integrity_verified: state.integrity_verified,
         consumer_verified: state.consumer_verified,
         total_client_acks: state.total_client_acks(),
+        per_partition_ack_counts,
     })
 }
 

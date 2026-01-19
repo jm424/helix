@@ -434,7 +434,7 @@ async fn process_outputs(
                 debug!(
                     group = group_id.get(),
                     term = term.get(),
-                    voted_for = ?voted_for.map(|n| n.get()),
+                    voted_for = ?voted_for.map(helix_core::NodeId::get),
                     "Vote state changed (single-node, not persisting)"
                 );
                 // Single-node mode doesn't persist vote state.
@@ -947,7 +947,7 @@ async fn process_outputs_multi_node(
                 debug!(
                     group = group_id.get(),
                     term = term.get(),
-                    voted_for = ?voted_for.map(|n| n.get()),
+                    voted_for = ?voted_for.map(helix_core::NodeId::get),
                     "Vote state changed (persistence not yet implemented)"
                 );
             }

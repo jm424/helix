@@ -36,6 +36,9 @@ tracing.workspace = true
 # Time and statistics.
 hdrhistogram.workspace = true
 
+# Async utilities.
+futures.workspace = true
+
 # Internal dependencies.
 helix-core.workspace = true
 

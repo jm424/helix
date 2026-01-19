@@ -308,7 +308,7 @@ impl MultiRaft {
     /// Creates a new Raft group with restored vote state.
     ///
     /// Use this when recovering from persisted storage to restore the group's
-    /// term and voted_for state. This prevents double-voting after restarts.
+    /// term and `voted_for` state. This prevents double-voting after restarts.
     ///
     /// # Arguments
     ///
@@ -376,6 +376,7 @@ impl MultiRaft {
     /// - The group already exists
     /// - Maximum group count exceeded
     /// - This node is not in the peer list
+    #[allow(clippy::too_many_arguments)] // All args are needed for state restoration.
     pub fn create_group_with_state_and_config(
         &mut self,
         group_id: GroupId,
