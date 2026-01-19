@@ -18,6 +18,7 @@ use bytes::Bytes;
 use helix_core::{LogIndex, NodeId, TermId};
 
 use crate::config::RaftConfig;
+use crate::limits;
 use crate::log::{LogEntry, RaftLog};
 use crate::message::{
     AppendEntriesRequest, AppendEntriesResponse, ClientRequest, InstallSnapshotRequest,
@@ -41,6 +42,41 @@ pub enum RaftState {
     Leader,
 }
 
+/// Replication state for a single follower (leader only).
+///
+/// Tracks the progress of replicating the log to a follower, including
+/// pipelining state for in-flight `AppendEntries` requests.
+#[derive(Debug, Clone)]
+struct ReplicationState {
+    /// Index of next log entry to send to this follower.
+    next_index: LogIndex,
+    /// Index of highest log entry known to be replicated on this follower.
+    match_index: LogIndex,
+    /// Number of `AppendEntries` currently in flight to this follower.
+    /// Bounded by `MAX_INFLIGHT_APPEND_ENTRIES`.
+    inflight_count: u32,
+    /// Ticks since inflight requests were sent without response.
+    /// Reset to 0 when a response is received. Used to timeout stale
+    /// inflight state (e.g., after follower crash/recovery).
+    inflight_stale_ticks: u32,
+}
+
+/// Number of ticks without response before resetting inflight state.
+/// This handles the case where a follower crashes and recovers.
+const INFLIGHT_TIMEOUT_TICKS: u32 = 20;
+
+impl ReplicationState {
+    /// Creates new replication state with the given `next_index`.
+    const fn new(next_index: LogIndex) -> Self {
+        Self {
+            next_index,
+            match_index: LogIndex::new(0),
+            inflight_count: 0,
+            inflight_stale_ticks: 0,
+        }
+    }
+}
+
 /// Output actions from the Raft state machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RaftOutput {
@@ -57,6 +93,16 @@ pub enum RaftOutput {
     BecameLeader,
     /// This node stepped down from leader.
     SteppedDown,
+    /// Vote state changed (term or voted_for).
+    ///
+    /// This output is emitted whenever the node's `term` or `voted_for` changes.
+    /// The caller should persist this state to prevent double-voting on restart.
+    VoteStateChanged {
+        /// The new term.
+        term: TermId,
+        /// Who we voted for in the new term (None if haven't voted).
+        voted_for: Option<NodeId>,
+    },
 }
 
 /// Simple linear congruential generator for deterministic randomization.
@@ -137,10 +183,10 @@ pub struct RaftNode {
     last_applied: LogIndex,
 
     // Volatile state on leaders (reinitialized after election).
-    /// For each server, index of next log entry to send.
-    next_index: HashMap<NodeId, LogIndex>,
-    /// For each server, index of highest log entry known to be replicated.
-    match_index: HashMap<NodeId, LogIndex>,
+    /// Replication state for each follower (leader only).
+    ///
+    /// Tracks `next_index`, `match_index`, and pipelining inflight count.
+    replication_state: HashMap<NodeId, ReplicationState>,
 
     // Pre-candidate state.
     /// Pre-votes received in current pre-election.
@@ -177,36 +223,78 @@ pub struct RaftNode {
 
     /// Random number generator for election timeout randomization.
     rng: SimpleRng,
+
+    // Observation mode state (for safe S3 recovery).
+    /// Whether observation mode is enabled.
+    ///
+    /// In observation mode, the node rejects vote requests but learns the
+    /// current term from heartbeats. This is used when recovering from S3
+    /// where the persisted state may be stale.
+    observation_mode: bool,
+
+    /// Ticks remaining in observation mode.
+    ///
+    /// Decremented each tick. When it reaches 0, observation mode ends.
+    observation_ticks_remaining: u32,
 }
 
 impl RaftNode {
     /// Creates a new Raft node.
     #[must_use]
     pub fn new(config: RaftConfig) -> Self {
-        let peers = config.peers();
-        let mut next_index = HashMap::new();
-        let mut match_index = HashMap::new();
+        Self::with_vote_state(config, TermId::new(0), None, false)
+    }
 
-        // Initialize leader state for all peers.
-        for peer in &peers {
-            next_index.insert(*peer, LogIndex::new(1));
-            match_index.insert(*peer, LogIndex::new(0));
-        }
-
+    /// Creates a Raft node with restored vote state.
+    ///
+    /// Use this when recovering from persisted storage to restore the node's
+    /// term and voted_for state. This prevents double-voting after restarts.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Node configuration
+    /// * `term` - Persisted term
+    /// * `voted_for` - Who we voted for in the persisted term
+    /// * `observation_mode` - Enable observation mode for safe S3 recovery
+    ///
+    /// # Observation Mode
+    ///
+    /// When recovering from S3 (vs local disk), the persisted state may be
+    /// stale because S3 uploads are asynchronous. In observation mode:
+    /// - The node rejects all vote requests
+    /// - The node learns the current term from heartbeats
+    /// - After one election timeout, observation mode ends
+    ///
+    /// This prevents double-voting when the persisted term is behind the actual
+    /// cluster term.
+    #[must_use]
+    pub fn with_vote_state(
+        config: RaftConfig,
+        term: TermId,
+        voted_for: Option<NodeId>,
+        observation_mode: bool,
+    ) -> Self {
         let mut rng = SimpleRng::new(config.random_seed);
         let election_tick = config.election_tick;
         let randomized_timeout = rng.range(election_tick, election_tick * 2);
 
+        // In observation mode, wait one full election timeout before participating.
+        let observation_ticks = if observation_mode {
+            randomized_timeout
+        } else {
+            0
+        };
+
         Self {
             config,
-            current_term: TermId::new(0),
-            voted_for: None,
+            current_term: term,
+            voted_for,
             log: RaftLog::new(),
             state: RaftState::Follower,
             commit_index: LogIndex::new(0),
             last_applied: LogIndex::new(0),
-            next_index,
-            match_index,
+            // Replication state is initialized when becoming leader.
+            replication_state: HashMap::new(),
             pre_votes_received: HashSet::new(),
             votes_received: HashSet::new(),
             leader_id: None,
@@ -216,7 +304,21 @@ impl RaftNode {
             heartbeat_elapsed: 0,
             randomized_election_timeout: randomized_timeout,
             rng,
+            observation_mode,
+            observation_ticks_remaining: observation_ticks,
         }
+    }
+
+    /// Returns the who this node voted for in the current term.
+    #[must_use]
+    pub const fn voted_for(&self) -> Option<NodeId> {
+        self.voted_for
+    }
+
+    /// Returns whether observation mode is active.
+    #[must_use]
+    pub const fn is_observation_mode(&self) -> bool {
+        self.observation_mode
     }
 
     /// Returns this node's ID.
@@ -300,8 +402,23 @@ impl RaftNode {
     /// Tick processing for leaders.
     ///
     /// Sends heartbeats when `heartbeat_elapsed` >= `heartbeat_tick`.
+    /// Also tracks inflight timeouts to handle follower crash/recovery.
     fn tick_leader(&mut self) -> Vec<RaftOutput> {
         self.heartbeat_elapsed += 1;
+
+        // Track inflight timeouts for each follower.
+        // If we've been waiting too long for responses, reset inflight state.
+        // This handles the case where a follower crashes and recovers.
+        for state in self.replication_state.values_mut() {
+            if state.inflight_count > 0 {
+                state.inflight_stale_ticks += 1;
+                if state.inflight_stale_ticks >= INFLIGHT_TIMEOUT_TICKS {
+                    // Assume inflight requests are lost. Reset state.
+                    state.inflight_count = 0;
+                    state.inflight_stale_ticks = 0;
+                }
+            }
+        }
 
         if self.heartbeat_elapsed >= self.config.heartbeat_tick {
             self.heartbeat_elapsed = 0;
@@ -314,7 +431,23 @@ impl RaftNode {
     /// Tick processing for non-leaders.
     ///
     /// Starts election when `election_elapsed` >= `randomized_timeout`.
+    /// In observation mode, decrements the observation timer instead of
+    /// starting elections.
     fn tick_election(&mut self) -> Vec<RaftOutput> {
+        // Handle observation mode countdown.
+        if self.observation_mode {
+            if self.observation_ticks_remaining > 0 {
+                self.observation_ticks_remaining -= 1;
+            }
+            if self.observation_ticks_remaining == 0 {
+                self.observation_mode = false;
+            }
+            // Don't start elections during observation mode.
+            // Reset election elapsed to prevent immediate election after exiting.
+            self.election_elapsed = 0;
+            return Vec::new();
+        }
+
         self.election_elapsed += 1;
 
         if self.election_elapsed >= self.randomized_election_timeout {
@@ -340,7 +473,7 @@ impl RaftNode {
     }
 
     /// Sends heartbeats to all followers (leader only).
-    fn send_heartbeats(&self) -> Vec<RaftOutput> {
+    fn send_heartbeats(&mut self) -> Vec<RaftOutput> {
         debug_assert!(self.state == RaftState::Leader);
         debug_assert!(self.leader_id == Some(self.config.node_id));
 
@@ -431,9 +564,44 @@ impl RaftNode {
         // (Leader implicitly has all its own entries.)
 
         // Send AppendEntries to all peers.
-        for peer in self.config.peers() {
+        let peers = self.config.peers();
+        let peer_count = peers.len();
+
+        // Log inflight state before sending.
+        for &peer in &peers {
+            if let Some(state) = self.replication_state.get(&peer) {
+                tracing::debug!(
+                    index = index.get(),
+                    peer = peer.get(),
+                    inflight = state.inflight_count,
+                    next_index = state.next_index.get(),
+                    match_index = state.match_index.get(),
+                    "handle_client_request: peer state before send"
+                );
+            } else {
+                tracing::warn!(
+                    index = index.get(),
+                    peer = peer.get(),
+                    "handle_client_request: NO replication state for peer"
+                );
+            }
+        }
+
+        for peer in peers {
             outputs.extend(self.send_append_entries(peer));
         }
+
+        // Count how many SendMessage outputs we generated.
+        let msg_count = outputs
+            .iter()
+            .filter(|o| matches!(o, RaftOutput::SendMessage(_)))
+            .count();
+        tracing::debug!(
+            index = index.get(),
+            peer_count,
+            msg_count,
+            "handle_client_request: proposed entry"
+        );
 
         // Try to advance commit index (might succeed in single-node cluster).
         outputs.extend(self.try_advance_commit_index());
@@ -445,6 +613,8 @@ impl RaftNode {
     ///
     /// Returns the actions to take.
     pub fn handle_message(&mut self, message: Message) -> Vec<RaftOutput> {
+        let mut outputs = Vec::new();
+
         // For pre-vote messages, don't step down based on term.
         // Pre-vote terms are speculative and shouldn't cause state changes.
         let is_pre_vote = matches!(message, Message::PreVote(_) | Message::PreVoteResponse(_));
@@ -453,10 +623,10 @@ impl RaftNode {
         // Don't step down for pre-vote messages.
         let msg_term = message.term();
         if !is_pre_vote && msg_term > self.current_term {
-            self.step_down(msg_term);
+            outputs.extend(self.step_down(msg_term));
         }
 
-        match message {
+        outputs.extend(match message {
             Message::PreVote(req) => self.handle_pre_vote(req),
             Message::PreVoteResponse(resp) => self.handle_pre_vote_response(resp),
             Message::RequestVote(req) => self.handle_request_vote(req),
@@ -466,13 +636,15 @@ impl RaftNode {
             Message::TimeoutNow(req) => self.handle_timeout_now(req),
             Message::InstallSnapshot(ref req) => self.handle_install_snapshot(req),
             Message::InstallSnapshotResponse(resp) => self.handle_install_snapshot_response(resp),
-        }
+        });
+
+        outputs
     }
 
     /// Steps down to follower and updates term.
-    fn step_down(&mut self, new_term: TermId) {
-        let was_leader = self.state == RaftState::Leader;
-
+    ///
+    /// Returns a `VoteStateChanged` output that must be included in the response.
+    fn step_down(&mut self, new_term: TermId) -> Vec<RaftOutput> {
         self.current_term = new_term;
         self.state = RaftState::Follower;
         self.voted_for = None;
@@ -484,9 +656,11 @@ impl RaftNode {
         self.reset_election_elapsed();
         self.reset_randomized_election_timeout();
 
-        // Note: we don't emit SteppedDown here because step_down is called
-        // before processing the message. The output will be handled elsewhere.
-        let _ = was_leader; // Suppress unused warning.
+        // Emit vote state change (term updated, vote cleared).
+        vec![RaftOutput::VoteStateChanged {
+            term: self.current_term,
+            voted_for: self.voted_for,
+        }]
     }
 
     /// Handles a pre-vote request.
@@ -494,6 +668,20 @@ impl RaftNode {
     /// Pre-vote doesn't update term or `voted_for` state - it's speculative.
     fn handle_pre_vote(&self, req: PreVoteRequest) -> Vec<RaftOutput> {
         let mut outputs = Vec::new();
+
+        // Reject all pre-votes during observation mode.
+        // In observation mode, we're recovering from S3 and don't know the
+        // current cluster state yet.
+        if self.observation_mode {
+            let response = PreVoteResponse::new(
+                req.term,
+                self.config.node_id,
+                req.candidate_id,
+                false,
+            );
+            outputs.push(RaftOutput::SendMessage(Message::PreVoteResponse(response)));
+            return outputs;
+        }
 
         // Grant pre-vote if:
         // 1. The candidate's proposed term is >= our term
@@ -557,6 +745,12 @@ impl RaftNode {
         self.votes_received.clear();
         self.votes_received.insert(self.config.node_id);
 
+        // Emit vote state change (term incremented, voted for self).
+        outputs.push(RaftOutput::VoteStateChanged {
+            term: self.current_term,
+            voted_for: self.voted_for,
+        });
+
         // Send RequestVote to all peers.
         for peer in self.config.peers() {
             let request = RequestVoteRequest::new(
@@ -587,6 +781,12 @@ impl RaftNode {
             self.voted_for = Some(req.candidate_id);
             // Reset election timeout when granting vote.
             self.reset_election_elapsed();
+
+            // Emit vote state change (voted for a candidate).
+            outputs.push(RaftOutput::VoteStateChanged {
+                term: self.current_term,
+                voted_for: self.voted_for,
+            });
         }
 
         let response = RequestVoteResponse::new(
@@ -604,6 +804,13 @@ impl RaftNode {
 
     /// Determines if we should grant a vote to a candidate.
     fn should_grant_vote(&self, req: &RequestVoteRequest) -> bool {
+        // Reject all votes during observation mode.
+        // In observation mode, we're recovering from S3 and don't know the
+        // current cluster state yet. We need to wait and learn from heartbeats.
+        if self.observation_mode {
+            return false;
+        }
+
         // Reject if term is old.
         if req.term < self.current_term {
             return false;
@@ -653,22 +860,40 @@ impl RaftNode {
         self.heartbeat_elapsed = 0;
 
         // Initialize leader state.
+        // next_index starts at last_index + 1 (optimistic).
+        // match_index starts at 0 (unknown).
+        // inflight_count starts at 0 (no in-flight requests).
         let next_idx = LogIndex::new(self.log.last_index().get() + 1);
         for peer in self.config.peers() {
-            self.next_index.insert(peer, next_idx);
-            self.match_index.insert(peer, LogIndex::new(0));
+            self.replication_state.insert(peer, ReplicationState::new(next_idx));
         }
 
         // Postcondition: leader state initialized for all peers.
-        debug_assert!(self.next_index.len() == self.config.peers().len());
-        debug_assert!(self.match_index.len() == self.config.peers().len());
+        debug_assert!(self.replication_state.len() == self.config.peers().len());
 
         outputs.push(RaftOutput::BecameLeader);
 
-        // Send initial empty AppendEntries (heartbeat) to all peers.
+        // Append a no-op entry to commit entries from previous terms.
+        //
+        // Raft leaders cannot directly commit entries from previous terms (safety).
+        // By appending an entry in the current term and committing it, all prior
+        // entries are also committed. Without this, uncommitted entries from a
+        // crashed leader could remain uncommitted indefinitely if no new client
+        // requests arrive.
+        //
+        // This is a standard Raft optimization implemented by Kafka KRaft
+        // (LeaderChangeMessage) and Redpanda (replicate_config_as_new_leader).
+        let noop_index = LogIndex::new(self.log.last_index().get() + 1);
+        let noop_entry = LogEntry::new(self.current_term, noop_index, Bytes::new());
+        self.log.append(noop_entry);
+
+        // Send AppendEntries (with no-op) to all peers.
         for peer in self.config.peers() {
             outputs.extend(self.send_append_entries(peer));
         }
+
+        // Try to advance commit index (may succeed in single-node cluster).
+        outputs.extend(self.try_advance_commit_index());
 
         // Postcondition: we are now the leader.
         debug_assert!(self.state == RaftState::Leader);
@@ -697,14 +922,23 @@ impl RaftNode {
         }
 
         // Valid AppendEntries from current or newer term.
-        // Step down if we're a candidate.
-        if self.state == RaftState::Candidate {
+        // Step down if we're a candidate or pre-candidate.
+        // A PreCandidate receiving AppendEntries from a valid leader should
+        // also step down (the leader exists, no need to start an election).
+        if self.state == RaftState::Candidate || self.state == RaftState::PreCandidate {
             self.state = RaftState::Follower;
             self.votes_received.clear();
+            self.pre_votes_received.clear();
         }
 
         // Remember the leader.
-        self.leader_id = Some(req.leader_id);
+        // Only update leader_id if we're not already the leader.
+        // A Leader receiving AppendEntries from another leader in the same term
+        // is a Raft violation (two leaders in same term). In this case, we keep
+        // our own leader_id to avoid corrupting our state.
+        if self.state != RaftState::Leader {
+            self.leader_id = Some(req.leader_id);
+        }
 
         // Reset election timeout - we heard from a valid leader.
         self.reset_election_elapsed();
@@ -756,6 +990,10 @@ impl RaftNode {
     }
 
     /// Handles an `AppendEntries` response (leader only).
+    ///
+    /// With pipelining, we may have multiple in-flight requests. On success,
+    /// we update `match_index` and try to send more. On failure, we reset the
+    /// pipeline and backtrack using the follower's `match_index` for fast backup.
     fn handle_append_entries_response(
         &mut self,
         resp: AppendEntriesResponse,
@@ -767,36 +1005,57 @@ impl RaftNode {
             return outputs;
         }
 
-        if resp.success {
-            // Update next_index and match_index for this follower.
-            let new_match = resp.match_index;
-            self.match_index.insert(resp.from, new_match);
-            self.next_index
-                .insert(resp.from, LogIndex::new(new_match.get() + 1));
+        let Some(state) = self.replication_state.get_mut(&resp.from) else {
+            return outputs;
+        };
 
-            // Try to advance commit index.
+        // Reset stale tick counter - we got a response from this follower.
+        state.inflight_stale_ticks = 0;
+
+        if resp.success {
+            // Decrement inflight count - this response completes one request.
+            state.inflight_count = state.inflight_count.saturating_sub(1);
+
+            // Update match_index to the confirmed value from the follower.
+            // Only advance if the new match is higher (responses may arrive
+            // out of order with pipelining).
+            let new_match = resp.match_index;
+            if new_match > state.match_index {
+                state.match_index = new_match;
+            }
+
+            // Try to advance commit index with the new match_index.
             outputs.extend(self.try_advance_commit_index());
 
+            // Try to send more entries now that we have a free inflight slot.
+            outputs.extend(self.send_append_entries(resp.from));
+
             // Check if leadership transfer can complete.
+            // Re-fetch state since send_append_entries may have modified it.
+            let state = self.replication_state.get(&resp.from);
             if self.transfer_target == Some(resp.from) {
-                // Target is now caught up, send TimeoutNow.
-                if new_match >= self.log.last_index() {
-                    let timeout_now = TimeoutNowRequest::new(
-                        self.current_term,
-                        self.config.node_id,
-                        resp.from,
-                    );
-                    outputs.push(RaftOutput::SendMessage(Message::TimeoutNow(timeout_now)));
+                if let Some(s) = state {
+                    if s.match_index >= self.log.last_index() {
+                        let timeout_now = TimeoutNowRequest::new(
+                            self.current_term,
+                            self.config.node_id,
+                            resp.from,
+                        );
+                        outputs.push(RaftOutput::SendMessage(Message::TimeoutNow(timeout_now)));
+                    }
                 }
             }
         } else {
-            // Decrement next_index and retry.
-            let next = self.next_index.get(&resp.from).copied().unwrap_or(LogIndex::new(1));
-            if next.get() > 1 {
-                self.next_index.insert(resp.from, LogIndex::new(next.get() - 1));
-            }
+            // Rejection - need to backtrack. Clear all in-flight requests
+            // since we don't know which ones will fail.
+            state.inflight_count = 0;
 
-            // Immediately retry with new next_index.
+            // Use the follower's match_index for fast backup.
+            // The follower tells us the last index it has, so we should
+            // start sending from match_index + 1.
+            state.next_index = LogIndex::new(resp.match_index.get() + 1);
+
+            // Immediately retry with corrected next_index.
             outputs.extend(self.send_append_entries(resp.from));
         }
 
@@ -824,6 +1083,12 @@ impl RaftNode {
         self.votes_received.clear();
         self.votes_received.insert(self.config.node_id); // Vote for self.
         self.leader_id = None;
+
+        // Emit vote state change (term incremented, voted for self).
+        outputs.push(RaftOutput::VoteStateChanged {
+            term: self.current_term,
+            voted_for: self.voted_for,
+        });
 
         // Reset election timing.
         self.reset_election_elapsed();
@@ -879,7 +1144,12 @@ impl RaftNode {
         }
 
         // Valid leader, update state.
-        self.leader_id = Some(req.leader_id);
+        // Only update leader_id if we're not already the leader.
+        // A Leader receiving InstallSnapshot from another leader in the same term
+        // is a Raft violation (two leaders in same term).
+        if self.state != RaftState::Leader {
+            self.leader_id = Some(req.leader_id);
+        }
         self.reset_election_elapsed();
 
         // For now, acknowledge receipt.
@@ -956,7 +1226,10 @@ impl RaftNode {
         self.transfer_target = Some(target);
 
         // Check if target is already caught up.
-        let target_match = self.match_index.get(&target).copied().unwrap_or(LogIndex::new(0));
+        let target_match = self
+            .replication_state
+            .get(&target)
+            .map_or(LogIndex::new(0), |s| s.match_index);
         if target_match >= self.log.last_index() {
             // Target is already caught up, send TimeoutNow immediately.
             let timeout_now = TimeoutNowRequest::new(self.current_term, self.config.node_id, target);
@@ -1069,14 +1342,50 @@ impl RaftNode {
     }
 
     /// Sends `AppendEntries` to a specific peer.
-    fn send_append_entries(&self, peer: NodeId) -> Vec<RaftOutput> {
+    ///
+    /// With pipelining, this function may send multiple requests without
+    /// waiting for responses, up to `MAX_INFLIGHT_APPEND_ENTRIES`. The
+    /// `next_index` is speculatively advanced after each send.
+    fn send_append_entries(&mut self, peer: NodeId) -> Vec<RaftOutput> {
         let mut outputs = Vec::new();
 
-        let next_idx = self.next_index.get(&peer).copied().unwrap_or(LogIndex::new(1));
+        let Some(state) = self.replication_state.get_mut(&peer) else {
+            tracing::debug!(
+                peer = peer.get(),
+                "send_append_entries: no replication state for peer"
+            );
+            return outputs;
+        };
+
+        // Don't send if at inflight limit (pipelining bound).
+        if state.inflight_count >= limits::MAX_INFLIGHT_APPEND_ENTRIES {
+            tracing::debug!(
+                peer = peer.get(),
+                inflight = state.inflight_count,
+                limit = limits::MAX_INFLIGHT_APPEND_ENTRIES,
+                "send_append_entries: at inflight limit"
+            );
+            return outputs;
+        }
+
+        let next_idx = state.next_index;
         let prev_idx = LogIndex::new(next_idx.get().saturating_sub(1));
         let prev_term = self.log.term_at(prev_idx);
 
         let entries = self.log.entries_from(next_idx);
+        let entries_count = entries.len();
+
+        // Speculatively advance next_index to the end of entries being sent.
+        // This allows subsequent sends to pipeline more entries.
+        if entries_count > 0 {
+            // Safe: entries_count is bounded by log size.
+            #[allow(clippy::cast_possible_truncation)]
+            let advance = entries_count as u64;
+            state.next_index = LogIndex::new(next_idx.get() + advance);
+        }
+
+        // Increment inflight count - will be decremented on response.
+        state.inflight_count += 1;
 
         let request = AppendEntriesRequest::new(
             self.current_term,
@@ -1128,8 +1437,8 @@ impl RaftNode {
             // Leader always has it.
             let mut count = 1;
             for peer in self.config.peers() {
-                if let Some(&match_idx) = self.match_index.get(&peer) {
-                    if match_idx >= idx {
+                if let Some(state) = self.replication_state.get(&peer) {
+                    if state.match_index >= idx {
                         count += 1;
                     }
                 }
@@ -1432,12 +1741,13 @@ mod tests {
         assert!(node.is_leader());
 
         // Send client request.
+        // Note: log already has 1 entry (no-op from leader election).
         let request = ClientRequest::new(Bytes::from("test command"));
         let outputs = node.handle_client_request(request);
 
         assert!(outputs.is_some());
-        assert_eq!(node.log().len(), 1);
-        assert_eq!(node.log().last_index().get(), 1);
+        assert_eq!(node.log().len(), 2); // no-op + client request
+        assert_eq!(node.log().last_index().get(), 2);
     }
 
     #[test]
@@ -1475,11 +1785,12 @@ mod tests {
         assert!(outputs.iter().any(|o| matches!(o, RaftOutput::BecameLeader)));
 
         // Client request should commit immediately.
+        // Note: no-op at index 1 is already committed, client request at index 2.
         let request = ClientRequest::new(Bytes::from("test"));
         let outputs = node.handle_client_request(request).unwrap();
 
         assert!(outputs.iter().any(|o| matches!(o, RaftOutput::CommitEntry { .. })));
-        assert_eq!(node.commit_index().get(), 1);
+        assert_eq!(node.commit_index().get(), 2); // no-op + client request both committed
     }
 
     #[test]
@@ -1503,5 +1814,200 @@ mod tests {
         // At least two should be different (with high probability).
         let unique: std::collections::HashSet<_> = timeouts.iter().collect();
         assert!(unique.len() >= 2, "Expected different timeouts, got {timeouts:?}");
+    }
+
+    // ========================================================================
+    // Pipelining Tests
+    // ========================================================================
+
+    #[test]
+    fn test_pipelining_inflight_limit_respected() {
+        let mut node = RaftNode::new(make_config(1));
+        make_leader(&mut node);
+        assert!(node.is_leader());
+
+        // Add many entries to the log.
+        for i in 0..10 {
+            let request = ClientRequest::new(Bytes::from(format!("entry {i}")));
+            node.handle_client_request(request);
+        }
+
+        // Reset a peer's replication state to simulate catching up.
+        let peer = NodeId::new(2);
+        if let Some(state) = node.replication_state.get_mut(&peer) {
+            state.next_index = LogIndex::new(1);
+            state.match_index = LogIndex::new(0);
+            state.inflight_count = 0;
+        }
+
+        // Send AppendEntries repeatedly - should be limited by MAX_INFLIGHT.
+        let mut total_sends = 0_u32;
+        for _ in 0..10 {
+            let outputs = node.send_append_entries(peer);
+            if outputs.is_empty() {
+                break;
+            }
+            total_sends += 1;
+        }
+
+        // Should have sent exactly MAX_INFLIGHT_APPEND_ENTRIES requests.
+        assert_eq!(total_sends, limits::MAX_INFLIGHT_APPEND_ENTRIES);
+
+        // Verify inflight count is at limit.
+        let state = node.replication_state.get(&peer).unwrap();
+        assert_eq!(state.inflight_count, limits::MAX_INFLIGHT_APPEND_ENTRIES);
+    }
+
+    #[test]
+    fn test_pipelining_success_frees_slot_for_retry() {
+        let mut node = RaftNode::new(make_config(1));
+        make_leader(&mut node);
+
+        let peer = NodeId::new(2);
+
+        // Set inflight to max so no new sends can happen.
+        if let Some(state) = node.replication_state.get_mut(&peer) {
+            state.inflight_count = limits::MAX_INFLIGHT_APPEND_ENTRIES;
+            state.next_index = LogIndex::new(1);
+        }
+
+        // Try to send - should fail because at limit.
+        let outputs = node.send_append_entries(peer);
+        assert!(outputs.is_empty(), "Should not send when at inflight limit");
+
+        // Simulate successful response - this decrements inflight.
+        let response = AppendEntriesResponse::new(
+            node.current_term(),
+            peer,
+            node.node_id(),
+            true,
+            LogIndex::new(0),
+        );
+        let outputs = node.handle_message(Message::AppendEntriesResponse(response));
+
+        // The response handler should have sent a new AppendEntries
+        // since we freed up an inflight slot.
+        let sent_count = outputs
+            .iter()
+            .filter(|o| matches!(o, RaftOutput::SendMessage(Message::AppendEntries(_))))
+            .count();
+        assert_eq!(sent_count, 1, "Should send new AppendEntries after freeing slot");
+    }
+
+    #[test]
+    fn test_pipelining_rejection_resets_inflight() {
+        let mut node = RaftNode::new(make_config(1));
+        make_leader(&mut node);
+
+        // Add entries.
+        for i in 0..5 {
+            let request = ClientRequest::new(Bytes::from(format!("entry {i}")));
+            node.handle_client_request(request);
+        }
+
+        let peer = NodeId::new(2);
+
+        // Artificially set high inflight count.
+        if let Some(state) = node.replication_state.get_mut(&peer) {
+            state.inflight_count = 3;
+        }
+
+        // Simulate rejection with match_index indicating follower has entry 2.
+        let response = AppendEntriesResponse::new(
+            node.current_term(),
+            peer,
+            node.node_id(),
+            false,
+            LogIndex::new(2),
+        );
+        node.handle_message(Message::AppendEntriesResponse(response));
+
+        // After rejection:
+        // 1. inflight_count is reset to 0
+        // 2. next_index is set to match_index + 1 = 3
+        // 3. send_append_entries is called which:
+        //    - sends entries from index 3 to end (3 entries: 3, 4, 5)
+        //    - speculatively advances next_index to 6
+        //    - increments inflight_count to 1
+        let state = node.replication_state.get(&peer).unwrap();
+        assert_eq!(state.inflight_count, 1);
+
+        // next_index should be advanced past the log after the retry.
+        assert_eq!(state.next_index.get(), node.log().last_index().get() + 1);
+    }
+
+    #[test]
+    fn test_pipelining_speculative_next_index_advance() {
+        let mut node = RaftNode::new(make_config(1));
+        make_leader(&mut node);
+
+        // Add entries.
+        for i in 0..3 {
+            let request = ClientRequest::new(Bytes::from(format!("entry {i}")));
+            node.handle_client_request(request);
+        }
+
+        let peer = NodeId::new(2);
+
+        // Reset the peer's state to simulate starting fresh.
+        if let Some(state) = node.replication_state.get_mut(&peer) {
+            state.next_index = LogIndex::new(1);
+            state.match_index = LogIndex::new(0);
+            state.inflight_count = 0;
+        }
+
+        // Send AppendEntries.
+        node.send_append_entries(peer);
+
+        // next_index should have advanced speculatively to end of log + 1.
+        let state = node.replication_state.get(&peer).unwrap();
+        assert_eq!(state.next_index.get(), node.log().last_index().get() + 1);
+        assert_eq!(state.inflight_count, 1);
+    }
+
+    #[test]
+    fn test_pipelining_out_of_order_responses() {
+        let mut node = RaftNode::new(make_config(1));
+        make_leader(&mut node);
+
+        // Add entries.
+        for i in 0..5 {
+            let request = ClientRequest::new(Bytes::from(format!("entry {i}")));
+            node.handle_client_request(request);
+        }
+
+        let peer = NodeId::new(2);
+
+        // Set up as if we've sent multiple pipelined requests.
+        if let Some(state) = node.replication_state.get_mut(&peer) {
+            state.inflight_count = 3;
+            state.match_index = LogIndex::new(0);
+        }
+
+        // Receive response for match_index 3 first (later batch).
+        let response = AppendEntriesResponse::new(
+            node.current_term(),
+            peer,
+            node.node_id(),
+            true,
+            LogIndex::new(3),
+        );
+        node.handle_message(Message::AppendEntriesResponse(response));
+
+        assert_eq!(node.replication_state.get(&peer).unwrap().match_index.get(), 3);
+
+        // Receive response for match_index 2 (earlier batch, out of order).
+        // match_index should NOT go backwards.
+        let response = AppendEntriesResponse::new(
+            node.current_term(),
+            peer,
+            node.node_id(),
+            true,
+            LogIndex::new(2),
+        );
+        node.handle_message(Message::AppendEntriesResponse(response));
+
+        // match_index should still be 3 (not 2).
+        assert_eq!(node.replication_state.get(&peer).unwrap().match_index.get(), 3);
     }
 }

@@ -70,15 +70,30 @@ impl HelixService {
                     .remove(&partition_id)
                     .unwrap_or_default();
 
-                ServerPartitionStorage::new_durable_with_shared_wal(
+                #[cfg(feature = "s3")]
+                let ps_result = ServerPartitionStorage::new_durable_with_shared_wal(
                     data_dir,
                     topic_id,
                     partition_id,
                     wal_handle,
                     recovered,
+                    self.object_storage_dir.as_ref(),
+                    self.s3_config.as_ref(),
+                    self.tiering_config.as_ref(),
                 )
-                .await
-                .map_err(|e| ServerError::Internal {
+                .await;
+                #[cfg(not(feature = "s3"))]
+                let ps_result = ServerPartitionStorage::new_durable_with_shared_wal(
+                    data_dir,
+                    topic_id,
+                    partition_id,
+                    wal_handle,
+                    recovered,
+                    self.object_storage_dir.as_ref(),
+                    self.tiering_config.as_ref(),
+                )
+                .await;
+                ps_result.map_err(|e| ServerError::Internal {
                     message: format!("failed to create partition with shared WAL: {e}"),
                 })?
             } else {
@@ -90,6 +105,7 @@ impl HelixService {
                         data_dir,
                         self.object_storage_dir.as_ref(),
                         self.s3_config.as_ref(),
+                        self.tiering_config.as_ref(),
                         topic_id,
                         partition_id,
                     )
@@ -106,6 +122,7 @@ impl HelixService {
                         TokioStorage::new(),
                         data_dir,
                         self.object_storage_dir.as_ref(),
+                        self.tiering_config.as_ref(),
                         topic_id,
                         partition_id,
                     )

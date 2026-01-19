@@ -28,7 +28,10 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::entry::{Entry, WalEntry};
 use crate::error::{WalError, WalResult};
-use crate::limits::{ENTRIES_PER_SEGMENT_MAX, SEGMENT_SIZE_BYTES_MAX, SEGMENT_SIZE_BYTES_MIN};
+use crate::limits::{
+    ENTRIES_PER_SEGMENT_MAX, SEGMENT_SIZE_BYTES_DEFAULT, SEGMENT_SIZE_BYTES_MAX,
+    SEGMENT_SIZE_BYTES_MIN,
+};
 
 /// Segment header size in bytes.
 pub const SEGMENT_HEADER_SIZE: usize = 32;
@@ -80,10 +83,13 @@ pub struct SegmentConfig {
 
 impl SegmentConfig {
     /// Creates a new segment configuration with defaults.
+    ///
+    /// Default segment size is 4 MiB, optimized for tiered storage.
+    /// Use `with_max_size_bytes` to override.
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            max_size_bytes: SEGMENT_SIZE_BYTES_MAX,
+            max_size_bytes: SEGMENT_SIZE_BYTES_DEFAULT,
             max_entries: ENTRIES_PER_SEGMENT_MAX,
         }
     }

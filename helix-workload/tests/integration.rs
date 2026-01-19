@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use helix_workload::{
-    RealCluster, RealExecutor, SizeDistribution, TopicConfig, Workload, WorkloadExecutor,
-    WorkloadPattern, WorkloadStats,
+    ProducerMode, RealCluster, RealExecutor, SizeDistribution, TopicConfig, Workload,
+    WorkloadExecutor, WorkloadPattern, WorkloadStats,
 };
 
 /// Returns the path to the helix-server binary.
@@ -47,6 +47,54 @@ fn test_data_dir(test_name: &str) -> PathBuf {
     // Clean up any previous run.
     let _ = std::fs::remove_dir_all(&dir);
     dir
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn find_available_base_port(start: u16, count: u16) -> u16 {
+    let max_base = u16::MAX.saturating_sub(count);
+    for base in start..=max_base {
+        let mut available = true;
+        for offset in 1..=count {
+            let port = base.saturating_add(offset);
+            let addr = format!("127.0.0.1:{port}");
+            if std::net::TcpListener::bind(&addr).is_err() {
+                available = false;
+                break;
+            }
+        }
+        if available {
+            return base;
+        }
+    }
+    panic!("unable to find available port block (count={count}) starting at {start}");
+}
+
+fn env_producer_mode(name: &str, default: ProducerMode) -> ProducerMode {
+    let value = std::env::var(name).ok();
+    match value
+        .as_deref()
+        .map(|mode| mode.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("low") | Some("lowlatency") | Some("low-latency") => ProducerMode::LowLatency,
+        Some("high") | Some("highthroughput") | Some("high-throughput") => {
+            ProducerMode::HighThroughput
+        }
+        _ => default,
+    }
 }
 
 /// Single-node test: basic produce and consume correctness.
@@ -268,4 +316,265 @@ async fn test_cluster_health_check() {
 
     // Health check should pass.
     cluster.check_health().expect("cluster should be healthy");
+}
+
+/// Three-node throughput test with concurrent requests and batching.
+///
+/// Uses `ProducerMode::HighThroughput` (linger.ms=100ms) and sends
+/// concurrent requests to measure actual throughput capacity.
+#[tokio::test]
+async fn test_three_node_concurrent_throughput() {
+    use bytes::Bytes;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let cluster = RealCluster::builder()
+        .nodes(3)
+        .base_port(19592)
+        .raft_base_port(19600)
+        .binary_path(binary_path())
+        .data_dir(test_data_dir("three_node_throughput"))
+        .auto_create_topics(true)
+        .default_replication_factor(3)
+        .build()
+        .expect("failed to start cluster");
+
+    // Create a temporary executor just for wait_ready check.
+    let wait_executor = RealExecutor::with_mode(cluster.bootstrap_servers(), ProducerMode::HighThroughput)
+        .expect("failed to create executor");
+
+    wait_executor
+        .wait_ready(Duration::from_secs(60))
+        .await
+        .expect("cluster not ready");
+
+    // Parameters for throughput test.
+    const TOTAL_MESSAGES: u64 = 1000;
+    const CONCURRENT_REQUESTS: u64 = 10;
+    const MESSAGE_SIZE: usize = 1024; // 1KB - realistic payload size
+
+    let topic = "throughput-test";
+    let success_count = Arc::new(AtomicU64::new(0));
+    let error_count = Arc::new(AtomicU64::new(0));
+
+    println!("=== Three Node Concurrent Throughput Test ===");
+    println!("Total messages: {TOTAL_MESSAGES}");
+    println!("Concurrent requests: {CONCURRENT_REQUESTS}");
+    println!("Message size: {MESSAGE_SIZE} bytes");
+    println!("Producer mode: HighThroughput (linger.ms=5ms, batch.size=512KB)");
+    println!();
+
+    let start = std::time::Instant::now();
+
+    // Spawn concurrent producer tasks.
+    // Each producer gets its OWN executor/connection to verify server-side concurrency.
+    // Using a shared executor would serialize requests due to rdkafka connection pooling.
+    let mut handles = Vec::new();
+    let messages_per_producer = TOTAL_MESSAGES / CONCURRENT_REQUESTS;
+    let bootstrap_servers = cluster.bootstrap_servers().to_string();
+
+    for producer_id in 0..CONCURRENT_REQUESTS {
+        let bootstrap = bootstrap_servers.clone();
+        let success = Arc::clone(&success_count);
+        let errors = Arc::clone(&error_count);
+
+        let handle = tokio::spawn(async move {
+            // Create a separate executor per producer for true connection concurrency.
+            let producer_executor = RealExecutor::with_mode(&bootstrap, ProducerMode::HighThroughput)
+                .expect("failed to create producer executor");
+
+            for i in 0..messages_per_producer {
+                let payload = Bytes::from(vec![0u8; MESSAGE_SIZE]);
+                match producer_executor.send(topic, 0, payload).await {
+                    Ok(_) => {
+                        success.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        errors.fetch_add(1, Ordering::Relaxed);
+                        if errors.load(Ordering::Relaxed) <= 5 {
+                            eprintln!("Producer {producer_id} error on msg {i}: {e}");
+                        }
+                    }
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    // Wait for all producers to complete.
+    for handle in handles {
+        handle.await.expect("producer task panicked");
+    }
+
+    let duration = start.elapsed();
+    let success = success_count.load(Ordering::Relaxed);
+    let errors = error_count.load(Ordering::Relaxed);
+    let throughput = success as f64 / duration.as_secs_f64();
+
+    println!("=== Results ===");
+    println!("Duration: {:.2}s", duration.as_secs_f64());
+    println!("Successful: {success}");
+    println!("Errors: {errors}");
+    println!("Throughput: {:.1} ops/sec", throughput);
+
+    // Allow up to 1% error rate for distributed system tolerance.
+    // Occasional timeouts can occur during leader transitions or network hiccups.
+    let max_allowed_errors = TOTAL_MESSAGES / 100; // 1%
+    assert!(
+        errors <= max_allowed_errors,
+        "Error rate too high: {errors}/{} ({:.1}%), max allowed: {max_allowed_errors}",
+        success + errors,
+        (errors as f64 / (success + errors) as f64) * 100.0
+    );
+    assert!(
+        success >= TOTAL_MESSAGES * 99 / 100,
+        "Expected at least 99% success rate, got {success}/{TOTAL_MESSAGES}"
+    );
+}
+
+/// Single-partition throughput test with configurable in-flight requests.
+///
+/// This keeps a single partition but allows multiple in-flight produce
+/// requests per producer to measure server-side batching capacity.
+#[tokio::test]
+async fn test_single_partition_throughput_inflight() {
+    use bytes::Bytes;
+    use futures::stream::{FuturesUnordered, StreamExt};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let total_messages = env_u64("HELIX_THROUGHPUT_TOTAL_MESSAGES", 2_000);
+    let inflight = env_usize("HELIX_THROUGHPUT_INFLIGHT", 64).max(1);
+    let producer_count = env_usize("HELIX_THROUGHPUT_PRODUCERS", 1).max(1);
+    let message_size = env_usize("HELIX_THROUGHPUT_MESSAGE_SIZE", 1024);
+    let producer_mode = env_producer_mode(
+        "HELIX_THROUGHPUT_MODE",
+        ProducerMode::HighThroughput,
+    );
+    let node_count = 3u16;
+    let base_port = std::env::var("HELIX_THROUGHPUT_BASE_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or_else(|| find_available_base_port(20000, node_count));
+    let raft_base_port = std::env::var("HELIX_THROUGHPUT_RAFT_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or_else(|| find_available_base_port(30000, node_count));
+
+    let topic = "throughput-single-partition";
+    let cluster = RealCluster::builder()
+        .nodes(u32::from(node_count))
+        .base_port(base_port)
+        .raft_base_port(raft_base_port)
+        .binary_path(binary_path())
+        .data_dir(test_data_dir("single_partition_throughput"))
+        .auto_create_topics(true)
+        .default_replication_factor(3)
+        .topic(topic, 1)
+        .build()
+        .expect("failed to start cluster");
+
+    let wait_executor =
+        RealExecutor::with_mode(cluster.bootstrap_servers(), producer_mode)
+            .expect("failed to create executor");
+    wait_executor
+        .wait_ready(Duration::from_secs(60))
+        .await
+        .expect("cluster not ready");
+
+    let success_count = Arc::new(AtomicU64::new(0));
+    let error_count = Arc::new(AtomicU64::new(0));
+
+    println!("=== Single Partition Inflight Throughput Test ===");
+    println!("Total messages: {total_messages}");
+    println!("Producers: {producer_count}");
+    println!("Inflight per producer: {inflight}");
+    println!("Message size: {message_size} bytes");
+    println!("Producer mode: {producer_mode:?}");
+    println!();
+
+    let start = std::time::Instant::now();
+    let mut handles = Vec::new();
+    let messages_per_producer = total_messages / producer_count as u64;
+    let remainder = total_messages % producer_count as u64;
+    let bootstrap_servers = cluster.bootstrap_servers().to_string();
+    let payload = Bytes::from(vec![0u8; message_size]);
+
+    for producer_id in 0..producer_count {
+        let bootstrap = bootstrap_servers.clone();
+        let success = Arc::clone(&success_count);
+        let errors = Arc::clone(&error_count);
+        let payload = payload.clone();
+        let producer_mode = producer_mode;
+        let producer_messages =
+            messages_per_producer + u64::from(producer_id == 0) * remainder;
+
+        let handle = tokio::spawn(async move {
+            let executor = Arc::new(
+                RealExecutor::with_mode(&bootstrap, producer_mode)
+                    .expect("failed to create producer executor"),
+            );
+            let mut inflight_set = FuturesUnordered::new();
+            let mut sent = 0u64;
+
+            while sent < producer_messages {
+                while inflight_set.len() < inflight && sent < producer_messages {
+                    let exec = Arc::clone(&executor);
+                    let payload = payload.clone();
+                    inflight_set.push(async move { exec.send(topic, 0, payload).await });
+                    sent += 1;
+                }
+
+                if let Some(result) = inflight_set.next().await {
+                    match result {
+                        Ok(_) => {
+                            success.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            let count = errors.fetch_add(1, Ordering::Relaxed) + 1;
+                            if count <= 5 {
+                                eprintln!("Producer {producer_id} error: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+
+            while let Some(result) = inflight_set.next().await {
+                match result {
+                    Ok(_) => {
+                        success.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        let count = errors.fetch_add(1, Ordering::Relaxed) + 1;
+                        if count <= 5 {
+                            eprintln!("Producer {producer_id} error: {e}");
+                        }
+                    }
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.await.expect("producer task panicked");
+    }
+
+    let duration = start.elapsed();
+    let success = success_count.load(Ordering::Relaxed);
+    let errors = error_count.load(Ordering::Relaxed);
+    let throughput = success as f64 / duration.as_secs_f64();
+
+    println!("=== Results ===");
+    println!("Duration: {:.2}s", duration.as_secs_f64());
+    println!("Successful: {success}");
+    println!("Errors: {errors}");
+    println!("Throughput: {:.1} ops/sec", throughput);
+
+    assert!(errors == 0, "Expected no errors, got {errors}");
+    assert!(
+        success >= total_messages.saturating_sub(10),
+        "Expected ~{total_messages} successes, got {success}"
+    );
 }

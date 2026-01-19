@@ -180,71 +180,128 @@ fn create_reusable_listener(addr: SocketAddr) -> KafkaResult<TcpListener> {
     Ok(listener)
 }
 
-/// Handle a single client connection.
+/// Handle a single client connection with concurrent request processing.
+///
+/// Requests are processed concurrently using:
+/// - A reader loop that spawns handler tasks for each request
+/// - A writer loop that sends responses as they complete
+/// - A bounded channel to coordinate between handlers and writer
+///
+/// This allows multiple in-flight requests on a single connection,
+/// significantly improving throughput when requests have latency (e.g., Raft consensus).
 async fn handle_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
     peer_addr: SocketAddr,
     handler: Arc<KafkaHandler>,
 ) -> KafkaResult<()> {
-    let mut read_buf = BytesMut::with_capacity(64 * 1024);
+    use tokio::sync::mpsc;
 
-    loop {
-        // Read data from the socket.
-        let bytes_read = stream.read_buf(&mut read_buf).await?;
-        if bytes_read == 0 {
-            // Connection closed by client.
-            return Ok(());
-        }
+    // Split stream into read and write halves for concurrent access.
+    let (mut read_half, mut write_half) = stream.into_split();
 
-        // Process all complete frames in the buffer.
-        while let Some(payload) = codec::read_frame(&mut read_buf)? {
-            // Decode request header.
-            let request = codec::decode_request_header(payload)?;
+    // Channel for sending responses from handler tasks to writer.
+    // Bounded to prevent unbounded memory growth with slow writes.
+    let (response_tx, mut response_rx) = mpsc::channel::<BytesMut>(100);
 
-            info!(
-                peer = %peer_addr,
-                api_key = request.api_key,
-                api_name = api_key_name(request.api_key),
-                api_version = request.api_version,
-                correlation_id = request.correlation_id,
-                "Received Kafka request"
-            );
-
-            // Handle the request.
-            let response_body = match handler.handle_request(&request).await {
-                Ok(body) => body,
-                Err(e) => {
-                    error!(
-                        peer = %peer_addr,
-                        api_key = request.api_key,
-                        error = %e,
-                        "Handler error - closing connection"
-                    );
-                    return Err(e);
-                }
-            };
-
-            // Write response with length prefix.
-            let mut response_frame = BytesMut::new();
-            codec::write_frame(&mut response_frame, &response_body);
-            info!(
-                peer = %peer_addr,
-                api_key = request.api_key,
-                api_name = api_key_name(request.api_key),
-                response_len = response_frame.len(),
-                "Sending response"
-            );
-            if let Err(e) = stream.write_all(&response_frame).await {
+    // Spawn writer task that sends responses as they arrive.
+    let writer_peer_addr = peer_addr;
+    let writer_task = tokio::spawn(async move {
+        while let Some(response_frame) = response_rx.recv().await {
+            if let Err(e) = write_half.write_all(&response_frame).await {
                 error!(
-                    peer = %peer_addr,
-                    api_key = request.api_key,
+                    peer = %writer_peer_addr,
                     error = %e,
                     "Failed to write response"
                 );
-                return Err(e.into());
+                return Err(KafkaError::Io(e));
+            }
+        }
+        Ok(())
+    });
+
+    // Reader loop: read frames and spawn handler tasks.
+    let mut read_buf = BytesMut::with_capacity(64 * 1024);
+    let reader_result: KafkaResult<()> = async {
+        loop {
+            // Read data from the socket.
+            let bytes_read = read_half.read_buf(&mut read_buf).await?;
+            if bytes_read == 0 {
+                // Connection closed by client.
+                return Ok(());
+            }
+
+            // Process all complete frames in the buffer.
+            while let Some(payload) = codec::read_frame(&mut read_buf)? {
+                // Decode request header.
+                let request = codec::decode_request_header(payload)?;
+
+                info!(
+                    peer = %peer_addr,
+                    api_key = request.api_key,
+                    api_name = api_key_name(request.api_key),
+                    api_version = request.api_version,
+                    correlation_id = request.correlation_id,
+                    "Received Kafka request"
+                );
+
+                // Spawn handler task for concurrent processing.
+                let handler_clone = Arc::clone(&handler);
+                let response_tx_clone = response_tx.clone();
+                let handler_peer_addr = peer_addr;
+
+                tokio::spawn(async move {
+                    let api_key = request.api_key;
+                    let api_name = api_key_name(api_key);
+
+                    match handler_clone.handle_request(&request).await {
+                        Ok(response_body) => {
+                            // Encode response with length prefix.
+                            let mut response_frame = BytesMut::new();
+                            codec::write_frame(&mut response_frame, &response_body);
+
+                            info!(
+                                peer = %handler_peer_addr,
+                                api_key,
+                                api_name,
+                                response_len = response_frame.len(),
+                                "Sending response"
+                            );
+
+                            // Send to writer task (ignore send errors - connection closing).
+                            let _ = response_tx_clone.send(response_frame).await;
+                        }
+                        Err(e) => {
+                            error!(
+                                peer = %handler_peer_addr,
+                                api_key,
+                                api_name,
+                                error = %e,
+                                "Handler error"
+                            );
+                            // Don't close connection for individual request errors.
+                            // The client will handle timeout/retry.
+                        }
+                    }
+                });
             }
         }
     }
+    .await;
+
+    // Drop the sender to signal writer task to exit.
+    drop(response_tx);
+
+    // Wait for writer task to complete.
+    let writer_result = writer_task.await.unwrap_or_else(|e| {
+        error!(peer = %peer_addr, error = %e, "Writer task panicked");
+        Err(KafkaError::Io(std::io::Error::other(
+            "writer task panicked",
+        )))
+    });
+
+    // Return first error encountered.
+    reader_result?;
+    writer_result
 }
 
 /// Convert API key to human-readable name for logging.

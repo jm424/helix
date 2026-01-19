@@ -26,6 +26,8 @@ pub mod service;
 mod grpc;
 /// Partition storage implementations.
 pub mod storage;
+/// Vote state persistence for Raft consensus.
+pub mod vote_store;
 
 pub mod generated {
     //! Generated protobuf types.

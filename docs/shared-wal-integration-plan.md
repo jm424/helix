@@ -133,7 +133,7 @@ data_dir/
 
 **Goal**: Replace dedicated WAL with SharedWalHandle in DurablePartition
 
-**File**: `/home/bits/go/src/github.com/DataDog/helix/helix-server/src/storage.rs`
+**File**: `helix-server/src/storage.rs`
 
 **Changes**:
 
@@ -221,7 +221,7 @@ data_dir/
 
 **Goal**: Add SharedWalPool to HelixService and manage its lifecycle
 
-**File**: `/home/bits/go/src/github.com/DataDog/helix/helix-server/src/service/mod.rs`
+**File**: `helix-server/src/service/mod.rs`
 
 **Changes**:
 
@@ -310,7 +310,7 @@ data_dir/
 
 **Goal**: Wire SharedWalPool handles into partition creation flow
 
-**File 1**: `/home/bits/go/src/github.com/DataDog/helix/helix-server/src/partition_storage.rs`
+**File 1**: `helix-server/src/partition_storage.rs`
 
 **Changes**:
 
@@ -339,7 +339,7 @@ data_dir/
    }
    ```
 
-**File 2**: `/home/bits/go/src/github.com/DataDog/helix/helix-server/src/service/handlers/topic.rs`
+**File 2**: `helix-server/src/service/handlers/topic.rs`
 
 **Changes**:
 
@@ -402,7 +402,7 @@ data_dir/
 
 **Goal**: Expose `--shared-wal-count` flag for overriding default
 
-**File**: `/home/bits/go/src/github.com/DataDog/helix/helix-server/src/main.rs`
+**File**: `helix-server/src/main.rs`
 
 **Changes**:
 
@@ -462,7 +462,7 @@ data_dir/
 
 **Goal**: Verify correctness with integration tests
 
-**File**: `/home/bits/go/src/github.com/DataDog/helix/helix-tests/src/shared_wal_integration_tests.rs` (new)
+**File**: `helix-tests/src/shared_wal_integration_tests.rs` (new)
 
 **Test Cases**:
 
@@ -542,7 +542,7 @@ data_dir/
 
 **Goal**: Verify correctness under crashes and faults
 
-**File**: `/home/bits/go/src/github.com/DataDog/helix/helix-tests/src/shared_wal_dst.rs` (new)
+**File**: `helix-tests/src/shared_wal_dst.rs` (new)
 
 **Test Pattern** (following existing DST tests):
 
@@ -594,37 +594,37 @@ fn run_crash_recovery_simulation(seed: u64) {
 ## Critical Files Modified
 
 ### Core Implementation
-1. `/home/bits/go/src/github.com/DataDog/helix/helix-server/src/storage.rs` (2098 lines)
+1. `helix-server/src/storage.rs` (2098 lines)
    - Replace WAL field in DurablePartition
    - Add `open_with_shared_wal()` constructor
    - Update append methods
 
-2. `/home/bits/go/src/github.com/DataDog/helix/helix-server/src/service/mod.rs` (395 lines)
+2. `helix-server/src/service/mod.rs` (395 lines)
    - Add shared_wal_pool field
    - Add recovered_entries field
    - Convert constructors to async
    - Add pool initialization logic
 
-3. `/home/bits/go/src/github.com/DataDog/helix/helix-server/src/partition_storage.rs` (386 lines)
+3. `helix-server/src/partition_storage.rs` (386 lines)
    - Add `new_durable_with_shared_wal()` constructor
 
 ### Integration Points
-4. `/home/bits/go/src/github.com/DataDog/helix/helix-server/src/service/handlers/topic.rs` (349 lines)
+4. `helix-server/src/service/handlers/topic.rs` (349 lines)
    - Update partition creation in `create_topic()`
    - Update multi-node partition creation
 
-5. `/home/bits/go/src/github.com/DataDog/helix/helix-server/src/service/tick.rs` (463 lines)
+5. `helix-server/src/service/tick.rs` (463 lines)
    - Update partition creation in tick task
 
-6. `/home/bits/go/src/github.com/DataDog/helix/helix-server/src/main.rs` (390 lines)
+6. `helix-server/src/main.rs` (390 lines)
    - Add --shared-wal-count CLI flag
    - Pass to service constructors
 
 ### Testing (New Files)
-7. `/home/bits/go/src/github.com/DataDog/helix/helix-tests/src/shared_wal_integration_tests.rs` (new)
+7. `helix-tests/src/shared_wal_integration_tests.rs` (new)
    - Integration tests for basic functionality
 
-8. `/home/bits/go/src/github.com/DataDog/helix/helix-tests/src/shared_wal_dst.rs`
+8. `helix-tests/src/shared_wal_dst.rs`
    - **Note**: Basic file exists (2298 lines) with DST tests for `SharedWal`
    - **Need to add**: DST tests for `SharedWalPool` with multi-partition scenarios
 

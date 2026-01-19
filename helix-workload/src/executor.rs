@@ -14,7 +14,7 @@ use bytes::Bytes;
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
-use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
+use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::Message;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -135,6 +135,84 @@ pub trait WorkloadExecutor {
     async fn wait_ready(&self, timeout: Duration) -> Result<(), ExecutorError>;
 }
 
+// =============================================================================
+// Tiering Configuration
+// =============================================================================
+
+/// S3 tiering configuration for tests.
+#[derive(Debug, Clone)]
+pub struct S3TieringConfig {
+    /// S3 bucket name.
+    pub bucket: String,
+    /// S3 key prefix.
+    pub prefix: String,
+    /// S3 region.
+    pub region: String,
+    /// Custom endpoint (for `LocalStack`/`MinIO`).
+    pub endpoint: Option<String>,
+    /// Force path-style addressing (required for `LocalStack`).
+    pub force_path_style: bool,
+}
+
+impl S3TieringConfig {
+    /// Create config for `LocalStack` testing.
+    #[must_use]
+    pub fn localstack(bucket: &str) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            prefix: "helix/segments/".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some("http://localhost:4566".to_string()),
+            force_path_style: true,
+        }
+    }
+
+    /// Create config for real S3.
+    #[must_use]
+    pub fn s3(bucket: &str, region: &str) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            prefix: "helix/segments/".to_string(),
+            region: region.to_string(),
+            endpoint: None,
+            force_path_style: false,
+        }
+    }
+
+    /// Set custom prefix.
+    #[must_use]
+    pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.prefix = prefix.into();
+        self
+    }
+}
+
+/// Tiering behavior configuration for tests.
+#[derive(Debug, Clone)]
+#[derive(Default)]
+pub struct TieringTestConfig {
+    /// Minimum segment age before tiering (0 for immediate).
+    pub min_age_secs: u64,
+}
+
+
+/// Tiering status for a partition.
+#[derive(Debug, Clone, Default)]
+pub struct TieringStatus {
+    /// Segments with location=Local only.
+    pub local_only: u32,
+    /// Segments with location=Both (local + S3).
+    pub tiered: u32,
+    /// Segments with location=Remote only (evicted).
+    pub evicted: u32,
+    /// Total bytes tiered.
+    pub tiered_bytes: u64,
+}
+
+// =============================================================================
+// Cluster Configuration
+// =============================================================================
+
 /// Configuration for a real Helix cluster.
 #[derive(Debug, Clone)]
 pub struct RealClusterConfig {
@@ -154,6 +232,17 @@ pub struct RealClusterConfig {
     pub default_replication_factor: u32,
     /// Topics to pre-create at startup (name, `partition_count`).
     pub topics: Vec<(String, u32)>,
+
+    // === Tiering Configuration ===
+
+    /// Filesystem object storage directory.
+    /// Mutually exclusive with `s3_config`.
+    pub object_storage_dir: Option<PathBuf>,
+    /// S3 configuration for tiered storage.
+    /// Mutually exclusive with `object_storage_dir`.
+    pub s3_config: Option<S3TieringConfig>,
+    /// Tiering thresholds for testing.
+    pub tiering_config: TieringTestConfig,
 }
 
 impl Default for RealClusterConfig {
@@ -167,6 +256,9 @@ impl Default for RealClusterConfig {
             auto_create_topics: true,
             default_replication_factor: 3,
             topics: Vec::new(),
+            object_storage_dir: None,
+            s3_config: None,
+            tiering_config: TieringTestConfig::default(),
         }
     }
 }
@@ -243,6 +335,48 @@ impl RealClusterBuilder {
         self
     }
 
+    // === Tiering Configuration ===
+
+    /// Enable filesystem-based tiering.
+    ///
+    /// Each node gets its own subdirectory under the specified path.
+    /// Mutually exclusive with S3 tiering.
+    #[must_use]
+    pub fn with_filesystem_tiering(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.config.object_storage_dir = Some(dir.into());
+        self.config.s3_config = None;
+        self
+    }
+
+    /// Enable S3-based tiering.
+    ///
+    /// Each node uses a unique prefix within the bucket.
+    /// Mutually exclusive with filesystem tiering.
+    #[must_use]
+    pub fn with_s3_tiering(mut self, config: S3TieringConfig) -> Self {
+        self.config.s3_config = Some(config);
+        self.config.object_storage_dir = None;
+        self
+    }
+
+    /// Enable `LocalStack` S3 tiering with default config.
+    ///
+    /// Convenience method for testing with `LocalStack`.
+    /// Equivalent to `with_s3_tiering(S3TieringConfig::localstack(bucket))`.
+    #[must_use]
+    pub fn with_localstack_tiering(self, bucket: &str) -> Self {
+        self.with_s3_tiering(S3TieringConfig::localstack(bucket))
+    }
+
+    /// Set tiering behavior config.
+    ///
+    /// Controls minimum age for tiering.
+    #[must_use]
+    pub const fn with_tiering_config(mut self, config: TieringTestConfig) -> Self {
+        self.config.tiering_config = config;
+        self
+    }
+
     /// Builds and starts the cluster.
     ///
     /// # Errors
@@ -268,6 +402,7 @@ impl RealCluster {
     }
 
     /// Starts a cluster with the given configuration.
+    #[allow(clippy::too_many_lines)] // Tiering config added; splitting would reduce clarity.
     fn start(config: RealClusterConfig) -> Result<Self, ExecutorError> {
         // Wait for all ports to be available before starting.
         // This prevents failures from leftover processes or TIME_WAIT sockets.
@@ -335,6 +470,33 @@ impl RealCluster {
             let peers = &peer_args[node_id as usize - 1];
             for peer_arg in peers {
                 cmd.arg(peer_arg);
+            }
+
+            // Add tiering configuration.
+            if let Some(ref dir) = config.object_storage_dir {
+                let node_tier_dir = dir.join(format!("node-{node_id}"));
+                std::fs::create_dir_all(&node_tier_dir).map_err(ExecutorError::SpawnFailed)?;
+                cmd.arg("--object-storage-dir").arg(&node_tier_dir);
+                // Pass min age when object storage is configured.
+                cmd.arg("--tier-min-age-secs")
+                    .arg(config.tiering_config.min_age_secs.to_string());
+            }
+
+            if let Some(ref s3) = config.s3_config {
+                cmd.arg("--s3-bucket").arg(&s3.bucket);
+                // Each node gets a unique prefix to avoid conflicts.
+                cmd.arg("--s3-prefix")
+                    .arg(format!("{}node-{}/", s3.prefix, node_id));
+                cmd.arg("--s3-region").arg(&s3.region);
+                if let Some(ref endpoint) = s3.endpoint {
+                    cmd.arg("--s3-endpoint").arg(endpoint);
+                }
+                if s3.force_path_style {
+                    cmd.arg("--s3-force-path-style");
+                }
+                // Pass min age when S3 is configured.
+                cmd.arg("--tier-min-age-secs")
+                    .arg(config.tiering_config.min_age_secs.to_string());
             }
 
             // Inherit stderr for debugging, suppress stdout.
@@ -510,6 +672,31 @@ impl RealCluster {
             }
         }
 
+        // Add tiering configuration.
+        if let Some(ref dir) = self.config.object_storage_dir {
+            let node_tier_dir = dir.join(format!("node-{node_id}"));
+            cmd.arg("--object-storage-dir").arg(&node_tier_dir);
+            // Pass min age when object storage is configured.
+            cmd.arg("--tier-min-age-secs")
+                .arg(self.config.tiering_config.min_age_secs.to_string());
+        }
+
+        if let Some(ref s3) = self.config.s3_config {
+            cmd.arg("--s3-bucket").arg(&s3.bucket);
+            cmd.arg("--s3-prefix")
+                .arg(format!("{}node-{}/", s3.prefix, node_id));
+            cmd.arg("--s3-region").arg(&s3.region);
+            if let Some(ref endpoint) = s3.endpoint {
+                cmd.arg("--s3-endpoint").arg(endpoint);
+            }
+            if s3.force_path_style {
+                cmd.arg("--s3-force-path-style");
+            }
+            // Pass min age when S3 is configured.
+            cmd.arg("--tier-min-age-secs")
+                .arg(self.config.tiering_config.min_age_secs.to_string());
+        }
+
         // Suppress stdout/stderr to avoid I/O overload.
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
 
@@ -636,6 +823,97 @@ impl RealCluster {
             "no leader for {topic}:{partition} after {timeout:?}"
         )))
     }
+
+    // =========================================================================
+    // Tiering Methods
+    // =========================================================================
+
+    /// Returns true if tiering is configured (either filesystem or S3).
+    #[must_use]
+    pub const fn is_tiering_enabled(&self) -> bool {
+        self.config.object_storage_dir.is_some() || self.config.s3_config.is_some()
+    }
+
+    /// Returns the S3 tiering configuration, if enabled.
+    #[must_use]
+    pub const fn s3_config(&self) -> Option<&S3TieringConfig> {
+        self.config.s3_config.as_ref()
+    }
+
+    /// Returns the filesystem tiering directory, if enabled.
+    #[must_use]
+    pub const fn object_storage_dir(&self) -> Option<&PathBuf> {
+        self.config.object_storage_dir.as_ref()
+    }
+
+    /// Waits for tiering to likely complete.
+    ///
+    /// Since helix-server doesn't yet have an admin API to query tiering status,
+    /// this method simply waits for the specified duration to allow tiering to
+    /// complete in the background.
+    ///
+    /// For robust testing, combine with data verification: write data, wait,
+    /// then verify all data can be read back.
+    ///
+    /// # Future Enhancement
+    ///
+    /// Once helix-server exposes a tiering status API, this method should poll
+    /// that API until the expected number of segments are tiered.
+    pub async fn wait_for_tiering_duration(&self, duration: Duration) {
+        if !self.is_tiering_enabled() {
+            eprintln!("[WARN] wait_for_tiering_duration called but tiering is not enabled");
+            return;
+        }
+        eprintln!("[TIERING] Waiting {duration:?} for tiering to complete...");
+        tokio::time::sleep(duration).await;
+        eprintln!("[TIERING] Wait complete");
+    }
+
+    /// Lists objects in the S3 bucket for verification.
+    ///
+    /// Uses the AWS CLI to list objects. Returns the object keys found.
+    /// This is a diagnostic method for test verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if S3 is not configured or the CLI fails.
+    pub fn list_s3_objects(&self) -> Result<Vec<String>, ExecutorError> {
+        let s3 = self.config.s3_config.as_ref().ok_or_else(|| {
+            ExecutorError::InvalidConfig("S3 tiering not configured".to_string())
+        })?;
+
+        let endpoint_args: Vec<&str> = s3
+            .endpoint
+            .as_ref()
+            .map_or_else(Vec::new, |endpoint| vec!["--endpoint-url", endpoint]);
+
+        let output = std::process::Command::new("aws")
+            .args(&endpoint_args)
+            .arg("s3")
+            .arg("ls")
+            .arg(format!("s3://{}/{}", s3.bucket, s3.prefix))
+            .arg("--recursive")
+            .output()
+            .map_err(|e| ExecutorError::InvalidConfig(format!("aws cli failed: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(ExecutorError::InvalidConfig(format!(
+                "aws s3 ls failed: {stderr}"
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let keys: Vec<String> = stdout
+            .lines()
+            .filter_map(|line| {
+                // AWS CLI output format: "2024-01-15 10:30:00 1234 path/to/object"
+                line.split_whitespace().last().map(String::from)
+            })
+            .collect();
+
+        Ok(keys)
+    }
 }
 
 impl Drop for RealCluster {
@@ -644,6 +922,20 @@ impl Drop for RealCluster {
         // Clean up data directory.
         let _ = std::fs::remove_dir_all(&self.config.data_dir);
     }
+}
+
+/// Producer configuration mode for different test scenarios.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum ProducerMode {
+    /// Low-latency mode: send immediately, no batching.
+    /// Use for sequential workloads where latency matters.
+    /// Sets `queue.buffering.max.ms=0`.
+    #[default]
+    LowLatency,
+    /// High-throughput mode: batch messages before sending.
+    /// Use for concurrent workloads where throughput matters.
+    /// Uses `linger.ms=100ms`, `batch.size=512KB`.
+    HighThroughput,
 }
 
 /// Executor that runs operations against a real Helix cluster.
@@ -660,6 +952,7 @@ pub struct RealExecutor {
 
 impl RealExecutor {
     /// Creates a new executor connected to the given cluster.
+    /// Uses low-latency mode by default (no batching).
     ///
     /// # Errors
     ///
@@ -668,22 +961,38 @@ impl RealExecutor {
         Self::with_bootstrap_servers(cluster.bootstrap_servers())
     }
 
+    /// Creates an executor with custom bootstrap servers and producer mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Kafka clients cannot be created.
+    pub fn with_mode(bootstrap_servers: &str, mode: ProducerMode) -> Result<Self, ExecutorError> {
+        Self::build(bootstrap_servers, mode)
+    }
+
     /// Creates an executor with custom bootstrap servers.
+    /// Uses low-latency mode by default (no batching).
     ///
     /// # Errors
     ///
     /// Returns an error if Kafka clients cannot be created.
     pub fn with_bootstrap_servers(bootstrap_servers: &str) -> Result<Self, ExecutorError> {
+        Self::build(bootstrap_servers, ProducerMode::LowLatency)
+    }
+
+    /// Internal builder with configurable producer mode.
+    fn build(bootstrap_servers: &str, mode: ProducerMode) -> Result<Self, ExecutorError> {
         // Configure rdkafka with connection retry settings so it handles
         // broker availability internally. No explicit wait loops needed.
         // NOTE: Retries enabled for retriable errors (e.g., controller not available).
         // This may cause duplicates until idempotent producers are implemented.
         //
-        // Timeout settings aligned with DD's libstreaming for faster failover:
+        // Timeout settings tuned for faster failover:
         // - request.timeout.ms: 12.5s (vs 30s default) - fail faster on dead brokers
         // - message.timeout.ms: 15s (vs 300s default) - retry faster with different partition
         // - connections.max.idle.ms: 0 - avoid stale connection issues
-        let producer: FutureProducer = ClientConfig::new()
+        let mut config = ClientConfig::new();
+        config
             .set("bootstrap.servers", bootstrap_servers)
             .set("message.timeout.ms", "15000")
             .set("request.timeout.ms", "12500")
@@ -692,10 +1001,58 @@ impl RealExecutor {
             .set("retry.backoff.ms", "500") // Wait between retries
             .set("acks", "all")
             .set("reconnect.backoff.ms", "100")
-            .set("reconnect.backoff.max.ms", "1000") // 1s max backoff for faster recovery
-            .create()?;
+            .set("reconnect.backoff.max.ms", "1000"); // 1s max backoff for faster recovery
 
-        // Consumer config aligned with DD's libstreaming for faster failover.
+        // Configure batching based on mode.
+        // NOTE: queue.buffering.max.ms (librdkafka) = linger.ms (Kafka Java).
+        match mode {
+            ProducerMode::LowLatency => {
+                // Send immediately, no batching. Best for sequential workloads.
+                config.set("queue.buffering.max.ms", "0");
+            }
+            ProducerMode::HighThroughput => {
+                // Batch messages before sending with low linger for latency.
+                // - linger.ms=5: short wait to collect batches without adding much latency
+                // - batch.size=512KB: max batch size before forcing send
+                // - batch.num.messages=10000: max messages per batch
+                // Note: High-volume scenarios may use 100ms linger.
+                // For moderate load, 5ms gives batching benefits without latency penalty.
+                config
+                    .set("queue.buffering.max.ms", "5")
+                    .set("batch.size", "524288") // 512KB
+                    .set("batch.num.messages", "10000");
+            }
+        }
+
+        if std::env::var("HELIX_USE_HIGH_VOLUME_DEFAULTS")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            let compression = std::env::var("HELIX_COMPRESSION")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "zstd".to_string());
+            // High-volume producer defaults (100ms linger, large batches).
+            config
+                .set("acks", "-1")
+                .set("linger.ms", "100")
+                .set("queue.buffering.max.ms", "100")
+                .set("sticky.partitioning.linger.ms", "200")
+                .set("batch.size", "512000")
+                .set("batch.num.messages", "10000")
+                .set("message.timeout.ms", "15000")
+                .set("queue.buffering.max.messages", "600000")
+                .set("queue.buffering.max.kbytes", "600000")
+                .set("message.max.bytes", "1000000")
+                .set("compression.codec", &compression)
+                .set("request.timeout.ms", "12500")
+                .set("connections.max.idle.ms", "0");
+        }
+
+        let producer: FutureProducer = config.create()?;
+
+        // Consumer config tuned for faster failover.
         let consumer: BaseConsumer = ClientConfig::new()
             .set("bootstrap.servers", bootstrap_servers)
             .set("group.id", "helix-workload-consumer")
@@ -707,7 +1064,7 @@ impl RealExecutor {
             .set("topic.metadata.refresh.fast.interval.ms", "100")
             // Enable partition EOF notifications so we know when we've consumed all data.
             .set("enable.partition.eof", "true")
-            // Connection timeout settings - aligned with DD's libstreaming.
+            // Connection timeout settings for faster failover.
             .set("socket.timeout.ms", "12500")
             .set("connections.max.idle.ms", "0")
             .set("fetch.wait.max.ms", "500")
@@ -737,37 +1094,26 @@ impl WorkloadExecutor for RealExecutor {
         partition: i32,
         payload: Bytes,
     ) -> Result<u64, ExecutorError> {
-        eprintln!("[SEND_START] topic={topic} partition={partition} payload_len={}", payload.len());
-        let send_start = std::time::Instant::now();
-
         let record: FutureRecord<'_, (), [u8]> = FutureRecord::to(topic)
             .partition(partition)
             .payload(payload.as_ref());
 
         // FutureProducer returns the delivery result with offset.
+        // The future resolves when the broker acknowledges (per acks setting).
         let delivery_result = self
             .producer
             .send(record, Duration::from_secs(30))
             .await
             .map_err(|(err, _record)| {
-                eprintln!("[SEND_ERROR] topic={topic} partition={partition} elapsed={:?} error={err}", send_start.elapsed());
                 ExecutorError::Generic {
                     code: -1,
                     message: err.to_string(),
                 }
             })?;
 
-        // Flush to ensure delivery (important before polling).
-        self.producer.flush(Duration::from_secs(5)).map_err(|e| ExecutorError::Generic {
-            code: -1,
-            message: format!("producer flush failed: {e}"),
-        })?;
-
         // Extract the offset from the delivery result.
         #[allow(clippy::cast_sign_loss)]
         let offset = delivery_result.1 as u64;
-
-        eprintln!("[SEND] topic={topic} partition={partition} offset={offset}");
 
         Ok(offset)
     }

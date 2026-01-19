@@ -408,6 +408,61 @@ impl<S: Storage + Send + Sync + 'static> BufferedWal<S> {
         guard.buffer.len()
     }
 
+    // -------------------------------------------------------------------------
+    // Segment methods (pass-through to underlying WAL for tiering support)
+    // -------------------------------------------------------------------------
+
+    /// Returns segment information for the given segment ID.
+    ///
+    /// Pass-through to underlying WAL for tiering support.
+    pub async fn segment_info(&self, segment_id: crate::SegmentId) -> Option<crate::SegmentInfo> {
+        let guard = self.inner.lock().await;
+        guard.wal.segment_info(segment_id)
+    }
+
+    /// Tries to get segment information synchronously (non-blocking).
+    ///
+    /// Returns `None` if the lock cannot be acquired or segment doesn't exist.
+    /// This is useful for precondition checks where blocking is not acceptable.
+    #[must_use]
+    pub fn try_segment_info(&self, segment_id: crate::SegmentId) -> Option<crate::SegmentInfo> {
+        self.inner
+            .try_lock()
+            .ok()
+            .and_then(|guard| guard.wal.segment_info(segment_id))
+    }
+
+    /// Returns the IDs of all sealed segments.
+    ///
+    /// Pass-through to underlying WAL for tiering support.
+    pub async fn sealed_segment_ids(&self) -> Vec<crate::SegmentId> {
+        let guard = self.inner.lock().await;
+        guard.wal.sealed_segment_ids()
+    }
+
+    /// Reads raw segment bytes for the given segment ID.
+    ///
+    /// Pass-through to underlying WAL for tiering support.
+    ///
+    /// # Errors
+    /// Returns an error if the segment cannot be read.
+    pub async fn read_segment_bytes(&self, segment_id: crate::SegmentId) -> WalResult<bytes::Bytes> {
+        let guard = self.inner.lock().await;
+        guard.wal.read_segment_bytes(segment_id)
+    }
+
+    /// Explicitly syncs all buffered writes to disk.
+    ///
+    /// This flushes the buffer and calls sync on the underlying WAL.
+    /// Normally the background task handles this, but this can be used
+    /// for explicit sync points.
+    ///
+    /// # Errors
+    /// Returns an error if the sync fails.
+    pub async fn sync(&self) -> WalResult<()> {
+        self.flush().await
+    }
+
     /// Stops the background flush task and flushes remaining entries.
     ///
     /// # Errors

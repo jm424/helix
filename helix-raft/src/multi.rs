@@ -105,6 +105,18 @@ pub enum MultiRaftOutput {
         /// The Raft group.
         group_id: GroupId,
     },
+    /// Vote state changed for a group.
+    ///
+    /// Emitted when the group's `term` or `voted_for` changes.
+    /// The caller should persist this state to prevent double-voting on restart.
+    VoteStateChanged {
+        /// The Raft group.
+        group_id: GroupId,
+        /// The new term.
+        term: TermId,
+        /// Who we voted for in the new term (None if haven't voted).
+        voted_for: Option<NodeId>,
+    },
 }
 
 /// Information about a Raft group.
@@ -133,6 +145,9 @@ pub struct MultiRaft {
     groups: BTreeMap<GroupId, GroupInfo>,
     /// Pending outbound messages batched by destination.
     outbound_batches: HashMap<NodeId, Vec<GroupMessage>>,
+    /// Default peer list for auto-creating groups on message receipt.
+    /// When set, groups are auto-created when receiving messages for unknown groups.
+    default_peers: Option<Vec<NodeId>>,
 }
 
 impl MultiRaft {
@@ -143,7 +158,18 @@ impl MultiRaft {
             node_id,
             groups: BTreeMap::new(),
             outbound_batches: HashMap::new(),
+            default_peers: None,
         }
+    }
+
+    /// Sets the default peer list for auto-creating groups.
+    ///
+    /// When set, receiving a message for an unknown group will automatically
+    /// create that group with this peer list. This is useful for recovery
+    /// scenarios where a node rejoins the cluster without knowing which
+    /// groups it should participate in.
+    pub fn set_default_peers(&mut self, peers: Vec<NodeId>) {
+        self.default_peers = Some(peers);
     }
 
     /// Returns this node's ID.
@@ -279,6 +305,118 @@ impl MultiRaft {
         Ok(())
     }
 
+    /// Creates a new Raft group with restored vote state.
+    ///
+    /// Use this when recovering from persisted storage to restore the group's
+    /// term and voted_for state. This prevents double-voting after restarts.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - The group ID
+    /// * `peers` - Cluster members including this node
+    /// * `term` - Persisted term
+    /// * `voted_for` - Who we voted for in the persisted term
+    /// * `observation_mode` - Enable observation mode for safe S3 recovery
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The group already exists
+    /// - Maximum group count exceeded
+    /// - This node is not in the peer list
+    pub fn create_group_with_state(
+        &mut self,
+        group_id: GroupId,
+        peers: Vec<NodeId>,
+        term: TermId,
+        voted_for: Option<NodeId>,
+        observation_mode: bool,
+    ) -> Result<(), MultiRaftError> {
+        // Precondition: group doesn't exist.
+        if self.groups.contains_key(&group_id) {
+            return Err(MultiRaftError::GroupExists(group_id));
+        }
+
+        // Precondition: under limit.
+        if self.groups.len() >= GROUPS_PER_NODE_MAX {
+            return Err(MultiRaftError::TooManyGroups {
+                count: self.groups.len(),
+                max: GROUPS_PER_NODE_MAX,
+            });
+        }
+
+        // Precondition: this node is in the peer list.
+        if !peers.contains(&self.node_id) {
+            return Err(MultiRaftError::NodeNotInPeers {
+                node_id: self.node_id,
+                group_id,
+            });
+        }
+
+        // Use group_id as part of seed for deterministic but varied timeouts.
+        let config = RaftConfig::new(self.node_id, peers)
+            .with_random_seed(self.node_id.get() ^ group_id.get());
+        let node = RaftNode::with_vote_state(config, term, voted_for, observation_mode);
+
+        self.groups.insert(group_id, GroupInfo { node });
+
+        // Postcondition: group now exists.
+        debug_assert!(self.groups.contains_key(&group_id));
+
+        Ok(())
+    }
+
+    /// Creates a new Raft group with restored vote state and custom tick configuration.
+    ///
+    /// Combines `create_group_with_config` and `create_group_with_state`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The group already exists
+    /// - Maximum group count exceeded
+    /// - This node is not in the peer list
+    pub fn create_group_with_state_and_config(
+        &mut self,
+        group_id: GroupId,
+        peers: Vec<NodeId>,
+        term: TermId,
+        voted_for: Option<NodeId>,
+        observation_mode: bool,
+        election_tick: u32,
+        heartbeat_tick: u32,
+    ) -> Result<(), MultiRaftError> {
+        // Precondition: group doesn't exist.
+        if self.groups.contains_key(&group_id) {
+            return Err(MultiRaftError::GroupExists(group_id));
+        }
+
+        // Precondition: under limit.
+        if self.groups.len() >= GROUPS_PER_NODE_MAX {
+            return Err(MultiRaftError::TooManyGroups {
+                count: self.groups.len(),
+                max: GROUPS_PER_NODE_MAX,
+            });
+        }
+
+        // Precondition: this node is in the peer list.
+        if !peers.contains(&self.node_id) {
+            return Err(MultiRaftError::NodeNotInPeers {
+                node_id: self.node_id,
+                group_id,
+            });
+        }
+
+        let config = RaftConfig::new(self.node_id, peers)
+            .with_tick_config(election_tick, heartbeat_tick)
+            .with_random_seed(self.node_id.get() ^ group_id.get());
+        let node = RaftNode::with_vote_state(config, term, voted_for, observation_mode);
+
+        self.groups.insert(group_id, GroupInfo { node });
+
+        Ok(())
+    }
+
     /// Removes a Raft group.
     ///
     /// Any pending operations for this group are cancelled.
@@ -378,11 +516,23 @@ impl MultiRaft {
     }
 
     /// Handles an incoming message for a specific group.
+    ///
+    /// If the group doesn't exist and `default_peers` is set, the group
+    /// is auto-created before processing the message. This enables nodes
+    /// to rejoin groups after recovery without explicit group creation.
     pub fn handle_message(
         &mut self,
         group_id: GroupId,
         message: Message,
     ) -> Vec<MultiRaftOutput> {
+        // Auto-create group if it doesn't exist and we have default peers.
+        if !self.groups.contains_key(&group_id) {
+            if let Some(ref peers) = self.default_peers {
+                // Ignore errors (e.g., too many groups) - just drop the message.
+                let _ = self.create_group(group_id, peers.clone());
+            }
+        }
+
         let Some(info) = self.groups.get_mut(&group_id) else {
             return Vec::new();
         };
@@ -511,6 +661,13 @@ impl MultiRaft {
                 }
                 RaftOutput::SteppedDown => {
                     result.push(MultiRaftOutput::SteppedDown { group_id });
+                }
+                RaftOutput::VoteStateChanged { term, voted_for } => {
+                    result.push(MultiRaftOutput::VoteStateChanged {
+                        group_id,
+                        term,
+                        voted_for,
+                    });
                 }
             }
         }

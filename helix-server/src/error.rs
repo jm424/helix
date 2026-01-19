@@ -4,7 +4,7 @@ use crate::generated::ErrorCode;
 use helix_progress::ProgressError;
 
 /// Server error type.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ServerError {
     /// Topic not found.
     #[error("topic not found: {topic}")]
@@ -156,6 +156,15 @@ pub enum ServerError {
         producer_id: u64,
     },
 
+    /// Server overloaded (backpressure).
+    #[error("server overloaded: {pending_requests} pending requests, {pending_bytes} pending bytes")]
+    Overloaded {
+        /// Number of pending requests.
+        pending_requests: u64,
+        /// Total pending bytes.
+        pending_bytes: u64,
+    },
+
     /// Internal error.
     #[error("internal error: {message}")]
     Internal {
@@ -186,6 +195,7 @@ impl ServerError {
             Self::Progress(e) => progress_error_to_code(e),
             Self::OutOfOrderSequence { .. } => ErrorCode::OutOfOrderSequence,
             Self::ProducerFenced { .. } => ErrorCode::ProducerFenced,
+            Self::Overloaded { .. } => ErrorCode::BrokerNotAvailable,
             Self::Internal { .. } => ErrorCode::Unknown,
         }
     }

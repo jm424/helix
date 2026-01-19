@@ -133,6 +133,9 @@ impl MultiRaftActor {
                 MultiRaftOutput::CommitEntry { .. } | MultiRaftOutput::SteppedDown { .. } => {
                     // Handled by application layer.
                 }
+                MultiRaftOutput::VoteStateChanged { .. } => {
+                    // Vote state persistence handled separately.
+                }
             }
         }
     }

@@ -21,7 +21,7 @@
 //! are sealed or committed.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -81,8 +81,7 @@ use helix_tier::{
 };
 #[cfg(feature = "s3")]
 use helix_tier::{S3Config, S3ObjectStorage};
-use helix_wal::{Entry, SegmentId, SharedEntry, SharedWalHandle, Storage, TokioStorage, Wal, WalConfig};
-use tokio::sync::RwLock;
+use helix_wal::{BufferedWal, BufferedWalConfig, Entry, SegmentId, SharedEntry, SharedWalHandle, Storage, TokioStorage, WalConfig};
 use tracing::{debug, info, warn};
 
 // -----------------------------------------------------------------------------
@@ -92,9 +91,12 @@ use tracing::{debug, info, warn};
 /// WAL backend for durable partitions.
 ///
 /// Supports both dedicated WAL (one per partition) and shared WAL (pooled).
-pub enum WalBackend<S: Storage> {
-    /// Dedicated WAL for a single partition.
-    Dedicated(Arc<RwLock<Wal<S>>>),
+pub enum WalBackend<S: Storage + Send + Sync + 'static> {
+    /// Dedicated WAL for a single partition with background sync.
+    ///
+    /// Uses `BufferedWal` which spawns a background task to periodically
+    /// flush and sync writes, providing durability without blocking appends.
+    Dedicated(BufferedWal<S>),
     /// Shared WAL handle from a pool.
     Shared(SharedWalHandle<S>),
 }
@@ -109,7 +111,7 @@ pub enum WalBackend<S: Storage> {
 /// from the WAL when tiering to S3.
 ///
 /// Supports both dedicated and shared WAL backends.
-pub struct WalSegmentReader<S: Storage> {
+pub struct WalSegmentReader<S: Storage + Send + Sync + 'static> {
     /// WAL backend (dedicated or shared).
     wal: WalBackend<S>,
 }
@@ -117,7 +119,7 @@ pub struct WalSegmentReader<S: Storage> {
 impl<S: Storage + Clone + Send + Sync + 'static> WalSegmentReader<S> {
     /// Creates a new segment reader for a dedicated WAL.
     #[must_use]
-    pub const fn new_dedicated(wal: Arc<RwLock<Wal<S>>>) -> Self {
+    pub fn new_dedicated(wal: BufferedWal<S>) -> Self {
         Self {
             wal: WalBackend::Dedicated(wal),
         }
@@ -137,18 +139,18 @@ impl<S: Storage + Clone + Send + Sync + 'static> SegmentReader for WalSegmentRea
     async fn read_segment_bytes(&self, segment_id: SegmentId) -> TierResult<Bytes> {
         match &self.wal {
             WalBackend::Dedicated(wal) => {
-                let wal = wal.read().await;
-
                 // TigerStyle: Assert precondition.
                 assert!(
-                    wal.segment_info(segment_id).is_some(),
+                    wal.segment_info(segment_id).await.is_some(),
                     "segment must exist before reading"
                 );
 
-                wal.read_segment_bytes(segment_id).map_err(|e| TierError::Io {
-                    operation: "read_segment_bytes",
-                    message: e.to_string(),
-                })
+                wal.read_segment_bytes(segment_id)
+                    .await
+                    .map_err(|e| TierError::Io {
+                        operation: "read_segment_bytes",
+                        message: e.to_string(),
+                    })
             }
             WalBackend::Shared(handle) => handle
                 .read_segment_bytes(segment_id)
@@ -163,11 +165,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> SegmentReader for WalSegmentRea
     fn is_segment_sealed(&self, segment_id: SegmentId) -> bool {
         match &self.wal {
             WalBackend::Dedicated(wal) => {
-                // Use try_read to avoid blocking; if we can't get the lock, assume not sealed.
+                // Use try_segment_info to avoid blocking; if we can't get the lock, assume not sealed.
                 // This is safe because is_segment_sealed is only used as a precondition check.
-                wal.try_read()
-                    .map(|wal| wal.segment_info(segment_id).is_some_and(|info| info.is_sealed))
-                    .unwrap_or(false)
+                wal.try_segment_info(segment_id)
+                    .is_some_and(|info| info.is_sealed)
             }
             WalBackend::Shared(_handle) => {
                 // For shared WAL, we don't have immediate access to segment info.
@@ -319,6 +320,20 @@ pub enum BlobFormat {
     KafkaRecordBatch,
 }
 
+/// A single blob within a batched append operation.
+///
+/// Used by `AppendBlobBatch` to group multiple producer requests into a single
+/// Raft entry for improved throughput.
+#[derive(Debug, Clone)]
+pub struct BatchedBlob {
+    /// Raw blob data.
+    pub blob: Bytes,
+    /// Number of records in this blob.
+    pub record_count: u32,
+    /// Format of the blob data.
+    pub format: BlobFormat,
+}
+
 // -----------------------------------------------------------------------------
 // PartitionCommand
 // -----------------------------------------------------------------------------
@@ -354,16 +369,32 @@ pub enum PartitionCommand {
         /// New high watermark value.
         high_watermark: Offset,
     },
+    /// Append multiple blobs as a single batched operation (type 4).
+    ///
+    /// Used to batch multiple producer requests into a single Raft entry,
+    /// reducing consensus overhead. Each blob is applied sequentially and
+    /// offsets are calculated at apply time.
+    AppendBlobBatch {
+        /// Blobs to append in order.
+        blobs: Vec<BatchedBlob>,
+    },
 }
 
 impl PartitionCommand {
     /// Encodes the command to bytes.
+    ///
+    /// Command types:
+    /// - 0: Append
+    /// - 1: Truncate
+    /// - 2: UpdateHighWatermark
+    /// - 3: AppendBlob
+    /// - 4: AppendBlobBatch
     #[must_use]
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
         match self {
             Self::Append { records } => {
-                buf.put_u8(0); // Command type.
+                buf.put_u8(0);
                 // Safe cast: record count bounded by MAX_RECORDS_PER_WRITE.
                 #[allow(clippy::cast_possible_truncation)]
                 let count = records.len() as u32;
@@ -373,7 +404,7 @@ impl PartitionCommand {
                 }
             }
             Self::AppendBlob { blob, record_count, format } => {
-                buf.put_u8(3); // Command type for blob.
+                buf.put_u8(3);
                 buf.put_u32_le(*record_count);
                 // Encode format: 0 = Raw, 1 = KafkaRecordBatch.
                 let format_byte = match format {
@@ -395,6 +426,26 @@ impl PartitionCommand {
                 buf.put_u8(2);
                 buf.put_u64_le(high_watermark.get());
             }
+            Self::AppendBlobBatch { blobs } => {
+                buf.put_u8(4); // Command type for batch.
+                // Safe cast: blob count bounded by MAX_BATCH_REQUESTS (1000).
+                #[allow(clippy::cast_possible_truncation)]
+                let blob_count = blobs.len() as u32;
+                buf.put_u32_le(blob_count);
+                for batched in blobs {
+                    buf.put_u32_le(batched.record_count);
+                    let format_byte = match batched.format {
+                        BlobFormat::Raw => 0u8,
+                        BlobFormat::KafkaRecordBatch => 1u8,
+                    };
+                    buf.put_u8(format_byte);
+                    // Safe cast: blob size bounded by protocol limits.
+                    #[allow(clippy::cast_possible_truncation)]
+                    let blob_len = batched.blob.len() as u32;
+                    buf.put_u32_le(blob_len);
+                    buf.put_slice(&batched.blob);
+                }
+            }
         }
         buf.freeze()
     }
@@ -402,6 +453,9 @@ impl PartitionCommand {
     /// Decodes a command from bytes.
     #[must_use]
     pub fn decode(data: &Bytes) -> Option<Self> {
+        // TigerStyle: bounded iteration for batch blobs.
+        const MAX_BATCH_BLOBS: usize = 1000;
+
         if data.is_empty() {
             return None;
         }
@@ -411,6 +465,7 @@ impl PartitionCommand {
 
         match cmd_type {
             0 => {
+                // Append: record_count (u32) + records.
                 if buf.remaining() < 4 {
                     return None;
                 }
@@ -439,7 +494,7 @@ impl PartitionCommand {
                 Some(Self::UpdateHighWatermark { high_watermark })
             }
             3 => {
-                // AppendBlob: record_count (u32) + format (u8) + blob_len (u32) + blob bytes.
+                // AppendBlob: record_count (u32) + format (u8) + blob_len (u32) + blob.
                 if buf.remaining() < 9 {
                     return None;
                 }
@@ -456,6 +511,38 @@ impl PartitionCommand {
                 }
                 let blob = buf.copy_to_bytes(blob_len);
                 Some(Self::AppendBlob { blob, record_count, format })
+            }
+            4 => {
+                // AppendBlobBatch: blob_count (u32) + [record_count (u32) + format (u8) + blob_len (u32) + blob bytes]...
+                if buf.remaining() < 4 {
+                    return None;
+                }
+                // Safe cast: blob count bounded by MAX_BATCH_REQUESTS (1000).
+                #[allow(clippy::cast_possible_truncation)]
+                let blob_count = buf.get_u32_le() as usize;
+                if blob_count > MAX_BATCH_BLOBS {
+                    return None;
+                }
+                let mut blobs = Vec::with_capacity(blob_count);
+                for _ in 0..blob_count {
+                    if buf.remaining() < 9 {
+                        return None;
+                    }
+                    let record_count = buf.get_u32_le();
+                    let format_byte = buf.get_u8();
+                    let format = match format_byte {
+                        0 => BlobFormat::Raw,
+                        1 => BlobFormat::KafkaRecordBatch,
+                        _ => return None,
+                    };
+                    let blob_len = buf.get_u32_le() as usize;
+                    if buf.remaining() < blob_len {
+                        return None;
+                    }
+                    let blob = buf.copy_to_bytes(blob_len);
+                    blobs.push(BatchedBlob { blob, record_count, format });
+                }
+                Some(Self::AppendBlobBatch { blobs })
             }
             _ => None,
         }
@@ -826,8 +913,20 @@ pub struct DurablePartitionConfig {
     pub topic_id: TopicId,
     /// Partition ID.
     pub partition_id: PartitionId,
-    /// Whether to sync after every write.
+    /// Whether to sync after every write (legacy, use `flush_interval` instead).
+    ///
+    /// If `true`, sets `flush_interval` to zero for immediate sync.
+    /// Prefer using `flush_interval` directly for more control.
     pub sync_on_write: bool,
+    /// Interval for background WAL sync.
+    ///
+    /// The WAL buffers writes and syncs them to disk periodically.
+    /// - `Duration::ZERO` = sync every write (max durability, lower throughput)
+    /// - `Duration::from_millis(1)` = 1ms batching (default, balanced)
+    /// - `Duration::from_millis(10)` = 10ms batching (higher throughput)
+    ///
+    /// Data is durable after Raft replication, so background sync is safe.
+    pub flush_interval: Duration,
     /// Optional tiering configuration. If `Some`, tiering is enabled.
     pub tiering: Option<TieringConfig>,
     /// Optional progress tracking configuration. If `Some`, consumer progress is tracked.
@@ -852,6 +951,7 @@ impl DurablePartitionConfig {
             topic_id,
             partition_id,
             sync_on_write: false, // Default to batched syncs for performance.
+            flush_interval: Duration::from_millis(1), // Default: 1ms batching.
             tiering: None,
             progress: None,
             object_storage_dir: None,
@@ -860,10 +960,26 @@ impl DurablePartitionConfig {
         }
     }
 
-    /// Enables sync after every write.
+    /// Enables sync after every write (legacy).
+    ///
+    /// Prefer using `with_flush_interval(Duration::ZERO)` for explicit control.
     #[must_use]
-    pub const fn with_sync_on_write(mut self, sync: bool) -> Self {
+    pub fn with_sync_on_write(mut self, sync: bool) -> Self {
         self.sync_on_write = sync;
+        if sync {
+            self.flush_interval = Duration::ZERO;
+        }
+        self
+    }
+
+    /// Sets the interval for background WAL sync.
+    ///
+    /// - `Duration::ZERO` = sync every write (max durability, lower throughput)
+    /// - `Duration::from_millis(1)` = 1ms batching (default, balanced)
+    /// - `Duration::from_millis(10)` = 10ms batching (higher throughput)
+    #[must_use]
+    pub const fn with_flush_interval(mut self, interval: Duration) -> Self {
+        self.flush_interval = interval;
         self
     }
 
@@ -975,17 +1091,29 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
     #[allow(clippy::too_many_lines)]
     pub async fn open(storage: S, config: DurablePartitionConfig) -> Result<Self, DurablePartitionError> {
         let wal_dir = config.wal_dir();
-        let wal_config = WalConfig::new(&wal_dir).with_sync_on_write(config.sync_on_write);
+
+        // Build BufferedWalConfig with flush_interval for background sync.
+        // The sync_on_write flag is translated to flush_interval=0 for backwards compatibility.
+        let effective_flush_interval = if config.sync_on_write {
+            Duration::ZERO
+        } else {
+            config.flush_interval
+        };
+
+        let wal_config = WalConfig::new(&wal_dir);
+        let buffered_config = BufferedWalConfig::new(wal_config)
+            .with_flush_interval(effective_flush_interval);
 
         info!(
             topic = config.topic_id.get(),
             partition = config.partition_id.get(),
             dir = ?wal_dir,
+            flush_interval_ms = effective_flush_interval.as_millis(),
             tiering_enabled = config.tiering.is_some(),
             "Opening durable partition"
         );
 
-        let wal = Wal::open(storage, wal_config)
+        let wal = BufferedWal::open(storage, buffered_config)
             .await
             .map_err(|e| DurablePartitionError::WalOpen {
                 path: wal_dir.clone(),
@@ -997,8 +1125,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         let mut last_applied_index = 0u64;
 
         // Recover entries from WAL.
-        if let Some(last_index) = wal.last_index() {
-            let first_index = wal.first_index();
+        if let Some(last_index) = wal.last_index().await {
+            let first_index = wal.first_index().await;
             info!(
                 first_index,
                 last_index,
@@ -1006,9 +1134,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             );
 
             for index in first_index..=last_index {
-                match wal.read(index) {
+                match wal.read(index).await {
                     Ok(entry) => {
-                        if let Err(e) = Self::apply_entry_to_cache(&mut cache, entry) {
+                        if let Err(e) = Self::apply_entry_to_cache(&mut cache, &entry) {
                             warn!(index, error = %e, "Failed to apply entry during recovery");
                         }
                         last_applied_index = index;
@@ -1025,13 +1153,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             );
         }
 
-        // Wrap WAL in Arc<RwLock> for shared access with tiering.
-        let wal_ref = Arc::new(RwLock::new(wal));
-        let wal = WalBackend::Dedicated(wal_ref.clone());
+        // BufferedWal is already Clone + Send + Sync, no need for Arc<RwLock>.
+        let wal_backend = WalBackend::Dedicated(wal.clone());
 
         // Initialize tiering if configured.
         let tiering = if let Some(tiering_config) = config.tiering.as_ref() {
-            let segment_reader = WalSegmentReader::new_dedicated(wal_ref.clone());
+            let segment_reader = WalSegmentReader::new_dedicated(wal.clone());
             let metadata_store = InMemoryMetadataStore::new();
 
             // Select backend: S3 (if configured) > Filesystem > Simulated
@@ -1162,7 +1289,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
 
         Ok(Self {
             config,
-            wal,
+            wal: wal_backend,
             cache,
             last_applied_index,
             tiering,
@@ -1307,17 +1434,36 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         self.cache.set_high_watermark(hwm);
     }
 
-    /// Appends records to the partition.
+    /// Returns the last applied WAL index.
+    ///
+    /// This is the index of the last entry that was applied to the partition,
+    /// recovered from the WAL on startup. Used to initialize idempotency tracking.
+    #[must_use]
+    pub const fn last_applied_index(&self) -> u64 {
+        self.last_applied_index
+    }
+
+    /// Appends records to the partition at the specified Raft index.
     ///
     /// The records are first written to the WAL for durability,
-    /// then applied to the in-memory cache.
+    /// then applied to the in-memory cache. The Raft index is used
+    /// as the WAL entry index for dedicated WALs, ensuring proper
+    /// idempotency after crash recovery.
+    ///
+    /// # Arguments
+    /// * `raft_index` - The Raft log index for this entry
+    /// * `records` - The records to append
     ///
     /// # Returns
     /// The base offset of the first appended record.
     ///
     /// # Errors
     /// Returns an error if the write fails.
-    pub async fn append(&mut self, records: Vec<Record>) -> Result<Offset, DurablePartitionError> {
+    pub async fn append_at_index(
+        &mut self,
+        raft_index: u64,
+        records: Vec<Record>,
+    ) -> Result<Offset, DurablePartitionError> {
         let base_offset = self.cache.log_end_offset();
 
         // Create WAL entry with command.
@@ -1329,32 +1475,33 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         let term = 0; // Terms managed by Raft layer.
 
         // Write to WAL first (durability).
+        // BufferedWal handles background sync, so appends are non-blocking.
         let assigned_index = match &self.wal {
             WalBackend::Dedicated(wal) => {
-                let next_index = self.last_applied_index + 1;
-                let entry = Entry::new(term, next_index, data).map_err(|e| {
+                // Use the Raft index as the WAL entry index.
+                // This ensures last_applied_index matches Raft indices after recovery.
+                let entry = Entry::new(term, raft_index, data).map_err(|e| {
                     DurablePartitionError::WalWrite {
                         message: format!("failed to create WAL entry: {e}"),
                     }
                 })?;
-                wal.write()
-                    .await
-                    .append(entry)
+                wal.append(entry)
                     .await
                     .map_err(|e| DurablePartitionError::WalWrite {
                         message: e.to_string(),
                     })?;
-                next_index
+                raft_index
             }
             WalBackend::Shared(handle) => {
                 // Use auto-index assignment to eliminate TOCTOU races.
-                let ack = handle
-                    .append_auto(term, data)
+                // Don't wait for fsync - durability is provided by Raft replication.
+                // The entry is buffered and will be fsynced within flush_interval.
+                handle
+                    .append_nowait(term, data)
                     .await
                     .map_err(|e| DurablePartitionError::WalWrite {
                         message: e.to_string(),
-                    })?;
-                ack.index
+                    })?
             }
         };
 
@@ -1376,10 +1523,28 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             partition = self.config.partition_id.get(),
             base_offset = base_offset.get(),
             wal_index = assigned_index,
+            raft_index = raft_index,
             "Appended records to durable partition"
         );
 
         Ok(base_offset)
+    }
+
+    /// Appends records to the partition.
+    ///
+    /// This is a convenience method that auto-assigns the WAL index.
+    /// For Raft-replicated partitions, prefer `append_at_index` to ensure
+    /// proper idempotency after crash recovery.
+    ///
+    /// # Returns
+    /// The base offset of the first appended record.
+    ///
+    /// # Errors
+    /// Returns an error if the write fails.
+    pub async fn append(&mut self, records: Vec<Record>) -> Result<Offset, DurablePartitionError> {
+        // Auto-assign the next index.
+        let next_index = self.last_applied_index + 1;
+        self.append_at_index(next_index, records).await
     }
 
     /// Reads records starting at the given offset.
@@ -1408,12 +1573,14 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         self.cache.blob_log_start_offset()
     }
 
-    /// Appends a blob to the partition.
+    /// Appends a blob to the partition at the specified Raft index.
     ///
     /// The blob is written to WAL for durability, then applied to the
-    /// in-memory cache. No parsing or conversion is performed.
+    /// in-memory cache. No parsing or conversion is performed. The Raft
+    /// index is used as the WAL entry index for dedicated WALs.
     ///
     /// # Arguments
+    /// * `raft_index` - The Raft log index for this entry
     /// * `blob` - Raw blob data (e.g., Kafka `RecordBatch` bytes).
     /// * `record_count` - Number of records in the blob (for offset allocation).
     ///
@@ -1422,8 +1589,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
     ///
     /// # Errors
     /// Returns an error if the write fails.
-    pub async fn append_blob(
+    pub async fn append_blob_at_index(
         &mut self,
+        raft_index: u64,
         blob: Bytes,
         record_count: u32,
     ) -> Result<Offset, DurablePartitionError> {
@@ -1443,32 +1611,32 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         let term = 0; // Terms managed by Raft layer.
 
         // Write to WAL first (durability).
+        // BufferedWal handles background sync, so appends are non-blocking.
         let assigned_index = match &self.wal {
             WalBackend::Dedicated(wal) => {
-                let next_index = self.last_applied_index + 1;
-                let entry = Entry::new(term, next_index, data).map_err(|e| {
+                // Use the Raft index as the WAL entry index.
+                let entry = Entry::new(term, raft_index, data).map_err(|e| {
                     DurablePartitionError::WalWrite {
                         message: format!("failed to create WAL entry: {e}"),
                     }
                 })?;
-                wal.write()
-                    .await
-                    .append(entry)
+                wal.append(entry)
                     .await
                     .map_err(|e| DurablePartitionError::WalWrite {
                         message: e.to_string(),
                     })?;
-                next_index
+                raft_index
             }
             WalBackend::Shared(handle) => {
                 // Use auto-index assignment to eliminate TOCTOU races.
-                let ack = handle
-                    .append_auto(term, data)
+                // Don't wait for fsync - durability is provided by Raft replication.
+                // The entry is buffered and will be fsynced within flush_interval.
+                handle
+                    .append_nowait(term, data)
                     .await
                     .map_err(|e| DurablePartitionError::WalWrite {
                         message: e.to_string(),
-                    })?;
-                ack.index
+                    })?
             }
         };
 
@@ -1492,10 +1660,35 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             record_count,
             blob_size,
             wal_index = assigned_index,
+            raft_index = raft_index,
             "Appended blob to durable partition"
         );
 
         Ok(base_offset)
+    }
+
+    /// Appends a blob to the partition.
+    ///
+    /// This is a convenience method that auto-assigns the WAL index.
+    /// For Raft-replicated partitions, prefer `append_blob_at_index`.
+    ///
+    /// # Arguments
+    /// * `blob` - Raw blob data (e.g., Kafka `RecordBatch` bytes).
+    /// * `record_count` - Number of records in the blob (for offset allocation).
+    ///
+    /// # Returns
+    /// The base offset assigned to this blob.
+    ///
+    /// # Errors
+    /// Returns an error if the write fails.
+    pub async fn append_blob(
+        &mut self,
+        blob: Bytes,
+        record_count: u32,
+    ) -> Result<Offset, DurablePartitionError> {
+        // Auto-assign the next index.
+        let next_index = self.last_applied_index + 1;
+        self.append_blob_at_index(next_index, blob, record_count).await
     }
 
     /// Reads blobs starting at the given offset.
@@ -1521,21 +1714,23 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
 
     /// Syncs the WAL to disk.
     ///
-    /// For dedicated WAL: Explicitly syncs to disk.
-    /// For shared WAL: No-op (append already waits for durability via background flush).
+    /// For dedicated WAL: Forces an immediate flush and sync.
+    /// For shared WAL: No-op (background flush handles durability).
+    ///
+    /// Note: With `BufferedWal`, this is typically not needed as background
+    /// sync handles durability. Use only for explicit sync points.
     ///
     /// # Errors
     /// Returns an error if the sync fails (dedicated WAL only).
     pub async fn sync(&self) -> Result<(), DurablePartitionError> {
         match &self.wal {
             WalBackend::Dedicated(wal) => {
-                let mut wal = wal.write().await;
                 wal.sync().await.map_err(|e| DurablePartitionError::WalSync {
                     message: e.to_string(),
                 })
             }
             WalBackend::Shared(_) => {
-                // Shared WAL auto-syncs via background flush. Append already waits for durability.
+                // Shared WAL auto-syncs via background flush.
                 Ok(())
             }
         }
@@ -1556,13 +1751,19 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         })?;
 
         match command {
-            PartitionCommand::Append { records } => {
+            PartitionCommand::Append { records, .. } => {
                 cache.append(records)?;
             }
-            PartitionCommand::AppendBlob { blob, record_count, format: _ } => {
+            PartitionCommand::AppendBlob { blob, record_count, .. } => {
                 // During WAL recovery, blobs are already in the correct format
                 // (patching happened at original apply time). Store as-is.
                 cache.append_blob(blob, record_count)?;
+            }
+            PartitionCommand::AppendBlobBatch { blobs } => {
+                // During WAL recovery, batch blobs are already patched. Apply each.
+                for batched in blobs {
+                    cache.append_blob(batched.blob, batched.record_count)?;
+                }
             }
             PartitionCommand::Truncate { from_offset } => {
                 cache.truncate(from_offset)?;
@@ -1595,16 +1796,22 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         })?;
 
         match command {
-            PartitionCommand::Append { records } => {
+            PartitionCommand::Append { records, .. } => {
                 cache.append(records)?;
             }
             PartitionCommand::AppendBlob {
                 blob,
                 record_count,
-                format: _,
+                ..
             } => {
                 // During WAL recovery, blobs are already in the correct format.
                 cache.append_blob(blob, record_count)?;
+            }
+            PartitionCommand::AppendBlobBatch { blobs } => {
+                // During WAL recovery, batch blobs are already patched. Apply each.
+                for batched in blobs {
+                    cache.append_blob(batched.blob, batched.record_count)?;
+                }
             }
             PartitionCommand::Truncate { from_offset } => {
                 cache.truncate(from_offset)?;
@@ -1640,10 +1847,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
 
         // Read WAL state.
         let sealed_ids = match &self.wal {
-            WalBackend::Dedicated(wal) => {
-                let wal = wal.read().await;
-                wal.sealed_segment_ids()
-            }
+            WalBackend::Dedicated(wal) => wal.sealed_segment_ids().await,
             WalBackend::Shared(handle) => handle.sealed_segment_ids().await,
         };
 
@@ -1659,10 +1863,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
 
             // Get segment info for metadata.
             let info_opt = match &self.wal {
-                WalBackend::Dedicated(wal) => {
-                    let wal = wal.read().await;
-                    wal.segment_info(*segment_id)
-                }
+                WalBackend::Dedicated(wal) => wal.segment_info(*segment_id).await,
                 WalBackend::Shared(handle) => handle.segment_info(*segment_id).await,
             };
 
@@ -1746,10 +1947,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
 
         // Read WAL state.
         let sealed_ids = match &self.wal {
-            WalBackend::Dedicated(wal) => {
-                let wal = wal.read().await;
-                wal.sealed_segment_ids()
-            }
+            WalBackend::Dedicated(wal) => wal.sealed_segment_ids().await,
             WalBackend::Shared(handle) => handle.sealed_segment_ids().await,
         };
 
@@ -1757,10 +1955,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         let mut segments_to_commit = Vec::new();
         for segment_id in sealed_ids.iter().take(100) {
             let info_opt = match &self.wal {
-                WalBackend::Dedicated(wal) => {
-                    let wal = wal.read().await;
-                    wal.segment_info(*segment_id)
-                }
+                WalBackend::Dedicated(wal) => wal.segment_info(*segment_id).await,
                 WalBackend::Shared(handle) => handle.segment_info(*segment_id).await,
             };
 

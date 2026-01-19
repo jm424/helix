@@ -38,7 +38,7 @@ const NETWORK_LATENCY_US: u64 = 1_000; // 1ms
 // Network Partition Tracking
 // ============================================================================
 
-/// Tracks network partition state across the cluster.
+/// Tracks network partition state and crashed nodes across the cluster.
 ///
 /// When a partition is active, messages between partitioned nodes are dropped.
 /// This is shared across all actors in the simulation.
@@ -48,6 +48,10 @@ pub struct NetworkState {
     /// from a to b are dropped. Partitions are bidirectional, so both
     /// (a, b) and (b, a) are added.
     partitioned_pairs: BTreeSet<(ActorId, ActorId)>,
+    /// Set of currently crashed nodes.
+    crashed_nodes: BTreeSet<ActorId>,
+    /// Total cluster size (for quorum calculation).
+    cluster_size: usize,
 }
 
 impl NetworkState {
@@ -89,6 +93,44 @@ impl NetworkState {
     /// Clears all partitions.
     pub fn clear(&mut self) {
         self.partitioned_pairs.clear();
+    }
+
+    /// Sets the cluster size (for quorum calculation).
+    pub fn set_cluster_size(&mut self, size: usize) {
+        self.cluster_size = size;
+    }
+
+    /// Marks a node as crashed.
+    pub fn mark_crashed(&mut self, actor: ActorId) {
+        self.crashed_nodes.insert(actor);
+    }
+
+    /// Marks a node as recovered.
+    pub fn mark_recovered(&mut self, actor: ActorId) {
+        self.crashed_nodes.remove(&actor);
+    }
+
+    /// Returns true if the given node can safely crash without violating quorum.
+    ///
+    /// A crash is safe if at least a majority of nodes would remain alive.
+    #[must_use]
+    pub fn can_crash_safely(&self, actor: ActorId) -> bool {
+        if self.cluster_size == 0 {
+            return true; // No cluster size set, allow crash.
+        }
+        // If already crashed, can "crash" again (no-op).
+        if self.crashed_nodes.contains(&actor) {
+            return true;
+        }
+        let alive_after_crash = self.cluster_size - self.crashed_nodes.len() - 1;
+        let quorum = (self.cluster_size / 2) + 1;
+        alive_after_crash >= quorum
+    }
+
+    /// Returns the number of currently crashed nodes.
+    #[must_use]
+    pub fn crashed_count(&self) -> usize {
+        self.crashed_nodes.len()
     }
 }
 
@@ -669,6 +711,14 @@ impl RaftActor {
                         actor = %self.name,
                         term = self.node.current_term().get(),
                         "stepped down"
+                    );
+                }
+                RaftOutput::VoteStateChanged { term, voted_for } => {
+                    tracing::debug!(
+                        actor = %self.name,
+                        term = term.get(),
+                        voted_for = ?voted_for.map(|n| n.get()),
+                        "vote state changed"
                     );
                 }
             }

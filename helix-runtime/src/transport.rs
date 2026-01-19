@@ -622,7 +622,15 @@ impl Transport {
                             break;
                         }
                         Err(e) => {
-                            error!(error = %e, "Failed to decode batch");
+                            let hex_dump: String = buffer.iter().take(64)
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<Vec<_>>().join(" ");
+                            error!(
+                                error = %e,
+                                buffer_len = buffer.len(),
+                                buffer_hex = %hex_dump,
+                                "Failed to decode batch"
+                            );
                             return Err(e.into());
                         }
                     }
@@ -650,7 +658,15 @@ impl Transport {
                             break;
                         }
                         Err(e) => {
-                            error!(error = %e, "Failed to decode heartbeat");
+                            let hex_dump: String = buffer.iter().take(64)
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<Vec<_>>().join(" ");
+                            error!(
+                                error = %e,
+                                buffer_len = buffer.len(),
+                                buffer_hex = %hex_dump,
+                                "Failed to decode heartbeat"
+                            );
                             return Err(e.into());
                         }
                     }
@@ -678,15 +694,27 @@ impl Transport {
                             break;
                         }
                         Err(e) => {
-                            error!(error = %e, "Failed to decode message");
+                            let hex_dump: String = buffer.iter().take(64)
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<Vec<_>>().join(" ");
+                            error!(
+                                error = %e,
+                                buffer_len = buffer.len(),
+                                buffer_hex = %hex_dump,
+                                "Failed to decode message"
+                            );
                             return Err(e.into());
                         }
                     }
                 }
             }
 
-            // Prevent buffer from growing unbounded.
-            if buffer.capacity() > READ_BUFFER_SIZE * 2 {
+            // Compact buffer only when empty to prevent unbounded growth.
+            // IMPORTANT: Only replace when empty! If we have partial message data
+            // waiting for more bytes (InsufficientData case), we must preserve it.
+            // Replacing a non-empty buffer would discard partial message data and
+            // cause the next read to see the middle of a message as a new frame.
+            if buffer.is_empty() && buffer.capacity() > READ_BUFFER_SIZE * 2 {
                 buffer = BytesMut::with_capacity(READ_BUFFER_SIZE);
             }
         }

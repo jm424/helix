@@ -8,6 +8,8 @@
 
 /// Handler implementations for the Helix service.
 pub mod handlers;
+/// Request batching for improved throughput.
+pub mod batcher;
 mod tick;
 
 use std::collections::HashMap;
@@ -15,7 +17,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use helix_core::{GroupId, NodeId, Offset, PartitionId, TopicId};
+use helix_core::{GroupId, LogIndex, NodeId, Offset, PartitionId, TopicId, WriteDurability};
 use helix_progress::{ProgressConfig, ProgressManager, SimulatedProgressStore};
 use helix_raft::multi::MultiRaft;
 use helix_runtime::{PeerInfo, TransportConfig, TransportError, TransportHandle};
@@ -61,6 +63,240 @@ pub struct PendingControllerProposal {
     pub result_tx: oneshot::Sender<crate::error::ServerResult<()>>,
 }
 
+/// A pending batched proposal waiting for Raft commit.
+///
+/// When multiple producer requests are batched into a single `AppendBlobBatch`
+/// entry, this struct tracks all the waiters. On commit, the tick task
+/// calculates per-request offsets and notifies each waiter.
+pub struct BatchPendingProposal {
+    /// The Raft log index of the proposed entry.
+    pub log_index: helix_core::LogIndex,
+    /// Timestamp when the first request entered the batch.
+    pub first_request_at: std::time::Instant,
+    /// Timestamp when the batch was proposed to Raft.
+    pub proposed_at: std::time::Instant,
+    /// Number of requests in this batch.
+    pub batch_size: u32,
+    /// Total bytes in this batch.
+    pub batch_bytes: u32,
+    /// Total records across all requests in this batch.
+    pub total_records: u64,
+    /// Record counts for each request in the batch (for offset calculation).
+    pub record_counts: Vec<u32>,
+    /// Channels to notify each waiter with their assigned offset.
+    pub result_txs: Vec<oneshot::Sender<crate::error::ServerResult<Offset>>>,
+}
+
+/// Aggregated batcher performance stats for reporting.
+#[derive(Default)]
+pub struct BatcherStats {
+    /// Total number of batch flushes.
+    flush_count: std::sync::atomic::AtomicU64,
+    /// Flushes triggered by linger timeout.
+    flush_linger_count: std::sync::atomic::AtomicU64,
+    /// Flushes triggered by batch size limits.
+    flush_size_count: std::sync::atomic::AtomicU64,
+    /// Flushes triggered by shutdown.
+    flush_shutdown_count: std::sync::atomic::AtomicU64,
+    /// Total requests observed across all batches.
+    total_batch_requests: std::sync::atomic::AtomicU64,
+    /// Total bytes observed across all batches.
+    total_batch_bytes: std::sync::atomic::AtomicU64,
+    /// Total records observed across all batches.
+    total_batch_records: std::sync::atomic::AtomicU64,
+    /// Total batch age at flush time (microseconds).
+    total_batch_age_us: std::sync::atomic::AtomicU64,
+    /// Total number of committed batches.
+    commit_count: std::sync::atomic::AtomicU64,
+    /// Total commit latency after proposal (microseconds).
+    total_commit_latency_us: std::sync::atomic::AtomicU64,
+    /// Total batch wait time before proposal (microseconds).
+    total_batch_wait_us: std::sync::atomic::AtomicU64,
+    /// Total time from first request to commit (microseconds).
+    total_total_age_us: std::sync::atomic::AtomicU64,
+    /// Number of batch flushes rejected due to not being leader.
+    not_leader_count: std::sync::atomic::AtomicU64,
+    /// Number of batch apply errors on commit.
+    apply_error_count: std::sync::atomic::AtomicU64,
+}
+
+impl BatcherStats {
+    /// Records a batch flush observation.
+    pub fn record_flush(
+        &self,
+        reason: &str,
+        batch_requests: u64,
+        batch_bytes: u64,
+        batch_records: u64,
+        batch_age_us: u64,
+    ) {
+        self.flush_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match reason {
+            "linger" => {
+                self.flush_linger_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            "size" => {
+                self.flush_size_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            "shutdown" => {
+                self.flush_shutdown_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        self.total_batch_requests
+            .fetch_add(batch_requests, std::sync::atomic::Ordering::Relaxed);
+        self.total_batch_bytes
+            .fetch_add(batch_bytes, std::sync::atomic::Ordering::Relaxed);
+        self.total_batch_records
+            .fetch_add(batch_records, std::sync::atomic::Ordering::Relaxed);
+        self.total_batch_age_us
+            .fetch_add(batch_age_us, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Records a batch commit observation.
+    pub fn record_commit(
+        &self,
+        batch_requests: u64,
+        batch_bytes: u64,
+        batch_records: u64,
+        batch_wait_us: u64,
+        commit_latency_us: u64,
+        total_age_us: u64,
+    ) {
+        self.commit_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.total_batch_requests
+            .fetch_add(batch_requests, std::sync::atomic::Ordering::Relaxed);
+        self.total_batch_bytes
+            .fetch_add(batch_bytes, std::sync::atomic::Ordering::Relaxed);
+        self.total_batch_records
+            .fetch_add(batch_records, std::sync::atomic::Ordering::Relaxed);
+        self.total_batch_wait_us
+            .fetch_add(batch_wait_us, std::sync::atomic::Ordering::Relaxed);
+        self.total_commit_latency_us
+            .fetch_add(commit_latency_us, std::sync::atomic::Ordering::Relaxed);
+        self.total_total_age_us
+            .fetch_add(total_age_us, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Records a batch flush rejection due to not being leader.
+    pub fn record_not_leader(&self) {
+        self.not_leader_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Records a batch apply error on commit.
+    pub fn record_apply_error(&self) {
+        self.apply_error_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Takes a snapshot of the current counters.
+    pub fn snapshot(&self) -> BatcherStatsSnapshot {
+        BatcherStatsSnapshot {
+            flush_count: self.flush_count.load(std::sync::atomic::Ordering::Relaxed),
+            flush_linger_count: self
+                .flush_linger_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            flush_size_count: self
+                .flush_size_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            flush_shutdown_count: self
+                .flush_shutdown_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            total_batch_requests: self
+                .total_batch_requests
+                .load(std::sync::atomic::Ordering::Relaxed),
+            total_batch_bytes: self
+                .total_batch_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            total_batch_records: self
+                .total_batch_records
+                .load(std::sync::atomic::Ordering::Relaxed),
+            total_batch_age_us: self
+                .total_batch_age_us
+                .load(std::sync::atomic::Ordering::Relaxed),
+            commit_count: self.commit_count.load(std::sync::atomic::Ordering::Relaxed),
+            total_commit_latency_us: self
+                .total_commit_latency_us
+                .load(std::sync::atomic::Ordering::Relaxed),
+            total_batch_wait_us: self
+                .total_batch_wait_us
+                .load(std::sync::atomic::Ordering::Relaxed),
+            total_total_age_us: self
+                .total_total_age_us
+                .load(std::sync::atomic::Ordering::Relaxed),
+            not_leader_count: self
+                .not_leader_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            apply_error_count: self
+                .apply_error_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+}
+
+/// Snapshot of batcher stats for reporting.
+pub struct BatcherStatsSnapshot {
+    /// Total number of batch flushes.
+    pub flush_count: u64,
+    /// Flushes triggered by linger timeout.
+    pub flush_linger_count: u64,
+    /// Flushes triggered by batch size limits.
+    pub flush_size_count: u64,
+    /// Flushes triggered by shutdown.
+    pub flush_shutdown_count: u64,
+    /// Total requests observed across all batches.
+    pub total_batch_requests: u64,
+    /// Total bytes observed across all batches.
+    pub total_batch_bytes: u64,
+    /// Total records observed across all batches.
+    pub total_batch_records: u64,
+    /// Total batch age at flush time (microseconds).
+    pub total_batch_age_us: u64,
+    /// Total number of committed batches.
+    pub commit_count: u64,
+    /// Total commit latency after proposal (microseconds).
+    pub total_commit_latency_us: u64,
+    /// Total batch wait time before proposal (microseconds).
+    pub total_batch_wait_us: u64,
+    /// Total time from first request to commit (microseconds).
+    pub total_total_age_us: u64,
+    /// Number of batch flushes rejected due to not being leader.
+    pub not_leader_count: u64,
+    /// Number of batch apply errors on commit.
+    pub apply_error_count: u64,
+}
+
+impl BatcherStatsSnapshot {
+    /// Formats the snapshot as a JSON string for reporting.
+    #[must_use] 
+    pub fn to_json(&self, node_id: u64, timestamp_ms: u64) -> String {
+        format!(
+            "{{\"node_id\":{node_id},\"timestamp_ms\":{timestamp_ms},\"flush_count\":{flush_count},\"flush_linger_count\":{flush_linger_count},\"flush_size_count\":{flush_size_count},\"flush_shutdown_count\":{flush_shutdown_count},\"commit_count\":{commit_count},\"total_batch_requests\":{total_batch_requests},\"total_batch_bytes\":{total_batch_bytes},\"total_batch_records\":{total_batch_records},\"total_batch_age_us\":{total_batch_age_us},\"total_batch_wait_us\":{total_batch_wait_us},\"total_commit_latency_us\":{total_commit_latency_us},\"total_total_age_us\":{total_total_age_us},\"not_leader_count\":{not_leader_count},\"apply_error_count\":{apply_error_count}}}",
+            node_id = node_id,
+            timestamp_ms = timestamp_ms,
+            flush_count = self.flush_count,
+            flush_linger_count = self.flush_linger_count,
+            flush_size_count = self.flush_size_count,
+            flush_shutdown_count = self.flush_shutdown_count,
+            commit_count = self.commit_count,
+            total_batch_requests = self.total_batch_requests,
+            total_batch_bytes = self.total_batch_bytes,
+            total_batch_records = self.total_batch_records,
+            total_batch_age_us = self.total_batch_age_us,
+            total_batch_wait_us = self.total_batch_wait_us,
+            total_commit_latency_us = self.total_commit_latency_us,
+            total_total_age_us = self.total_total_age_us,
+            not_leader_count = self.not_leader_count,
+            apply_error_count = self.apply_error_count,
+        )
+    }
+}
+
 /// Topic metadata.
 #[derive(Debug, Clone)]
 pub struct TopicMetadata {
@@ -102,6 +338,8 @@ pub struct HelixService {
     /// S3 configuration for tiering (None = use filesystem or simulated).
     #[cfg(feature = "s3")]
     pub(crate) s3_config: Option<helix_tier::S3Config>,
+    /// Tiering configuration (None = tiering disabled).
+    pub(crate) tiering_config: Option<helix_tier::TieringConfig>,
     /// Transport handle for sending Raft messages (multi-node only).
     #[allow(dead_code)]
     pub(crate) transport_handle: Option<TransportHandle>,
@@ -110,7 +348,8 @@ pub struct HelixService {
     /// Controller state machine (cluster metadata).
     pub(crate) controller_state: Arc<RwLock<ControllerState>>,
     /// Pending proposals waiting for Raft commit (multi-node mode only).
-    pub(crate) pending_proposals: Arc<RwLock<HashMap<GroupId, Vec<PendingProposal>>>>,
+    /// Indexed by (`GroupId`, `LogIndex`) for O(1) lookup on commit.
+    pub(crate) pending_proposals: Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, PendingProposal>>>>,
     /// Pending controller proposals waiting for Raft commit.
     pub(crate) pending_controller_proposals: Arc<RwLock<Vec<PendingControllerProposal>>>,
     /// Local broker heartbeat timestamps (soft state, not Raft-replicated).
@@ -125,6 +364,15 @@ pub struct HelixService {
     /// Used during partition creation to restore state (Phase 3).
     #[allow(dead_code)] // Used in Phase 3 of SharedWAL integration.
     pub(crate) recovered_entries: Arc<RwLock<HashMap<PartitionId, Vec<SharedEntry>>>>,
+    /// Pending batched proposals waiting for Raft commit (multi-node mode only).
+    /// Indexed by (`GroupId`, `LogIndex`) for O(1) lookup on commit.
+    /// Note: This field is shared via Arc with the tick task, not read directly here.
+    #[allow(dead_code)]
+    pub(crate) batch_pending_proposals: Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, BatchPendingProposal>>>>,
+    /// Handle to submit requests to the batcher (multi-node mode only).
+    pub(crate) batcher_handle: Option<batcher::BatcherHandle>,
+    /// Aggregated batcher performance stats (multi-node mode only).
+    pub(crate) batcher_stats: Option<Arc<BatcherStats>>,
 }
 
 impl HelixService {
@@ -132,7 +380,8 @@ impl HelixService {
     ///
     /// This starts a background task to handle Raft ticks for all groups.
     pub async fn new(cluster_id: String, node_id: u64) -> Self {
-        Self::new_internal(cluster_id, node_id, None, None, None).await
+        // In-memory mode doesn't use WAL, but pass Fsync for safety if WAL is added later.
+        Self::new_internal(cluster_id, node_id, None, None, None, WriteDurability::Fsync).await
     }
 
     /// Creates a new Helix service with durable WAL-backed storage.
@@ -145,13 +394,15 @@ impl HelixService {
     /// * `node_id` - This node's ID
     /// * `data_dir` - Directory for durable storage
     /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
+    /// * `write_durability` - Durability mode for writes
     pub async fn with_data_dir(
         cluster_id: String,
         node_id: u64,
         data_dir: PathBuf,
         shared_wal_count: Option<u32>,
+        write_durability: WriteDurability,
     ) -> Self {
-        Self::new_internal(cluster_id, node_id, Some(data_dir), None, shared_wal_count).await
+        Self::new_internal(cluster_id, node_id, Some(data_dir), None, shared_wal_count, write_durability).await
     }
 
     /// Creates a new Helix service with durable storage and object storage for tiering.
@@ -162,12 +413,14 @@ impl HelixService {
     ///
     /// # Arguments
     /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
+    /// * `write_durability` - Durability mode for writes
     pub async fn with_data_and_object_storage(
         cluster_id: String,
         node_id: u64,
         data_dir: PathBuf,
         object_storage_dir: PathBuf,
         shared_wal_count: Option<u32>,
+        write_durability: WriteDurability,
     ) -> Self {
         Self::new_internal(
             cluster_id,
@@ -175,6 +428,7 @@ impl HelixService {
             Some(data_dir),
             Some(object_storage_dir),
             shared_wal_count,
+            write_durability,
         )
         .await
     }
@@ -186,6 +440,7 @@ impl HelixService {
         data_dir: Option<PathBuf>,
         object_storage_dir: Option<PathBuf>,
         shared_wal_count: Option<u32>,
+        write_durability: WriteDurability,
     ) -> Self {
         let node_id = NodeId::new(node_id);
         let cluster_nodes = vec![node_id]; // Single node for now.
@@ -215,10 +470,17 @@ impl HelixService {
                 "Initializing SharedWalPool"
             );
 
-            // Create pool config.
+            // Create pool config with durability setting.
             let pool_config = PoolConfig::new(dir.join("shared-wal"), wal_count)
                 .with_flush_interval(std::time::Duration::from_millis(1))
-                .with_max_buffer_entries(1000);
+                .with_max_buffer_entries(1000)
+                .with_durability(write_durability);
+
+            info!(
+                wal_count,
+                durability = %write_durability,
+                "SharedWalPool durability mode"
+            );
 
             // Open pool.
             let pool = SharedWalPool::open(TokioStorage::new(), pool_config)
@@ -265,6 +527,7 @@ impl HelixService {
             object_storage_dir,
             #[cfg(feature = "s3")]
             s3_config: None,
+            tiering_config: None,
             transport_handle: None,
             progress_manager,
             controller_state: Arc::new(RwLock::new(ControllerState::new())),
@@ -273,6 +536,9 @@ impl HelixService {
             local_broker_heartbeats: Arc::new(RwLock::new(HashMap::new())),
             shared_wal_pool,
             recovered_entries,
+            batch_pending_proposals: Arc::new(RwLock::new(HashMap::new())),
+            batcher_handle: None, // No batching in single-node mode.
+            batcher_stats: None,
         }
     }
 
@@ -283,6 +549,7 @@ impl HelixService {
     ///
     /// # Arguments
     /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
+    /// * `write_durability` - Durability mode for writes
     ///
     /// # Errors
     /// Returns an error if the transport cannot be started.
@@ -301,9 +568,11 @@ impl HelixService {
         data_dir: Option<PathBuf>,
         object_storage_dir: Option<PathBuf>,
         s3_config: Option<helix_tier::S3Config>,
+        tiering_config: Option<helix_tier::TieringConfig>,
         kafka_addr: String,
         kafka_peer_addrs: HashMap<NodeId, String>,
         shared_wal_count: Option<u32>,
+        write_durability: WriteDurability,
     ) -> Result<Self, TransportError> {
         Self::new_multi_node_internal(
             cluster_id,
@@ -313,9 +582,11 @@ impl HelixService {
             data_dir,
             object_storage_dir,
             s3_config,
+            tiering_config,
             kafka_addr,
             kafka_peer_addrs,
             shared_wal_count,
+            write_durability,
         )
         .await
     }
@@ -327,6 +598,7 @@ impl HelixService {
     ///
     /// # Arguments
     /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
+    /// * `write_durability` - Durability mode for writes
     ///
     /// # Errors
     /// Returns an error if the transport cannot be started.
@@ -343,9 +615,11 @@ impl HelixService {
         peers: Vec<PeerInfo>,
         data_dir: Option<PathBuf>,
         object_storage_dir: Option<PathBuf>,
+        tiering_config: Option<helix_tier::TieringConfig>,
         kafka_addr: String,
         kafka_peer_addrs: HashMap<NodeId, String>,
         shared_wal_count: Option<u32>,
+        write_durability: WriteDurability,
     ) -> Result<Self, TransportError> {
         Self::new_multi_node_internal(
             cluster_id,
@@ -354,9 +628,11 @@ impl HelixService {
             peers,
             data_dir,
             object_storage_dir,
+            tiering_config,
             kafka_addr,
             kafka_peer_addrs,
             shared_wal_count,
+            write_durability,
         )
         .await
     }
@@ -370,9 +646,11 @@ impl HelixService {
         data_dir: Option<PathBuf>,
         object_storage_dir: Option<PathBuf>,
         #[cfg(feature = "s3")] s3_config: Option<helix_tier::S3Config>,
+        tiering_config: Option<helix_tier::TieringConfig>,
         kafka_addr: String,
         kafka_peer_addrs: HashMap<NodeId, String>,
         shared_wal_count: Option<u32>,
+        write_durability: WriteDurability,
     ) -> Result<Self, TransportError> {
         let node_id = NodeId::new(node_id);
 
@@ -396,6 +674,12 @@ impl HelixService {
         let pending_proposals = Arc::new(RwLock::new(HashMap::new()));
         let pending_controller_proposals = Arc::new(RwLock::new(Vec::new()));
         let local_broker_heartbeats = Arc::new(RwLock::new(HashMap::new()));
+
+        // Note: We do NOT set default_peers for auto-creating groups.
+        // Data partition groups must only be created via the controller's
+        // AssignPartition command, which ensures partition_storage is also
+        // created. Auto-creating Raft groups on message receipt would cause
+        // commits to be dropped because partition_storage doesn't exist yet.
 
         // Create controller partition (group 0) with all cluster nodes.
         {
@@ -431,10 +715,17 @@ impl HelixService {
                 "Initializing SharedWalPool for multi-node"
             );
 
-            // Create pool config.
+            // Create pool config with durability setting.
             let pool_config = PoolConfig::new(dir.join("shared-wal"), wal_count)
                 .with_flush_interval(std::time::Duration::from_millis(1))
-                .with_max_buffer_entries(1000);
+                .with_max_buffer_entries(1000)
+                .with_durability(write_durability);
+
+            info!(
+                wal_count,
+                durability = %write_durability,
+                "SharedWalPool durability mode (multi-node)"
+            );
 
             // Open pool.
             let pool = SharedWalPool::open(TokioStorage::new(), pool_config)
@@ -457,6 +748,24 @@ impl HelixService {
 
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
+        // Create batch pending proposals map.
+        let batch_pending_proposals = Arc::new(RwLock::new(HashMap::new()));
+
+        // Create and spawn the batcher task.
+        let batcher_stats = Arc::new(BatcherStats::default());
+        let (batcher_handle, batcher_rx, backpressure_state) = batcher::create_batcher();
+        tokio::spawn(batcher::batcher_task(
+            batcher_rx,
+            Arc::clone(&multi_raft),
+            Arc::clone(&batch_pending_proposals),
+            Some(transport_handle.clone()),
+            Arc::clone(&batcher_stats),
+            batcher::BatcherConfig::default(),
+            Arc::clone(&backpressure_state),
+        ));
+
+        info!("Started request batcher for multi-node");
+
         // Start background tick task with transport.
         #[cfg(feature = "s3")]
         tokio::spawn(tick::tick_task_multi_node(
@@ -466,14 +775,18 @@ impl HelixService {
             Arc::clone(&controller_state),
             Arc::clone(&pending_proposals),
             Arc::clone(&pending_controller_proposals),
+            Arc::clone(&batch_pending_proposals),
             Arc::clone(&local_broker_heartbeats),
             cluster_nodes.clone(),
             transport_handle.clone(),
             data_dir.clone(),
             object_storage_dir.clone(),
             s3_config.clone(),
+            tiering_config.clone(),
             shared_wal_pool.clone(),
             Arc::clone(&recovered_entries),
+            Some(Arc::clone(&batcher_stats)),
+            Some(backpressure_state),
             incoming_rx,
             shutdown_rx,
         ));
@@ -485,13 +798,17 @@ impl HelixService {
             Arc::clone(&controller_state),
             Arc::clone(&pending_proposals),
             Arc::clone(&pending_controller_proposals),
+            Arc::clone(&batch_pending_proposals),
             Arc::clone(&local_broker_heartbeats),
             cluster_nodes.clone(),
             transport_handle.clone(),
             data_dir.clone(),
             object_storage_dir.clone(),
+            tiering_config.clone(),
             shared_wal_pool.clone(),
             Arc::clone(&recovered_entries),
+            Some(Arc::clone(&batcher_stats)),
+            Some(backpressure_state),
             incoming_rx,
             shutdown_rx,
         ));
@@ -522,6 +839,7 @@ impl HelixService {
             object_storage_dir,
             #[cfg(feature = "s3")]
             s3_config,
+            tiering_config,
             transport_handle: Some(transport_handle),
             progress_manager,
             controller_state,
@@ -530,6 +848,9 @@ impl HelixService {
             local_broker_heartbeats,
             shared_wal_pool,
             recovered_entries,
+            batch_pending_proposals,
+            batcher_handle: Some(batcher_handle),
+            batcher_stats: Some(batcher_stats),
         })
     }
 
@@ -624,6 +945,35 @@ impl HelixService {
         self.peer_addrs.get(&node_id).map(String::as_str)
     }
 
+    /// Sends Raft messages via the transport handle.
+    ///
+    /// This is used to immediately send messages after proposing entries,
+    /// rather than waiting for the next tick. This significantly reduces
+    /// latency for acks=all workloads.
+    ///
+    /// Messages are sent in parallel to all destination nodes.
+    pub(crate) async fn send_raft_messages(
+        &self,
+        outputs: &[helix_raft::multi::MultiRaftOutput],
+    ) {
+        let Some(ref transport) = self.transport_handle else {
+            return;
+        };
+
+        for output in outputs {
+            if let helix_raft::multi::MultiRaftOutput::SendMessages { to, messages } = output {
+                if let Err(e) = transport.send_batch(*to, messages.clone()).await {
+                    tracing::debug!(
+                        to = to.get(),
+                        count = messages.len(),
+                        error = %e,
+                        "Failed to send Raft messages (will retry on tick)"
+                    );
+                }
+            }
+        }
+    }
+
     /// Waits for the controller partition to have a leader.
     ///
     /// This should be called before attempting controller operations like
@@ -666,5 +1016,36 @@ impl HelixService {
 
             tokio::time::sleep(poll_interval).await;
         }
+    }
+
+    /// Starts a periodic batcher stats reporter that writes JSON to a file.
+    pub fn start_bench_reporter(&self, report_path: PathBuf, interval_ms: u64) {
+        let Some(stats) = self.batcher_stats.clone() else {
+            return;
+        };
+
+        let node_id = self.node_id.get();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+            loop {
+                interval.tick().await;
+                // Safety: duration since UNIX_EPOCH will never exceed u64::MAX milliseconds
+                // (would require running for hundreds of millions of years).
+                #[allow(clippy::cast_possible_truncation)]
+                let timestamp_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64);
+                let snapshot = stats.snapshot();
+                let json = snapshot.to_json(node_id, timestamp_ms);
+                if let Err(e) = tokio::fs::write(&report_path, json).await {
+                    tracing::warn!(
+                        path = %report_path.display(),
+                        error = %e,
+                        "Failed to write bench report"
+                    );
+                }
+            }
+        });
     }
 }

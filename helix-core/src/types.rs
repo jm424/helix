@@ -215,6 +215,82 @@ impl From<SequenceNum> for i32 {
     }
 }
 
+// ============================================================================
+// Write Durability Configuration
+// ============================================================================
+
+/// Controls how writes are persisted to disk.
+///
+/// This enum allows trading durability guarantees for performance.
+/// In a replicated system with `acks=all`, data is already replicated to
+/// multiple nodes before acknowledgment, so local fsync may be unnecessary.
+///
+/// # Durability vs Performance Trade-offs
+///
+/// | Mode | Durability | Throughput | Use Case |
+/// |------|------------|------------|----------|
+/// | `Fsync` | Highest | ~500 ops/s | Single-node, paranoid |
+/// | `ReplicationOnly` | High (via replicas) | ~50K+ ops/s | Multi-node production |
+///
+/// # Safety
+///
+/// `ReplicationOnly` is safe when:
+/// - Running with replication factor >= 2
+/// - Using `acks=all` (wait for majority acknowledgment)
+/// - Acceptable to recover from peers after crash
+///
+/// `ReplicationOnly` is NOT safe when:
+/// - Running single-node (no replication)
+/// - Data must survive simultaneous failure of all replicas
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WriteDurability {
+    /// Wait for fsync before acknowledging writes.
+    ///
+    /// This is the safest mode but slowest. Each write waits for data
+    /// to be flushed to disk before returning. Use this for:
+    /// - Single-node deployments
+    /// - Maximum durability requirements
+    /// - When you can't tolerate any data loss on crash
+    Fsync,
+
+    /// Rely on replication for durability, skip local fsync.
+    ///
+    /// Writes go to OS page cache and return immediately. The OS flushes
+    /// to disk in the background. If the node crashes before flush:
+    /// - Data in page cache is lost on this node
+    /// - But it exists on other replicas (if acks=all)
+    /// - Node recovers from peers on restart
+    ///
+    /// This is how Kafka achieves high throughput with `acks=all`.
+    #[default]
+    ReplicationOnly,
+}
+
+impl WriteDurability {
+    /// Returns true if this mode requires fsync on the write path.
+    #[must_use]
+    pub const fn requires_fsync(&self) -> bool {
+        matches!(self, Self::Fsync)
+    }
+
+    /// Returns true if this mode is safe for single-node operation.
+    ///
+    /// Single-node has no replication, so `ReplicationOnly` would risk data loss.
+    #[must_use]
+    pub const fn safe_for_single_node(&self) -> bool {
+        matches!(self, Self::Fsync)
+    }
+}
+
+impl fmt::Display for WriteDurability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fsync => write!(f, "fsync"),
+            Self::ReplicationOnly => write!(f, "replication-only"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

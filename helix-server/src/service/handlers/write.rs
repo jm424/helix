@@ -41,6 +41,10 @@ impl HelixService {
     /// proposal, and wait for the tick task to apply and notify us with the
     /// resulting offset. This ensures entries are applied in Raft log order
     /// regardless of concurrent write timing.
+    ///
+    /// In single-node mode, entries commit synchronously and we handle ordering
+    /// directly in this handler. In multi-node mode, we rely on the tick task
+    /// to process replication and notify pending proposals.
     #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     pub(crate) async fn write_internal(&self, request: WriteRequest) -> ServerResult<WriteResponse> {
         // Validate request.
@@ -127,13 +131,16 @@ impl HelixService {
         };
 
         // In single-node mode, the commit happens synchronously and the CommitEntry
-        // is returned in outputs. We can apply immediately IF our entry is next in
-        // line (index == last_applied + 1). If there's a gap (another concurrent
-        // write's entry needs to be applied first), we wait for the tick task.
+        // is returned in outputs. We need to apply entries in order, so if our
+        // entry isn't next in line, we wait and retry until it is.
+        //
+        // Note: In single-node mode, once CommitEntry is returned from propose,
+        // it won't be returned again by tick(). So we must handle ordering here
+        // rather than relying on the tick task.
         //
         // In multi-node mode, outputs won't contain CommitEntry (needs replication),
         // so we always register a pending proposal and wait for the tick task.
-        let mut immediate_offset = None;
+        let mut committed_entry_data: Option<Bytes> = None;
         for output in &outputs {
             if let MultiRaftOutput::CommitEntry {
                 group_id: gid,
@@ -142,43 +149,100 @@ impl HelixService {
             } = output
             {
                 if *gid == group_id && *index == proposed_index {
-                    let mut storage = self.partition_storage.write().await;
-                    if let Some(ps) = storage.get_mut(&group_id) {
-                        // Only apply if we're next in line (no gap).
-                        // This ensures entries are applied in order even with concurrent writes.
-                        let last_applied = ps.last_applied();
-                        let expected_next = helix_core::LogIndex::new(last_applied.get() + 1);
-
-                        if *index == expected_next {
-                            match ps.apply_entry_async(*index, entry_data).await {
-                                Ok(Some(offset)) => immediate_offset = Some(offset),
-                                Ok(None) => immediate_offset = Some(ps.log_end_offset()),
-                                Err(e) => {
-                                    return Err(ServerError::Internal {
-                                        message: format!("failed to apply: {e}"),
-                                    });
-                                }
-                            }
-                        }
-                        // If index > expected_next, there's a gap - another write's entry
-                        // needs to be applied first. Fall through to wait for tick task.
-                    }
+                    committed_entry_data = Some(entry_data.clone());
                 }
             }
         }
 
-        // If we got an immediate offset, we're done (single-node fast path).
-        // Otherwise, register pending proposal and wait for tick task.
-        let base_offset = if let Some(offset) = immediate_offset {
-            offset
+        // If we got a CommitEntry (single-node mode), apply with ordering.
+        let base_offset = if let Some(entry_data) = committed_entry_data {
+            // Single-node fast path: apply in order.
+            // Loop until it's our turn to apply (bounded by MAX_CONCURRENT_APPLY_RETRIES).
+            const MAX_CONCURRENT_APPLY_RETRIES: u32 = 10_000;
+            const RETRY_DELAY_MICROS: u64 = 100;
+
+            for retry in 0..MAX_CONCURRENT_APPLY_RETRIES {
+                let mut storage = self.partition_storage.write().await;
+                if let Some(ps) = storage.get_mut(&group_id) {
+                    let last_applied = ps.last_applied();
+                    let expected_next = helix_core::LogIndex::new(last_applied.get() + 1);
+
+                    if proposed_index <= last_applied {
+                        // Already applied (shouldn't normally happen, but handle gracefully).
+                        debug!(
+                            topic = %request.topic,
+                            partition = partition_idx,
+                            index = proposed_index.get(),
+                            last_applied = last_applied.get(),
+                            "Entry already applied"
+                        );
+                        return Ok(WriteResponse {
+                            base_offset: ps.log_end_offset().get(),
+                            record_count: record_count as u32,
+                            error_code: ErrorCode::None.into(),
+                            error_message: None,
+                        });
+                    }
+
+                    if proposed_index == expected_next {
+                        // It's our turn to apply.
+                        match ps.apply_entry_async(proposed_index, &entry_data).await {
+                            Ok(Some(offset)) => return Ok(WriteResponse {
+                                base_offset: offset.get(),
+                                record_count: record_count as u32,
+                                error_code: ErrorCode::None.into(),
+                                error_message: None,
+                            }),
+                            Ok(None) => return Ok(WriteResponse {
+                                base_offset: ps.log_end_offset().get(),
+                                record_count: record_count as u32,
+                                error_code: ErrorCode::None.into(),
+                                error_message: None,
+                            }),
+                            Err(e) => {
+                                return Err(ServerError::Internal {
+                                    message: format!("failed to apply: {e}"),
+                                });
+                            }
+                        }
+                    }
+
+                    // Not our turn yet. Release lock, yield, and retry.
+                    // Another concurrent write should apply its entry, advancing last_applied.
+                    drop(storage);
+                    if retry % 100 == 0 && retry > 0 {
+                        debug!(
+                            topic = %request.topic,
+                            partition = partition_idx,
+                            index = proposed_index.get(),
+                            last_applied = last_applied.get(),
+                            retry,
+                            "Waiting for turn to apply"
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_micros(RETRY_DELAY_MICROS)).await;
+                } else {
+                    return Err(ServerError::Internal {
+                        message: "partition storage not found".to_string(),
+                    });
+                }
+            }
+
+            // Exhausted retries - this indicates a bug or deadlock.
+            return Err(ServerError::Internal {
+                message: format!(
+                    "timeout waiting for apply ordering after {} retries",
+                    MAX_CONCURRENT_APPLY_RETRIES
+                ),
+            });
         } else {
-            // Register the pending proposal so the tick task can notify us.
+            // Multi-node mode: register pending proposal and wait for tick task.
             {
                 let mut proposals = self.pending_proposals.write().await;
                 proposals
                     .entry(group_id)
-                    .or_insert_with(Vec::new)
-                    .push(PendingProposal {
+                    .or_default()
+                    .insert(proposed_index, PendingProposal {
                         log_index: proposed_index,
                         result_tx,
                     });

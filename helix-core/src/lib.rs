@@ -30,4 +30,5 @@ pub use record::{
 pub use types::{
     BatchId, ConsumerGroupId, ConsumerId, GroupId, LeaseId, LogIndex, NodeId, PartitionId,
     ProducerEpoch, ProducerId, ReplicaId, SequenceNum, TermId, TopicId, TransferId,
+    WriteDurability,
 };

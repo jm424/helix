@@ -418,6 +418,10 @@ impl RaftServer {
 
                 let _ = self.events.send(ServerEvent::SteppedDown).await;
             }
+            RaftOutput::VoteStateChanged { .. } => {
+                // Vote state persistence is handled by the HelixService tick task.
+                // The single-node RaftServer doesn't persist vote state.
+            }
         }
     }
 
@@ -435,6 +439,9 @@ impl RaftServer {
             }
             RaftOutput::SteppedDown => {
                 let _ = events.send(ServerEvent::SteppedDown).await;
+            }
+            RaftOutput::VoteStateChanged { .. } => {
+                // Vote state persistence is handled by the HelixService tick task.
             }
         }
     }

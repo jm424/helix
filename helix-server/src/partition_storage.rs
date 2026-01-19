@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use bytes::Bytes;
 use helix_core::{LogIndex, Offset, PartitionId, ProducerEpoch, ProducerId, Record, SequenceNum, TopicId};
 use helix_wal::{SharedEntry, SharedWalHandle, Storage, TokioStorage};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::error::{ServerError, ServerResult};
 use crate::producer_state::{PartitionProducerState, SequenceCheckResult};
@@ -16,6 +16,7 @@ use crate::storage::{
     BlobFormat, DurablePartition, DurablePartitionConfig, DurablePartitionError, Partition,
     PartitionCommand, PartitionConfig, patch_kafka_base_offset,
 };
+use helix_tier::TieringConfig;
 #[cfg(feature = "s3")]
 use helix_tier::S3Config;
 
@@ -78,6 +79,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     /// * `data_dir` - Base directory for partition data
     /// * `object_storage_dir` - Optional directory for object storage (tiering)
     /// * `s3_config` - Optional S3 configuration for tiering (requires `s3` feature)
+    /// * `tiering_config` - Optional tiering configuration (enables tiering when set)
     /// * `topic_id` - Topic identifier
     /// * `partition_id` - Partition identifier
     ///
@@ -89,6 +91,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         data_dir: &PathBuf,
         object_storage_dir: Option<&PathBuf>,
         s3_config: Option<&S3Config>,
+        tiering_config: Option<&TieringConfig>,
         topic_id: TopicId,
         partition_id: PartitionId,
     ) -> Result<Self, DurablePartitionError> {
@@ -98,12 +101,18 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         } else if let Some(object_dir) = object_storage_dir {
             config = config.with_object_storage_dir(object_dir);
         }
+        // Enable tiering when config is provided.
+        if let Some(tier_cfg) = tiering_config {
+            config = config.with_tiering(tier_cfg.clone());
+        }
         let durable = DurablePartition::open(storage, config).await?;
+        // Initialize last_applied from recovered WAL state for proper idempotency.
+        let last_applied = LogIndex::new(durable.last_applied_index());
         Ok(Self {
             topic_id,
             partition_id,
             inner: PartitionStorageInner::Durable(Box::new(durable)),
-            last_applied: LogIndex::new(0),
+            last_applied,
             producer_state: PartitionProducerState::new(),
         })
     }
@@ -115,6 +124,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     /// * `storage` - Storage backend to use for WAL operations
     /// * `data_dir` - Base directory for partition data
     /// * `object_storage_dir` - Optional directory for object storage (tiering)
+    /// * `tiering_config` - Optional tiering configuration (enables tiering when set)
     /// * `topic_id` - Topic identifier
     /// * `partition_id` - Partition identifier
     ///
@@ -125,6 +135,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         storage: S,
         data_dir: &PathBuf,
         object_storage_dir: Option<&PathBuf>,
+        tiering_config: Option<&TieringConfig>,
         topic_id: TopicId,
         partition_id: PartitionId,
     ) -> Result<Self, DurablePartitionError> {
@@ -132,12 +143,18 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         if let Some(object_dir) = object_storage_dir {
             config = config.with_object_storage_dir(object_dir);
         }
+        // Enable tiering when config is provided.
+        if let Some(tier_cfg) = tiering_config {
+            config = config.with_tiering(tier_cfg.clone());
+        }
         let durable = DurablePartition::open(storage, config).await?;
+        // Initialize last_applied from recovered WAL state for proper idempotency.
+        let last_applied = LogIndex::new(durable.last_applied_index());
         Ok(Self {
             topic_id,
             partition_id,
             inner: PartitionStorageInner::Durable(Box::new(durable)),
-            last_applied: LogIndex::new(0),
+            last_applied,
             producer_state: PartitionProducerState::new(),
         })
     }
@@ -153,23 +170,77 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     /// * `partition_id` - Partition identifier
     /// * `wal_handle` - Shared WAL handle from the pool
     /// * `recovered_entries` - Entries recovered from the shared WAL for this partition
+    /// * `object_storage_dir` - Optional directory for object storage (tiering)
+    /// * `s3_config` - Optional S3 configuration for tiering (requires `s3` feature)
+    /// * `tiering_config` - Optional tiering configuration
     ///
     /// # Errors
     /// Returns an error if the partition cannot be opened.
+    #[cfg(feature = "s3")]
+    #[allow(clippy::too_many_arguments)]
     pub async fn new_durable_with_shared_wal(
         data_dir: &PathBuf,
         topic_id: TopicId,
         partition_id: PartitionId,
         wal_handle: SharedWalHandle<S>,
         recovered_entries: Vec<SharedEntry>,
+        object_storage_dir: Option<&PathBuf>,
+        s3_config: Option<&S3Config>,
+        tiering_config: Option<&TieringConfig>,
     ) -> Result<Self, DurablePartitionError> {
-        let config = DurablePartitionConfig::new(data_dir, topic_id, partition_id);
+        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id);
+        if let Some(s3_cfg) = s3_config {
+            config = config.with_s3_config(s3_cfg.clone());
+        } else if let Some(object_dir) = object_storage_dir {
+            config = config.with_object_storage_dir(object_dir);
+        }
+        if let Some(tier_cfg) = tiering_config {
+            config = config.with_tiering(tier_cfg.clone());
+        }
         let durable = DurablePartition::open_with_shared_wal(config, wal_handle, recovered_entries).await?;
+        // Initialize last_applied from recovered WAL state for proper idempotency.
+        let last_applied = LogIndex::new(durable.last_applied_index());
         Ok(Self {
             topic_id,
             partition_id,
             inner: PartitionStorageInner::Durable(Box::new(durable)),
-            last_applied: LogIndex::new(0),
+            last_applied,
+            producer_state: PartitionProducerState::new(),
+        })
+    }
+
+    /// Creates new durable partition storage with a shared WAL handle.
+    ///
+    /// This is used when partitions share a WAL pool for fsync amortization.
+    ///
+    /// # Errors
+    /// Returns an error if the partition cannot be opened.
+    #[cfg(not(feature = "s3"))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_durable_with_shared_wal(
+        data_dir: &PathBuf,
+        topic_id: TopicId,
+        partition_id: PartitionId,
+        wal_handle: SharedWalHandle<S>,
+        recovered_entries: Vec<SharedEntry>,
+        object_storage_dir: Option<&PathBuf>,
+        tiering_config: Option<&TieringConfig>,
+    ) -> Result<Self, DurablePartitionError> {
+        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id);
+        if let Some(object_dir) = object_storage_dir {
+            config = config.with_object_storage_dir(object_dir);
+        }
+        if let Some(tier_cfg) = tiering_config {
+            config = config.with_tiering(tier_cfg.clone());
+        }
+        let durable = DurablePartition::open_with_shared_wal(config, wal_handle, recovered_entries).await?;
+        // Initialize last_applied from recovered WAL state for proper idempotency.
+        let last_applied = LogIndex::new(durable.last_applied_index());
+        Ok(Self {
+            topic_id,
+            partition_id,
+            inner: PartitionStorageInner::Durable(Box::new(durable)),
+            last_applied,
             producer_state: PartitionProducerState::new(),
         })
     }
@@ -290,18 +361,28 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     ///
     /// Returns an error if the entry cannot be decoded or applied.
     #[allow(dead_code)] // Kept for potential future use; async version used everywhere.
+    #[allow(clippy::too_many_lines)]
     pub fn apply_entry_sync(&mut self, index: LogIndex, data: &Bytes) -> ServerResult<Option<Offset>> {
         // Skip if already applied.
         if index <= self.last_applied {
-            eprintln!("[APPLY_SKIP] topic={} partition={} index={} (already applied, last={})",
-                self.topic_id, self.partition_id, index, self.last_applied);
+            debug!(
+                topic = %self.topic_id,
+                partition = %self.partition_id,
+                index = %index,
+                last_applied = %self.last_applied,
+                "skipping already-applied entry"
+            );
             return Ok(None);
         }
 
         // Skip empty entries (e.g., no-op entries).
         if data.is_empty() {
-            eprintln!("[APPLY_NOOP] topic={} partition={} index={} empty entry",
-                self.topic_id, self.partition_id, index);
+            debug!(
+                topic = %self.topic_id,
+                partition = %self.partition_id,
+                index = %index,
+                "skipping empty entry (no-op)"
+            );
             self.last_applied = index;
             return Ok(None);
         }
@@ -312,7 +393,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
 
         let base_offset = match &mut self.inner {
             PartitionStorageInner::InMemory(partition) => match command {
-                PartitionCommand::Append { records } => {
+                PartitionCommand::Append { records, .. } => {
                     let _record_count = records.len();
                     let offset = partition.append(records).map_err(|e| ServerError::Internal {
                         message: format!("failed to append: {e}"),
@@ -324,7 +405,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
 
                     Some(offset)
                 }
-                PartitionCommand::AppendBlob { blob, record_count, format } => {
+                PartitionCommand::AppendBlob { blob, record_count, format, .. } => {
                     // Get the offset that will be assigned before appending.
                     let base_offset = partition.blob_log_end_offset();
 
@@ -343,23 +424,74 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                     let new_hwm = partition.blob_log_end_offset();
                     partition.set_high_watermark(new_hwm);
 
-                    eprintln!("[APPLY_BLOB] topic={} partition={} index={} records={} base_offset={} new_hwm={} format={:?}",
-                        self.topic_id, self.partition_id, index, record_count, offset, new_hwm, format);
+                    debug!(
+                        topic = %self.topic_id,
+                        partition = %self.partition_id,
+                        index = %index,
+                        record_count = record_count,
+                        base_offset = %offset,
+                        new_hwm = %new_hwm,
+                        format = ?format,
+                        "applied blob"
+                    );
                     Some(offset)
                 }
                 PartitionCommand::Truncate { from_offset } => {
-                    eprintln!("[APPLY_TRUNCATE] topic={} partition={} index={} from_offset={}",
-                        self.topic_id, self.partition_id, index, from_offset);
+                    debug!(
+                        topic = %self.topic_id,
+                        partition = %self.partition_id,
+                        index = %index,
+                        from_offset = %from_offset,
+                        "applied truncate"
+                    );
                     partition.truncate(from_offset).map_err(|e| ServerError::Internal {
                         message: format!("failed to truncate: {e}"),
                     })?;
                     None
                 }
                 PartitionCommand::UpdateHighWatermark { high_watermark } => {
-                    eprintln!("[APPLY_HWM] topic={} partition={} index={} hwm={}",
-                        self.topic_id, self.partition_id, index, high_watermark);
+                    debug!(
+                        topic = %self.topic_id,
+                        partition = %self.partition_id,
+                        index = %index,
+                        high_watermark = %high_watermark,
+                        "applied high watermark update"
+                    );
                     partition.set_high_watermark(high_watermark);
                     None
+                }
+                PartitionCommand::AppendBlobBatch { blobs } => {
+                    // Get the first offset that will be assigned.
+                    let first_base_offset = partition.blob_log_end_offset();
+
+                    // Apply each blob in sequence.
+                    for batched in blobs {
+                        let current_offset = partition.blob_log_end_offset();
+                        let blob_to_store = match batched.format {
+                            BlobFormat::Raw => batched.blob,
+                            BlobFormat::KafkaRecordBatch => {
+                                patch_kafka_base_offset(batched.blob, current_offset)
+                            }
+                        };
+                        partition.append_blob(blob_to_store, batched.record_count).map_err(|e| {
+                            ServerError::Internal {
+                                message: format!("failed to append blob in batch: {e}"),
+                            }
+                        })?;
+                    }
+
+                    let new_hwm = partition.blob_log_end_offset();
+                    partition.set_high_watermark(new_hwm);
+
+                    debug!(
+                        topic = %self.topic_id,
+                        partition = %self.partition_id,
+                        index = %index,
+                        first_base_offset = %first_base_offset,
+                        new_hwm = %new_hwm,
+                        "applied blob batch (sync)"
+                    );
+                    Some(first_base_offset)
                 }
             },
             PartitionStorageInner::Durable(_) => {
@@ -379,6 +511,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     /// # Errors
     ///
     /// Returns an error if the entry cannot be decoded or applied.
+    #[tracing::instrument(skip_all, name = "apply_entry", fields(index = index.get()))]
+    #[allow(clippy::too_many_lines)]
     pub async fn apply_entry_async(
         &mut self,
         index: LogIndex,
@@ -386,15 +520,24 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     ) -> ServerResult<Option<Offset>> {
         // Skip if already applied.
         if index <= self.last_applied {
-            eprintln!("[APPLY_SKIP] topic={} partition={} index={} (already applied, last={})",
-                self.topic_id, self.partition_id, index, self.last_applied);
+            debug!(
+                topic = %self.topic_id,
+                partition = %self.partition_id,
+                index = %index,
+                last_applied = %self.last_applied,
+                "skipping already-applied entry"
+            );
             return Ok(None);
         }
 
         // Skip empty entries (e.g., no-op entries).
         if data.is_empty() {
-            eprintln!("[APPLY_NOOP] topic={} partition={} index={} empty entry",
-                self.topic_id, self.partition_id, index);
+            debug!(
+                topic = %self.topic_id,
+                partition = %self.partition_id,
+                index = %index,
+                "skipping empty entry (no-op)"
+            );
             self.last_applied = index;
             return Ok(None);
         }
@@ -406,7 +549,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         let base_offset = match &mut self.inner {
             PartitionStorageInner::InMemory(partition) => match command {
                 PartitionCommand::Append { records } => {
-                    let _record_count = records.len();
                     let offset = partition.append(records).map_err(|e| ServerError::Internal {
                         message: format!("failed to append: {e}"),
                     })?;
@@ -417,7 +559,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                     Some(offset)
                 }
                 PartitionCommand::AppendBlob { blob, record_count, format } => {
-                    // Get the offset that will be assigned before appending.
                     let base_offset = partition.blob_log_end_offset();
 
                     // Apply protocol-specific patching if needed.
@@ -435,35 +576,88 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                     let new_hwm = partition.blob_log_end_offset();
                     partition.set_high_watermark(new_hwm);
 
-                    eprintln!("[APPLY_BLOB] topic={} partition={} index={} records={} base_offset={} new_hwm={} format={:?}",
-                        self.topic_id, self.partition_id, index, record_count, offset, new_hwm, format);
+                    debug!(
+                        topic = %self.topic_id,
+                        partition = %self.partition_id,
+                        index = %index,
+                        record_count = record_count,
+                        base_offset = %offset,
+                        new_hwm = %new_hwm,
+                        format = ?format,
+                        "applied blob"
+                    );
                     Some(offset)
                 }
                 PartitionCommand::Truncate { from_offset } => {
-                    eprintln!("[APPLY_TRUNCATE] topic={} partition={} index={} from_offset={}",
-                        self.topic_id, self.partition_id, index, from_offset);
+                    debug!(
+                        topic = %self.topic_id,
+                        partition = %self.partition_id,
+                        index = %index,
+                        from_offset = %from_offset,
+                        "applied truncate"
+                    );
                     partition.truncate(from_offset).map_err(|e| ServerError::Internal {
                         message: format!("failed to truncate: {e}"),
                     })?;
                     None
                 }
                 PartitionCommand::UpdateHighWatermark { high_watermark } => {
-                    eprintln!("[APPLY_HWM] topic={} partition={} index={} hwm={}",
-                        self.topic_id, self.partition_id, index, high_watermark);
+                    debug!(
+                        topic = %self.topic_id,
+                        partition = %self.partition_id,
+                        index = %index,
+                        high_watermark = %high_watermark,
+                        "applied high watermark update"
+                    );
                     partition.set_high_watermark(high_watermark);
                     None
                 }
+                PartitionCommand::AppendBlobBatch { blobs } => {
+                    // Get the first offset that will be assigned.
+                    let first_base_offset = partition.blob_log_end_offset();
+
+                    // Apply each blob in sequence.
+                    for batched in blobs {
+                        let current_offset = partition.blob_log_end_offset();
+                        let blob_to_store = match batched.format {
+                            BlobFormat::Raw => batched.blob,
+                            BlobFormat::KafkaRecordBatch => {
+                                patch_kafka_base_offset(batched.blob, current_offset)
+                            }
+                        };
+                        partition.append_blob(blob_to_store, batched.record_count).map_err(|e| {
+                            ServerError::Internal {
+                                message: format!("failed to append blob in batch: {e}"),
+                            }
+                        })?;
+                    }
+
+                    let new_hwm = partition.blob_log_end_offset();
+                    partition.set_high_watermark(new_hwm);
+
+                    debug!(
+                        topic = %self.topic_id,
+                        partition = %self.partition_id,
+                        index = %index,
+                        first_base_offset = %first_base_offset,
+                        new_hwm = %new_hwm,
+                        "applied blob batch"
+                    );
+                    Some(first_base_offset)
+                }
             },
             PartitionStorageInner::Durable(partition) => match command {
-                PartitionCommand::Append { records } => {
-                    let offset = partition.append(records).await.map_err(|e| {
+                PartitionCommand::Append { records, .. } => {
+                    // Use append_at_index with the Raft index to ensure proper
+                    // idempotency tracking after crash recovery.
+                    let offset = partition.append_at_index(index.get(), records).await.map_err(|e| {
                         ServerError::Internal {
                             message: format!("failed to append: {e}"),
                         }
                     })?;
                     Some(offset)
                 }
-                PartitionCommand::AppendBlob { blob, record_count, format } => {
+                PartitionCommand::AppendBlob { blob, record_count, format, .. } => {
                     // Get the offset that will be assigned before appending.
                     let base_offset = partition.blob_log_end_offset();
 
@@ -473,7 +667,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                         BlobFormat::KafkaRecordBatch => patch_kafka_base_offset(blob, base_offset),
                     };
 
-                    let offset = partition.append_blob(blob_to_store, record_count).await.map_err(|e| {
+                    // Use append_blob_at_index with the Raft index.
+                    let offset = partition.append_blob_at_index(index.get(), blob_to_store, record_count).await.map_err(|e| {
                         ServerError::Internal {
                             message: format!("failed to append blob: {e}"),
                         }
@@ -489,10 +684,121 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                     partition.set_high_watermark(high_watermark);
                     None
                 }
+                PartitionCommand::AppendBlobBatch { blobs } => {
+                    // Get the first offset that will be assigned.
+                    let first_base_offset = partition.blob_log_end_offset();
+
+                    // Note: For blob batches, we use the single index for all blobs.
+                    // This is semantically correct since they're all part of the same
+                    // Raft entry and will all be recovered together.
+                    for batched in blobs {
+                        let current_offset = partition.blob_log_end_offset();
+                        let blob_to_store = match batched.format {
+                            BlobFormat::Raw => batched.blob,
+                            BlobFormat::KafkaRecordBatch => {
+                                patch_kafka_base_offset(batched.blob, current_offset)
+                            }
+                        };
+                        partition.append_blob_at_index(index.get(), blob_to_store, batched.record_count).await.map_err(|e| {
+                            ServerError::Internal {
+                                message: format!("failed to append blob in batch: {e}"),
+                            }
+                        })?;
+                    }
+
+                    debug!(
+                        topic = %self.topic_id,
+                        partition = %self.partition_id,
+                        index = %index,
+                        first_base_offset = %first_base_offset,
+                        new_log_end = %partition.blob_log_end_offset(),
+                        "applied blob batch (durable)"
+                    );
+                    Some(first_base_offset)
+                }
             },
         };
 
         self.last_applied = index;
         Ok(base_offset)
+    }
+
+    // -------------------------------------------------------------------------
+    // Tiering Methods
+    // -------------------------------------------------------------------------
+
+    /// Returns whether tiering is enabled for this partition.
+    #[must_use]
+    pub fn has_tiering(&self) -> bool {
+        match &self.inner {
+            PartitionStorageInner::InMemory(_) => false,
+            PartitionStorageInner::Durable(p) => p.has_tiering(),
+        }
+    }
+
+    /// Checks for newly sealed segments and registers them with the tiering manager.
+    ///
+    /// This should be called periodically or after writes that may have caused
+    /// segment rotation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if registration with the tiering manager fails.
+    pub async fn check_and_register_sealed_segments(&mut self) -> Result<u32, ServerError> {
+        match &mut self.inner {
+            PartitionStorageInner::InMemory(_) => Ok(0),
+            PartitionStorageInner::Durable(p) => {
+                p.check_and_register_sealed_segments()
+                    .await
+                    .map_err(|e| ServerError::Internal {
+                        message: format!("tiering registration failed: {e}"),
+                    })
+            }
+        }
+    }
+
+    /// Marks segments as committed when entries are committed via Raft.
+    ///
+    /// Segments containing only committed entries become eligible for tiering.
+    ///
+    /// # Arguments
+    ///
+    /// * `committed_index` - The Raft log index that has been committed
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if marking segments as committed fails.
+    pub async fn on_entries_committed(&self, committed_index: u64) -> Result<u32, ServerError> {
+        match &self.inner {
+            PartitionStorageInner::InMemory(_) => Ok(0),
+            PartitionStorageInner::Durable(p) => {
+                p.on_entries_committed(committed_index)
+                    .await
+                    .map_err(|e| ServerError::Internal {
+                        message: format!("tiering commit notification failed: {e}"),
+                    })
+            }
+        }
+    }
+
+    /// Uploads eligible segments to object storage.
+    ///
+    /// This should be called periodically to tier segments that meet the
+    /// eligibility criteria (committed, sealed, and past minimum age).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tiering operation fails.
+    pub async fn tier_eligible_segments(&self) -> Result<u32, ServerError> {
+        match &self.inner {
+            PartitionStorageInner::InMemory(_) => Ok(0),
+            PartitionStorageInner::Durable(p) => {
+                p.tier_eligible_segments()
+                    .await
+                    .map_err(|e| ServerError::Internal {
+                        message: format!("tiering upload failed: {e}"),
+                    })
+            }
+        }
     }
 }

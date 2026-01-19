@@ -597,6 +597,14 @@ pub struct VerifiedMultiRaftActor {
     property_state: Option<SharedPropertyState>,
     /// Network (shared).
     network: Option<SharedChaoticNetwork>,
+    /// Persisted vote state per group (survives crashes).
+    ///
+    /// Simulates local disk persistence. On recover, this state is used to
+    /// restore the Raft node's term and `voted_for` to prevent double-voting.
+    persisted_vote_state: BTreeMap<GroupId, (TermId, Option<NodeId>)>,
+    /// Track votes granted per term for double-vote detection.
+    /// Key: (group_id, term), Value: node we voted for.
+    votes_granted: BTreeMap<(u64, u64), NodeId>,
 }
 
 impl VerifiedMultiRaftActor {
@@ -625,6 +633,8 @@ impl VerifiedMultiRaftActor {
             crashed: false,
             property_state: None,
             network: None,
+            persisted_vote_state: BTreeMap::new(),
+            votes_granted: BTreeMap::new(),
         }
     }
 
@@ -714,6 +724,36 @@ impl VerifiedMultiRaftActor {
                 }
                 MultiRaftOutput::BecameLeader { .. } | MultiRaftOutput::SteppedDown { .. } => {
                     // State change - will be captured in report_state.
+                }
+                MultiRaftOutput::VoteStateChanged {
+                    group_id,
+                    term,
+                    voted_for,
+                } => {
+                    // Check for double-vote violation BEFORE persisting.
+                    // This detects if the Raft implementation itself is buggy.
+                    if let Some(voted_for_node) = voted_for {
+                        let key = (group_id.get(), term.get());
+                        if let Some(&previous_vote) = self.votes_granted.get(&key) {
+                            if previous_vote != voted_for_node {
+                                // DOUBLE VOTE DETECTED - critical safety violation!
+                                // This should NEVER happen if vote persistence is working.
+                                panic!(
+                                    "DOUBLE VOTE VIOLATION in {} group {} term {}: \
+                                     previously voted for {}, now voting for {}!",
+                                    self.name, group_id.get(), term.get(),
+                                    previous_vote.get(), voted_for_node.get()
+                                );
+                            }
+                        } else {
+                            // Record this vote for double-vote detection.
+                            self.votes_granted.insert(key, voted_for_node);
+                        }
+                    }
+
+                    // Persist vote state (simulates local disk persistence).
+                    // This state survives crashes and is restored on recovery.
+                    self.persisted_vote_state.insert(group_id, (term, voted_for));
                 }
             }
         }
@@ -807,12 +847,25 @@ impl VerifiedMultiRaftActor {
     fn handle_recover(&mut self, ctx: &mut SimulationContext) {
         self.crashed = false;
 
-        // Recreate Multi-Raft.
+        // Recreate Multi-Raft with persisted vote state.
+        // This simulates restoring from local disk persistence.
         let node_id = self.multi_raft.node_id();
         let all_nodes: Vec<_> = self.node_to_actor.keys().copied().collect();
         self.multi_raft = MultiRaft::new(node_id);
         for &group_id in &self.groups {
-            let _ = self.multi_raft.create_group(group_id, all_nodes.clone());
+            // Restore from persisted vote state if available.
+            // This prevents double-voting after crash/recovery.
+            if let Some(&(term, voted_for)) = self.persisted_vote_state.get(&group_id) {
+                let _ = self.multi_raft.create_group_with_state(
+                    group_id,
+                    all_nodes.clone(),
+                    term,
+                    voted_for,
+                    false, // Not using observation mode (local disk recovery)
+                );
+            } else {
+                let _ = self.multi_raft.create_group(group_id, all_nodes.clone());
+            }
         }
 
         self.report_state();
@@ -2291,6 +2344,238 @@ mod tests {
             dropped,
             check.leaders_summary.len(),
             check.violations.len()
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // 7. Vote Persistence DST Tests
+    //
+    // These tests verify vote persistence safety properties:
+    // - Double-vote detection (critical Raft safety property)
+    // - Vote state survives crashes and is restored correctly
+    // - Observation mode prevents stale state issues
+    //
+    // Note: The existing crash/recovery tests already exercise vote persistence
+    // since we added persisted_vote_state tracking and double-vote detection.
+    // These additional tests focus on specific fault scenarios.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_vote_persistence_multiple_crash_cycles() {
+        // Test vote persistence across multiple crash/recovery cycles.
+        // The double-vote detector in VerifiedMultiRaftActor will catch violations.
+        let config = VerifiedTestConfig {
+            max_time_secs: 45,
+            ..Default::default()
+        };
+        let (mut engine, actor_ids, property_state, _) = create_verified_simulation(&config);
+
+        // Schedule multiple crash/recovery cycles for each node.
+        for cycle in 0..3 {
+            for (i, &actor) in actor_ids.iter().enumerate() {
+                let base_time = (cycle * 12000 + i as u64 * 3000) as u64;
+                engine.schedule_after(
+                    Duration::from_millis(base_time + 1000),
+                    EventKind::ProcessCrash { actor },
+                );
+                engine.schedule_after(
+                    Duration::from_millis(base_time + 3000),
+                    EventKind::ProcessRecover { actor },
+                );
+            }
+        }
+
+        let result = engine.run();
+        assert!(result.success);
+
+        let check = check_shared_state(&property_state).expect("lock failed");
+        assert_no_violations(&check, "vote_persistence_multiple_cycles");
+
+        println!(
+            "Vote persistence multiple cycles: {} events, {} violations",
+            result.stats.events_processed, check.violations.len()
+        );
+    }
+
+    #[test]
+    fn test_vote_persistence_simultaneous_crashes() {
+        // Test vote persistence when multiple nodes crash and recover simultaneously.
+        // This is a challenging scenario that can trigger multiple elections.
+        let config = VerifiedTestConfig {
+            max_time_secs: 40,
+            ..Default::default()
+        };
+        let (mut engine, actor_ids, property_state, _) = create_verified_simulation(&config);
+
+        // Crash all nodes simultaneously at 5s.
+        for &actor in &actor_ids {
+            engine.schedule_after(
+                Duration::from_millis(5000),
+                EventKind::ProcessCrash { actor },
+            );
+        }
+
+        // Recover all nodes at 10s (staggered by 100ms to create election races).
+        for (i, &actor) in actor_ids.iter().enumerate() {
+            engine.schedule_after(
+                Duration::from_millis(10000 + (i as u64 * 100)),
+                EventKind::ProcessRecover { actor },
+            );
+        }
+
+        // Another simultaneous crash at 20s.
+        for &actor in &actor_ids {
+            engine.schedule_after(
+                Duration::from_millis(20000),
+                EventKind::ProcessCrash { actor },
+            );
+        }
+
+        // Recover again.
+        for (i, &actor) in actor_ids.iter().enumerate() {
+            engine.schedule_after(
+                Duration::from_millis(25000 + (i as u64 * 50)),
+                EventKind::ProcessRecover { actor },
+            );
+        }
+
+        let result = engine.run();
+        assert!(result.success);
+
+        let check = check_shared_state(&property_state).expect("lock failed");
+        assert_no_violations(&check, "vote_persistence_simultaneous_crashes");
+
+        println!(
+            "Vote persistence simultaneous crashes: {} events, {} (group,term) combos, {} violations",
+            result.stats.events_processed, check.leaders_summary.len(), check.violations.len()
+        );
+    }
+
+    #[test]
+    fn test_vote_persistence_with_network_partitions() {
+        // Test vote persistence combined with network partitions.
+        // This creates scenarios where nodes might have stale vote state.
+        let config = VerifiedTestConfig {
+            max_time_secs: 50,
+            ..Default::default()
+        };
+        let (mut engine, actor_ids, property_state, _) = create_verified_simulation(&config);
+
+        // Partition node 0 at 3s.
+        engine.schedule_after(
+            Duration::from_millis(3000),
+            EventKind::NetworkPartition {
+                nodes: vec![actor_ids[0], actor_ids[1]],
+            },
+        );
+        engine.schedule_after(
+            Duration::from_millis(3000),
+            EventKind::NetworkPartition {
+                nodes: vec![actor_ids[0], actor_ids[2]],
+            },
+        );
+
+        // Crash node 0 while partitioned at 5s.
+        engine.schedule_after(
+            Duration::from_millis(5000),
+            EventKind::ProcessCrash {
+                actor: actor_ids[0],
+            },
+        );
+
+        // Heal partition at 10s.
+        engine.schedule_after(
+            Duration::from_millis(10000),
+            EventKind::NetworkHeal {
+                nodes: vec![actor_ids[0], actor_ids[1]],
+            },
+        );
+        engine.schedule_after(
+            Duration::from_millis(10000),
+            EventKind::NetworkHeal {
+                nodes: vec![actor_ids[0], actor_ids[2]],
+            },
+        );
+
+        // Recover node 0 after partition healed at 12s.
+        engine.schedule_after(
+            Duration::from_millis(12000),
+            EventKind::ProcessRecover {
+                actor: actor_ids[0],
+            },
+        );
+
+        // More activity to verify safety.
+        engine.schedule_after(
+            Duration::from_millis(20000),
+            EventKind::ProcessCrash {
+                actor: actor_ids[1],
+            },
+        );
+        engine.schedule_after(
+            Duration::from_millis(25000),
+            EventKind::ProcessRecover {
+                actor: actor_ids[1],
+            },
+        );
+
+        let result = engine.run();
+        assert!(result.success);
+
+        let check = check_shared_state(&property_state).expect("lock failed");
+        assert_no_violations(&check, "vote_persistence_with_partitions");
+
+        println!(
+            "Vote persistence with partitions: {} events, {} violations",
+            result.stats.events_processed, check.violations.len()
+        );
+    }
+
+    #[test]
+    fn test_vote_persistence_election_storm() {
+        // Stress test: create conditions for many elections with crashes.
+        // This thoroughly tests that vote state is tracked correctly.
+        let config = VerifiedTestConfig {
+            max_time_secs: 60,
+            ..Default::default()
+        };
+        let (mut engine, actor_ids, property_state, _) = create_verified_simulation(&config);
+
+        let mut rng = StdRng::seed_from_u64(42);
+
+        // Schedule 15 random crashes with short recovery times.
+        // This creates many election cycles.
+        for i in 0..15 {
+            let actor = actor_ids[rng.gen_range(0..actor_ids.len())];
+            let crash_time = 2000 + i * 3000 + rng.gen_range(0..500);
+            let recover_time = crash_time + 800 + rng.gen_range(0..400);
+
+            engine.schedule_after(
+                Duration::from_millis(crash_time),
+                EventKind::ProcessCrash { actor },
+            );
+            engine.schedule_after(
+                Duration::from_millis(recover_time),
+                EventKind::ProcessRecover { actor },
+            );
+        }
+
+        let result = engine.run();
+        assert!(result.success);
+
+        let check = check_shared_state(&property_state).expect("lock failed");
+        assert_no_violations(&check, "vote_persistence_election_storm");
+
+        println!(
+            "Vote persistence election storm: {} events, {} (group,term) combos, {} violations",
+            result.stats.events_processed, check.leaders_summary.len(), check.violations.len()
+        );
+
+        // Should have many elections due to rapid crashes.
+        assert!(
+            check.leaders_summary.len() >= 5,
+            "Expected multiple elections, got {}",
+            check.leaders_summary.len()
         );
     }
 }

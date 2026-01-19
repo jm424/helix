@@ -39,7 +39,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use bytes::Bytes;
-use helix_core::PartitionId;
+use helix_core::{PartitionId, WriteDurability};
 
 use crate::error::WalResult;
 use crate::shared_entry::SharedEntry;
@@ -282,13 +282,23 @@ impl<S: Storage> SharedWal<S> {
     /// Returns an error if the sync fails.
     pub async fn sync(&mut self) -> WalResult<()> {
         self.wal.sync().await?;
+        self.update_partition_durable_indices();
+        Ok(())
+    }
 
-        // Update per-partition durable indices after successful sync.
+    /// Marks all written entries as durable without fsync.
+    ///
+    /// This is used in `ReplicationOnly` mode where durability is provided
+    /// by Raft replication rather than local fsync. Once entries are written
+    /// to the WAL file (in page cache), they're considered "locally durable"
+    /// for the purposes of replication tracking.
+    ///
+    /// In `Fsync` mode, use `sync()` instead which both fsyncs and updates
+    /// the durable indices.
+    pub fn update_partition_durable_indices(&mut self) {
         for (partition_id, state) in &self.partition_state {
             self.partition_durable.insert(*partition_id, state.last_index);
         }
-
-        Ok(())
     }
 
     /// Returns the durable index (last synced entry's index).
@@ -556,10 +566,20 @@ pub struct CoordinatorConfig {
     pub max_buffer_entries: usize,
     /// Maximum bytes to buffer before forcing a flush.
     pub max_buffer_bytes: usize,
+    /// Write durability mode.
+    ///
+    /// - `Fsync`: Wait for fsync on each flush (safe for single-node, slower)
+    /// - `ReplicationOnly`: Skip fsync, rely on Raft replication (fast, requires multi-node)
+    ///
+    /// Default is `ReplicationOnly` for maximum throughput in replicated deployments.
+    pub durability: WriteDurability,
 }
 
 impl CoordinatorConfig {
     /// Creates a new coordinator configuration with defaults.
+    ///
+    /// Default durability is `ReplicationOnly` for maximum throughput.
+    /// Use `with_durability(WriteDurability::Fsync)` for single-node safety.
     #[must_use]
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -567,6 +587,7 @@ impl CoordinatorConfig {
             flush_interval: Duration::from_millis(1),
             max_buffer_entries: 1000,
             max_buffer_bytes: 16 * 1024 * 1024, // 16 MB
+            durability: WriteDurability::default(), // ReplicationOnly for throughput
         }
     }
 
@@ -595,6 +616,28 @@ impl CoordinatorConfig {
     #[must_use]
     pub fn with_segment_config(mut self, config: crate::SegmentConfig) -> Self {
         self.wal_config = self.wal_config.with_segment_config(config);
+        self
+    }
+
+    /// Sets the write durability mode.
+    ///
+    /// - `WriteDurability::Fsync`: Wait for fsync on each flush (safe for single-node)
+    /// - `WriteDurability::ReplicationOnly`: Skip fsync, rely on Raft replication (fast)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // For single-node deployments (safe but slower):
+    /// let config = CoordinatorConfig::new(dir)
+    ///     .with_durability(WriteDurability::Fsync);
+    ///
+    /// // For multi-node deployments (fast, relies on replication):
+    /// let config = CoordinatorConfig::new(dir)
+    ///     .with_durability(WriteDurability::ReplicationOnly);
+    /// ```
+    #[must_use]
+    pub const fn with_durability(mut self, durability: WriteDurability) -> Self {
+        self.durability = durability;
         self
     }
 }
@@ -694,7 +737,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
     ///
     /// Returns an error if the append or sync fails.
     pub async fn append_auto(&self, term: u64, payload: Bytes) -> WalResult<DurableAck> {
-        let rx = self.append_auto_async(term, payload).await?;
+        let (_index, rx) = self.append_auto_async(term, payload).await?;
         rx.await.map_err(|_| crate::WalError::Shutdown)?
     }
 
@@ -703,8 +746,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
     /// The index is assigned atomically while holding the buffer lock, eliminating
     /// TOCTOU races. This is the recommended method for new code.
     ///
-    /// Returns a receiver that will be notified when the entry is durable.
-    /// The `DurableAck` contains the assigned index.
+    /// Returns a tuple of (`assigned_index`, `receiver`). The receiver will be notified
+    /// when the entry is durable. The index is available immediately.
     ///
     /// # Errors
     ///
@@ -713,7 +756,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
         &self,
         term: u64,
         payload: Bytes,
-    ) -> WalResult<oneshot::Receiver<WalResult<DurableAck>>> {
+    ) -> WalResult<(u64, oneshot::Receiver<WalResult<DurableAck>>)> {
         if self.inner.shutdown.load(Ordering::Acquire) {
             return Err(crate::WalError::Shutdown);
         }
@@ -721,7 +764,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
         let (tx, rx) = oneshot::channel();
 
         // Add to buffer with atomically assigned index.
-        {
+        let next_index = {
             let mut buffer = self.inner.buffer.lock().await;
 
             // Determine the next index atomically while holding buffer lock.
@@ -756,14 +799,39 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
             buffer.bytes += entry_bytes;
 
             // Check if we should trigger immediate flush.
-            if buffer.entries.len() >= self.inner.config.max_buffer_entries
-                || buffer.bytes >= self.inner.config.max_buffer_bytes
-            {
+            let should_flush = buffer.entries.len() >= self.inner.config.max_buffer_entries
+                || buffer.bytes >= self.inner.config.max_buffer_bytes;
+
+            // Drop buffer lock before notifying to avoid holding lock during notification.
+            drop(buffer);
+
+            if should_flush {
                 self.inner.flush_notify.notify_one();
             }
-        }
 
-        Ok(rx)
+            next_index
+        };
+
+        Ok((next_index, rx))
+    }
+
+    /// Appends an entry with auto-assigned index, returning immediately.
+    ///
+    /// This method does NOT wait for durability. In a replicated system,
+    /// durability is provided by Raft replication across nodes, so waiting
+    /// for local fsync is unnecessary and hurts throughput.
+    ///
+    /// The entry is buffered and will be fsynced within `flush_interval` (typically 1ms).
+    /// If the node crashes before fsync, recovery rebuilds state from Raft peers.
+    ///
+    /// Returns the assigned index immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the coordinator is shut down.
+    pub async fn append_nowait(&self, term: u64, payload: Bytes) -> WalResult<u64> {
+        let (index, _rx) = self.append_auto_async(term, payload).await?;
+        Ok(index)
     }
 
     /// Returns the partition ID for this handle.
@@ -1166,8 +1234,23 @@ async fn flush_loop<S: Storage + Clone + Send + Sync + 'static>(inner: Arc<Coord
             continue;
         }
 
-        // Single fsync for entire batch.
-        let sync_result = wal.sync().await;
+        // Conditionally fsync based on durability mode.
+        //
+        // - Fsync mode: Wait for fsync to ensure data is on disk (safe, slow)
+        // - ReplicationOnly mode: Skip fsync, rely on Raft replication for durability (fast)
+        //
+        // In ReplicationOnly mode, data goes to the OS page cache and will be
+        // flushed to disk by the OS in the background. If the node crashes before
+        // the OS flush, data is recovered from Raft peers.
+        let sync_result = if inner.config.durability.requires_fsync() {
+            // Fsync mode: sync to disk (also updates partition_durable indices).
+            wal.sync().await
+        } else {
+            // ReplicationOnly: skip fsync, but still update partition_durable indices
+            // since entries are now written and "durable enough" for replication tracking.
+            wal.update_partition_durable_indices();
+            Ok(())
+        };
 
         // Notify all waiters.
         match sync_result {
@@ -1275,6 +1358,16 @@ impl PoolConfig {
     #[must_use]
     pub const fn with_max_buffer_entries(mut self, max: usize) -> Self {
         self.coordinator_config.max_buffer_entries = max;
+        self
+    }
+
+    /// Sets the write durability mode for all WALs.
+    ///
+    /// - `WriteDurability::Fsync`: Wait for fsync on each flush (safe for single-node)
+    /// - `WriteDurability::ReplicationOnly`: Skip fsync, rely on Raft replication (fast)
+    #[must_use]
+    pub const fn with_durability(mut self, durability: WriteDurability) -> Self {
+        self.coordinator_config.durability = durability;
         self
     }
 }

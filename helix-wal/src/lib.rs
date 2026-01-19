@@ -54,6 +54,8 @@ pub use shared_wal::{
     CoordinatorConfig, DurableAck, PoolConfig, SharedWal, SharedWalConfig, SharedWalCoordinator,
     SharedWalHandle, SharedWalPool, POOL_WAL_COUNT_MAX,
 };
+// Re-export WriteDurability for convenience (also available from helix_core).
+pub use helix_core::WriteDurability;
 pub use storage::{create_storage, FaultConfig, FaultStats, SimulatedFile, SimulatedStorage, Storage, StorageFile, TokioStorage};
 
 // Low-level io_uring types (for direct use within tokio_uring context).
@@ -76,6 +78,15 @@ pub mod limits {
 
     /// Minimum size of a segment in bytes (1 MB).
     pub const SEGMENT_SIZE_BYTES_MIN: u64 = 1024 * 1024;
+
+    /// Default segment size (4 MB).
+    ///
+    /// This is the recommended operating point for tiered storage:
+    /// - Large enough to amortize S3 PUT/GET overhead
+    /// - Small enough to tier frequently and limit recovery time
+    ///
+    /// See `docs/design/object-storage.md` for rationale.
+    pub const SEGMENT_SIZE_BYTES_DEFAULT: u64 = 4 * 1024 * 1024;
 
     /// Maximum number of entries per segment.
     pub const ENTRIES_PER_SEGMENT_MAX: u64 = 10_000_000;

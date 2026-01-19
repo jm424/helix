@@ -44,6 +44,7 @@
 mod history;
 mod operation;
 mod payload;
+pub mod profiles;
 mod verification;
 mod workload;
 
@@ -60,6 +61,6 @@ pub use workload::{
 
 // Re-export executor types.
 pub use executor::{
-    ExecutorError, RealCluster, RealClusterBuilder, RealClusterConfig, RealExecutor,
-    WorkloadExecutor,
+    ExecutorError, ProducerMode, RealCluster, RealClusterBuilder, RealClusterConfig, RealExecutor,
+    S3TieringConfig, TieringStatus, TieringTestConfig, WorkloadExecutor,
 };

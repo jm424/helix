@@ -34,6 +34,7 @@ async fn start_test_server_with_shared_wal(
         1,
         data_dir,
         shared_wal_count,
+        helix_core::WriteDurability::ReplicationOnly,
     )
     .await;
 
@@ -433,6 +434,7 @@ async fn test_shared_wal_recovery_after_restart() {
             1,
             data_path_clone,
             Some(4),
+            helix_core::WriteDurability::ReplicationOnly,
         )
         .await;
 
@@ -515,6 +517,7 @@ async fn test_shared_wal_recovery_after_restart() {
         1,
         data_path,
         Some(4),
+        helix_core::WriteDurability::ReplicationOnly,
     )
     .await;
 

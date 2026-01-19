@@ -46,15 +46,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, ValueEnum};
-use helix_core::NodeId;
+use helix_core::{NodeId, WriteDurability};
 use helix_runtime::PeerInfo;
 use tonic::transport::Server;
 use tracing::{info, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing_subscriber::{fmt::format::FmtSpan, FmtSubscriber};
 
 use helix_server::generated::helix_server::HelixServer;
 use helix_server::kafka::{KafkaServer, KafkaServerConfig};
 use helix_server::HelixService;
+use helix_tier::TieringConfig;
 #[cfg(feature = "s3")]
 use helix_tier::S3Config;
 
@@ -66,6 +67,27 @@ enum Protocol {
     Grpc,
     /// Kafka wire protocol compatibility.
     Kafka,
+}
+
+/// Write durability mode for the WAL.
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum Durability {
+    /// Skip fsync, rely on Raft replication for durability (fast, default).
+    /// Safe for multi-node deployments with replication.
+    #[default]
+    ReplicationOnly,
+    /// Wait for fsync on each flush (safe for single-node, slower).
+    /// Use this for single-node deployments or maximum durability.
+    Fsync,
+}
+
+impl From<Durability> for WriteDurability {
+    fn from(d: Durability) -> Self {
+        match d {
+            Durability::Fsync => Self::Fsync,
+            Durability::ReplicationOnly => Self::ReplicationOnly,
+        }
+    }
 }
 
 /// Helix distributed log server.
@@ -135,11 +157,24 @@ struct Args {
     #[arg(long)]
     s3_force_path_style: bool,
 
+    /// Minimum age (in seconds) before a segment is eligible for tiering.
+    /// Default is 300 seconds (5 minutes). Set to 0 for immediate tiering.
+    #[arg(long, default_value = "300")]
+    tier_min_age_secs: u64,
+
     /// Number of shared WALs to use for fsync amortization (1-16).
     /// Only applies when --data-dir is specified.
     /// If not specified, defaults to 4.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=16))]
     shared_wal_count: Option<u32>,
+
+    /// Write durability mode for the WAL.
+    ///
+    /// - replication-only (default): Skip fsync, rely on Raft replication.
+    ///   Fast, safe for multi-node with acks=all.
+    /// - fsync: Wait for fsync on each flush. Safe for single-node, slower.
+    #[arg(long, value_enum, default_value = "replication-only")]
+    write_durability: Durability,
 
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info")]
@@ -280,10 +315,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Initialize logging to stderr (stdout may be suppressed by test harness).
+    // FmtSpan::CLOSE logs when spans close with their duration - useful for profiling.
     let subscriber = FmtSubscriber::builder()
         .with_max_level(args.log_level)
         .with_target(true)
         .with_thread_ids(true)
+        .with_span_events(FmtSpan::CLOSE)
         .with_writer(std::io::stderr)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
@@ -335,6 +372,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             config
         });
 
+        // Build tiering config if S3 or object_storage_dir is set.
+        #[cfg(feature = "s3")]
+        let tiering_config = if args.s3_bucket.is_some() || args.object_storage_dir.is_some() {
+            Some(TieringConfig {
+                min_age_secs: args.tier_min_age_secs,
+                max_concurrent_uploads: 4,
+                verify_on_download: true,
+            })
+        } else {
+            None
+        };
+        #[cfg(not(feature = "s3"))]
+        let tiering_config = if args.object_storage_dir.is_some() {
+            Some(TieringConfig {
+                min_age_secs: args.tier_min_age_secs,
+                max_concurrent_uploads: 4,
+                verify_on_download: true,
+            })
+        } else {
+            None
+        };
+
+        let write_durability = args.write_durability.into();
+
         #[cfg(feature = "s3")]
         let service = HelixService::new_multi_node(
             args.cluster_id,
@@ -344,9 +405,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.data_dir,
             args.object_storage_dir,
             s3_config,
+            tiering_config,
             kafka_addr,
             kafka_peer_addrs,
             args.shared_wal_count,
+            write_durability,
         )
         .await?;
         #[cfg(not(feature = "s3"))]
@@ -357,15 +420,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             raft_peers,
             args.data_dir,
             args.object_storage_dir,
+            tiering_config,
             kafka_addr,
             kafka_peer_addrs,
             args.shared_wal_count,
+            write_durability,
         )
         .await?;
+
+        if let Ok(report_path) = std::env::var("HELIX_BENCH_REPORT_PATH") {
+            let interval_ms = std::env::var("HELIX_BENCH_REPORT_INTERVAL_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(1000);
+            let report_path = report_path.replace("{node_id}", &args.node_id.to_string());
+            service.start_bench_reporter(PathBuf::from(report_path), interval_ms);
+        }
+
         service
     } else {
         // Single-node mode (for development/testing).
         info!("Starting in single-node mode");
+        let write_durability = args.write_durability.into();
+
         match (args.data_dir, args.object_storage_dir) {
             (Some(data_dir), Some(object_storage_dir)) => {
                 HelixService::with_data_and_object_storage(
@@ -374,12 +451,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     data_dir,
                     object_storage_dir,
                     args.shared_wal_count,
+                    write_durability,
                 )
                 .await
             }
             (Some(data_dir), None) => {
-                HelixService::with_data_dir(args.cluster_id, args.node_id, data_dir, args.shared_wal_count)
-                    .await
+                HelixService::with_data_dir(
+                    args.cluster_id,
+                    args.node_id,
+                    data_dir,
+                    args.shared_wal_count,
+                    write_durability,
+                )
+                .await
             }
             (None, _) => HelixService::new(args.cluster_id, args.node_id).await,
         }

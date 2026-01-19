@@ -20,6 +20,8 @@ rdkafka.workspace = true
 # Serialization.
 bytes.workspace = true
 crc.workspace = true
+serde = { workspace = true, features = ["derive"] }
+toml.workspace = true
 
 # Random number generation (deterministic).
 rand.workspace = true
@@ -42,4 +44,5 @@ name = "integration_test"
 path = "src/bin/integration_test.rs"
 
 [dev-dependencies]
+futures.workspace = true
 tempfile.workspace = true

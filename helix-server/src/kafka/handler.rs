@@ -392,6 +392,7 @@ impl KafkaHandler {
     }
 
     /// Handle Produce request.
+    #[tracing::instrument(skip_all, name = "kafka_produce")]
     async fn handle_produce(&self, request: &DecodedRequest) -> KafkaResult<BytesMut> {
         let mut body = request.body.clone();
         let produce_request =
@@ -521,6 +522,7 @@ impl KafkaHandler {
     ///
     /// This extracts producer info from the Kafka `RecordBatch` header and
     /// uses idempotent deduplication when `producer_id` is valid (>= 0).
+    #[tracing::instrument(skip_all, name = "append_and_get_offset", fields(topic = %topic, partition))]
     async fn append_and_get_offset(
         &self,
         topic: &str,
@@ -595,9 +597,19 @@ impl KafkaHandler {
                 );
                 (0, 57) // INVALID_PRODUCER_EPOCH
             }
+            Err(crate::ServerError::Overloaded { pending_requests, pending_bytes }) => {
+                debug!(
+                    topic = %topic,
+                    partition,
+                    pending_requests,
+                    pending_bytes,
+                    "Server overloaded - backpressure"
+                );
+                (0, 9) // BROKER_NOT_AVAILABLE - triggers client retry
+            }
             Err(e) => {
                 warn!(topic = %topic, partition, error = %e, "Produce failed");
-                (0, 1) // UNKNOWN_SERVER_ERROR
+                (0, -1_i16) // UNKNOWN - generic server error
             }
         }
     }
