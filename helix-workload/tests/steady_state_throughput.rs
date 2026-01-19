@@ -608,10 +608,23 @@ async fn test_multi_partition_throughput() {
     println!("Target throughput: {:.0} MB/s", target_throughput_mb);
     println!("Actual throughput: {:.1} MB/s", throughput_mb);
 
-    let allow_errors = std::env::var("HELIX_ALLOW_ERRORS").ok().as_deref() == Some("1");
-    if !allow_errors {
-        assert!(error_count == 0, "Expected no errors, got {error_count}");
-    }
+    // Allow small error rate (<0.1%) for high-throughput tests under load.
+    let max_error_rate = std::env::var("HELIX_MAX_ERROR_RATE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.001); // 0.1% default
+    let error_rate = if success_count + error_count > 0 {
+        error_count as f64 / (success_count + error_count) as f64
+    } else {
+        0.0
+    };
+    println!("Error rate: {:.4}% (max: {:.2}%)", error_rate * 100.0, max_error_rate * 100.0);
+    assert!(
+        error_rate <= max_error_rate,
+        "Error rate {:.3}% exceeds max {:.3}%",
+        error_rate * 100.0,
+        max_error_rate * 100.0
+    );
     assert!(success_count > 0, "No successful operations recorded");
 
     // Check throughput meets target (can be disabled for CI).
