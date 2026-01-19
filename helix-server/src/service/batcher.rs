@@ -72,10 +72,17 @@ pub struct BatcherConfig {
 
 impl Default for BatcherConfig {
     fn default() -> Self {
+        // Allow override via environment variable for testing partition-aware batching.
+        let linger_ms = std::env::var("HELIX_BATCHER_LINGER_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+
         Self {
             // 1ms minimal linger: clients already batch, so server-side linger
             // adds latency without much benefit. Higher values cause backpressure.
-            linger_ms: 1,
+            // For multi-partition workloads, increase via HELIX_BATCHER_LINGER_MS.
+            linger_ms,
             // Must be larger than typical client batches (rdkafka batch.size=512KB)
             // to allow server-side batching of multiple producer requests.
             // Too small = each producer batch becomes separate Raft proposal.

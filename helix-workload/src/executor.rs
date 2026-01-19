@@ -243,6 +243,8 @@ pub struct RealClusterConfig {
     pub s3_config: Option<S3TieringConfig>,
     /// Tiering thresholds for testing.
     pub tiering_config: TieringTestConfig,
+    /// Log level for server nodes (trace, debug, info, warn, error).
+    pub log_level: String,
 }
 
 impl Default for RealClusterConfig {
@@ -259,6 +261,7 @@ impl Default for RealClusterConfig {
             object_storage_dir: None,
             s3_config: None,
             tiering_config: TieringTestConfig::default(),
+            log_level: String::from("info"),
         }
     }
 }
@@ -377,6 +380,16 @@ impl RealClusterBuilder {
         self
     }
 
+    /// Set log level for server nodes.
+    ///
+    /// Valid values: trace, debug, info, warn, error.
+    /// Default is "info".
+    #[must_use]
+    pub fn log_level(mut self, level: impl Into<String>) -> Self {
+        self.config.log_level = level.into();
+        self
+    }
+
     /// Builds and starts the cluster.
     ///
     /// # Errors
@@ -455,7 +468,7 @@ impl RealCluster {
                 .arg("--data-dir")
                 .arg(&node_dir)
                 .arg("--log-level")
-                .arg("debug");
+                .arg(&config.log_level);
 
             if config.auto_create_topics {
                 cmd.arg("--auto-create-topics");
