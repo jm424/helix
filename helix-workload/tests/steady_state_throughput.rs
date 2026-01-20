@@ -378,15 +378,16 @@ async fn test_single_partition_steady_state_throughput() {
 async fn test_multi_partition_throughput() {
     let node_count = 3u16;
     let partition_count = 8i32;
-    // Match single-partition throughput test settings (6 producers, 2000 inflight).
+    // Optimal settings for zero errors: 4 producers, 1000 inflight = ~108 MB/s.
+    // Higher settings cause timeouts due to per-partition batching overhead.
     let producer_count = std::env::var("HELIX_MP_PRODUCERS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(6usize);
+        .unwrap_or(4usize);
     let inflight = std::env::var("HELIX_MP_INFLIGHT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(2000usize);
+        .unwrap_or(1000usize);
     let message_size = 1024usize; // 1KB messages
     let duration_secs = 30u64;
     let warmup_secs = 5u64;
@@ -596,12 +597,12 @@ async fn test_multi_partition_throughput() {
     }
 
     // Verify throughput target.
-    // Default 10 MB/s is conservative for laptop testing with RF=3, acks=-1.
-    // Override with HELIX_MP_THROUGHPUT_TARGET_MB=200 for production hardware.
+    // Default 100 MB/s matches observed zero-error throughput (~108 MB/s).
+    // Override with HELIX_MP_THROUGHPUT_TARGET_MB for different hardware.
     let target_throughput_mb = std::env::var("HELIX_MP_THROUGHPUT_TARGET_MB")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(10.0);
+        .unwrap_or(100.0);
 
     println!();
     println!("=== Verification ===");
