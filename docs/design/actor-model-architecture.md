@@ -415,7 +415,53 @@ impl WalActor {
 - Multi-node cluster tests pass
 - DST tests pass
 
-### Phase 6: Performance Validation
+### Phase 6: DST Testing for Actor Model
+
+**Goal:** Comprehensive deterministic simulation testing of actor-based architecture
+
+**Files to modify:**
+- `helix-tests/src/actor_dst.rs` (new)
+- `helix-tests/src/helix_service_actor.rs` (update for actors)
+- `helix-tests/src/properties.rs` (add actor-specific properties)
+
+**Tasks:**
+
+1. **Actor-aware simulation harness**
+   - Simulate actor message delivery with controlled timing
+   - Allow message reordering within actor mailboxes
+   - Inject delays between actor command send and receive
+
+2. **Actor fault injection**
+   - Actor mailbox overflow (backpressure)
+   - Actor task panic/restart
+   - Message loss between actors
+   - Slow actor (processing delays)
+   - Channel closure (actor shutdown during operation)
+
+3. **Property verification for actors**
+   - `ActorMessageOrdering`: Messages to same actor processed in order
+   - `NoMessageLoss`: All sent messages eventually delivered (or error returned)
+   - `ActorIsolation`: Partition actor failure doesn't affect other partitions
+   - `WalActorBatching`: WAL batches respect ordering within partition
+
+4. **Comparative testing**
+   - Run same workload on lock-based and actor-based implementations
+   - Verify identical results (offsets, data integrity)
+   - Compare violation counts
+
+5. **Multi-partition stress tests**
+   - 8+ partitions with concurrent traffic to all
+   - Leader failures with actor model
+   - Network partitions affecting actor message delivery
+   - WAL actor failure and recovery
+
+**Verification:**
+- 10+ seeds pass with zero violations
+- Actor faults are correctly handled
+- No deadlocks or livelocks detected
+- Performance comparable to lock-based under simulation
+
+### Phase 7: Performance Validation
 
 **Goal:** Verify multi-partition throughput matches single-partition
 
@@ -424,7 +470,7 @@ impl WalActor {
 2. Run multi-partition throughput test
 3. Compare results - expect <5% gap
 4. Profile with flamegraph - verify no lock contention
-5. Run DST stress tests
+5. Run E2E integration tests with actor model
 
 **Success Criteria:**
 - Multi-partition throughput within 5% of single-partition
