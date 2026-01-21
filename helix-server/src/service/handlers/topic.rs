@@ -242,19 +242,22 @@ impl HelixService {
         };
 
         // Register the pending controller proposal.
-        {
+        let pending_count = {
             let mut proposals = self.pending_controller_proposals.write().await;
             proposals.push(PendingControllerProposal {
                 log_index: proposed_index,
                 result_tx,
             });
-        }
+            proposals.len()
+        };
 
         info!(
             topic = %name,
             partitions = partition_count,
             replication = replication_factor,
             log_index = proposed_index.get(),
+            pending_count = pending_count,
+            pending_proposals_ptr = ?std::sync::Arc::as_ptr(&self.pending_controller_proposals),
             "Proposed topic creation to controller, waiting for commit"
         );
 
@@ -317,36 +320,43 @@ impl HelixService {
 
         // Step 3: Wait for data Raft groups to elect leaders.
         // This ensures clients can immediately produce/consume after topic creation.
-        loop {
-            let all_have_leaders = {
-                let state = self.controller_state.read().await;
-                let mr = self.multi_raft.read().await;
+        if self.actor_mode {
+            // In actor mode, data partitions are managed by partition actors, not MultiRaft.
+            // Skip the leader check since the partition actors will elect leaders independently.
+            // Clients will get LEADER_NOT_AVAILABLE and retry if leaders aren't ready yet.
+            debug!(topic = %name, "Actor mode: skipping leader election check");
+        } else {
+            loop {
+                let all_have_leaders = {
+                    let state = self.controller_state.read().await;
+                    let mr = self.multi_raft.read().await;
 
-                (0..partition_count).all(|p| {
-                    let partition_id = PartitionId::new(u64::from(p));
-                    state.get_assignment(topic_id, partition_id).is_some_and(|assignment| {
-                        mr.group_state(assignment.group_id)
-                            .is_some_and(|gs| gs.leader_id.is_some())
+                    (0..partition_count).all(|p| {
+                        let partition_id = PartitionId::new(u64::from(p));
+                        state.get_assignment(topic_id, partition_id).is_some_and(|assignment| {
+                            mr.group_state(assignment.group_id)
+                                .is_some_and(|gs| gs.leader_id.is_some())
+                        })
                     })
-                })
-            };
+                };
 
-            if all_have_leaders {
-                debug!(topic = %name, "All partitions have leaders");
-                break;
+                if all_have_leaders {
+                    debug!(topic = %name, "All partitions have leaders");
+                    break;
+                }
+
+                if tokio::time::Instant::now() >= deadline {
+                    warn!(
+                        topic = %name,
+                        "Timeout waiting for leader election, returning success anyway"
+                    );
+                    // Don't fail here - partitions are created, just leaders not elected yet.
+                    // Clients will get LEADER_NOT_AVAILABLE and retry.
+                    break;
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
             }
-
-            if tokio::time::Instant::now() >= deadline {
-                warn!(
-                    topic = %name,
-                    "Timeout waiting for leader election, returning success anyway"
-                );
-                // Don't fail here - partitions are created, just leaders not elected yet.
-                // Clients will get LEADER_NOT_AVAILABLE and retry.
-                break;
-            }
-
-            tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
         }
 
         info!(

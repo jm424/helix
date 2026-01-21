@@ -139,10 +139,16 @@ async fn test_single_node_sequential() {
         stats.violations
     );
 
-    // Verify operations completed.
-    assert!(
-        stats.operations_ok > 0,
-        "No successful operations recorded"
+    // All sends must succeed on a healthy cluster.
+    assert_eq!(
+        stats.sends_ok, 100,
+        "Expected exactly 100 successful sends, got {}",
+        stats.sends_ok
+    );
+    assert_eq!(
+        stats.operations_failed, 0,
+        "Expected no failed operations, got {}",
+        stats.operations_failed
     );
 }
 
@@ -185,7 +191,17 @@ async fn test_single_node_larger_workload() {
         "Found violations: {:?}",
         stats.violations
     );
-    assert!(stats.operations_ok > 0);
+    // All sends must succeed on a healthy cluster.
+    assert_eq!(
+        stats.sends_ok, 500,
+        "Expected exactly 500 successful sends, got {}",
+        stats.sends_ok
+    );
+    assert_eq!(
+        stats.operations_failed, 0,
+        "Expected no failed operations, got {}",
+        stats.operations_failed
+    );
 }
 
 /// Three-node cluster test: basic produce and consume.
@@ -228,7 +244,17 @@ async fn test_three_node_sequential() {
         "Found violations: {:?}",
         stats.violations
     );
-    assert!(stats.operations_ok > 0);
+    // All sends must succeed on a healthy cluster.
+    assert_eq!(
+        stats.sends_ok, 100,
+        "Expected exactly 100 successful sends, got {}",
+        stats.sends_ok
+    );
+    assert_eq!(
+        stats.operations_failed, 0,
+        "Expected no failed operations, got {}",
+        stats.operations_failed
+    );
 }
 
 /// Three-node test with multiple partitions.
@@ -274,7 +300,17 @@ async fn test_three_node_many_partitions() {
         "Found violations: {:?}",
         stats.violations
     );
-    assert!(stats.operations_ok > 0);
+    // All sends must succeed on a healthy cluster.
+    assert_eq!(
+        stats.sends_ok, 200,
+        "Expected exactly 200 successful sends, got {}",
+        stats.sends_ok
+    );
+    assert_eq!(
+        stats.operations_failed, 0,
+        "Expected no failed operations, got {}",
+        stats.operations_failed
+    );
 }
 
 /// Test that deterministic workloads produce consistent results.
@@ -486,11 +522,16 @@ async fn test_concurrent_multi_partition_correctness() {
         stats.violations
     );
 
-    // Verify operations completed.
-    assert!(
-        stats.operations_ok > 400,
-        "Expected at least 400 successful operations, got {}",
-        stats.operations_ok
+    // All sends must succeed on a healthy cluster.
+    assert_eq!(
+        stats.sends_ok, 500,
+        "Expected exactly 500 successful sends, got {}",
+        stats.sends_ok
+    );
+    assert_eq!(
+        stats.operations_failed, 0,
+        "Expected no failed operations, got {}",
+        stats.operations_failed
     );
 }
 
@@ -548,11 +589,16 @@ async fn test_producer_consumer_multi_partition() {
         stats.violations
     );
 
-    // Verify most operations completed successfully.
-    assert!(
-        stats.operations_ok > 900,
-        "Expected at least 900 successful operations, got {}",
-        stats.operations_ok
+    // All sends must succeed on a healthy cluster.
+    assert_eq!(
+        stats.sends_ok, 1000,
+        "Expected exactly 1000 successful sends, got {}",
+        stats.sends_ok
+    );
+    assert_eq!(
+        stats.operations_failed, 0,
+        "Expected no failed operations, got {}",
+        stats.operations_failed
     );
 }
 
@@ -601,8 +647,8 @@ async fn test_multi_partition_node_failure() {
         .build();
 
     let stats1: WorkloadStats = workload1.run(&executor).await;
-    let phase1_ok = stats1.operations_ok;
-    println!("Phase 1: {} successful operations", phase1_ok);
+    let phase1_ok = stats1.sends_ok;
+    println!("Phase 1: {} successful sends", phase1_ok);
 
     // Kill node 2.
     println!("=== Killing node 2 ===");
@@ -623,8 +669,8 @@ async fn test_multi_partition_node_failure() {
         .build();
 
     let stats2: WorkloadStats = workload2.run(&executor).await;
-    let phase2_ok = stats2.operations_ok;
-    println!("Phase 2: {} successful operations", phase2_ok);
+    let phase2_ok = stats2.sends_ok;
+    println!("Phase 2: {} successful sends", phase2_ok);
 
     // Restart node 2.
     println!("=== Restarting node 2 ===");
@@ -645,8 +691,8 @@ async fn test_multi_partition_node_failure() {
         .build();
 
     let stats3: WorkloadStats = workload3.run(&executor).await;
-    let phase3_ok = stats3.operations_ok;
-    println!("Phase 3: {} successful operations", phase3_ok);
+    let phase3_ok = stats3.sends_ok;
+    println!("Phase 3: {} successful sends", phase3_ok);
 
     // Summary.
     println!("=== Multi-Partition Node Failure Test Summary ===");
@@ -675,22 +721,22 @@ async fn test_multi_partition_node_failure() {
         stats3.violations
     );
 
-    // Verify reasonable success rate in each phase.
-    // With RF=3 and only 1 node down, we should have full availability.
-    assert!(
-        phase1_ok >= 180,
-        "Phase 1: expected at least 180 successful, got {}",
+    // Phase 1 and 3 must be 100% - no faults active.
+    assert_eq!(
+        phase1_ok, 200,
+        "Phase 1: expected all 200 successful before failure, got {}",
         phase1_ok
     );
-    // Phase 2 might have some failures during failover.
+    // Phase 2 may have brief unavailability during leader election after node death.
+    // With RF=3 and 1 node down, majority quorum (2/3) is still available.
     assert!(
-        phase2_ok >= 150,
-        "Phase 2: expected at least 150 successful, got {}",
+        phase2_ok >= 180,
+        "Phase 2: expected at least 180 successful during failure, got {}",
         phase2_ok
     );
-    assert!(
-        phase3_ok >= 180,
-        "Phase 3: expected at least 180 successful, got {}",
+    assert_eq!(
+        phase3_ok, 200,
+        "Phase 3: expected all 200 successful after recovery, got {}",
         phase3_ok
     );
 }
@@ -749,11 +795,16 @@ async fn test_multi_partition_scale() {
         stats.violations
     );
 
-    // Verify high success rate.
-    assert!(
-        stats.operations_ok >= 1500,
-        "Expected at least 1500 successful operations, got {}",
-        stats.operations_ok
+    // All sends must succeed on a healthy cluster.
+    assert_eq!(
+        stats.sends_ok, 1600,
+        "Expected exactly 1600 successful sends, got {}",
+        stats.sends_ok
+    );
+    assert_eq!(
+        stats.operations_failed, 0,
+        "Expected no failed operations, got {}",
+        stats.operations_failed
     );
 }
 
@@ -901,5 +952,64 @@ async fn test_single_partition_throughput_inflight() {
     assert!(
         success >= total_messages.saturating_sub(10),
         "Expected ~{total_messages} successes, got {success}"
+    );
+}
+
+/// Three-node cluster test with experimental actor mode enabled.
+///
+/// Actor mode uses lock-free partition actors instead of the global `RwLock`
+/// on `MultiRaft`, improving multi-partition concurrency.
+#[tokio::test]
+async fn test_three_node_actor_mode() {
+    let cluster = RealCluster::builder()
+        .nodes(3)
+        .base_port(19792)
+        .raft_base_port(19800)
+        .binary_path(binary_path())
+        .data_dir(test_data_dir("three_node_actor_mode"))
+        .auto_create_topics(true)
+        .default_replication_factor(3)
+        .actor_mode(true)
+        .build()
+        .expect("failed to start cluster");
+
+    let executor = RealExecutor::new(&cluster).expect("failed to create executor");
+
+    // Multi-node clusters may take longer to elect leader.
+    executor
+        .wait_ready(Duration::from_secs(60))
+        .await
+        .expect("cluster not ready");
+
+    // Test with single partition first to verify actor mode works.
+    // Auto-create topics will create with 1 partition by default.
+    let mut workload = Workload::builder()
+        .seed(999)
+        .topics(vec![TopicConfig::new("test-actor-mode", 1, 3)])
+        .operations(50)
+        .pattern(WorkloadPattern::Sequential)
+        .message_size(SizeDistribution::Fixed(64))
+        .build();
+
+    let stats: WorkloadStats = workload.run(&executor).await;
+
+    println!("=== Three Node Actor Mode Test ===");
+    stats.print_summary();
+
+    assert!(
+        stats.violations.is_empty(),
+        "Found violations: {:?}",
+        stats.violations
+    );
+    // All sends must succeed on a healthy cluster.
+    assert_eq!(
+        stats.sends_ok, 50,
+        "Expected exactly 50 successful sends, got {}",
+        stats.sends_ok
+    );
+    assert_eq!(
+        stats.operations_failed, 0,
+        "Expected no failed operations, got {}",
+        stats.operations_failed
     );
 }

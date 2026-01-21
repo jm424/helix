@@ -184,6 +184,16 @@ struct Args {
     #[arg(long)]
     auto_create_topics: bool,
 
+    /// Default number of partitions for auto-created topics.
+    #[arg(long, default_value = "1")]
+    auto_create_partitions: u32,
+
+    /// Enable experimental actor-based architecture for lock-free multi-partition.
+    /// When enabled, data partitions use message-passing actors instead of
+    /// lock-based `MultiRaft`, improving scalability for high-partition workloads.
+    #[arg(long, hide = true)]
+    actor_mode: bool,
+
     /// Pre-create a topic at startup in format `name:partitions` (e.g., `test-topic:1`).
     /// Can be specified multiple times for multiple topics.
     /// All nodes should use the same topics for consistent Raft group allocation.
@@ -410,6 +420,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             kafka_peer_addrs,
             args.shared_wal_count,
             write_durability,
+            args.actor_mode,
         )
         .await?;
         #[cfg(not(feature = "s3"))]
@@ -425,6 +436,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             kafka_peer_addrs,
             args.shared_wal_count,
             write_durability,
+            args.actor_mode,
         )
         .await?;
 
@@ -539,13 +551,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Configure Kafka server.
             let kafka_config = KafkaServerConfig::new(args.listen_addr)
-                .with_auto_create_topics(args.auto_create_topics);
+                .with_auto_create_topics(args.auto_create_topics)
+                .with_auto_create_partitions(args.auto_create_partitions);
 
             let kafka_server = KafkaServer::new(service, kafka_config);
 
             info!(
                 addr = %args.listen_addr,
                 auto_create_topics = args.auto_create_topics,
+                auto_create_partitions = args.auto_create_partitions,
                 "Kafka server listening"
             );
 

@@ -29,12 +29,17 @@ use bloodhound::simulation::discrete::event::{ActorId, EventKind};
 use bytes::Bytes;
 use helix_core::{GroupId, LogIndex, NodeId, Offset, PartitionId, Record, TopicId};
 use helix_raft::multi::{MultiRaft, MultiRaftOutput};
-use helix_raft::RaftState;
+use helix_raft::{RaftConfig, RaftNode, RaftState};
+use tokio::sync::mpsc;
 use helix_server::controller::{ControllerCommand, ControllerState, CONTROLLER_GROUP_ID};
 use helix_server::group_map::GroupMap;
 use helix_server::partition_storage::PartitionStorage;
 use helix_server::storage::PartitionCommand;
 use helix_server::service::{HEARTBEAT_INTERVAL_MS, TICK_INTERVAL_MS};
+use helix_server::service::partition_actor::{
+    spawn_partition_actor_shared, BatchProposalInfo, GroupedOutput, PartitionActorConfig,
+    PartitionActorHandle, PartitionOutput,
+};
 use helix_wal::{
     Entry, FaultConfig, FaultStats, PoolConfig, SharedEntry, SharedWalPool, SimulatedStorage, Wal,
     WalConfig,
@@ -335,6 +340,26 @@ pub struct HelixServiceActor {
     /// `BufferedWal` spawns background tasks that require a tokio runtime.
     /// This is only used when `wal_mode` is `PerPartition`.
     per_partition_runtime: Option<tokio::runtime::Runtime>,
+    /// Actor mode: use real production partition actors instead of `MultiRaft`.
+    /// This tests the actual production implementation with zero code duplication.
+    actor_mode: bool,
+    /// Real partition actor handles (only used when `actor_mode` is true).
+    /// Each partition has its own real `PartitionActorShared` with its own `RaftNode`.
+    partition_actor_handles: BTreeMap<GroupId, PartitionActorHandle>,
+    /// Shared output channel sender for partition actors.
+    /// Passed to each `spawn_partition_actor_shared()` call.
+    partition_output_tx: Option<mpsc::Sender<GroupedOutput>>,
+    /// Shared output channel receiver for partition actors.
+    /// Outputs from ALL partition actors come through this channel.
+    partition_output_rx: Option<mpsc::Receiver<GroupedOutput>>,
+    /// Tokio runtime for actor mode (drives async partition actors).
+    actor_runtime: Option<tokio::runtime::Runtime>,
+    /// Actor mode commits with notification (for verification).
+    /// Counts commits where `batch_notify.is_some()` - we were the proposing leader.
+    actor_mode_commits_with_notify: u64,
+    /// Actor mode commits without notification (replicated entries).
+    /// Counts commits where `batch_notify.is_none()` - we're a follower.
+    actor_mode_commits_without_notify: u64,
 }
 
 impl HelixServiceActor {
@@ -352,8 +377,9 @@ impl HelixServiceActor {
     /// * `seed` - Random seed for deterministic behavior
     /// * `wal_mode` - WAL mode: per-partition or shared
     /// * `shared_wal_count` - Number of shared WALs (only used when `wal_mode` is `Shared`)
+    /// * `actor_mode` - Whether to use actor mode batch tracking
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn new(
         actor_id: ActorId,
         node_id: NodeId,
@@ -365,6 +391,7 @@ impl HelixServiceActor {
         seed: u64,
         wal_mode: WalMode,
         shared_wal_count: u32,
+        actor_mode: bool,
     ) -> Self {
         let name = format!("helix-service-{}", node_id.get());
 
@@ -431,10 +458,44 @@ impl HelixServiceActor {
         // Determine effective WAL mode (may fall back if pool creation failed).
         let effective_wal_mode = match wal_mode {
             WalMode::Shared if shared_wal_pool.is_some() => WalMode::Shared,
-            WalMode::Shared | WalMode::InMemory => WalMode::InMemory, // Fallback if pool creation failed
             WalMode::PerPartition if per_partition_runtime.is_some() => WalMode::PerPartition,
-            WalMode::PerPartition => WalMode::InMemory, // Fallback if runtime creation failed
+            // Fallback to InMemory if pool/runtime creation failed.
+            WalMode::Shared | WalMode::InMemory | WalMode::PerPartition => WalMode::InMemory,
         };
+
+        // Create actor mode infrastructure if enabled.
+        // This creates a shared output channel and tokio runtime for REAL partition actors.
+        let (partition_output_tx, partition_output_rx, actor_runtime) = if actor_mode {
+            // Create shared output channel - all partition actors send outputs here.
+            let (tx, rx) = mpsc::channel(1000);
+
+            // Create tokio runtime for async partition actor operations.
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => Some(rt),
+                Err(e) => {
+                    error!(error = %e, "Failed to create tokio runtime for actor mode");
+                    None
+                }
+            };
+
+            if runtime.is_some() {
+                eprintln!("[ACTOR-MODE] Node {} enabling actor mode with real partition actors", node_id.get());
+                info!(node = node_id.get(), "Actor mode enabled with real partition actors");
+                (Some(tx), Some(rx), runtime)
+            } else {
+                warn!(node = node_id.get(), "Actor mode disabled - runtime creation failed");
+                (None, None, None)
+            }
+        } else {
+            (None, None, None)
+        };
+
+        // Effective actor mode - only enabled if runtime was created successfully.
+        let effective_actor_mode = actor_mode && actor_runtime.is_some();
 
         Self {
             actor_id,
@@ -461,6 +522,13 @@ impl HelixServiceActor {
             shared_wal_pool,
             shared_wal_count,
             per_partition_runtime,
+            actor_mode: effective_actor_mode,
+            partition_actor_handles: BTreeMap::new(),
+            partition_output_tx,
+            partition_output_rx,
+            actor_runtime,
+            actor_mode_commits_with_notify: 0,
+            actor_mode_commits_without_notify: 0,
         }
     }
 
@@ -868,11 +936,14 @@ impl HelixServiceActor {
         // Increment tick counter for time tracking.
         self.tick_count += 1;
 
-        // Tick the Multi-Raft engine.
-        let outputs = self.multi_raft.tick();
-
-        // Process outputs synchronously.
-        self.process_outputs(&outputs, ctx);
+        if self.actor_mode {
+            // Actor mode: tick real partition actors and controller via MultiRaft.
+            self.handle_tick_actor_mode(ctx);
+        } else {
+            // Legacy mode: tick all groups via MultiRaft.
+            let outputs = self.multi_raft.tick();
+            self.process_outputs(&outputs, ctx);
+        }
 
         // Drain transport queue and schedule message deliveries.
         self.transport.drain_and_schedule(ctx);
@@ -885,6 +956,120 @@ impl HelixServiceActor {
 
         // Schedule next tick.
         self.schedule_tick(ctx);
+    }
+
+    /// Handles tick in actor mode - ticks real partition actors.
+    fn handle_tick_actor_mode(&mut self, ctx: &mut SimulationContext) {
+        // Tick controller partition via MultiRaft (controller uses legacy path).
+        let controller_outputs = self.multi_raft.tick();
+        self.process_outputs(&controller_outputs, ctx);
+
+        // Tick each real partition actor via its handle.
+        let Some(runtime) = self.actor_runtime.as_ref() else {
+            return;
+        };
+
+        // Send tick to each partition actor (REAL production code!).
+        for handle in self.partition_actor_handles.values() {
+            runtime.block_on(async {
+                let _ = handle.tick().await;
+            });
+        }
+
+        // Give the runtime time to process commands on worker threads.
+        // The tick() calls above just send commands to channels and return immediately.
+        // The actual processing happens asynchronously on worker threads, so we need
+        // to yield to let them complete before draining outputs.
+        runtime.block_on(async {
+            // Small sleep to let worker threads process. This ensures the actors
+            // have time to handle the tick commands and generate outputs.
+            tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+        });
+
+        // Drain outputs from all partition actors (shared channel).
+        self.process_partition_actor_outputs(ctx);
+    }
+
+    /// Processes outputs from real partition actors (actor mode).
+    fn process_partition_actor_outputs(&mut self, ctx: &mut SimulationContext) {
+        // Drain all available outputs into a Vec first to avoid borrow issues.
+        // We need to release the mutable borrow of partition_output_rx before
+        // calling handle_commit which needs mutable access to self.
+        let outputs: Vec<GroupedOutput> = {
+            let Some(output_rx) = self.partition_output_rx.as_mut() else {
+                return;
+            };
+
+            let mut collected = Vec::new();
+            while let Ok(grouped) = output_rx.try_recv() {
+                collected.push(grouped);
+            }
+            collected
+        };
+
+        // Now process all collected outputs.
+        if !outputs.is_empty() {
+            eprintln!(
+                "[ACTOR-MODE] {} processing {} outputs from partition actors",
+                self.name, outputs.len()
+            );
+        }
+        for grouped in outputs {
+            let group_id = grouped.group_id;
+
+            match grouped.output {
+                PartitionOutput::SendMessages { to, messages } => {
+                    eprintln!(
+                        "[SEND] {} group={} sending {} messages to {:?}",
+                        self.name, group_id.get(), messages.len(), to.get()
+                    );
+                    // Route through simulated network instead of real TCP.
+                    self.transport.queue_batch(to, &messages);
+                }
+                PartitionOutput::EntryCommitted { index, data, batch_notify } => {
+                    eprintln!(
+                        "[ACTOR-MODE] {} committed entry: group={} index={} has_notify={}",
+                        self.name, group_id.get(), index.get(), batch_notify.is_some()
+                    );
+                    // Track notification status for verification.
+                    if batch_notify.is_some() {
+                        self.actor_mode_commits_with_notify += 1;
+                    } else {
+                        self.actor_mode_commits_without_notify += 1;
+                    }
+
+                    // Apply to storage using the existing commit handling.
+                    self.handle_commit(group_id, index, &data, ctx);
+                }
+                PartitionOutput::BecameLeader => {
+                    eprintln!(
+                        "[ACTOR-MODE] {} became leader of group {}",
+                        self.name, group_id.get()
+                    );
+                    info!(
+                        actor = %self.name,
+                        group = group_id.get(),
+                        "became leader (actor mode)"
+                    );
+                }
+                PartitionOutput::SteppedDown => {
+                    info!(
+                        actor = %self.name,
+                        group = group_id.get(),
+                        "stepped down (actor mode)"
+                    );
+                }
+                PartitionOutput::VoteStateChanged { term, voted_for } => {
+                    debug!(
+                        actor = %self.name,
+                        group = group_id.get(),
+                        term,
+                        voted_for = ?voted_for.map(NodeId::get),
+                        "vote state changed (actor mode)"
+                    );
+                }
+            }
+        }
     }
 
     /// Handles a heartbeat timer event.
@@ -958,7 +1143,7 @@ impl HelixServiceActor {
                         actor = %self.name,
                         group = group_id.get(),
                         term = term.get(),
-                        voted_for = ?voted_for.map(|n| n.get()),
+                        voted_for = ?voted_for.map(NodeId::get),
                         "vote state changed"
                     );
                 }
@@ -967,6 +1152,7 @@ impl HelixServiceActor {
     }
 
     /// Handles a committed entry.
+    #[allow(clippy::too_many_lines)]
     fn handle_commit(
         &mut self,
         group_id: GroupId,
@@ -988,15 +1174,33 @@ impl HelixServiceActor {
             return;
         }
 
+        // In actor mode, batch notification tracking is done in process_partition_actor_outputs
+        // via the real batch_notify field from production PartitionOutput::EntryCommitted.
+        // No fake tracking needed here - we just apply to storage.
+
         // Regular data partition commit - apply to storage.
         if let Some((topic_id, partition_id)) = self.group_map.get_key(group_id) {
             if let Some(ps) = self.partition_storage.get_mut(&group_id) {
+                eprintln!(
+                    "[ACTOR-MODE-COMMIT] {} handling commit: group={} topic={} partition={} index={}",
+                    self.name, group_id.get(), topic_id.get(), partition_id.get(), index.get()
+                );
                 // Decode the command to get the actual record payloads for tracking.
                 let record_payloads: Vec<Vec<u8>> = match PartitionCommand::decode(data) {
                     Some(PartitionCommand::Append { ref records, .. }) => {
+                        eprintln!(
+                            "[DECODE] {} decoded Append with {} records, data len={}",
+                            self.name, records.len(), data.len()
+                        );
                         records.iter().map(|r| r.value.to_vec()).collect()
                     }
-                    _ => Vec::new(),
+                    other => {
+                        eprintln!(
+                            "[DECODE] {} command is {:?}, data len={}",
+                            self.name, other, data.len()
+                        );
+                        Vec::new()
+                    }
                 };
 
                 // TRACE: Log state before apply for debugging offset 21.
@@ -1028,8 +1232,16 @@ impl HelixServiceActor {
                     }
                 };
 
+                eprintln!(
+                    "[APPLY] {} applying index={} record_payloads_len={} wal_mode={:?}",
+                    self.name, index.get(), record_payloads.len(), self.wal_mode
+                );
                 match apply_result {
                     Ok(offset_opt) => {
+                        eprintln!(
+                            "[APPLY-OK] {} applied index={} offset_opt={:?}",
+                            self.name, index.get(), offset_opt.map(helix_core::Offset::get)
+                        );
                         // Track committed data for durability verification.
                         let was_skipped = offset_opt.is_none();
                         let base_offset = offset_opt.unwrap_or_else(|| ps.log_end_offset());
@@ -1090,6 +1302,10 @@ impl HelixServiceActor {
                         }
 
                         self.produce_success_count += 1;
+                        eprintln!(
+                            "[ACTOR-MODE-STAT] {} produce_success_count={} committed_data_len={} after commit index={}",
+                            self.name, self.produce_success_count, self.committed_data.values().map(Vec::len).sum::<usize>(), index.get()
+                        );
                     }
                     Err(e) => {
                         let error_msg = e.to_string();
@@ -1234,6 +1450,7 @@ impl HelixServiceActor {
     }
 
     /// Creates a data partition from controller assignment.
+    #[allow(clippy::too_many_lines)]
     fn create_data_partition(
         &mut self,
         topic_id: TopicId,
@@ -1247,25 +1464,31 @@ impl HelixServiceActor {
             partition = partition_id.get(),
             group = group_id.get(),
             wal_mode = ?self.wal_mode,
+            actor_mode = self.actor_mode,
             "Creating data partition"
         );
 
-        // Create Raft group if it doesn't exist.
-        let existing_groups = self.multi_raft.group_ids();
-        if !existing_groups.contains(&group_id) {
-            if let Err(e) = self.multi_raft.create_group(group_id, replicas.to_vec()) {
-                warn!(
-                    actor = %self.name,
-                    error = %e,
-                    group = group_id.get(),
-                    "Failed to create data Raft group"
-                );
-                return;
+        // Update group map first.
+        self.group_map.insert(topic_id, partition_id, group_id);
+
+        if self.actor_mode {
+            // Actor mode: spawn a REAL production partition actor.
+            self.create_data_partition_actor_mode(topic_id, partition_id, group_id, replicas);
+        } else {
+            // Legacy mode: use MultiRaft.
+            let existing_groups = self.multi_raft.group_ids();
+            if !existing_groups.contains(&group_id) {
+                if let Err(e) = self.multi_raft.create_group(group_id, replicas.to_vec()) {
+                    warn!(
+                        actor = %self.name,
+                        error = %e,
+                        group = group_id.get(),
+                        "Failed to create data Raft group"
+                    );
+                    return;
+                }
             }
         }
-
-        // Update group map.
-        self.group_map.insert(topic_id, partition_id, group_id);
 
         // Create partition storage based on WAL mode.
         if self.partition_storage.contains_key(&group_id) {
@@ -1361,6 +1584,71 @@ impl HelixServiceActor {
         self.partition_storage.insert(group_id, storage);
     }
 
+    /// Creates a data partition in actor mode by spawning a REAL production partition actor.
+    ///
+    /// This is the key function that enables testing the actual production implementation.
+    /// It spawns a real `PartitionActorShared` via `spawn_partition_actor_shared()`.
+    fn create_data_partition_actor_mode(
+        &mut self,
+        topic_id: TopicId,
+        partition_id: PartitionId,
+        group_id: GroupId,
+        replicas: &[NodeId],
+    ) {
+        // Check if we already have this partition actor.
+        if self.partition_actor_handles.contains_key(&group_id) {
+            return;
+        }
+
+        let Some(runtime) = self.actor_runtime.as_ref() else {
+            error!(
+                actor = %self.name,
+                group = group_id.get(),
+                "No tokio runtime for actor mode"
+            );
+            return;
+        };
+
+        let Some(output_tx) = self.partition_output_tx.clone() else {
+            error!(
+                actor = %self.name,
+                group = group_id.get(),
+                "No output channel for actor mode"
+            );
+            return;
+        };
+
+        // Create a REAL RaftNode for this partition (same as production).
+        let config = RaftConfig::new(self.node_id, replicas.to_vec())
+            .with_tick_config(10, 2)
+            .with_random_seed(self.seed.wrapping_add(group_id.get()));
+        let raft_node = RaftNode::new(config);
+
+        // Spawn the REAL production partition actor!
+        // This calls the exact same function that production uses.
+        let actor_config = PartitionActorConfig {
+            channel_buffer_size: 100,
+        };
+
+        let handle = runtime.block_on(async {
+            spawn_partition_actor_shared(group_id, raft_node, actor_config, output_tx)
+        });
+
+        eprintln!(
+            "[ACTOR-MODE] {} spawned REAL production partition actor: group={} topic={} partition={}",
+            self.name, group_id.get(), topic_id.get(), partition_id.get()
+        );
+        info!(
+            actor = %self.name,
+            group = group_id.get(),
+            topic = topic_id.get(),
+            partition = partition_id.get(),
+            "Spawned REAL production partition actor"
+        );
+
+        self.partition_actor_handles.insert(group_id, handle);
+    }
+
     /// Handles incoming message from another node.
     fn handle_message(&mut self, payload: &[u8], ctx: &mut SimulationContext) {
         use crate::simulated_transport::{decode_simulated_message, is_group_batch, is_heartbeat};
@@ -1376,11 +1664,21 @@ impl HelixServiceActor {
             match decode_group_batch(data) {
                 Ok((messages, _consumed)) => {
                     for group_msg in messages {
-                        let outputs = self.multi_raft.handle_message(
-                            group_msg.group_id,
-                            group_msg.message,
-                        );
-                        self.process_outputs(&outputs, ctx);
+                        if self.actor_mode && group_msg.group_id != CONTROLLER_GROUP_ID {
+                            // Actor mode: route data partition messages to real partition actors.
+                            self.handle_raft_message_actor_mode(
+                                group_msg.group_id,
+                                group_msg.message,
+                                ctx,
+                            );
+                        } else {
+                            // Legacy mode or controller messages: use MultiRaft.
+                            let outputs = self.multi_raft.handle_message(
+                                group_msg.group_id,
+                                group_msg.message,
+                            );
+                            self.process_outputs(&outputs, ctx);
+                        }
                     }
                 }
                 Err(e) => {
@@ -1410,6 +1708,45 @@ impl HelixServiceActor {
         self.transport.drain_and_schedule(ctx);
     }
 
+    /// Routes a Raft message to a real partition actor (actor mode).
+    fn handle_raft_message_actor_mode(
+        &mut self,
+        group_id: GroupId,
+        message: helix_raft::Message,
+        ctx: &mut SimulationContext,
+    ) {
+        let Some(runtime) = self.actor_runtime.as_ref() else {
+            return;
+        };
+
+        // Find the partition actor handle.
+        if let Some(handle) = self.partition_actor_handles.get(&group_id) {
+            // Send message to real partition actor.
+            let from = message.from();
+            eprintln!(
+                "[RECV] {} received raft message for group {} from node {}",
+                self.name, group_id.get(), from.get()
+            );
+            runtime.block_on(async {
+                let _ = handle.send_raft_message(from, message).await;
+            });
+
+            // Give the runtime time to process the message on worker threads.
+            runtime.block_on(async {
+                tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+            });
+
+            // Drain outputs from all partition actors.
+            self.process_partition_actor_outputs(ctx);
+        } else {
+            debug!(
+                actor = %self.name,
+                group = group_id.get(),
+                "No partition actor for group (may not be created yet)"
+            );
+        }
+    }
+
     /// Handles crash event.
     fn handle_crash(&mut self) {
         if self.crashed {
@@ -1432,6 +1769,24 @@ impl HelixServiceActor {
         // Drop the shared WAL pool (this shuts down its Tokio runtime).
         // It will be recreated on recovery.
         self.shared_wal_pool = None;
+
+        // Shutdown all partition actors (actor mode).
+        // We clear the handles which drops the senders, causing actors to shutdown.
+        if self.actor_mode {
+            // Shutdown each partition actor gracefully.
+            if let Some(ref runtime) = self.actor_runtime {
+                for handle in self.partition_actor_handles.values() {
+                    runtime.block_on(async {
+                        let _ = handle.shutdown().await;
+                    });
+                }
+            }
+            self.partition_actor_handles.clear();
+
+            // Drop and recreate output channel for fresh recovery.
+            self.partition_output_tx = None;
+            self.partition_output_rx = None;
+        }
 
         info!(
             actor = %self.name,
@@ -1477,6 +1832,15 @@ impl HelixServiceActor {
                     self.wal_mode = WalMode::InMemory;
                 }
             }
+        }
+
+        // Recreate actor mode output channel if needed.
+        // Partition actors will be recreated when controller replays AssignPartition commands.
+        if self.actor_mode && self.partition_output_tx.is_none() {
+            let (tx, rx) = mpsc::channel(1000);
+            self.partition_output_tx = Some(tx);
+            self.partition_output_rx = Some(rx);
+            info!(actor = %self.name, "Recreated actor mode output channel on recovery");
         }
 
         // Clear in-memory state.
@@ -1833,20 +2197,99 @@ impl HelixServiceActor {
         // Encode the command for Raft.
         let encoded = command.encode();
 
-        // Propose to Raft.
-        if self.multi_raft.propose(group_id, encoded).is_none() {
+        self.produce_count += 1;
+
+        if self.actor_mode {
+            // Actor mode: use REAL production partition actor's propose_batch.
+            self.handle_produce_actor_mode(group_id, encoded, ctx);
+        } else {
+            // Standard mode: just propose without tracking.
+            if self.multi_raft.propose(group_id, encoded).is_none() {
+                debug!(
+                    actor = %self.name,
+                    group = group_id.get(),
+                    "Not leader, cannot propose"
+                );
+            }
+
+            // Process any immediate outputs.
+            let outputs = self.multi_raft.tick();
+            self.process_outputs(&outputs, ctx);
+            self.transport.drain_and_schedule(ctx);
+        }
+    }
+
+    /// Handles produce in actor mode using real production partition actors.
+    fn handle_produce_actor_mode(
+        &mut self,
+        group_id: GroupId,
+        data: Bytes,
+        ctx: &mut SimulationContext,
+    ) {
+        let Some(runtime) = self.actor_runtime.as_ref() else {
+            warn!(actor = %self.name, "No tokio runtime for actor mode produce");
+            return;
+        };
+
+        let Some(handle) = self.partition_actor_handles.get(&group_id) else {
+            eprintln!(
+                "[ACTOR-MODE] {} ERROR: No partition actor for group {} (have {} handles)",
+                self.name, group_id.get(), self.partition_actor_handles.len()
+            );
             debug!(
                 actor = %self.name,
                 group = group_id.get(),
-                "Not leader, cannot propose"
+                "No partition actor for group (partition may not exist)"
             );
+            return;
+        };
+
+        // Check if we're the leader before proposing.
+        // In production, clients would get NotLeader and redirect. In DST, we just skip.
+        let is_leader = {
+            let handle_clone = handle.clone();
+            runtime.block_on(async { handle_clone.is_leader().await.unwrap_or(false) })
+        };
+
+        if !is_leader {
+            // Not leader - skip this produce (just like non-actor mode does).
+            debug!(
+                actor = %self.name,
+                group = group_id.get(),
+                "Not leader, cannot propose (actor mode)"
+            );
+            return;
         }
 
-        self.produce_count += 1;
+        // Create batch info (same as production batcher does).
+        // DST doesn't need notification channels since we track via batch_notify output.
+        // Safety: data.len() is bounded by test input sizes (< 4KB typically).
+        #[allow(clippy::cast_possible_truncation)]
+        let batch_info = BatchProposalInfo {
+            first_request_at: std::time::Instant::now(),
+            batch_size: 1,
+            batch_bytes: data.len() as u32,
+            total_records: 1,
+            record_counts: vec![1],
+            result_txs: vec![], // DST doesn't use notification channels
+        };
 
-        // Process any immediate outputs.
-        let outputs = self.multi_raft.tick();
-        self.process_outputs(&outputs, ctx);
+        // Call the REAL production propose_batch!
+        // This is the actual production code path being tested.
+        let handle_clone = handle.clone();
+        runtime.block_on(async {
+            let _ = handle_clone.propose_batch(data, batch_info).await;
+        });
+
+        // Give the runtime time to process the command on worker threads.
+        runtime.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_micros(100)).await;
+        });
+
+        // Drain outputs from all partition actors.
+        self.process_partition_actor_outputs(ctx);
+
+        // Drain transport queue.
         self.transport.drain_and_schedule(ctx);
     }
 
@@ -2013,6 +2456,7 @@ pub fn create_helix_cluster(
     fault_config: FaultConfig,
     wal_mode: WalMode,
     shared_wal_count: u32,
+    actor_mode: bool,
 ) -> (Vec<HelixServiceActor>, SharedNetworkState) {
     assert!(node_count > 0, "cluster must have at least one node");
     assert!(node_count <= 7, "cluster size exceeds maximum");
@@ -2055,6 +2499,7 @@ pub fn create_helix_cluster(
                 seed,
                 wal_mode,
                 shared_wal_count,
+                actor_mode,
             )
         })
         .collect();
@@ -2081,6 +2526,7 @@ mod tests {
             FaultConfig::default(),
             WalMode::InMemory,
             4,
+            false, // actor_mode
         );
         assert_eq!(actors.len(), 3);
 
@@ -2102,6 +2548,7 @@ mod tests {
             FaultConfig::default(),
             WalMode::Shared,
             4,
+            false, // actor_mode
         );
         assert_eq!(actors.len(), 3);
 
@@ -2123,6 +2570,7 @@ mod tests {
             FaultConfig::default(),
             WalMode::InMemory,
             4,
+            false, // actor_mode
         );
         let actor = &mut actors[0];
 
@@ -2143,6 +2591,7 @@ mod tests {
             FaultConfig::flaky(),
             WalMode::InMemory,
             4,
+            false, // actor_mode
         );
         assert_eq!(actors.len(), 3);
     }
@@ -2157,6 +2606,7 @@ mod tests {
             FaultConfig::flaky(),
             WalMode::Shared,
             4,
+            false, // actor_mode
         );
         assert_eq!(actors.len(), 3);
     }

@@ -34,3 +34,4 @@ futures = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 tracing-subscriber = { workspace = true }
+turmoil = { workspace = true }

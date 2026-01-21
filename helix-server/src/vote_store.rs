@@ -496,14 +496,12 @@ impl VoteStorage for SimulatedVoteStorage {
             )));
         }
 
-        let mut storage = self.data.lock().expect("data lock poisoned");
-        *storage = Some(data.to_vec());
+        *self.data.lock().expect("data lock poisoned") = Some(data.to_vec());
         Ok(())
     }
 
     fn delete(&self) -> VoteStoreResult<()> {
-        let mut storage = self.data.lock().expect("data lock poisoned");
-        *storage = None;
+        *self.data.lock().expect("data lock poisoned") = None;
         Ok(())
     }
 }
@@ -562,6 +560,10 @@ impl<L: VoteStorage + 'static> VoteStore<L> {
     /// Loads vote state from local or remote storage.
     ///
     /// Tries local first (fast path), falls back to remote (S3).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if neither local nor remote storage can be read.
     pub async fn load<R: ObjectStorage>(
         node_id: NodeId,
         local: &L,
@@ -637,6 +639,10 @@ impl<L: VoteStorage + 'static> VoteStore<L> {
     ///
     /// Writes to local storage synchronously (blocks until fsync),
     /// then queues async upload to S3.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the local storage write or fsync fails.
     pub fn save(
         &mut self,
         group_id: GroupId,
@@ -651,7 +657,7 @@ impl<L: VoteStorage + 'static> VoteStore<L> {
             node_id = self.node_id.get(),
             group_id = group_id.get(),
             term = term.get(),
-            voted_for = voted_for.map(|n| n.get()),
+            voted_for = voted_for.map(NodeId::get),
             sequence = self.state.sequence,
             "Saving vote state"
         );
@@ -667,6 +673,10 @@ impl<L: VoteStorage + 'static> VoteStore<L> {
     }
 
     /// Removes a group from the vote state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the local storage write fails.
     pub fn remove_group(&mut self, group_id: GroupId) -> VoteStoreResult<()> {
         self.state.sequence += 1;
         self.state.remove_group(group_id);
@@ -681,7 +691,7 @@ impl<L: VoteStorage + 'static> VoteStore<L> {
 
     /// Returns the current vote state.
     #[must_use]
-    pub fn state(&self) -> &VoteState {
+    pub const fn state(&self) -> &VoteState {
         &self.state
     }
 
@@ -709,15 +719,14 @@ impl VoteStoreHandle {
 
         loop {
             // Wait for work or use pending state
-            let state = match pending.take() {
-                Some(s) => s,
-                None => match self.upload_rx.recv().await {
-                    Some(s) => s,
-                    None => {
-                        info!(node_id = self.node_id.get(), "Vote store S3 worker shutting down");
-                        break;
-                    }
-                },
+            let state = if let Some(s) = pending.take() {
+                s
+            } else {
+                let Some(s) = self.upload_rx.recv().await else {
+                    info!(node_id = self.node_id.get(), "Vote store S3 worker shutting down");
+                    break;
+                };
+                s
             };
 
             // Drain channel - only upload latest state

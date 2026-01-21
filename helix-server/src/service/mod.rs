@@ -10,6 +10,16 @@
 pub mod handlers;
 /// Request batching for improved throughput.
 pub mod batcher;
+/// Partition actor for lock-free multi-partition scalability.
+pub mod partition_actor;
+/// WAL actor for command-channel based WAL access.
+pub mod wal_actor;
+/// Partition router for lock-free request dispatch.
+pub mod router;
+/// Output processor for actor-based multi-partition coordination.
+pub mod output_processor;
+/// Actor-based service setup for lock-free multi-partition coordination.
+pub mod actor_setup;
 mod tick;
 
 use std::collections::HashMap;
@@ -29,6 +39,8 @@ use crate::controller::{ControllerState, BROKER_HEARTBEAT_TIMEOUT_MS, CONTROLLER
 use crate::group_map::GroupMap;
 use crate::partition_storage::ServerPartitionStorage;
 
+use self::router::PartitionRouter;
+
 /// Maximum records per write request.
 pub const MAX_RECORDS_PER_WRITE: usize = 1000;
 
@@ -41,6 +53,10 @@ pub const TICK_INTERVAL_MS: u64 = 50;
 /// Heartbeat interval in milliseconds (re-exported for DST use).
 #[allow(unused_imports)]
 pub use tick::HEARTBEAT_INTERVAL_MS;
+
+/// Actor-based tick task (re-exported for service wiring).
+#[allow(unused_imports)]
+pub use tick::tick_task_actor;
 
 /// A pending proposal waiting for Raft commit.
 ///
@@ -373,6 +389,21 @@ pub struct HelixService {
     pub(crate) batcher_handle: Option<batcher::BatcherHandle>,
     /// Aggregated batcher performance stats (multi-node mode only).
     pub(crate) batcher_stats: Option<Arc<BatcherStats>>,
+    /// Whether actor mode is enabled (lock-free multi-partition).
+    #[allow(dead_code)] // Used by handlers in follow-up integration.
+    pub(crate) actor_mode: bool,
+    /// Partition router for actor mode (lock-free request dispatch).
+    #[allow(dead_code)] // Used by handlers in follow-up integration.
+    pub(crate) actor_router: Option<Arc<PartitionRouter>>,
+    /// Shutdown sender for actor tick task (data partitions).
+    #[allow(dead_code)] // Used for graceful shutdown in follow-up.
+    pub(crate) actor_shutdown_tx: Option<mpsc::Sender<()>>,
+    /// Shutdown sender for controller tick task (actor mode only).
+    #[allow(dead_code)] // Used for graceful shutdown in follow-up.
+    pub(crate) controller_shutdown_tx: Option<mpsc::Sender<()>>,
+    /// Backpressure state for actor mode.
+    #[allow(dead_code)] // Used by handlers in follow-up integration.
+    pub(crate) actor_backpressure: Option<Arc<batcher::BackpressureState>>,
 }
 
 impl HelixService {
@@ -539,6 +570,11 @@ impl HelixService {
             batch_pending_proposals: Arc::new(RwLock::new(HashMap::new())),
             batcher_handle: None, // No batching in single-node mode.
             batcher_stats: None,
+            actor_mode: false, // Single-node uses lock-based approach.
+            actor_router: None,
+            actor_shutdown_tx: None,
+            controller_shutdown_tx: None,
+            actor_backpressure: None,
         }
     }
 
@@ -550,6 +586,7 @@ impl HelixService {
     /// # Arguments
     /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
     /// * `write_durability` - Durability mode for writes
+    /// * `enable_actor_mode` - If true, uses lock-free actor-based architecture
     ///
     /// # Errors
     /// Returns an error if the transport cannot be started.
@@ -573,6 +610,7 @@ impl HelixService {
         kafka_peer_addrs: HashMap<NodeId, String>,
         shared_wal_count: Option<u32>,
         write_durability: WriteDurability,
+        enable_actor_mode: bool,
     ) -> Result<Self, TransportError> {
         Self::new_multi_node_internal(
             cluster_id,
@@ -587,6 +625,7 @@ impl HelixService {
             kafka_peer_addrs,
             shared_wal_count,
             write_durability,
+            enable_actor_mode,
         )
         .await
     }
@@ -599,6 +638,7 @@ impl HelixService {
     /// # Arguments
     /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
     /// * `write_durability` - Durability mode for writes
+    /// * `enable_actor_mode` - If true, uses lock-free actor-based architecture
     ///
     /// # Errors
     /// Returns an error if the transport cannot be started.
@@ -620,6 +660,7 @@ impl HelixService {
         kafka_peer_addrs: HashMap<NodeId, String>,
         shared_wal_count: Option<u32>,
         write_durability: WriteDurability,
+        enable_actor_mode: bool,
     ) -> Result<Self, TransportError> {
         Self::new_multi_node_internal(
             cluster_id,
@@ -633,6 +674,7 @@ impl HelixService {
             kafka_peer_addrs,
             shared_wal_count,
             write_durability,
+            enable_actor_mode,
         )
         .await
     }
@@ -651,6 +693,7 @@ impl HelixService {
         kafka_peer_addrs: HashMap<NodeId, String>,
         shared_wal_count: Option<u32>,
         write_durability: WriteDurability,
+        enable_actor_mode: bool,
     ) -> Result<Self, TransportError> {
         let node_id = NodeId::new(node_id);
 
@@ -751,74 +794,151 @@ impl HelixService {
         // Create batch pending proposals map.
         let batch_pending_proposals = Arc::new(RwLock::new(HashMap::new()));
 
-        // Create and spawn the batcher task.
-        let batcher_stats = Arc::new(BatcherStats::default());
-        let (batcher_handle, batcher_rx, backpressure_state) = batcher::create_batcher();
-        tokio::spawn(batcher::batcher_task(
-            batcher_rx,
-            Arc::clone(&multi_raft),
-            Arc::clone(&batch_pending_proposals),
-            Some(transport_handle.clone()),
-            Arc::clone(&batcher_stats),
-            batcher::BatcherConfig::default(),
-            Arc::clone(&backpressure_state),
-        ));
+        // Branch based on actor mode.
+        let (batcher_handle, batcher_stats, actor_router, actor_shutdown_tx, controller_shutdown_tx, actor_backpressure) =
+            if enable_actor_mode {
+                // Actor mode: use lock-free actor-based architecture.
+                info!("Initializing actor mode for multi-node service");
 
-        info!("Started request batcher for multi-node");
+                // Create actor-based setup with empty initial groups.
+                // Data partitions will be created dynamically via AssignPartition.
+                let actor_handles = actor_setup::setup_multi_partition(
+                    node_id,
+                    cluster_nodes.clone(),
+                    HashMap::new(), // Empty initial groups - created via controller.
+                    Arc::clone(&partition_storage),
+                    Arc::clone(&group_map),
+                    Arc::clone(&controller_state),
+                    Arc::clone(&pending_proposals),
+                    Arc::clone(&pending_controller_proposals),
+                    Arc::clone(&batch_pending_proposals),
+                    Arc::clone(&local_broker_heartbeats),
+                    Arc::clone(&multi_raft),
+                    transport_handle.clone(),
+                    incoming_rx,
+                    actor_setup::ActorSetupConfig::default(),
+                )
+                .await;
 
-        // Start background tick task with transport.
-        #[cfg(feature = "s3")]
-        tokio::spawn(tick::tick_task_multi_node(
-            Arc::clone(&multi_raft),
-            Arc::clone(&partition_storage),
-            Arc::clone(&group_map),
-            Arc::clone(&controller_state),
-            Arc::clone(&pending_proposals),
-            Arc::clone(&pending_controller_proposals),
-            Arc::clone(&batch_pending_proposals),
-            Arc::clone(&local_broker_heartbeats),
-            cluster_nodes.clone(),
-            transport_handle.clone(),
-            data_dir.clone(),
-            object_storage_dir.clone(),
-            s3_config.clone(),
-            tiering_config.clone(),
-            shared_wal_pool.clone(),
-            Arc::clone(&recovered_entries),
-            Some(Arc::clone(&batcher_stats)),
-            Some(backpressure_state),
-            incoming_rx,
-            shutdown_rx,
-        ));
-        #[cfg(not(feature = "s3"))]
-        tokio::spawn(tick::tick_task_multi_node(
-            Arc::clone(&multi_raft),
-            Arc::clone(&partition_storage),
-            Arc::clone(&group_map),
-            Arc::clone(&controller_state),
-            Arc::clone(&pending_proposals),
-            Arc::clone(&pending_controller_proposals),
-            Arc::clone(&batch_pending_proposals),
-            Arc::clone(&local_broker_heartbeats),
-            cluster_nodes.clone(),
-            transport_handle.clone(),
-            data_dir.clone(),
-            object_storage_dir.clone(),
-            tiering_config.clone(),
-            shared_wal_pool.clone(),
-            Arc::clone(&recovered_entries),
-            Some(Arc::clone(&batcher_stats)),
-            Some(backpressure_state),
-            incoming_rx,
-            shutdown_rx,
-        ));
+                // Spawn controller tick task (handles controller partition via MultiRaft).
+                let controller_shutdown_rx = {
+                    let (tx, rx) = mpsc::channel(1);
+                    // Store tx in actor_shutdown_tx to signal shutdown.
+                    // For now, we'll use the actor_handles.shutdown_tx for the actor tick,
+                    // and spawn a separate controller tick.
+                    tokio::spawn(tick::tick_task_controller(
+                        Arc::clone(&multi_raft),
+                        Arc::clone(&partition_storage),
+                        Arc::clone(&group_map),
+                        Arc::clone(&controller_state),
+                        Arc::clone(&pending_proposals),
+                        Arc::clone(&pending_controller_proposals),
+                        cluster_nodes.clone(),
+                        transport_handle.clone(),
+                        Arc::clone(&actor_handles.router),
+                        actor_handles.output_tx.clone(),
+                        rx,
+                    ));
+                    tx
+                };
 
-        info!(
-            node_id = node_id.get(),
-            listen_addr = %listen_addr,
-            peer_count = peers.len(),
-            "Started multi-node Helix service"
-        );
+                info!(
+                    node_id = node_id.get(),
+                    listen_addr = %listen_addr,
+                    peer_count = peers.len(),
+                    "Started multi-node Helix service (actor mode)"
+                );
+
+                // Return actor handles - keep both shutdown channels alive.
+                (
+                    Some(actor_handles.batcher_handle),
+                    Some(actor_handles.batcher_stats),
+                    Some(actor_handles.router),
+                    Some(actor_handles.shutdown_tx), // Actor tick task (data partitions)
+                    Some(controller_shutdown_rx),    // Controller tick task
+                    Some(actor_handles.backpressure),
+                )
+            } else {
+                // Lock-based mode: use existing MultiRaft-based architecture.
+
+                // Create and spawn the batcher task.
+                let batcher_stats = Arc::new(BatcherStats::default());
+                let (batcher_handle, batcher_rx, backpressure_state) = batcher::create_batcher();
+                tokio::spawn(batcher::batcher_task(
+                    batcher_rx,
+                    Arc::clone(&multi_raft),
+                    Arc::clone(&batch_pending_proposals),
+                    Some(transport_handle.clone()),
+                    Arc::clone(&batcher_stats),
+                    batcher::BatcherConfig::default(),
+                    Arc::clone(&backpressure_state),
+                ));
+
+                info!("Started request batcher for multi-node");
+
+                // Start background tick task with transport.
+                #[cfg(feature = "s3")]
+                tokio::spawn(tick::tick_task_multi_node(
+                    Arc::clone(&multi_raft),
+                    Arc::clone(&partition_storage),
+                    Arc::clone(&group_map),
+                    Arc::clone(&controller_state),
+                    Arc::clone(&pending_proposals),
+                    Arc::clone(&pending_controller_proposals),
+                    Arc::clone(&batch_pending_proposals),
+                    Arc::clone(&local_broker_heartbeats),
+                    cluster_nodes.clone(),
+                    transport_handle.clone(),
+                    data_dir.clone(),
+                    object_storage_dir.clone(),
+                    s3_config.clone(),
+                    tiering_config.clone(),
+                    shared_wal_pool.clone(),
+                    Arc::clone(&recovered_entries),
+                    Some(Arc::clone(&batcher_stats)),
+                    Some(backpressure_state.clone()),
+                    incoming_rx,
+                    shutdown_rx,
+                ));
+                #[cfg(not(feature = "s3"))]
+                tokio::spawn(tick::tick_task_multi_node(
+                    Arc::clone(&multi_raft),
+                    Arc::clone(&partition_storage),
+                    Arc::clone(&group_map),
+                    Arc::clone(&controller_state),
+                    Arc::clone(&pending_proposals),
+                    Arc::clone(&pending_controller_proposals),
+                    Arc::clone(&batch_pending_proposals),
+                    Arc::clone(&local_broker_heartbeats),
+                    cluster_nodes.clone(),
+                    transport_handle.clone(),
+                    data_dir.clone(),
+                    object_storage_dir.clone(),
+                    tiering_config.clone(),
+                    shared_wal_pool.clone(),
+                    Arc::clone(&recovered_entries),
+                    Some(Arc::clone(&batcher_stats)),
+                    Some(backpressure_state.clone()),
+                    incoming_rx,
+                    shutdown_rx,
+                ));
+
+                info!(
+                    node_id = node_id.get(),
+                    listen_addr = %listen_addr,
+                    peer_count = peers.len(),
+                    "Started multi-node Helix service"
+                );
+
+                (
+                    Some(batcher_handle),
+                    Some(batcher_stats),
+                    None,  // No actor router in lock-based mode
+                    None,  // No actor shutdown in lock-based mode
+                    None,  // No controller shutdown in lock-based mode
+                    Some(backpressure_state),
+                )
+            };
 
         // Build Kafka peer addresses map (includes self).
         let mut peer_addrs = kafka_peer_addrs;
@@ -849,8 +969,13 @@ impl HelixService {
             shared_wal_pool,
             recovered_entries,
             batch_pending_proposals,
-            batcher_handle: Some(batcher_handle),
-            batcher_stats: Some(batcher_stats),
+            batcher_handle,
+            batcher_stats,
+            actor_mode: enable_actor_mode,
+            actor_router,
+            actor_shutdown_tx,
+            controller_shutdown_tx,
+            actor_backpressure,
         })
     }
 

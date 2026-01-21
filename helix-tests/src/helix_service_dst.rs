@@ -86,6 +86,8 @@ pub struct HelixTestConfig {
     pub wal_mode: WalMode,
     /// Number of shared WALs (only used when wal_mode is Shared).
     pub shared_wal_count: u32,
+    /// Actor mode: track batch pending per-group instead of shared map.
+    pub actor_mode: bool,
 }
 
 impl Default for HelixTestConfig {
@@ -108,6 +110,7 @@ impl Default for HelixTestConfig {
             produce_count: 200, // Many more produces
             wal_mode: WalMode::InMemory, // Default to per-partition for backwards compatibility
             shared_wal_count: 4, // Default K=4 shared WALs when using shared mode
+            actor_mode: false, // Default to standard mode
         }
     }
 }
@@ -153,6 +156,7 @@ pub fn create_helix_simulation(
         fault_config,
         config.wal_mode,
         config.shared_wal_count,
+        config.actor_mode,
     );
 
     // Collect actor IDs.
@@ -1102,6 +1106,7 @@ mod tests {
             produce_count: 500,
             wal_mode: WalMode::Shared,
             shared_wal_count: 4,
+            ..Default::default()
         };
 
         let result = run_basic_simulation(&config);
@@ -1668,4 +1673,5 @@ mod tests {
         );
         assert_eq!(total_violations, 0, "No violations across 500 seeds");
     }
+
 }

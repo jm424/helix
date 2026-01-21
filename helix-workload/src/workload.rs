@@ -360,6 +360,8 @@ impl Workload {
             operations_total: stats.total_ops,
             operations_ok: stats.successful_ops,
             operations_failed: stats.failed_ops,
+            sends_ok: stats.send_count,
+            polls_ok: stats.poll_count,
             send_latency_p50: send_latencies.value_at_percentile(50.0) as f64 / 1000.0,
             send_latency_p95: send_latencies.value_at_percentile(95.0) as f64 / 1000.0,
             send_latency_p99: send_latencies.value_at_percentile(99.0) as f64 / 1000.0,
@@ -733,12 +735,16 @@ impl Workload {
 /// Statistics from a workload execution.
 #[derive(Debug, Clone)]
 pub struct WorkloadStats {
-    /// Total operations attempted.
+    /// Total operations attempted (sends + polls).
     pub operations_total: u64,
-    /// Successful operations.
+    /// Successful operations (sends + polls).
     pub operations_ok: u64,
     /// Failed operations.
     pub operations_failed: u64,
+    /// Successful sends only.
+    pub sends_ok: u64,
+    /// Successful polls only.
+    pub polls_ok: u64,
 
     /// Send latency p50 in milliseconds.
     pub send_latency_p50: f64,
@@ -775,8 +781,9 @@ impl WorkloadStats {
     pub fn print_summary(&self) {
         println!("=== Workload Statistics ===");
         println!(
-            "Operations: {} total, {} ok, {} failed",
-            self.operations_total, self.operations_ok, self.operations_failed
+            "Operations: {} total, {} ok, {} failed (sends: {}, polls: {})",
+            self.operations_total, self.operations_ok, self.operations_failed,
+            self.sends_ok, self.polls_ok
         );
         println!(
             "Send latency: p50={:.2}ms p95={:.2}ms p99={:.2}ms max={:.2}ms",

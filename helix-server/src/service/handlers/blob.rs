@@ -68,7 +68,22 @@ impl HelixService {
         };
 
         // Check if we're the leader.
-        let (is_leader, leader_hint) = {
+        // In actor mode, data partitions are managed by partition actors, not MultiRaft.
+        let (is_leader, leader_hint) = if let Some(router) = &self.actor_router {
+            // Actor mode: query partition actor for leadership.
+            match router.partition(group_id).await {
+                Ok(handle) => {
+                    let is_leader = handle.is_leader().await.unwrap_or(false);
+                    let leader = handle.leader_id().await.ok().flatten();
+                    (is_leader, leader)
+                }
+                Err(_) => {
+                    // Partition not yet in router - not leader.
+                    (false, None)
+                }
+            }
+        } else {
+            // Non-actor mode: query MultiRaft for leadership.
             let mr = self.multi_raft.read().await;
             let state = mr.group_state(group_id);
             let is_leader = state.as_ref().is_some_and(|s| s.state == RaftState::Leader);
@@ -297,7 +312,36 @@ impl HelixService {
         };
 
         // Check if we're the leader.
-        let (is_leader, leader_hint) = {
+        // In actor mode, data partitions are managed by partition actors, not MultiRaft.
+        let (is_leader, leader_hint) = if let Some(router) = &self.actor_router {
+            // Actor mode: query partition actor for leadership.
+            if let Ok(handle) = router.partition(group_id).await {
+                let is_leader_result = handle.is_leader().await;
+                let is_leader_err = is_leader_result.is_err();
+                let is_leader = is_leader_result.unwrap_or(false);
+                let leader = handle.leader_id().await.ok().flatten();
+                info!(
+                    topic = %topic,
+                    partition,
+                    group_id = group_id.get(),
+                    is_leader,
+                    is_leader_err,
+                    leader_id = ?leader.map(NodeId::get),
+                    "Actor mode leadership check"
+                );
+                (is_leader, leader)
+            } else {
+                // Partition not yet in router - not leader.
+                info!(
+                    topic = %topic,
+                    partition,
+                    group_id = group_id.get(),
+                    "Actor mode: partition not in router"
+                );
+                (false, None)
+            }
+        } else {
+            // Non-actor mode: query MultiRaft for leadership.
             let mr = self.multi_raft.read().await;
             let state = mr.group_state(group_id);
             let is_leader = state.as_ref().is_some_and(|s| s.state == RaftState::Leader);
@@ -306,6 +350,12 @@ impl HelixService {
         };
 
         if !is_leader {
+            debug!(
+                topic = %topic,
+                partition,
+                leader_hint = ?leader_hint.map(NodeId::get),
+                "Not leader, returning error"
+            );
             return Err(ServerError::NotLeader {
                 topic: topic.to_string(),
                 partition,

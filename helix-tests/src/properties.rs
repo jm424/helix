@@ -926,7 +926,7 @@ pub struct HelixPropertyCheckResult {
     pub consumer_verified: bool,
     /// Total client-acknowledged produces.
     pub total_client_acks: usize,
-    /// Per-partition client-ack counts: (topic_id, partition_id) -> count.
+    /// Per-partition client-ack counts: (`topic_id`, `partition_id`) -> count.
     /// Used to verify data is distributed across partitions in multi-partition tests.
     pub per_partition_ack_counts: BTreeMap<(u64, u64), usize>,
 }

@@ -228,6 +228,8 @@ pub struct RealClusterConfig {
     pub data_dir: PathBuf,
     /// Whether to auto-create topics.
     pub auto_create_topics: bool,
+    /// Default number of partitions for auto-created topics.
+    pub auto_create_partitions: u32,
     /// Default replication factor for auto-created topics.
     pub default_replication_factor: u32,
     /// Topics to pre-create at startup (name, `partition_count`).
@@ -245,6 +247,11 @@ pub struct RealClusterConfig {
     pub tiering_config: TieringTestConfig,
     /// Log level for server nodes (trace, debug, info, warn, error).
     pub log_level: String,
+
+    // === Experimental ===
+
+    /// Enable actor-based architecture for lock-free multi-partition.
+    pub actor_mode: bool,
 }
 
 impl Default for RealClusterConfig {
@@ -256,12 +263,14 @@ impl Default for RealClusterConfig {
             binary_path: PathBuf::from("./target/release/helix-server"),
             data_dir: PathBuf::from("/tmp/helix-workload"),
             auto_create_topics: true,
+            auto_create_partitions: 8, // Default to 8 partitions for multi-partition testing.
             default_replication_factor: 3,
             topics: Vec::new(),
             object_storage_dir: None,
             s3_config: None,
             tiering_config: TieringTestConfig::default(),
             log_level: String::from("info"),
+            actor_mode: false,
         }
     }
 }
@@ -318,6 +327,13 @@ impl RealClusterBuilder {
     #[must_use]
     pub const fn auto_create_topics(mut self, auto_create: bool) -> Self {
         self.config.auto_create_topics = auto_create;
+        self
+    }
+
+    /// Sets the default number of partitions for auto-created topics.
+    #[must_use]
+    pub const fn auto_create_partitions(mut self, partitions: u32) -> Self {
+        self.config.auto_create_partitions = partitions;
         self
     }
 
@@ -387,6 +403,13 @@ impl RealClusterBuilder {
     #[must_use]
     pub fn log_level(mut self, level: impl Into<String>) -> Self {
         self.config.log_level = level.into();
+        self
+    }
+
+    /// Enables actor-based architecture for lock-free multi-partition.
+    #[must_use]
+    pub const fn actor_mode(mut self, enabled: bool) -> Self {
+        self.config.actor_mode = enabled;
         self
     }
 
@@ -472,6 +495,8 @@ impl RealCluster {
 
             if config.auto_create_topics {
                 cmd.arg("--auto-create-topics");
+                cmd.arg("--auto-create-partitions")
+                    .arg(config.auto_create_partitions.to_string());
             }
 
             // Add pre-created topics.
@@ -510,6 +535,11 @@ impl RealCluster {
                 // Pass min age when S3 is configured.
                 cmd.arg("--tier-min-age-secs")
                     .arg(config.tiering_config.min_age_secs.to_string());
+            }
+
+            // Enable actor mode if configured.
+            if config.actor_mode {
+                cmd.arg("--actor-mode");
             }
 
             // Inherit stderr for debugging, suppress stdout.
@@ -670,6 +700,8 @@ impl RealCluster {
 
         if self.config.auto_create_topics {
             cmd.arg("--auto-create-topics");
+            cmd.arg("--auto-create-partitions")
+                .arg(self.config.auto_create_partitions.to_string());
         }
 
         // Add peers (format: node_id:host:kafka_port:raft_port).
@@ -708,6 +740,11 @@ impl RealCluster {
             // Pass min age when S3 is configured.
             cmd.arg("--tier-min-age-secs")
                 .arg(self.config.tiering_config.min_age_secs.to_string());
+        }
+
+        // Enable actor mode if configured.
+        if self.config.actor_mode {
+            cmd.arg("--actor-mode");
         }
 
         // Suppress stdout/stderr to avoid I/O overload.

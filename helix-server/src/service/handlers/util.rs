@@ -56,7 +56,17 @@ impl HelixService {
             gm.get(topic_meta.topic_id, partition_id)?
         };
 
-        // Get leader from MultiRaft.
+        // In actor mode, query the partition actor for leader.
+        // Data partitions are managed by partition actors, not MultiRaft.
+        if let Some(router) = &self.actor_router {
+            if let Ok(handle) = router.partition(group_id).await {
+                return handle.leader_id().await.ok().flatten();
+            }
+            // Partition not yet registered in router - leader unknown.
+            return None;
+        }
+
+        // Non-actor mode: get leader from MultiRaft.
         let mr = self.multi_raft.read().await;
         mr.group_state(group_id).and_then(|s| s.leader_id)
     }

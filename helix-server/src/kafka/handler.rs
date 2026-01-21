@@ -70,6 +70,8 @@ pub struct KafkaHandler {
     port: i32,
     /// Auto-create topics on first produce/fetch.
     auto_create_topics: bool,
+    /// Default number of partitions for auto-created topics.
+    auto_create_partitions: u32,
     /// Counter for generating unique producer IDs.
     next_producer_id: AtomicU64,
 }
@@ -78,7 +80,13 @@ impl KafkaHandler {
     /// Creates a new Kafka handler.
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // Arc fields prevent const.
-    pub fn new(service: Arc<HelixService>, host: String, port: i32, auto_create_topics: bool) -> Self {
+    pub fn new(
+        service: Arc<HelixService>,
+        host: String,
+        port: i32,
+        auto_create_topics: bool,
+        auto_create_partitions: u32,
+    ) -> Self {
         // Generate a unique base producer ID using node_id + timestamp.
         // Format: (node_id << 48) | (timestamp_micros & 0x0000_FFFF_FFFF_FFFF)
         // - 16 bits for node_id (up to 65k nodes)
@@ -98,6 +106,7 @@ impl KafkaHandler {
             host,
             port,
             auto_create_topics,
+            auto_create_partitions,
             next_producer_id: AtomicU64::new(base_producer_id),
         }
     }
@@ -272,33 +281,36 @@ impl KafkaHandler {
                 }
 
                 if self.auto_create_topics {
-                    // Auto-create topic with 1 partition.
+                    // Auto-create topic with configured partition count.
                     // In multi-node mode, use controller (forward if needed); in single-node, use direct creation.
                     let replication_factor =
                         u32::try_from(self.service.cluster_nodes().len()).unwrap_or(3).max(1);
+                    let partition_count = self.auto_create_partitions;
+                    #[allow(clippy::cast_possible_wrap)]
+                    let partition_count_i32 = partition_count as i32;
 
                     let create_result = if self.service.is_multi_node() {
                         // Try direct creation first (works if we're the controller).
                         match self.service
-                            .create_topic_via_controller(topic_name.clone(), 1, replication_factor)
+                            .create_topic_via_controller(topic_name.clone(), partition_count, replication_factor)
                             .await
                         {
                             Ok(()) => Ok(()),
                             Err(crate::error::ServerError::NotController { .. }) => {
                                 // Not the controller - forward to controller.
-                                self.forward_create_topic_to_controller(topic_name, 1, replication_factor)
+                                self.forward_create_topic_to_controller(topic_name, partition_count, replication_factor)
                                     .await
                                     .map_err(|e| crate::error::ServerError::Internal { message: e })
                             }
                             Err(e) => Err(e),
                         }
                     } else {
-                        self.service.create_topic(topic_name.clone(), 1).await
+                        self.service.create_topic(topic_name.clone(), partition_count_i32).await
                     };
 
                     match create_result {
                         Ok(()) => {
-                            info!(topic = %topic_name, "Auto-created topic");
+                            info!(topic = %topic_name, partitions = partition_count, "Auto-created topic");
 
                             let mut topic_response = MetadataResponseTopic::default();
                             topic_response.error_code = 0;
@@ -306,9 +318,12 @@ impl KafkaHandler {
                                 Some(TopicName(StrBytes::from_string(topic_name.clone())));
                             topic_response.is_internal = false;
 
-                            let partition_response =
-                                self.build_partition_metadata(topic_name, 0).await;
-                            topic_response.partitions.push(partition_response);
+                            // Build metadata for all partitions.
+                            for p in 0..partition_count_i32 {
+                                let partition_response =
+                                    self.build_partition_metadata(topic_name, p).await;
+                                topic_response.partitions.push(partition_response);
+                            }
                             response.topics.push(topic_response);
                         }
                         Err(e) => {
@@ -480,23 +495,27 @@ impl KafkaHandler {
                 let replication_factor =
                     u32::try_from(self.service.cluster_nodes().len()).unwrap_or(3).max(1);
 
+                // Cast to i32 for single-node API, keep u32 for controller API.
+                #[allow(clippy::cast_possible_wrap)]
+                let partition_count_i32 = self.auto_create_partitions as i32;
+                let partition_count = self.auto_create_partitions;
                 let create_result = if self.service.is_multi_node() {
                     // Try direct creation first (works if we're the controller).
                     match self.service
-                        .create_topic_via_controller(topic.to_string(), 1, replication_factor)
+                        .create_topic_via_controller(topic.to_string(), partition_count, replication_factor)
                         .await
                     {
                         Ok(()) => Ok(()),
                         Err(crate::ServerError::NotController { .. }) => {
                             // Not the controller - forward to controller.
-                            self.forward_create_topic_to_controller(topic, 1, replication_factor)
+                            self.forward_create_topic_to_controller(topic, partition_count, replication_factor)
                                 .await
                                 .map_err(|e| crate::ServerError::Internal { message: e })
                         }
                         Err(e) => Err(e),
                     }
                 } else {
-                    self.service.create_topic(topic.to_string(), 1).await
+                    self.service.create_topic(topic.to_string(), partition_count_i32).await
                 };
 
                 if let Err(e) = create_result {

@@ -270,6 +270,466 @@ pub async fn tick_task_multi_node(
     }
 }
 
+/// Background tick task for actor-based multi-node operation.
+///
+/// This is the actor-based alternative to `tick_task_multi_node`. Instead of
+/// using `Arc<RwLock<MultiRaft>>`, it routes ticks and messages to partition
+/// actors via the `PartitionRouter`, eliminating lock contention.
+///
+/// # Responsibilities
+///
+/// 1. **Tick broadcast**: Periodically calls `router.tick_all()` to tick all
+///    partition actors in parallel.
+/// 2. **Message routing**: Routes incoming Raft messages from transport to
+///    the appropriate partition actors via `router.route_messages()`.
+/// 3. **Heartbeats**: Sends broker heartbeats to all peers (Kafka `KRaft` pattern).
+/// 4. **Tiering**: Processes tiering for durable partitions.
+///
+/// # Key Differences from `tick_task_multi_node`
+///
+/// - No `multi_raft` lock - ticks are sent via channels to partition actors
+/// - No `process_outputs_multi_node` - outputs go through the shared output
+///   channel and are processed by the `OutputProcessor`
+/// - Simpler control flow since output processing is decoupled
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+pub async fn tick_task_actor(
+    router: Arc<super::router::PartitionRouter>,
+    multi_raft: Arc<RwLock<MultiRaft>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
+    group_map: Arc<RwLock<GroupMap>>,
+    controller_state: Arc<RwLock<ControllerState>>,
+    pending_proposals: Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, PendingProposal>>>>,
+    pending_controller_proposals: Arc<RwLock<Vec<PendingControllerProposal>>>,
+    local_broker_heartbeats: Arc<RwLock<HashMap<NodeId, u64>>>,
+    node_id: NodeId,
+    cluster_nodes: Vec<NodeId>,
+    transport_handle: TransportHandle,
+    output_tx: mpsc::Sender<super::partition_actor::GroupedOutput>,
+    mut incoming_rx: mpsc::Receiver<IncomingMessage>,
+    mut shutdown_rx: mpsc::Receiver<()>,
+) {
+    let mut tick_interval =
+        tokio::time::interval(tokio::time::Duration::from_millis(TICK_INTERVAL_MS));
+    let mut heartbeat_interval =
+        tokio::time::interval(tokio::time::Duration::from_millis(HEARTBEAT_INTERVAL_MS));
+    let mut tiering_interval =
+        tokio::time::interval(tokio::time::Duration::from_millis(TIERING_INTERVAL_MS));
+
+    let initial_partition_count = router.partition_count().await;
+    info!(
+        node_id = node_id.get(),
+        partition_count = initial_partition_count,
+        "Actor tick task started"
+    );
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                info!("Actor tick task shutting down");
+                break;
+            }
+            _ = tick_interval.tick() => {
+                // Broadcast tick to all partition actors in parallel.
+                // Each actor processes its tick independently without lock contention.
+                router.tick_all().await;
+            }
+            _ = heartbeat_interval.tick() => {
+                // Send broker heartbeats to all peers (Kafka KRaft pattern).
+                // This is unchanged from the lock-based approach since heartbeats
+                // are soft state that doesn't require Raft consensus.
+                send_broker_heartbeats_to_peers(
+                    &local_broker_heartbeats,
+                    node_id,
+                    &cluster_nodes,
+                    &transport_handle,
+                ).await;
+            }
+            _ = tiering_interval.tick() => {
+                // Process tiering for all durable partitions.
+                // This is unchanged from the lock-based approach.
+                process_tiering(&partition_storage).await;
+            }
+            Some(incoming) = incoming_rx.recv() => {
+                // Route incoming messages to partition actors or MultiRaft.
+                match incoming {
+                    IncomingMessage::Single(_message) => {
+                        warn!("Received single message in actor mode, expected batch");
+                    }
+                    IncomingMessage::Batch(group_messages) => {
+                        // Split messages: controller messages go to MultiRaft,
+                        // data partition messages go to partition actors.
+                        let (controller_msgs, data_msgs): (Vec<_>, Vec<_>) = group_messages
+                            .into_iter()
+                            .partition(|gm| gm.group_id == CONTROLLER_GROUP_ID);
+
+                        // Step controller messages through MultiRaft and process ALL outputs.
+                        // This includes BecameLeader, CommitEntry, etc. - not just SendMessages.
+                        if !controller_msgs.is_empty() {
+                            info!(
+                                count = controller_msgs.len(),
+                                "Received controller messages in tick_task_actor"
+                            );
+                            let outputs = {
+                                let mut mr = multi_raft.write().await;
+                                mr.handle_messages(controller_msgs)
+                            };
+                            info!(
+                                output_count = outputs.len(),
+                                "Processed controller messages, got outputs"
+                            );
+
+                            // Process all controller outputs including BecameLeader, CommitEntry.
+                            process_controller_outputs(
+                                &outputs,
+                                &multi_raft,
+                                &partition_storage,
+                                &group_map,
+                                &controller_state,
+                                &pending_proposals,
+                                &pending_controller_proposals,
+                                &cluster_nodes,
+                                &transport_handle,
+                                &router,
+                                &output_tx,
+                            ).await;
+                        }
+
+                        // Route data partition messages to partition actors.
+                        if !data_msgs.is_empty() {
+                            let from = data_msgs
+                                .first()
+                                .map_or(NodeId::new(0), |m| m.message.from());
+                            router.route_messages(data_msgs, from).await;
+                        }
+                    }
+                    IncomingMessage::Heartbeat(heartbeat) => {
+                        // Update local heartbeat soft state.
+                        // This is unchanged from the lock-based approach.
+                        local_broker_heartbeats
+                            .write()
+                            .await
+                            .insert(heartbeat.node_id, heartbeat.timestamp_ms);
+                        debug!(
+                            from = heartbeat.node_id.get(),
+                            timestamp_ms = heartbeat.timestamp_ms,
+                            "Recorded heartbeat from peer (actor mode)"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    info!("Actor tick task stopped");
+}
+
+/// Background tick task for controller partition only (actor mode).
+///
+/// When actor mode is enabled for data partitions, the controller partition
+/// still needs to be ticked via `MultiRaft`. This task handles:
+///
+/// 1. **Controller ticking**: Periodically ticks the controller Raft group.
+/// 2. **Controller outputs**: Processes commits, leader changes, and message sending.
+/// 3. **Follow-up commands**: Proposes follow-up controller commands.
+/// 4. **Dynamic partition creation**: Creates partition actors on `AssignPartition`.
+///
+/// Data partition operations are handled by `tick_task_actor` via the router.
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+pub async fn tick_task_controller(
+    multi_raft: Arc<RwLock<MultiRaft>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
+    group_map: Arc<RwLock<GroupMap>>,
+    controller_state: Arc<RwLock<ControllerState>>,
+    pending_proposals: Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, PendingProposal>>>>,
+    pending_controller_proposals: Arc<RwLock<Vec<PendingControllerProposal>>>,
+    cluster_nodes: Vec<NodeId>,
+    transport_handle: TransportHandle,
+    router: Arc<super::router::PartitionRouter>,
+    output_tx: mpsc::Sender<super::partition_actor::GroupedOutput>,
+    mut shutdown_rx: mpsc::Receiver<()>,
+) {
+    let mut tick_interval =
+        tokio::time::interval(tokio::time::Duration::from_millis(TICK_INTERVAL_MS));
+
+    let node_id = {
+        let mr = multi_raft.read().await;
+        mr.node_id()
+    };
+
+    info!(
+        node_id = node_id.get(),
+        "Controller tick task started (actor mode)"
+    );
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                info!("Controller tick task shutting down");
+                break;
+            }
+            _ = tick_interval.tick() => {
+                // Tick only the controller partition via MultiRaft.
+                let outputs = {
+                    let mut mr = multi_raft.write().await;
+                    mr.tick()
+                };
+
+                if !outputs.is_empty() {
+                    for output in &outputs {
+                        match output {
+                            MultiRaftOutput::CommitEntry { group_id, index, .. } => {
+                                info!(group = group_id.get(), index = index.get(), "Tick: CommitEntry");
+                            }
+                            MultiRaftOutput::BecameLeader { group_id } => {
+                                info!(group = group_id.get(), "Tick: BecameLeader");
+                            }
+                            MultiRaftOutput::SendMessages { to, messages } => {
+                                info!(to = to.get(), count = messages.len(), "Tick: SendMessages");
+                            }
+                            MultiRaftOutput::SteppedDown { group_id } => {
+                                info!(group = group_id.get(), "Tick: SteppedDown");
+                            }
+                            MultiRaftOutput::VoteStateChanged { group_id, term, .. } => {
+                                info!(group = group_id.get(), term = term.get(), "Tick: VoteStateChanged");
+                            }
+                        }
+                    }
+                }
+
+                // Process controller-related outputs only.
+                process_controller_outputs(
+                    &outputs,
+                    &multi_raft,
+                    &partition_storage,
+                    &group_map,
+                    &controller_state,
+                    &pending_proposals,
+                    &pending_controller_proposals,
+                    &cluster_nodes,
+                    &transport_handle,
+                    &router,
+                    &output_tx,
+                ).await;
+            }
+        }
+    }
+
+    info!("Controller tick task stopped");
+}
+
+/// Processes outputs for controller partition only (actor mode).
+///
+/// This is a simplified version of `process_outputs_multi_node` that only
+/// handles controller partition (group 0) outputs. Data partition outputs
+/// are handled by the `OutputProcessor`.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::significant_drop_tightening)]
+async fn process_controller_outputs(
+    outputs: &[MultiRaftOutput],
+    multi_raft: &Arc<RwLock<MultiRaft>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
+    group_map: &Arc<RwLock<GroupMap>>,
+    controller_state: &Arc<RwLock<ControllerState>>,
+    _pending_proposals: &Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, PendingProposal>>>>,
+    pending_controller_proposals: &Arc<RwLock<Vec<PendingControllerProposal>>>,
+    cluster_nodes: &[NodeId],
+    transport_handle: &TransportHandle,
+    router: &Arc<super::router::PartitionRouter>,
+    output_tx: &mpsc::Sender<super::partition_actor::GroupedOutput>,
+) {
+    for output in outputs {
+        match output {
+            MultiRaftOutput::CommitEntry {
+                group_id,
+                index,
+                data,
+            } => {
+                // Only process controller partition commits.
+                if *group_id != CONTROLLER_GROUP_ID {
+                    // Data partition commits are handled by OutputProcessor in actor mode.
+                    continue;
+                }
+
+                let Some(cmd) = ControllerCommand::decode(data) else {
+                    warn!(
+                        index = index.get(),
+                        "Failed to decode controller command"
+                    );
+                    continue;
+                };
+
+                info!(
+                    index = index.get(),
+                    command = ?cmd,
+                    "Applying controller command (actor mode)"
+                );
+                let mut state = controller_state.write().await;
+                let follow_ups = state.apply(&cmd, cluster_nodes);
+
+                // Notify any pending controller proposals for this index.
+                {
+                    let mut proposals = pending_controller_proposals.write().await;
+                    let pending_indexes: Vec<u64> = proposals.iter().map(|p| p.log_index.get()).collect();
+                    info!(
+                        commit_index = index.get(),
+                        pending_count = proposals.len(),
+                        pending_indexes = ?pending_indexes,
+                        "Checking pending controller proposals (actor mode)"
+                    );
+                    if let Some(pos) = proposals.iter().position(|p| p.log_index == *index) {
+                        let proposal = proposals.swap_remove(pos);
+                        let send_result = proposal.result_tx.send(Ok(()));
+                        info!(
+                            index = index.get(),
+                            send_success = send_result.is_ok(),
+                            "Notified pending controller proposal (actor mode)"
+                        );
+                    } else {
+                        info!(
+                            index = index.get(),
+                            "No pending controller proposal for this index (actor mode)"
+                        );
+                    }
+                }
+
+                // Propose follow-up commands if we're the leader.
+                if !follow_ups.is_empty() {
+                    let is_leader = {
+                        let mr = multi_raft.read().await;
+                        mr.group_state(CONTROLLER_GROUP_ID)
+                            .is_some_and(|s| s.state == RaftState::Leader)
+                    };
+
+                    if is_leader {
+                        let mut mr = multi_raft.write().await;
+                        for follow_up in follow_ups {
+                            let encoded = follow_up.encode();
+                            if mr.propose(CONTROLLER_GROUP_ID, encoded).is_none() {
+                                warn!(
+                                    command = ?follow_up,
+                                    "Failed to propose follow-up controller command (actor mode)"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Handle AssignPartition by creating partition actor and storage.
+                if let ControllerCommand::AssignPartition {
+                    topic_id,
+                    partition_id,
+                    group_id: data_group_id,
+                    ref replicas,
+                } = cmd
+                {
+                    let node_id = {
+                        let mr = multi_raft.read().await;
+                        mr.node_id()
+                    };
+
+                    if replicas.contains(&node_id) {
+                        info!(
+                            topic = topic_id.get(),
+                            partition = partition_id.get(),
+                            group = data_group_id.get(),
+                            replicas = ?replicas.iter().map(|n| n.get()).collect::<Vec<_>>(),
+                            "Creating data partition from controller assignment (actor mode)"
+                        );
+
+                        // Update group map.
+                        {
+                            let mut gm = group_map.write().await;
+                            gm.insert(topic_id, partition_id, data_group_id);
+                        }
+
+                        // Create partition storage (in-memory for now).
+                        {
+                            let mut storage = partition_storage.write().await;
+                            if let std::collections::hash_map::Entry::Vacant(e) = storage.entry(data_group_id) {
+                                let ps = ServerPartitionStorage::new_in_memory(topic_id, partition_id);
+                                e.insert(ps);
+                            }
+                        }
+
+                        // Create the partition actor and add it to the router.
+                        let partition_handle = super::actor_setup::create_partition_actor(
+                            data_group_id,
+                            node_id,
+                            replicas.clone(),
+                            output_tx.clone(),
+                            super::partition_actor::PartitionActorConfig::default(),
+                        );
+
+                        if router.add_partition_dynamic(data_group_id, partition_handle).await {
+                            info!(
+                                topic = topic_id.get(),
+                                partition = partition_id.get(),
+                                group = data_group_id.get(),
+                                "Created partition actor (actor mode)"
+                            );
+                        } else {
+                            warn!(
+                                topic = topic_id.get(),
+                                partition = partition_id.get(),
+                                group = data_group_id.get(),
+                                "Partition actor already exists"
+                            );
+                        }
+                    }
+                }
+            }
+            MultiRaftOutput::BecameLeader { group_id } => {
+                if *group_id == CONTROLLER_GROUP_ID {
+                    info!("Became controller leader (actor mode)");
+                }
+                // Ignore data partition leader changes - handled by OutputProcessor.
+            }
+            MultiRaftOutput::SteppedDown { group_id } => {
+                if *group_id == CONTROLLER_GROUP_ID {
+                    info!("Stepped down from controller leader (actor mode)");
+                }
+                // Ignore data partition step downs - handled by OutputProcessor.
+            }
+            MultiRaftOutput::SendMessages { to, messages } => {
+                // Filter to only send controller partition messages.
+                // Data partition messages are sent by OutputProcessor.
+                let controller_messages: Vec<_> = messages
+                    .iter()
+                    .filter(|m| m.group_id == CONTROLLER_GROUP_ID)
+                    .cloned()
+                    .collect();
+
+                if !controller_messages.is_empty() {
+                    if let Err(e) = transport_handle.send_batch(*to, controller_messages.clone()).await {
+                        error!(
+                            to = to.get(),
+                            count = controller_messages.len(),
+                            error = %e,
+                            "Failed to send controller messages to peer (actor mode)"
+                        );
+                    } else {
+                        debug!(
+                            to = to.get(),
+                            count = controller_messages.len(),
+                            "Sent controller messages to peer (actor mode)"
+                        );
+                    }
+                }
+            }
+            MultiRaftOutput::VoteStateChanged { group_id, term, voted_for } => {
+                if *group_id == CONTROLLER_GROUP_ID {
+                    debug!(
+                        group = group_id.get(),
+                        term = term.get(),
+                        voted_for = ?voted_for.map(helix_core::NodeId::get),
+                        "Controller vote state changed (actor mode)"
+                    );
+                }
+                // Ignore data partition vote changes - handled by OutputProcessor.
+            }
+        }
+    }
+}
+
 /// Sends broker heartbeats to all peers via transport (Kafka `KRaft` pattern).
 ///
 /// Unlike Raft-replicated state, heartbeats are soft state. Each broker:
@@ -481,15 +941,23 @@ async fn process_outputs_multi_node(
             } => {
                 // Check if this is a controller partition commit.
                 if *group_id == CONTROLLER_GROUP_ID {
+                    info!(
+                        index = index.get(),
+                        data_len = data.len(),
+                        pending_proposals_ptr = ?std::sync::Arc::as_ptr(pending_controller_proposals),
+                        "CommitEntry received for controller group"
+                    );
+
                     let Some(cmd) = ControllerCommand::decode(data) else {
                         warn!(
                             index = index.get(),
+                            data_len = data.len(),
                             "Failed to decode controller command"
                         );
                         continue;
                     };
 
-                    debug!(
+                    info!(
                         index = index.get(),
                         command = ?cmd,
                         "Applying controller command"
@@ -499,13 +967,28 @@ async fn process_outputs_multi_node(
 
                     // Notify any pending controller proposals for this index.
                     {
+                        let proposals = pending_controller_proposals.read().await;
+                        let pending_indexes: Vec<u64> = proposals.iter().map(|p| p.log_index.get()).collect();
+                        info!(
+                            index = index.get(),
+                            pending_count = proposals.len(),
+                            pending_indexes = ?pending_indexes,
+                            "Checking for pending proposal to notify"
+                        );
+                        drop(proposals);
+
                         let mut proposals = pending_controller_proposals.write().await;
                         if let Some(pos) = proposals.iter().position(|p| p.log_index == *index) {
                             let proposal = proposals.swap_remove(pos);
                             let _ = proposal.result_tx.send(Ok(()));
-                            debug!(
+                            info!(
                                 index = index.get(),
                                 "Notified pending controller proposal"
+                            );
+                        } else {
+                            info!(
+                                index = index.get(),
+                                "No pending proposal found for this index"
                             );
                         }
                     }

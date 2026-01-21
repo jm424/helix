@@ -33,6 +33,8 @@ pub struct KafkaServerConfig {
     pub max_connections: usize,
     /// Auto-create topics on first metadata request.
     pub auto_create_topics: bool,
+    /// Default number of partitions for auto-created topics.
+    pub auto_create_partitions: u32,
 }
 
 impl KafkaServerConfig {
@@ -47,6 +49,7 @@ impl KafkaServerConfig {
             advertised_port: port,
             max_connections: 1000,
             auto_create_topics: false,
+            auto_create_partitions: 1,
         }
     }
 
@@ -54,6 +57,13 @@ impl KafkaServerConfig {
     #[must_use]
     pub const fn with_auto_create_topics(mut self, enabled: bool) -> Self {
         self.auto_create_topics = enabled;
+        self
+    }
+
+    /// Set the default number of partitions for auto-created topics.
+    #[must_use]
+    pub const fn with_auto_create_partitions(mut self, partitions: u32) -> Self {
+        self.auto_create_partitions = partitions;
         self
     }
 
@@ -82,6 +92,7 @@ impl KafkaServer {
             config.advertised_host.clone(),
             config.advertised_port,
             config.auto_create_topics,
+            config.auto_create_partitions,
         ));
 
         Self {

@@ -6,6 +6,7 @@
 //! ## Test Organization
 //!
 //! **DST Tests** (`*_dst.rs`): Deterministic simulation with fault injection
+//! - `actor_mode_dst`: Actor-mode partition architecture DST
 //! - `helix_service_dst`: Full Helix service E2E DST
 //! - `raft_dst`: Raft consensus DST with Bloodhound simulation
 //! - `wal_dst`: Per-partition WAL DST with `SimulatedStorage`

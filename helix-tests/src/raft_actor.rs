@@ -96,7 +96,7 @@ impl NetworkState {
     }
 
     /// Sets the cluster size (for quorum calculation).
-    pub fn set_cluster_size(&mut self, size: usize) {
+    pub const fn set_cluster_size(&mut self, size: usize) {
         self.cluster_size = size;
     }
 
@@ -717,7 +717,7 @@ impl RaftActor {
                     tracing::debug!(
                         actor = %self.name,
                         term = term.get(),
-                        voted_for = ?voted_for.map(|n| n.get()),
+                        voted_for = ?voted_for.map(NodeId::get),
                         "vote state changed"
                     );
                 }
