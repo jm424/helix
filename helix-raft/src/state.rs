@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
-use helix_core::{LogIndex, NodeId, TermId};
+use helix_core::{LogIndex, NodeId, TermId, MAX_RAFT_MESSAGE_BYTES};
 
 use crate::config::RaftConfig;
 use crate::limits;
@@ -1378,7 +1378,10 @@ impl RaftNode {
         let prev_idx = LogIndex::new(next_idx.get().saturating_sub(1));
         let prev_term = self.log.term_at(prev_idx);
 
-        let entries = self.log.entries_from(next_idx);
+        // Limit entries to fit within transport message size.
+        // Uses half of MAX_RAFT_MESSAGE_BYTES to leave room for AppendEntries headers.
+        let max_entries_bytes = MAX_RAFT_MESSAGE_BYTES / 2;
+        let entries = self.log.entries_from_limited(next_idx, max_entries_bytes);
         let entries_count = entries.len();
 
         // Speculatively advance next_index to the end of entries being sent.

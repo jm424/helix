@@ -23,7 +23,7 @@ mod record;
 mod types;
 
 pub use error::{Error, Result};
-pub use limits::Limits;
+pub use limits::{Limits, MAX_RAFT_MESSAGE_BYTES};
 pub use record::{
     Compression, Header, Offset, Record, RecordBatch, RecordError, Timestamp,
 };

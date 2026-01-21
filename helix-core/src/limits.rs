@@ -4,6 +4,14 @@
 //! Every queue, buffer, and resource has an explicit maximum size.
 //! This prevents unbounded growth and makes the system predictable.
 
+/// Maximum size of a Raft message on the wire (16 MB).
+///
+/// This is the transport layer's message size limit. Both the codec
+/// and Raft use this to ensure messages fit within transport limits.
+/// Raft uses half of this for `AppendEntries` payloads, leaving room
+/// for headers.
+pub const MAX_RAFT_MESSAGE_BYTES: u64 = 16 * 1024 * 1024;
+
 /// System-wide limits for Helix.
 ///
 /// All limits are explicit and configurable. Default values are chosen

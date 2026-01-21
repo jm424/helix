@@ -22,7 +22,7 @@
 //! - 7: `GroupMessageBatch` (for Multi-Raft batched messages)
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use helix_core::{GroupId, LogIndex, NodeId, TermId};
+use helix_core::{GroupId, LogIndex, NodeId, TermId, MAX_RAFT_MESSAGE_BYTES};
 use helix_raft::{
     multi::GroupMessage, AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
     InstallSnapshotResponse, LogEntry, Message, PreVoteRequest, PreVoteResponse,
@@ -30,8 +30,10 @@ use helix_raft::{
 };
 use thiserror::Error;
 
-/// Maximum message size (16 MB).
-const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
+/// Maximum message size (from helix-core).
+/// Safe cast: `MAX_RAFT_MESSAGE_BYTES` is 16 MB which fits in u32.
+#[allow(clippy::cast_possible_truncation)]
+const MAX_MESSAGE_SIZE: u32 = MAX_RAFT_MESSAGE_BYTES as u32;
 
 /// Message type tags.
 const TAG_PRE_VOTE: u8 = 0;

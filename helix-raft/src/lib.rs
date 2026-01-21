@@ -54,6 +54,7 @@ pub mod limits {
     /// multiple `AppendEntries` without waiting for each response.
     pub const MAX_INFLIGHT_APPEND_ENTRIES: u32 = 5;
 
+
     /// Maximum number of nodes in a cluster.
     pub const CLUSTER_SIZE_MAX: usize = 7;
 

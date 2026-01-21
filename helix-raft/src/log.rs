@@ -20,6 +20,15 @@ impl LogEntry {
     pub const fn new(term: TermId, index: LogIndex, data: Bytes) -> Self {
         Self { term, index, data }
     }
+
+    /// Returns the wire size of this entry when encoded.
+    ///
+    /// Wire format: 8 (term) + 8 (index) + 4 (data length prefix) + `data.len()`.
+    #[must_use]
+    pub const fn wire_size(&self) -> u64 {
+        // 8 (term) + 8 (index) + 4 (data_len prefix) + data.len()
+        20 + self.data.len() as u64
+    }
 }
 
 /// In-memory Raft log.
@@ -225,6 +234,45 @@ impl RaftLog {
         self.entries[start..].to_vec()
     }
 
+    /// Returns entries from `start_index` up to `max_bytes` total wire size.
+    ///
+    /// This is used to limit the size of `AppendEntries` messages to fit within
+    /// transport message size limits. At least one entry is always returned if
+    /// available, even if it exceeds `max_bytes` (to ensure progress).
+    #[must_use]
+    pub fn entries_from_limited(&self, start_index: LogIndex, max_bytes: u64) -> Vec<LogEntry> {
+        if self.entries.is_empty() || start_index.get() > self.last_index().get() {
+            return Vec::new();
+        }
+
+        let start = if start_index.get() < self.first_index {
+            0
+        } else {
+            // Safe cast: start is bounded by entries.len() which fits in usize.
+            #[allow(clippy::cast_possible_truncation)]
+            let s = (start_index.get() - self.first_index) as usize;
+            s
+        };
+
+        let mut result = Vec::new();
+        let mut total_bytes: u64 = 0;
+
+        for entry in &self.entries[start..] {
+            let entry_size = entry.wire_size();
+
+            // Always include at least one entry to ensure progress,
+            // even if it exceeds max_bytes.
+            if !result.is_empty() && total_bytes + entry_size > max_bytes {
+                break;
+            }
+
+            total_bytes += entry_size;
+            result.push(entry.clone());
+        }
+
+        result
+    }
+
     /// Checks if the candidate's log (`other_term`, `other_index`) is at least as
     /// up-to-date as ours.
     ///
@@ -362,5 +410,86 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].index.get(), 2);
         assert_eq!(entries[1].index.get(), 3);
+    }
+
+    #[test]
+    fn test_wire_size() {
+        // Wire format: 8 (term) + 8 (index) + 4 (data length) + data.len()
+        let entry = LogEntry::new(TermId::new(1), LogIndex::new(1), Bytes::from("hello"));
+        // 20 + 5 = 25
+        assert_eq!(entry.wire_size(), 25);
+
+        let empty_entry = LogEntry::new(TermId::new(1), LogIndex::new(1), Bytes::new());
+        // 20 + 0 = 20
+        assert_eq!(empty_entry.wire_size(), 20);
+
+        let large_entry = LogEntry::new(
+            TermId::new(1),
+            LogIndex::new(1),
+            Bytes::from(vec![0u8; 1000]),
+        );
+        // 20 + 1000 = 1020
+        assert_eq!(large_entry.wire_size(), 1020);
+    }
+
+    #[test]
+    fn test_entries_from_limited_all_fit() {
+        let mut log = RaftLog::new();
+        log.append(make_entry(1, 1)); // ~27 bytes
+        log.append(make_entry(1, 2)); // ~27 bytes
+        log.append(make_entry(2, 3)); // ~27 bytes
+
+        // Large limit - all entries fit.
+        let entries = log.entries_from_limited(LogIndex::new(1), 1000);
+        assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn test_entries_from_limited_partial() {
+        let mut log = RaftLog::new();
+        // Each entry: 20 (header) + ~7 bytes data = ~27 bytes.
+        log.append(make_entry(1, 1));
+        log.append(make_entry(1, 2));
+        log.append(make_entry(2, 3));
+
+        // Limit to fit only 2 entries (54 bytes).
+        let entries = log.entries_from_limited(LogIndex::new(1), 55);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].index.get(), 1);
+        assert_eq!(entries[1].index.get(), 2);
+    }
+
+    #[test]
+    fn test_entries_from_limited_at_least_one() {
+        let mut log = RaftLog::new();
+        // Create a large entry.
+        let large_data = vec![0u8; 1000];
+        log.append(LogEntry::new(
+            TermId::new(1),
+            LogIndex::new(1),
+            Bytes::from(large_data),
+        ));
+        log.append(make_entry(1, 2));
+
+        // Even with a tiny limit, at least one entry is returned.
+        let entries = log.entries_from_limited(LogIndex::new(1), 10);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].index.get(), 1);
+    }
+
+    #[test]
+    fn test_entries_from_limited_empty_log() {
+        let log = RaftLog::new();
+        let entries = log.entries_from_limited(LogIndex::new(1), 1000);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_entries_from_limited_start_beyond_end() {
+        let mut log = RaftLog::new();
+        log.append(make_entry(1, 1));
+
+        let entries = log.entries_from_limited(LogIndex::new(5), 1000);
+        assert!(entries.is_empty());
     }
 }
