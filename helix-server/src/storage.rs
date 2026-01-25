@@ -351,6 +351,9 @@ pub enum PartitionCommand {
     /// Protocol-specific transformations (like Kafka baseOffset patching) are
     /// applied at command application time, not at storage time. This ensures
     /// data written to the log is correct while keeping storage protocol-agnostic.
+    ///
+    /// The `base_offset` is captured by the leader at propose time and encoded
+    /// in the command, ensuring all replicas use the same offset for consistency.
     AppendBlob {
         /// Raw blob data.
         blob: Bytes,
@@ -358,6 +361,9 @@ pub enum PartitionCommand {
         record_count: u32,
         /// Format of the blob data.
         format: BlobFormat,
+        /// Base offset assigned by leader at propose time.
+        /// All replicas must use this offset for consistency.
+        base_offset: Offset,
     },
     /// Truncate the partition from a given offset.
     Truncate {
@@ -372,11 +378,14 @@ pub enum PartitionCommand {
     /// Append multiple blobs as a single batched operation (type 4).
     ///
     /// Used to batch multiple producer requests into a single Raft entry,
-    /// reducing consensus overhead. Each blob is applied sequentially and
-    /// offsets are calculated at apply time.
+    /// reducing consensus overhead. Each blob is applied sequentially starting
+    /// from the `base_offset` captured by the leader at propose time.
     AppendBlobBatch {
         /// Blobs to append in order.
         blobs: Vec<BatchedBlob>,
+        /// Base offset assigned by leader at propose time.
+        /// All replicas must use this offset for consistency.
+        base_offset: Offset,
     },
 }
 
@@ -403,8 +412,9 @@ impl PartitionCommand {
                     record.encode(&mut buf);
                 }
             }
-            Self::AppendBlob { blob, record_count, format } => {
+            Self::AppendBlob { blob, record_count, format, base_offset } => {
                 buf.put_u8(3);
+                buf.put_u64_le(base_offset.get()); // Encode base_offset first for consistency.
                 buf.put_u32_le(*record_count);
                 // Encode format: 0 = Raw, 1 = KafkaRecordBatch.
                 let format_byte = match format {
@@ -426,8 +436,9 @@ impl PartitionCommand {
                 buf.put_u8(2);
                 buf.put_u64_le(high_watermark.get());
             }
-            Self::AppendBlobBatch { blobs } => {
+            Self::AppendBlobBatch { blobs, base_offset } => {
                 buf.put_u8(4); // Command type for batch.
+                buf.put_u64_le(base_offset.get()); // Encode base_offset for all replicas.
                 // Safe cast: blob count bounded by MAX_BATCH_REQUESTS (1000).
                 #[allow(clippy::cast_possible_truncation)]
                 let blob_count = blobs.len() as u32;
@@ -494,10 +505,11 @@ impl PartitionCommand {
                 Some(Self::UpdateHighWatermark { high_watermark })
             }
             3 => {
-                // AppendBlob: record_count (u32) + format (u8) + blob_len (u32) + blob.
-                if buf.remaining() < 9 {
+                // AppendBlob: base_offset (u64) + record_count (u32) + format (u8) + blob_len (u32) + blob.
+                if buf.remaining() < 17 {
                     return None;
                 }
+                let base_offset = Offset::new(buf.get_u64_le());
                 let record_count = buf.get_u32_le();
                 let format_byte = buf.get_u8();
                 let format = match format_byte {
@@ -510,13 +522,14 @@ impl PartitionCommand {
                     return None;
                 }
                 let blob = buf.copy_to_bytes(blob_len);
-                Some(Self::AppendBlob { blob, record_count, format })
+                Some(Self::AppendBlob { blob, record_count, format, base_offset })
             }
             4 => {
-                // AppendBlobBatch: blob_count (u32) + [record_count (u32) + format (u8) + blob_len (u32) + blob bytes]...
-                if buf.remaining() < 4 {
+                // AppendBlobBatch: base_offset (u64) + blob_count (u32) + [record_count (u32) + format (u8) + blob_len (u32) + blob bytes]...
+                if buf.remaining() < 12 {
                     return None;
                 }
+                let base_offset = Offset::new(buf.get_u64_le());
                 // Safe cast: blob count bounded by MAX_BATCH_REQUESTS (1000).
                 #[allow(clippy::cast_possible_truncation)]
                 let blob_count = buf.get_u32_le() as usize;
@@ -542,7 +555,7 @@ impl PartitionCommand {
                     let blob = buf.copy_to_bytes(blob_len);
                     blobs.push(BatchedBlob { blob, record_count, format });
                 }
-                Some(Self::AppendBlobBatch { blobs })
+                Some(Self::AppendBlobBatch { blobs, base_offset })
             }
             _ => None,
         }
@@ -846,12 +859,134 @@ impl Partition {
 
         let base_offset = self.blob_log_end_offset;
 
+        // Debug: log calls to non-idempotent append_blob.
+        // This path should only be used during WAL recovery, NOT live writes.
+        tracing::info!(
+            topic = %self.config.topic_id,
+            partition = %self.config.partition_id,
+            base_offset = base_offset.get(),
+            record_count = record_count,
+            existing_blobs = self.blobs.len(),
+            "APPEND_BLOB_SEQUENTIAL: entry (non-idempotent path)"
+        );
+
         // Store the blob as-is with its metadata.
         // Protocol-specific transformations (like Kafka baseOffset patching) happen at read time.
         self.blobs.push(StoredBlob::new(base_offset, record_count, blob));
 
         // Advance the log end offset.
         self.blob_log_end_offset = Offset::new(base_offset.get() + u64::from(record_count));
+
+        Ok(base_offset)
+    }
+
+    /// Appends a blob at a specific offset (leader-assigned).
+    ///
+    /// This variant is used for Raft-based replication where the leader assigns
+    /// the offset at propose time to ensure all replicas use the same offset.
+    ///
+    /// # Arguments
+    /// * `blob` - Raw blob data.
+    /// * `record_count` - Number of records in the blob.
+    /// * `base_offset` - Leader-assigned offset to store the blob at.
+    ///
+    /// # Returns
+    /// The base offset (same as input, for API consistency).
+    ///
+    /// # Errors
+    /// Returns an error if the partition is closed.
+    pub fn append_blob_at_offset(
+        &mut self,
+        blob: Bytes,
+        record_count: u32,
+        base_offset: Offset,
+    ) -> PartitionResult<Offset> {
+        if self.closed {
+            return Err(PartitionError::Closed);
+        }
+
+        // Debug: log every call to this function to trace duplicates.
+        tracing::info!(
+            topic = %self.config.topic_id,
+            partition = %self.config.partition_id,
+            base_offset = base_offset.get(),
+            record_count = record_count,
+            existing_blobs = self.blobs.len(),
+            "APPEND_BLOB_AT_OFFSET: entry"
+        );
+
+        // Check for overlapping blobs and apply idempotency (defense in depth).
+        // This can happen if two different Raft entries are assigned the same base_offset
+        // during failover, when a new leader doesn't know about old leader's uncommitted
+        // proposals. The batcher should prevent this, but we add storage-level protection.
+        let new_end = Offset::new(base_offset.get() + u64::from(record_count));
+        for existing in &self.blobs {
+            let existing_end = existing.next_offset();
+            // Check if this blob's base_offset matches an existing blob's base_offset.
+            // If so, this is a duplicate proposal and we skip it (idempotent).
+            if base_offset == existing.base_offset {
+                // Extract payload preview for debugging.
+                let preview: String = blob
+                    .iter()
+                    .rev()
+                    .take(30)
+                    .filter(|b| b.is_ascii_alphanumeric() || **b == b'-' || **b == b'_')
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .map(char::from)
+                    .collect();
+                let existing_preview: String = existing
+                    .data
+                    .iter()
+                    .rev()
+                    .take(30)
+                    .filter(|b| b.is_ascii_alphanumeric() || **b == b'-' || **b == b'_')
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .map(char::from)
+                    .collect();
+                tracing::warn!(
+                    base_offset = base_offset.get(),
+                    new_payload = %preview,
+                    existing_payload = %existing_preview,
+                    same_data = (blob == existing.data),
+                    "OFFSET_DEDUP: Skipping blob with same base_offset (idempotent)"
+                );
+                // Return success - this is idempotent duplicate, client already notified.
+                return Ok(base_offset);
+            }
+            // Check if ranges overlap (different base_offset but ranges intersect).
+            // This can happen during failover when a PREVIOUS_TERM entry commits
+            // with an offset range that overlaps with a newer entry.
+            // Skip storing the overlapping blob to prevent duplicates.
+            if base_offset.get() < existing_end.get() && new_end.get() > existing.base_offset.get()
+            {
+                tracing::warn!(
+                    new_base = base_offset.get(),
+                    new_end = new_end.get(),
+                    existing_base = existing.base_offset.get(),
+                    existing_end = existing_end.get(),
+                    "OVERLAP_SKIP: Skipping blob with overlapping offset range (idempotent)"
+                );
+                // Skip this blob - it overlaps with existing data.
+                // This is idempotent behavior during failover.
+                return Ok(base_offset);
+            }
+        }
+
+        // Store the blob at the leader-assigned offset.
+        self.blobs.push(StoredBlob::new(base_offset, record_count, blob.clone()));
+
+        // Update the log end offset to be after this blob.
+        // This ensures consistency even if entries arrive out of order due to
+        // concurrent PREVIOUS_TERM entry processing.
+        if new_end > self.blob_log_end_offset {
+            self.blob_log_end_offset = new_end;
+        }
 
         Ok(base_offset)
     }
@@ -1573,7 +1708,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         self.cache.blob_log_start_offset()
     }
 
-    /// Appends a blob to the partition at the specified Raft index.
+    /// Appends a blob to the partition at the specified Raft index and offset.
     ///
     /// The blob is written to WAL for durability, then applied to the
     /// in-memory cache. No parsing or conversion is performed. The Raft
@@ -1583,9 +1718,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
     /// * `raft_index` - The Raft log index for this entry
     /// * `blob` - Raw blob data (e.g., Kafka `RecordBatch` bytes).
     /// * `record_count` - Number of records in the blob (for offset allocation).
+    /// * `base_offset` - The leader-assigned offset for this blob.
     ///
     /// # Returns
-    /// The base offset assigned to this blob.
+    /// The base offset (same as input, for consistency).
     ///
     /// # Errors
     /// Returns an error if the write fails.
@@ -1594,8 +1730,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         raft_index: u64,
         blob: Bytes,
         record_count: u32,
+        base_offset: Offset,
     ) -> Result<Offset, DurablePartitionError> {
-        let base_offset = self.cache.blob_log_end_offset();
+        // Use the leader-assigned base_offset for consistency across replicas.
         let blob_size = blob.len();
 
         // Create WAL entry with blob command.
@@ -1605,6 +1742,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             blob: blob.clone(),
             record_count,
             format: BlobFormat::Raw,
+            base_offset,
         };
         let data = command.encode();
 
@@ -1640,8 +1778,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             }
         };
 
-        // Update in-memory cache.
-        self.cache.append_blob(blob, record_count).map_err(|e| {
+        // Update in-memory cache at the leader-assigned offset.
+        // This uses append_blob_at_offset which has idempotency checking to skip
+        // duplicates that might occur during failover.
+        self.cache.append_blob_at_offset(blob, record_count, base_offset).map_err(|e| {
             DurablePartitionError::CacheUpdate {
                 message: e.to_string(),
             }
@@ -1686,9 +1826,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         blob: Bytes,
         record_count: u32,
     ) -> Result<Offset, DurablePartitionError> {
-        // Auto-assign the next index.
+        // Auto-assign the next index and offset (for non-replicated use cases).
         let next_index = self.last_applied_index + 1;
-        self.append_blob_at_index(next_index, blob, record_count).await
+        let base_offset = self.cache.blob_log_end_offset();
+        self.append_blob_at_index(next_index, blob, record_count, base_offset).await
     }
 
     /// Reads blobs starting at the given offset.
@@ -1750,19 +1891,43 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             last: Offset::new(0),
         })?;
 
+        // Debug: log WAL recovery entries.
+        tracing::info!(
+            wal_index = entry.index(),
+            command_type = ?std::mem::discriminant(&command),
+            "WAL_RECOVERY: applying entry"
+        );
+
         match command {
             PartitionCommand::Append { records, .. } => {
                 cache.append(records)?;
             }
-            PartitionCommand::AppendBlob { blob, record_count, .. } => {
+            PartitionCommand::AppendBlob { blob, record_count, base_offset, .. } => {
                 // During WAL recovery, blobs are already in the correct format
-                // (patching happened at original apply time). Store as-is.
-                cache.append_blob(blob, record_count)?;
+                // (patching happened at original apply time). Store at the leader-assigned offset.
+                // Use append_blob_at_offset for idempotency - this prevents duplicates if the
+                // WAL contains overlapping entries from failover scenarios.
+                tracing::info!(
+                    wal_index = entry.index(),
+                    base_offset = base_offset.get(),
+                    record_count = record_count,
+                    "WAL_RECOVERY_BLOB: using idempotent append at offset"
+                );
+                cache.append_blob_at_offset(blob, record_count, base_offset)?;
             }
-            PartitionCommand::AppendBlobBatch { blobs } => {
-                // During WAL recovery, batch blobs are already patched. Apply each.
+            PartitionCommand::AppendBlobBatch { blobs, base_offset, .. } => {
+                // During WAL recovery, batch blobs are already patched. Apply each at its offset.
+                // Use append_blob_at_offset for idempotency - prevents duplicates from failover.
+                tracing::info!(
+                    wal_index = entry.index(),
+                    batch_base_offset = base_offset.get(),
+                    num_blobs = blobs.len(),
+                    "WAL_RECOVERY_BATCH: using idempotent append at offset"
+                );
+                let mut current_offset = base_offset;
                 for batched in blobs {
-                    cache.append_blob(batched.blob, batched.record_count)?;
+                    cache.append_blob_at_offset(batched.blob, batched.record_count, current_offset)?;
+                    current_offset = Offset::new(current_offset.get() + u64::from(batched.record_count));
                 }
             }
             PartitionCommand::Truncate { from_offset } => {
@@ -1802,15 +1967,20 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             PartitionCommand::AppendBlob {
                 blob,
                 record_count,
+                base_offset,
                 ..
             } => {
                 // During WAL recovery, blobs are already in the correct format.
-                cache.append_blob(blob, record_count)?;
+                // Use append_blob_at_offset for idempotency - prevents duplicates from failover.
+                cache.append_blob_at_offset(blob, record_count, base_offset)?;
             }
-            PartitionCommand::AppendBlobBatch { blobs } => {
-                // During WAL recovery, batch blobs are already patched. Apply each.
+            PartitionCommand::AppendBlobBatch { blobs, base_offset, .. } => {
+                // During WAL recovery, batch blobs are already patched. Apply each at its offset.
+                // Use append_blob_at_offset for idempotency - prevents duplicates from failover.
+                let mut current_offset = base_offset;
                 for batched in blobs {
-                    cache.append_blob(batched.blob, batched.record_count)?;
+                    cache.append_blob_at_offset(batched.blob, batched.record_count, current_offset)?;
+                    current_offset = Offset::new(current_offset.get() + u64::from(batched.record_count));
                 }
             }
             PartitionCommand::Truncate { from_offset } => {
@@ -2711,10 +2881,12 @@ mod tests {
     #[test]
     fn test_partition_command_blob_roundtrip() {
         let blob = Bytes::from("test-kafka-batch-data");
+        let test_offset = Offset::new(42);
         let cmd = PartitionCommand::AppendBlob {
             blob: blob.clone(),
             record_count: 5,
             format: BlobFormat::KafkaRecordBatch,
+            base_offset: test_offset,
         };
         let encoded = cmd.encode();
         let decoded = PartitionCommand::decode(&encoded).unwrap();
@@ -2724,10 +2896,12 @@ mod tests {
                 blob: decoded_blob,
                 record_count,
                 format,
+                base_offset,
             } => {
                 assert_eq!(decoded_blob, blob);
                 assert_eq!(record_count, 5);
                 assert_eq!(format, BlobFormat::KafkaRecordBatch);
+                assert_eq!(base_offset, test_offset);
             }
             _ => panic!("wrong command type"),
         }

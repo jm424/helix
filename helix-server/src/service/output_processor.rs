@@ -38,14 +38,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use helix_core::{GroupId, LogIndex, Offset};
+use bytes::Bytes;
+use helix_core::{GroupId, LogIndex, Offset, ProducerEpoch, ProducerId, SequenceNum};
 use helix_runtime::TransportHandle;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::error::ServerError;
 use crate::group_map::GroupMap;
+use crate::kafka::extract_producer_info;
 use crate::partition_storage::ServerPartitionStorage;
+use crate::storage::{BlobFormat, PartitionCommand};
 
 use super::batcher::BackpressureState;
 use super::partition_actor::{BatchNotifyInfo, GroupedOutput, PartitionOutput};
@@ -240,13 +243,33 @@ async fn handle_entry_committed(
     };
 
     if let Some(batch_proposal) = batch_proposal {
-        // Batch proposal path: get base offset BEFORE apply.
-        let base_offset = {
-            let storage = partition_storage.read().await;
-            storage
-                .get(&group_id)
-                .map_or(Offset::new(0), ServerPartitionStorage::blob_log_end_offset)
+        // Extract base_offset from the encoded command - this was captured by the leader
+        // at propose time and must be used by ALL replicas for consistency.
+        // CRITICAL: Do NOT read base_offset from storage - that would be wrong on
+        // followers where storage state differs from the original leader.
+        let base_offset = match PartitionCommand::decode(data) {
+            Some(PartitionCommand::AppendBlobBatch { base_offset, .. }) => base_offset,
+            Some(PartitionCommand::AppendBlob { base_offset, .. }) => base_offset,
+            _ => {
+                warn!(
+                    group = group_id.get(),
+                    index = index.get(),
+                    "Failed to extract base_offset from command, falling back to storage"
+                );
+                // Fallback to storage for backwards compatibility with old commands.
+                let storage = partition_storage.read().await;
+                storage
+                    .get(&group_id)
+                    .map_or(Offset::new(0), ServerPartitionStorage::blob_log_end_offset)
+            }
         };
+
+        info!(
+            group = group_id.get(),
+            index = index.get(),
+            base_offset = base_offset.get(),
+            "COMMIT_OFFSET: Using base_offset from encoded command for client notification"
+        );
 
         // Apply the batch entry.
         let apply_result = {
@@ -366,6 +389,20 @@ async fn handle_entry_committed(
         // This can happen for:
         // 1. Entries replicated from leader (follower commits)
         // 2. Entries proposed via non-batcher path
+        // 3. PREVIOUS_TERM entries committed by new leader via no-op
+        //
+        // CRITICAL: We must extract and record producer state from the entry data.
+        // Without this, a new leader won't know about producer sequences from
+        // PREVIOUS_TERM entries, causing duplicate detection to fail.
+
+        // Get base_offset BEFORE apply (needed for producer state recording).
+        let base_offset = {
+            let storage = partition_storage.read().await;
+            storage
+                .get(&group_id)
+                .map_or(Offset::new(0), ServerPartitionStorage::blob_log_end_offset)
+        };
+
         let apply_result = {
             let mut storage = partition_storage.write().await;
             if let Some(ps) = storage.get_mut(&group_id) {
@@ -387,13 +424,118 @@ async fn handle_entry_committed(
                 "Failed to apply committed entry (actor mode)"
             );
         } else {
+            // Extract and record producer state from the entry data.
+            // This ensures idempotent deduplication works correctly even for
+            // entries committed by a new leader (PREVIOUS_TERM entries).
+            extract_and_record_producer_state(
+                data,
+                base_offset,
+                group_id,
+                partition_storage,
+            )
+            .await;
+
             debug!(
                 topic = topic_id.get(),
                 partition = partition_id.get(),
                 index = index.get(),
-                "Applied committed entry (actor mode)"
+                base_offset = base_offset.get(),
+                "Applied committed entry with producer state (actor mode)"
             );
         }
+    }
+}
+
+/// Extracts producer info from a committed entry and records it in the partition state.
+///
+/// This is critical for handling PREVIOUS_TERM entries on a new leader. When a new
+/// leader takes over, it commits uncommitted entries from the previous term via its
+/// no-op entry. Without recording producer state from these entries, the new leader
+/// would not know about the sequences accepted by the old leader, causing:
+/// - Duplicate entries when clients retry
+/// - Offset gaps in the data
+///
+/// # Entry Formats Handled
+///
+/// - `AppendBlob` with `KafkaRecordBatch`: Single blob with producer info in header
+/// - `AppendBlobBatch`: Multiple blobs, each with producer info in header
+pub async fn extract_and_record_producer_state(
+    data: &Bytes,
+    base_offset: Offset,
+    group_id: GroupId,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
+) {
+    // Decode the partition command to access blob data.
+    let Some(command) = PartitionCommand::decode(data) else {
+        return;
+    };
+
+    match command {
+        PartitionCommand::AppendBlob {
+            blob,
+            record_count,
+            format,
+            ..
+        } => {
+            if format == BlobFormat::KafkaRecordBatch {
+                if let Some(info) = extract_producer_info(&blob) {
+                    if info.is_idempotent() {
+                        let mut storage = partition_storage.write().await;
+                        if let Some(ps) = storage.get_mut(&group_id) {
+                            ps.record_producer_sequence(
+                                ProducerId::new(info.producer_id as u64),
+                                ProducerEpoch::new(info.epoch as u16),
+                                SequenceNum::new(info.base_sequence),
+                                base_offset,
+                            );
+                            debug!(
+                                group = group_id.get(),
+                                producer_id = info.producer_id,
+                                epoch = info.epoch,
+                                sequence = info.base_sequence,
+                                offset = base_offset.get(),
+                                record_count,
+                                "Recorded producer state from committed entry"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        PartitionCommand::AppendBlobBatch { blobs, .. } => {
+            // Process each blob in the batch, accumulating offsets.
+            let mut cumulative_offset = base_offset;
+            for batched in blobs {
+                if batched.format == BlobFormat::KafkaRecordBatch {
+                    if let Some(info) = extract_producer_info(&batched.blob) {
+                        if info.is_idempotent() {
+                            let mut storage = partition_storage.write().await;
+                            if let Some(ps) = storage.get_mut(&group_id) {
+                                ps.record_producer_sequence(
+                                    ProducerId::new(info.producer_id as u64),
+                                    ProducerEpoch::new(info.epoch as u16),
+                                    SequenceNum::new(info.base_sequence),
+                                    cumulative_offset,
+                                );
+                                debug!(
+                                    group = group_id.get(),
+                                    producer_id = info.producer_id,
+                                    epoch = info.epoch,
+                                    sequence = info.base_sequence,
+                                    offset = cumulative_offset.get(),
+                                    record_count = batched.record_count,
+                                    "Recorded producer state from batched entry"
+                                );
+                            }
+                        }
+                    }
+                }
+                // Advance offset for next blob in batch.
+                cumulative_offset = Offset::new(cumulative_offset.get() + u64::from(batched.record_count));
+            }
+        }
+        // Other command types don't have producer state to record.
+        _ => {}
     }
 }
 
@@ -639,12 +781,14 @@ mod tests {
 
         // Create valid batch entry data.
         use crate::storage::{BatchedBlob, BlobFormat, PartitionCommand};
+        use helix_core::Offset;
         let command = PartitionCommand::AppendBlobBatch {
             blobs: vec![BatchedBlob {
                 blob: Bytes::from("test"),
                 record_count: 1,
                 format: BlobFormat::Raw,
             }],
+            base_offset: Offset::new(0),
         };
         let data = command.encode();
 

@@ -8,7 +8,39 @@ use std::path::PathBuf;
 use bytes::Bytes;
 use helix_core::{LogIndex, Offset, PartitionId, ProducerEpoch, ProducerId, Record, SequenceNum, TopicId};
 use helix_wal::{SharedEntry, SharedWalHandle, Storage, TokioStorage};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
+
+/// Extract a preview of the payload from a Kafka RecordBatch for debugging.
+/// Returns the first ~30 bytes of the record value as a string.
+fn extract_payload_preview(blob: &Bytes) -> String {
+    // Kafka RecordBatch structure:
+    // - 8 bytes: base offset
+    // - 4 bytes: batch length
+    // - ... headers ...
+    // - Records start after ~57 bytes from start
+    // Each record has: length (varint), attributes, timestamp delta, offset delta, key, value
+    // This is a rough extraction - just grab ASCII bytes from the end of the blob.
+    if blob.len() < 60 {
+        return format!("<blob len={}>", blob.len());
+    }
+
+    // Scan backwards from end looking for ASCII text (the payload).
+    let mut preview = Vec::new();
+    for &b in blob.iter().rev().take(50) {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' {
+            preview.push(b);
+        } else if !preview.is_empty() {
+            break;
+        }
+    }
+    preview.reverse();
+
+    if preview.is_empty() {
+        format!("<no ascii, len={}>", blob.len())
+    } else {
+        String::from_utf8_lossy(&preview).to_string()
+    }
+}
 
 use crate::error::{ServerError, ServerResult};
 use crate::producer_state::{PartitionProducerState, SequenceCheckResult};
@@ -315,7 +347,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     ///
     /// Updates the producer state with the new sequence number and offset.
     /// This should be called after the batch has been committed to Raft.
-    #[allow(dead_code)] // Will be used in append_blob integration.
+    ///
+    /// This is called from:
+    /// - blob.rs handlers after batch commit (leader path)
+    /// - output_processor.rs when applying committed entries (follower/PREVIOUS_TERM path)
     pub fn record_producer_sequence(
         &mut self,
         producer_id: ProducerId,
@@ -405,9 +440,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
 
                     Some(offset)
                 }
-                PartitionCommand::AppendBlob { blob, record_count, format, .. } => {
-                    // Get the offset that will be assigned before appending.
-                    let base_offset = partition.blob_log_end_offset();
+                PartitionCommand::AppendBlob { blob, record_count, format, base_offset } => {
+                    // Use base_offset from command - assigned by leader at propose time.
+                    // This ensures all replicas use the same offset for consistency.
 
                     // Apply protocol-specific patching if needed.
                     let blob_to_store = match format {
@@ -415,7 +450,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                         BlobFormat::KafkaRecordBatch => patch_kafka_base_offset(blob, base_offset),
                     };
 
-                    let offset = partition.append_blob(blob_to_store, record_count).map_err(|e| {
+                    partition.append_blob(blob_to_store, record_count).map_err(|e| {
                         ServerError::Internal {
                             message: format!("failed to append blob: {e}"),
                         }
@@ -429,12 +464,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                         partition = %self.partition_id,
                         index = %index,
                         record_count = record_count,
-                        base_offset = %offset,
+                        base_offset = %base_offset,
                         new_hwm = %new_hwm,
                         format = ?format,
                         "applied blob"
                     );
-                    Some(offset)
+                    Some(base_offset)
                 }
                 PartitionCommand::Truncate { from_offset } => {
                     debug!(
@@ -460,13 +495,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                     partition.set_high_watermark(high_watermark);
                     None
                 }
-                PartitionCommand::AppendBlobBatch { blobs } => {
-                    // Get the first offset that will be assigned.
-                    let first_base_offset = partition.blob_log_end_offset();
+                PartitionCommand::AppendBlobBatch { blobs, base_offset } => {
+                    // Use base_offset from command - assigned by leader at propose time.
+                    // This ensures all replicas use the same offset for consistency.
 
-                    // Apply each blob in sequence.
+                    // Apply each blob in sequence, computing current offset from base.
+                    let mut current_offset = base_offset;
                     for batched in blobs {
-                        let current_offset = partition.blob_log_end_offset();
                         let blob_to_store = match batched.format {
                             BlobFormat::Raw => batched.blob,
                             BlobFormat::KafkaRecordBatch => {
@@ -478,6 +513,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                                 message: format!("failed to append blob in batch: {e}"),
                             }
                         })?;
+                        // Advance offset for next blob in batch.
+                        current_offset = Offset::new(current_offset.get() + u64::from(batched.record_count));
                     }
 
                     let new_hwm = partition.blob_log_end_offset();
@@ -487,11 +524,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                         topic = %self.topic_id,
                         partition = %self.partition_id,
                         index = %index,
-                        first_base_offset = %first_base_offset,
+                        base_offset = %base_offset,
                         new_hwm = %new_hwm,
                         "applied blob batch (sync)"
                     );
-                    Some(first_base_offset)
+                    Some(base_offset)
                 }
             },
             PartitionStorageInner::Durable(_) => {
@@ -548,7 +585,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
 
         let base_offset = match &mut self.inner {
             PartitionStorageInner::InMemory(partition) => match command {
-                PartitionCommand::Append { records } => {
+                PartitionCommand::Append { records, .. } => {
                     let offset = partition.append(records).map_err(|e| ServerError::Internal {
                         message: format!("failed to append: {e}"),
                     })?;
@@ -558,8 +595,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
 
                     Some(offset)
                 }
-                PartitionCommand::AppendBlob { blob, record_count, format } => {
-                    let base_offset = partition.blob_log_end_offset();
+                PartitionCommand::AppendBlob { blob, record_count, format, base_offset } => {
+                    // Use base_offset from command - assigned by leader at propose time.
+
+                    // Extract payload preview for debugging offset bugs.
+                    let payload_preview = extract_payload_preview(&blob);
 
                     // Apply protocol-specific patching if needed.
                     let blob_to_store = match format {
@@ -567,7 +607,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                         BlobFormat::KafkaRecordBatch => patch_kafka_base_offset(blob, base_offset),
                     };
 
-                    let offset = partition.append_blob(blob_to_store, record_count).map_err(|e| {
+                    // Use append_blob_at_offset to store at the leader-assigned offset.
+                    // This ensures all replicas use the same offset, even with concurrent
+                    // PREVIOUS_TERM entry processing.
+                    partition.append_blob_at_offset(blob_to_store, record_count, base_offset).map_err(|e| {
                         ServerError::Internal {
                             message: format!("failed to append blob: {e}"),
                         }
@@ -576,17 +619,17 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                     let new_hwm = partition.blob_log_end_offset();
                     partition.set_high_watermark(new_hwm);
 
-                    debug!(
+                    info!(
                         topic = %self.topic_id,
                         partition = %self.partition_id,
                         index = %index,
                         record_count = record_count,
-                        base_offset = %offset,
+                        base_offset = %base_offset,
                         new_hwm = %new_hwm,
-                        format = ?format,
-                        "applied blob"
+                        payload_preview = %payload_preview,
+                        "APPLY_BLOB: stored at offset"
                     );
-                    Some(offset)
+                    Some(base_offset)
                 }
                 PartitionCommand::Truncate { from_offset } => {
                     debug!(
@@ -612,24 +655,35 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                     partition.set_high_watermark(high_watermark);
                     None
                 }
-                PartitionCommand::AppendBlobBatch { blobs } => {
-                    // Get the first offset that will be assigned.
-                    let first_base_offset = partition.blob_log_end_offset();
+                PartitionCommand::AppendBlobBatch { blobs, base_offset } => {
+                    // Use base_offset from command - assigned by leader at propose time.
+                    // This ensures all replicas use the same offset for consistency.
 
-                    // Apply each blob in sequence.
-                    for batched in blobs {
-                        let current_offset = partition.blob_log_end_offset();
+                    // Apply each blob in sequence starting from leader-assigned offset.
+                    let mut current_offset = base_offset;
+                    for batched in &blobs {
+                        let payload_preview = extract_payload_preview(&batched.blob);
+                        info!(
+                            topic = %self.topic_id,
+                            partition = %self.partition_id,
+                            index = %index,
+                            offset = %current_offset,
+                            payload = %payload_preview,
+                            "APPLY_BATCH: storing blob"
+                        );
                         let blob_to_store = match batched.format {
-                            BlobFormat::Raw => batched.blob,
+                            BlobFormat::Raw => batched.blob.clone(),
                             BlobFormat::KafkaRecordBatch => {
-                                patch_kafka_base_offset(batched.blob, current_offset)
+                                patch_kafka_base_offset(batched.blob.clone(), current_offset)
                             }
                         };
-                        partition.append_blob(blob_to_store, batched.record_count).map_err(|e| {
+                        // Use append_blob_at_offset to store at the leader-assigned offset.
+                        partition.append_blob_at_offset(blob_to_store, batched.record_count, current_offset).map_err(|e| {
                             ServerError::Internal {
                                 message: format!("failed to append blob in batch: {e}"),
                             }
                         })?;
+                        current_offset = Offset::new(current_offset.get() + u64::from(batched.record_count));
                     }
 
                     let new_hwm = partition.blob_log_end_offset();
@@ -639,11 +693,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                         topic = %self.topic_id,
                         partition = %self.partition_id,
                         index = %index,
-                        first_base_offset = %first_base_offset,
+                        base_offset = %base_offset,
                         new_hwm = %new_hwm,
                         "applied blob batch"
                     );
-                    Some(first_base_offset)
+                    Some(base_offset)
                 }
             },
             PartitionStorageInner::Durable(partition) => match command {
@@ -657,9 +711,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                     })?;
                     Some(offset)
                 }
-                PartitionCommand::AppendBlob { blob, record_count, format, .. } => {
-                    // Get the offset that will be assigned before appending.
-                    let base_offset = partition.blob_log_end_offset();
+                PartitionCommand::AppendBlob { blob, record_count, format, base_offset } => {
+                    // Use base_offset from command - assigned by leader at propose time.
 
                     // Apply protocol-specific patching if needed.
                     let blob_to_store = match format {
@@ -667,13 +720,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                         BlobFormat::KafkaRecordBatch => patch_kafka_base_offset(blob, base_offset),
                     };
 
-                    // Use append_blob_at_index with the Raft index.
-                    let offset = partition.append_blob_at_index(index.get(), blob_to_store, record_count).await.map_err(|e| {
+                    // Use append_blob_at_index with the Raft index AND leader-assigned offset.
+                    partition.append_blob_at_index(index.get(), blob_to_store, record_count, base_offset).await.map_err(|e| {
                         ServerError::Internal {
                             message: format!("failed to append blob: {e}"),
                         }
                     })?;
-                    Some(offset)
+                    Some(base_offset)
                 }
                 PartitionCommand::Truncate { from_offset: _ } => {
                     // TODO: Implement truncate for durable partition.
@@ -684,37 +737,43 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                     partition.set_high_watermark(high_watermark);
                     None
                 }
-                PartitionCommand::AppendBlobBatch { blobs } => {
-                    // Get the first offset that will be assigned.
-                    let first_base_offset = partition.blob_log_end_offset();
-
-                    // Note: For blob batches, we use the single index for all blobs.
-                    // This is semantically correct since they're all part of the same
-                    // Raft entry and will all be recovered together.
-                    for batched in blobs {
-                        let current_offset = partition.blob_log_end_offset();
+                PartitionCommand::AppendBlobBatch { blobs, base_offset } => {
+                    // Use base_offset from command - assigned by leader at propose time.
+                    // This ensures all replicas use the same offset for consistency.
+                    let mut current_offset = base_offset;
+                    for batched in &blobs {
+                        let payload_preview = extract_payload_preview(&batched.blob);
+                        info!(
+                            topic = %self.topic_id,
+                            partition = %self.partition_id,
+                            index = %index,
+                            offset = %current_offset,
+                            payload = %payload_preview,
+                            "APPLY_BATCH: storing blob"
+                        );
                         let blob_to_store = match batched.format {
-                            BlobFormat::Raw => batched.blob,
+                            BlobFormat::Raw => batched.blob.clone(),
                             BlobFormat::KafkaRecordBatch => {
-                                patch_kafka_base_offset(batched.blob, current_offset)
+                                patch_kafka_base_offset(batched.blob.clone(), current_offset)
                             }
                         };
-                        partition.append_blob_at_index(index.get(), blob_to_store, batched.record_count).await.map_err(|e| {
+                        partition.append_blob_at_index(index.get(), blob_to_store, batched.record_count, current_offset).await.map_err(|e| {
                             ServerError::Internal {
                                 message: format!("failed to append blob in batch: {e}"),
                             }
                         })?;
+                        current_offset = Offset::new(current_offset.get() + u64::from(batched.record_count));
                     }
 
                     debug!(
                         topic = %self.topic_id,
                         partition = %self.partition_id,
                         index = %index,
-                        first_base_offset = %first_base_offset,
+                        base_offset = %base_offset,
                         new_log_end = %partition.blob_log_end_offset(),
                         "applied blob batch (durable)"
                     );
-                    Some(first_base_offset)
+                    Some(base_offset)
                 }
             },
         };

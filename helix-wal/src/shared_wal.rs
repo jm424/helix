@@ -175,14 +175,14 @@ impl<S: Storage> SharedWal<S> {
         index: u64,
         payload: Bytes,
     ) -> WalResult<()> {
-        // TigerStyle: Assert per-partition sequential indices.
+        // TigerStyle: Assert per-partition indices are strictly increasing.
+        // Gaps are allowed to support cases where NOOP entries are skipped.
         if let Some(state) = self.partition_state.get(&partition_id) {
-            assert_eq!(
-                index,
-                state.last_index + 1,
-                "partition {} index must be sequential: expected {}, got {}",
+            assert!(
+                index > state.last_index,
+                "partition {} index must be greater than last: last {}, got {}",
                 partition_id,
-                state.last_index + 1,
+                state.last_index,
                 index
             );
             assert!(
@@ -240,12 +240,11 @@ impl<S: Storage> SharedWal<S> {
             let term = entry.term();
 
             if let Some(state) = self.partition_state.get(&partition_id) {
-                assert_eq!(
-                    index,
-                    state.last_index + 1,
-                    "partition {} index must be sequential: expected {}, got {}",
+                assert!(
+                    index > state.last_index,
+                    "partition {} index must be greater than last: last {}, got {}",
                     partition_id,
-                    state.last_index + 1,
+                    state.last_index,
                     index
                 );
                 assert!(
@@ -1672,8 +1671,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "index must be sequential")]
-    async fn test_shared_wal_asserts_sequential_index() {
+    async fn test_shared_wal_allows_index_gaps() {
+        // Gaps are allowed to support explicit index mode where NOOP entries
+        // may be skipped (e.g., Raft PREVIOUS_TERM entries).
         let temp_dir = tempfile::tempdir().unwrap();
         let config = SharedWalConfig::new(temp_dir.path());
 
@@ -1682,7 +1682,29 @@ mod tests {
         let p1 = PartitionId::new(1);
 
         wal.append(p1, 1, 1, Bytes::from("p1-1")).await.unwrap();
-        // Skip index 2 - should panic.
+        // Skip index 2 - gaps are allowed.
+        wal.append(p1, 1, 3, Bytes::from("p1-3")).await.unwrap();
+        wal.sync().await.unwrap();
+
+        let entries = wal.entries_for_partition(p1);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].index(), 1);
+        assert_eq!(entries[1].index(), 3);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "index must be greater than last")]
+    async fn test_shared_wal_rejects_out_of_order_index() {
+        // Out-of-order (going backwards) is still rejected.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = SharedWalConfig::new(temp_dir.path());
+
+        let mut wal = SharedWal::open(TokioStorage::new(), config).await.unwrap();
+
+        let p1 = PartitionId::new(1);
+
+        wal.append(p1, 1, 5, Bytes::from("p1-5")).await.unwrap();
+        // Going backwards - should panic.
         wal.append(p1, 1, 3, Bytes::from("p1-3")).await.unwrap();
     }
 

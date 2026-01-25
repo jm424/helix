@@ -18,13 +18,14 @@ use crate::controller::{ControllerCommand, ControllerState, CONTROLLER_GROUP_ID}
 use crate::error::ServerError;
 use crate::group_map::GroupMap;
 use crate::partition_storage::ServerPartitionStorage;
+use crate::storage::PartitionCommand;
 use helix_tier::TieringConfig;
 #[cfg(feature = "s3")]
 use helix_tier::S3Config;
 
 use super::{
-    BatchPendingProposal, BatcherStats, PendingControllerProposal, PendingProposal,
-    TICK_INTERVAL_MS,
+    output_processor::extract_and_record_producer_state, BatchPendingProposal, BatcherStats,
+    PendingControllerProposal, PendingProposal, TICK_INTERVAL_MS,
 };
 
 /// Interval for sending broker heartbeats to the controller (in milliseconds).
@@ -43,6 +44,44 @@ pub const HEARTBEAT_INTERVAL_MS: u64 = 1_000; // 1 second.
 /// - Marking committed segments as eligible for tiering
 /// - Uploading eligible segments to object storage (S3/filesystem)
 pub const TIERING_INTERVAL_MS: u64 = 5_000; // 5 seconds.
+
+/// Extract a payload preview from a CommitEntry's data for diagnostic logging.
+///
+/// Decodes the PartitionCommand and extracts the first ~30 bytes of ASCII text
+/// from the first blob (if present). This helps correlate NOTIFY_CLIENT logs
+/// with the actual data being committed.
+fn extract_commit_payload_preview(data: &bytes::Bytes) -> String {
+    let Some(command) = PartitionCommand::decode(data) else {
+        return "<decode failed>".to_string();
+    };
+
+    let blob = match &command {
+        PartitionCommand::AppendBlob { blob, .. } => blob,
+        PartitionCommand::AppendBlobBatch { blobs, .. } => {
+            if blobs.is_empty() {
+                return "<empty batch>".to_string();
+            }
+            &blobs[0].blob
+        }
+        _ => return "<non-blob command>".to_string(),
+    };
+
+    // Extract ASCII text from the end of the blob (where payload typically is).
+    if blob.len() < 60 {
+        return format!("<blob len={}>", blob.len());
+    }
+
+    let mut preview = Vec::new();
+    for &b in blob.iter().rev().take(50) {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' {
+            preview.push(b);
+        } else if !preview.is_empty() {
+            break;
+        }
+    }
+    preview.reverse();
+    String::from_utf8(preview).unwrap_or_else(|_| "<non-utf8>".to_string())
+}
 
 /// Background task to handle Raft ticks for all groups (single-node).
 #[allow(clippy::significant_drop_tightening)]
@@ -135,6 +174,7 @@ pub async fn tick_task_multi_node(
                 #[cfg(feature = "s3")]
                 process_outputs_multi_node(
                     &outputs,
+                    node_id,
                     &multi_raft,
                     &partition_storage,
                     &group_map,
@@ -156,6 +196,7 @@ pub async fn tick_task_multi_node(
                 #[cfg(not(feature = "s3"))]
                 process_outputs_multi_node(
                     &outputs,
+                    node_id,
                     &multi_raft,
                     &partition_storage,
                     &group_map,
@@ -227,6 +268,7 @@ pub async fn tick_task_multi_node(
                 #[cfg(feature = "s3")]
                 process_outputs_multi_node(
                     &outputs,
+                    node_id,
                     &multi_raft,
                     &partition_storage,
                     &group_map,
@@ -248,6 +290,7 @@ pub async fn tick_task_multi_node(
                 #[cfg(not(feature = "s3"))]
                 process_outputs_multi_node(
                     &outputs,
+                    node_id,
                     &multi_raft,
                     &partition_storage,
                     &group_map,
@@ -804,6 +847,14 @@ async fn process_outputs(
                     gm.get_key(*group_id)
                 };
 
+                // Get base_offset BEFORE apply for producer state recording.
+                let base_offset = {
+                    let storage = partition_storage.read().await;
+                    storage
+                        .get(group_id)
+                        .map_or(Offset::new(0), ServerPartitionStorage::blob_log_end_offset)
+                };
+
                 let apply_result = if let Some((topic_id, partition_id)) = key {
                     let mut storage = partition_storage.write().await;
                     if let Some(ps) = storage.get_mut(group_id) {
@@ -829,6 +880,18 @@ async fn process_outputs(
                         message: "group not found in group map".to_string(),
                     })
                 };
+
+                // Extract and record producer state from committed entry.
+                // Critical for PREVIOUS_TERM entries on new leader.
+                if apply_result.is_ok() {
+                    extract_and_record_producer_state(
+                        data,
+                        base_offset,
+                        *group_id,
+                        partition_storage,
+                    )
+                    .await;
+                }
 
                 // Find and notify any pending proposal for this entry (O(1) lookup).
                 let mut proposals = pending_proposals.write().await;
@@ -911,9 +974,10 @@ async fn process_outputs(
     clippy::ref_option,
     clippy::significant_drop_tightening
 )]
-#[tracing::instrument(skip_all, name = "process_outputs", fields(output_count = outputs.len()))]
+#[tracing::instrument(skip_all, name = "process_outputs", fields(output_count = outputs.len(), node_id = node_id.get()))]
 async fn process_outputs_multi_node(
     outputs: &[MultiRaftOutput],
+    node_id: NodeId,
     multi_raft: &Arc<RwLock<MultiRaft>>,
     partition_storage: &Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
     group_map: &Arc<RwLock<GroupMap>>,
@@ -939,6 +1003,14 @@ async fn process_outputs_multi_node(
                 index,
                 data,
             } => {
+                info!(
+                    node = node_id.get(),
+                    group = group_id.get(),
+                    index = index.get(),
+                    data_len = data.len(),
+                    "COMMIT_ENTRY: received"
+                );
+
                 // Check if this is a controller partition commit.
                 if *group_id == CONTROLLER_GROUP_ID {
                     info!(
@@ -1181,20 +1253,71 @@ async fn process_outputs_multi_node(
                             .and_then(|m| m.remove(index))
                     };
 
-                    if let Some(batch_proposal) = batch_proposal {
-                        // Batch proposal path: get base offset BEFORE apply.
-                        let base_offset = {
-                            let storage = partition_storage.read().await;
-                            storage
-                                .get(group_id)
-                                .map_or(Offset::new(0), ServerPartitionStorage::blob_log_end_offset)
-                        };
+                    // Also check for single pending proposal to determine entry type.
+                    let has_single_proposal = {
+                        let proposals = pending_proposals.read().await;
+                        proposals.get(group_id).is_some_and(|m| m.contains_key(index))
+                    };
 
-                        // Apply the batch entry.
+                    // Log the offset BEFORE applying to detect interleaving.
+                    let offset_before = {
+                        let storage = partition_storage.read().await;
+                        storage.get(group_id).map_or(0, |ps| ps.blob_log_end_offset().get())
+                    };
+
+                    // Determine entry type for logging
+                    let entry_type = if batch_proposal.is_some() {
+                        "BATCH_CLIENT"
+                    } else if has_single_proposal {
+                        "SINGLE_CLIENT"
+                    } else {
+                        "PREVIOUS_TERM"  // No pending proposal = replicated from old leader
+                    };
+
+                    info!(
+                        node = node_id.get(),
+                        group = group_id.get(),
+                        index = index.get(),
+                        entry_type = entry_type,
+                        offset_before = offset_before,
+                        has_batch_proposal = batch_proposal.is_some(),
+                        has_single_proposal = has_single_proposal,
+                        topic = topic_id.get(),
+                        partition = partition_id.get(),
+                        "ENTRY_TYPE: determined entry type before apply"
+                    );
+
+                    if let Some(batch_proposal) = batch_proposal {
+                        // DEFENSIVE ASSERTION: Verify the batch_proposal's stored index matches
+                        // the CommitEntry index. If these don't match, there's a bug in the lookup.
+                        if batch_proposal.log_index != *index {
+                            error!(
+                                node = node_id.get(),
+                                group = group_id.get(),
+                                commit_index = index.get(),
+                                stored_index = batch_proposal.log_index.get(),
+                                "BUG: batch_proposal log_index mismatch! This indicates a lookup error."
+                            );
+                        }
+
+                        // Batch proposal path: apply and use the returned base_offset.
+                        // The apply_entry_async function returns the actual base_offset used,
+                        // which is captured atomically during the apply operation.
                         let apply_result = {
                             let mut storage = partition_storage.write().await;
                             if let Some(ps) = storage.get_mut(group_id) {
-                                ps.apply_entry_async(*index, data).await
+                                let result = ps.apply_entry_async(*index, data).await;
+                                let offset_after = ps.blob_log_end_offset().get();
+                                info!(
+                                    node = node_id.get(),
+                                    group = group_id.get(),
+                                    index = index.get(),
+                                    offset_before = offset_before,
+                                    offset_after = offset_after,
+                                    returned_offset = ?result.as_ref().ok().and_then(|o| o.map(|x| x.get())),
+                                    "BATCH: apply_entry_async completed"
+                                );
+                                result
                             } else {
                                 Err(ServerError::PartitionNotFound {
                                     topic: topic_id.get().to_string(),
@@ -1203,10 +1326,36 @@ async fn process_outputs_multi_node(
                             }
                         };
 
-                        // Notify each waiter with calculated offset.
+                        // Notify each waiter with the offset returned by apply.
                         let batch_size = batch_proposal.record_counts.len();
                         match apply_result {
-                            Ok(_) => {
+                            Ok(Some(base_offset)) => {
+                                // DEFENSIVE CHECK: The offset returned by apply should match
+                                // what we observed before apply. If they differ, something else
+                                // modified storage (indicates a race condition or bug).
+                                if base_offset.get() != offset_before {
+                                    error!(
+                                        node = node_id.get(),
+                                        group = group_id.get(),
+                                        index = index.get(),
+                                        offset_before = offset_before,
+                                        base_offset = base_offset.get(),
+                                        delta = base_offset.get() as i64 - offset_before as i64,
+                                        "BUG: apply returned different offset than expected! \
+                                         Storage was modified between offset capture and apply."
+                                    );
+                                }
+
+                                // Extract and record producer state from committed entry.
+                                // Critical for PREVIOUS_TERM entries on new leader.
+                                extract_and_record_producer_state(
+                                    data,
+                                    base_offset,
+                                    *group_id,
+                                    partition_storage,
+                                )
+                                .await;
+
                                 let commit_latency = batch_proposal.proposed_at.elapsed();
                                 let total_age = batch_proposal.first_request_at.elapsed();
                                 let batch_wait = batch_proposal
@@ -1225,13 +1374,29 @@ async fn process_outputs_multi_node(
                                         total_age.as_micros() as u64,
                                     );
                                 }
+                                // Extract payload preview for diagnostic logging.
+                                let commit_payload = extract_commit_payload_preview(data);
+
                                 let mut cumulative = 0u64;
-                                for (record_count, result_tx) in batch_proposal
+                                for (i, (record_count, result_tx)) in batch_proposal
                                     .record_counts
                                     .iter()
                                     .zip(batch_proposal.result_txs)
+                                    .enumerate()
                                 {
                                     let offset = Offset::new(base_offset.get() + cumulative);
+                                    debug!(
+                                        node = node_id.get(),
+                                        group = group_id.get(),
+                                        index = index.get(),
+                                        waiter_index = i,
+                                        base_offset = base_offset.get(),
+                                        cumulative = cumulative,
+                                        sent_offset = offset.get(),
+                                        record_count = record_count,
+                                        commit_payload = %commit_payload,
+                                        "NOTIFY_CLIENT: sending offset to waiter"
+                                    );
                                     let _ = result_tx.send(Ok(offset));
                                     cumulative += u64::from(*record_count);
                                 }
@@ -1270,6 +1435,33 @@ async fn process_outputs_multi_node(
                                     "Notified batch pending proposal"
                                 );
                             }
+                            Ok(None) => {
+                                // Entry was already applied or empty - shouldn't happen for batches.
+                                // Decrement backpressure and notify waiters with error.
+                                if let Some(ref bp) = batcher_backpressure {
+                                    bp.pending_requests.fetch_sub(
+                                        u64::from(batch_proposal.batch_size),
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    bp.pending_bytes.fetch_sub(
+                                        u64::from(batch_proposal.batch_bytes),
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                }
+                                let err = ServerError::Internal {
+                                    message: "batch apply returned no offset (already applied or empty)".to_string(),
+                                };
+                                for result_tx in batch_proposal.result_txs {
+                                    let _ = result_tx.send(Err(err.clone()));
+                                }
+                                warn!(
+                                    topic = topic_id.get(),
+                                    partition = partition_id.get(),
+                                    group = group_id.get(),
+                                    index = index.get(),
+                                    "Batch apply returned None - entry was already applied or empty"
+                                );
+                            }
                             Err(ref e) => {
                                 // Decrement backpressure counters now that requests are complete (failed).
                                 if let Some(ref bp) = batcher_backpressure {
@@ -1300,11 +1492,25 @@ async fn process_outputs_multi_node(
                             }
                         }
                     } else {
-                        // Single proposal path (existing logic).
+                        // Single proposal path (existing logic) or PREVIOUS_TERM entry.
+                        // Apply first, then use the returned offset for everything.
+                        // This eliminates the TOCTOU race where base_offset could be
+                        // captured before concurrent PREVIOUS_TERM entries are applied.
                         let apply_result = {
                             let mut storage = partition_storage.write().await;
                             if let Some(ps) = storage.get_mut(group_id) {
-                                ps.apply_entry_async(*index, data).await
+                                let result = ps.apply_entry_async(*index, data).await;
+                                let offset_after = ps.blob_log_end_offset().get();
+                                info!(
+                                    node = node_id.get(),
+                                    group = group_id.get(),
+                                    index = index.get(),
+                                    offset_before = offset_before,
+                                    offset_after = offset_after,
+                                    returned_offset = ?result.as_ref().ok().and_then(|o| o.map(|x| x.get())),
+                                    "NON-BATCH: apply_entry_async completed"
+                                );
+                                result
                             } else {
                                 Err(ServerError::PartitionNotFound {
                                     topic: topic_id.get().to_string(),
@@ -1313,8 +1519,24 @@ async fn process_outputs_multi_node(
                             }
                         };
 
+                        // Extract and record producer state from committed entry.
+                        // Critical for PREVIOUS_TERM entries on new leader.
+                        // Use the offset returned by apply (not pre-captured) to avoid races.
+                        if let Ok(Some(applied_offset)) = &apply_result {
+                            extract_and_record_producer_state(
+                                data,
+                                *applied_offset,
+                                *group_id,
+                                partition_storage,
+                            )
+                            .await;
+                        }
+
                         // Find and notify any pending proposal (O(1) lookup).
                         let mut proposals = pending_proposals.write().await;
+                        let had_proposal = proposals
+                            .get(group_id)
+                            .is_some_and(|m| m.contains_key(index));
                         if let Some(group_proposals) = proposals.get_mut(group_id) {
                             if let Some(proposal) = group_proposals.remove(index) {
                                 let result = match &apply_result {
@@ -1330,19 +1552,19 @@ async fn process_outputs_multi_node(
                                         Ok(*offset)
                                     }
                                     Ok(None) => {
-                                        let storage = partition_storage.read().await;
-                                        let offset = storage
-                                            .get(group_id)
-                                            .map_or(Offset::new(0), ServerPartitionStorage::blob_log_end_offset);
-                                        debug!(
+                                        // Apply returned None - entry was empty or already applied.
+                                        // This should NOT happen for client entries with pending proposals.
+                                        // Log an error and return a failure instead of guessing offset.
+                                        error!(
                                             topic = topic_id.get(),
                                             partition = partition_id.get(),
                                             group = group_id.get(),
                                             index = index.get(),
-                                            offset = offset.get(),
-                                            "Notifying pending proposal (using blob_log_end_offset)"
+                                            "BUG: apply returned None for entry with pending proposal"
                                         );
-                                        Ok(offset)
+                                        Err(ServerError::Internal {
+                                            message: "apply returned None for client entry".to_string(),
+                                        })
                                     }
                                     Err(e) => Err(ServerError::Internal {
                                         message: format!("apply failed: {e}"),
@@ -1355,6 +1577,22 @@ async fn process_outputs_multi_node(
                                         "Pending proposal receiver dropped"
                                     );
                                 }
+                            }
+                        }
+
+                        // Log PREVIOUS_TERM entries that consumed offsets without client notification.
+                        // These are critical because they "steal" offsets from subsequent client entries.
+                        if !had_proposal {
+                            if let Ok(Some(offset)) = &apply_result {
+                                let payload = extract_commit_payload_preview(data);
+                                debug!(
+                                    node = node_id.get(),
+                                    group = group_id.get(),
+                                    index = index.get(),
+                                    offset = offset.get(),
+                                    payload = %payload,
+                                    "PREVIOUS_TERM: applied entry without client notification"
+                                );
                             }
                         }
 

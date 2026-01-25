@@ -99,18 +99,30 @@ impl HelixService {
             });
         }
 
-        // Encode blob command and propose to Raft.
+        // In multi-node mode, we need to wait for the commit to happen asynchronously.
+        // In single-node mode, the commit happens synchronously.
+        let is_multi_node = self.is_multi_node();
+
+        // Capture base_offset BEFORE proposing to ensure consistency across all replicas.
+        // The offset is encoded in the command and used by all replicas during apply.
+        let base_offset = {
+            let storage = self.partition_storage.read().await;
+            let ps = storage.get(&group_id).ok_or_else(|| ServerError::PartitionNotFound {
+                topic: topic.to_string(),
+                partition,
+            })?;
+            ps.blob_log_end_offset()
+        };
+
+        // Encode blob command with the leader-assigned base_offset.
         // Use KafkaRecordBatch format since this API is for Kafka protocol.
         let command = PartitionCommand::AppendBlob {
             blob: data,
             record_count,
             format: BlobFormat::KafkaRecordBatch,
+            base_offset,
         };
         let command_data = command.encode();
-
-        // In multi-node mode, we need to wait for the commit to happen asynchronously.
-        // In single-node mode, the commit happens synchronously.
-        let is_multi_node = self.is_multi_node();
 
         if is_multi_node {
             // Multi-node: propose, register pending proposal, wait for commit notification.
@@ -180,15 +192,7 @@ impl HelixService {
             Ok(offset.get())
         } else {
             // Single-node: commit happens synchronously.
-            // Get base offset before proposing.
-            let base_offset = {
-                let storage = self.partition_storage.read().await;
-                let ps = storage.get(&group_id).ok_or_else(|| ServerError::PartitionNotFound {
-                    topic: topic.to_string(),
-                    partition,
-                })?;
-                ps.blob_log_end_offset()
-            };
+            // base_offset already captured above (used in the command).
 
             let outputs = {
                 let mut mr = self.multi_raft.write().await;
@@ -425,16 +429,6 @@ impl HelixService {
             }
         }
 
-        // Encode blob command and propose to Raft.
-        // Use KafkaRecordBatch format since this API is for Kafka protocol.
-        // Clone data because we may use the original for the batcher path.
-        let command = PartitionCommand::AppendBlob {
-            blob: data.clone(),
-            record_count,
-            format: BlobFormat::KafkaRecordBatch,
-        };
-        let command_data = command.encode();
-
         // In multi-node mode, we need to wait for the commit to happen asynchronously.
         // In single-node mode, the commit happens synchronously.
         let is_multi_node = self.is_multi_node();
@@ -462,6 +456,15 @@ impl HelixService {
                     message: "batch commit notification channel closed".to_string(),
                 })??;
 
+                tracing::info!(
+                    topic = %topic,
+                    partition,
+                    group_id = group_id.get(),
+                    received_offset = offset.get(),
+                    record_count,
+                    "BLOB_HANDLER: received offset from commit notification"
+                );
+
                 // Record producer sequence after successful commit.
                 if let Some(ref info) = producer_info {
                     let mut storage = self.partition_storage.write().await;
@@ -488,6 +491,25 @@ impl HelixService {
             }
 
             // Fallback: direct propose (if batcher not configured).
+            // Capture base_offset BEFORE proposing to ensure consistency across all replicas.
+            let base_offset = {
+                let storage = self.partition_storage.read().await;
+                let ps = storage.get(&group_id).ok_or_else(|| ServerError::PartitionNotFound {
+                    topic: topic.to_string(),
+                    partition,
+                })?;
+                ps.blob_log_end_offset()
+            };
+
+            // Encode blob command with the leader-assigned base_offset.
+            let command = PartitionCommand::AppendBlob {
+                blob: data.clone(),
+                record_count,
+                format: BlobFormat::KafkaRecordBatch,
+                base_offset,
+            };
+            let command_data = command.encode();
+
             let (result_tx, result_rx) = oneshot::channel();
 
             // Propose to Raft, flush pending messages, and get the log index.
@@ -565,6 +587,7 @@ impl HelixService {
             Ok(offset.get())
         } else {
             // Single-node: commit happens synchronously.
+            // Capture base_offset BEFORE proposing to ensure consistency.
             let base_offset = {
                 let storage = self.partition_storage.read().await;
                 let ps = storage.get(&group_id).ok_or_else(|| ServerError::PartitionNotFound {
@@ -573,6 +596,15 @@ impl HelixService {
                 })?;
                 ps.blob_log_end_offset()
             };
+
+            // Encode blob command with the leader-assigned base_offset.
+            let command = PartitionCommand::AppendBlob {
+                blob: data,
+                record_count,
+                format: BlobFormat::KafkaRecordBatch,
+                base_offset,
+            };
+            let command_data = command.encode();
 
             let outputs = {
                 let mut mr = self.multi_raft.write().await;

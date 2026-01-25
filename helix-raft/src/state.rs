@@ -1484,6 +1484,14 @@ impl RaftNode {
         while self.last_applied < self.commit_index {
             let idx = LogIndex::new(self.last_applied.get() + 1);
             if let Some(entry) = self.log.get(idx) {
+                tracing::info!(
+                    node_id = self.config.node_id.get(),
+                    index = idx.get(),
+                    entry_term = entry.term.get(),
+                    current_term = self.current_term.get(),
+                    data_len = entry.data.len(),
+                    "RAFT_COMMIT_EMIT: emitting CommitEntry"
+                );
                 outputs.push(RaftOutput::CommitEntry {
                     index: idx,
                     data: entry.data.clone(),

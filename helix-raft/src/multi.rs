@@ -200,6 +200,7 @@ impl MultiRaft {
             leader_id: info.node.leader_id(),
             commit_index: info.node.commit_index(),
             last_applied: info.node.last_applied(),
+            last_log_index: info.node.log().last_index(),
         })
     }
 
@@ -713,6 +714,8 @@ pub struct GroupStateInfo {
     pub commit_index: LogIndex,
     /// Last applied index.
     pub last_applied: LogIndex,
+    /// Last log index (may be > commit_index if there are uncommitted entries).
+    pub last_log_index: LogIndex,
 }
 
 /// Errors from Multi-Raft operations.

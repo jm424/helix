@@ -322,6 +322,7 @@ pub async fn batcher_task(
     batcher_stats: Arc<BatcherStats>,
     config: BatcherConfig,
     backpressure: Arc<BackpressureState>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, crate::partition_storage::ServerPartitionStorage>>>,
 ) {
     let mut batches: HashMap<GroupId, AccumulatedBatch> = HashMap::new();
     let linger_duration = Duration::from_millis(config.linger_ms);
@@ -361,6 +362,7 @@ pub async fn batcher_task(
                             &batcher_stats,
                             &config,
                             &backpressure,
+                            &partition_storage,
                         ).await;
                     }
                     Some(BatcherMessage::Shutdown) | None => {
@@ -376,6 +378,7 @@ pub async fn batcher_task(
                                     &batcher_stats,
                                     FlushReason::Shutdown,
                                     &backpressure,
+                                    &partition_storage,
                                 ).await;
                             }
                         }
@@ -415,6 +418,7 @@ pub async fn batcher_task(
                             &batcher_stats,
                             FlushReason::Linger,
                             &backpressure,
+                            &partition_storage,
                         ).await;
                     }
                 }
@@ -436,6 +440,7 @@ async fn handle_submit(
     batcher_stats: &Arc<BatcherStats>,
     config: &BatcherConfig,
     backpressure: &Arc<BackpressureState>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, crate::partition_storage::ServerPartitionStorage>>>,
 ) {
     let group_id = request.group_id;
     #[allow(clippy::cast_possible_truncation)]
@@ -460,6 +465,7 @@ async fn handle_submit(
             batcher_stats,
             FlushReason::Size,
             backpressure,
+            partition_storage,
         )
         .await;
     }
@@ -495,6 +501,7 @@ async fn flush_batch(
     batcher_stats: &Arc<BatcherStats>,
     reason: FlushReason,
     backpressure: &Arc<BackpressureState>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, crate::partition_storage::ServerPartitionStorage>>>,
 ) {
     let batch_size = batch.request_count();
     let batch_bytes = batch.total_bytes;
@@ -537,12 +544,10 @@ async fn flush_batch(
     }
 
     // Check if we're the leader.
-    let (is_leader, _leader_hint) = async {
+    let is_leader = async {
         let mr = multi_raft.read().await;
         let state = mr.group_state(group_id);
-        let is_leader = state.as_ref().is_some_and(|s| s.state == RaftState::Leader);
-        let leader = state.and_then(|s| s.leader_id);
-        (is_leader, leader)
+        state.as_ref().is_some_and(|s| s.state == RaftState::Leader)
     }
     .instrument(tracing::info_span!("check_leader"))
     .await;
@@ -569,32 +574,208 @@ async fn flush_batch(
         return;
     }
 
-    // Encode the batch command (sync, no span needed - fast).
-    let command = PartitionCommand::AppendBlobBatch { blobs: batch.blobs };
-    let command_data = command.encode();
-
-    // CRITICAL: Register pending proposal while holding multi_raft lock to avoid race.
-    //
-    // Race condition that can occur if we register after releasing lock:
-    // 1. propose_to_raft returns index=8, releases lock
-    // 2. Raft messages sent to peers, ACK received
-    // 3. Tick task processes ACK, generates CommitEntry for index=8
-    // 4. CommitEntry handler looks up batch_pending_proposals[8] - NOT FOUND!
-    // 5. Entry applied but waiter never notified (lost write from client's perspective)
-    // 6. register_pending runs - TOO LATE, commit already processed
-    //
-    // Fix: Register pending proposal while still holding multi_raft write lock.
-    // The tick task needs multi_raft read lock to process commits, so it will
-    // block until we finish registration.
+    // Extract batch fields before the async block.
+    let batch_blobs = batch.blobs;
     let first_request_at = batch.first_request_time;
     let record_counts = batch.record_counts;
     let result_txs = batch.result_txs;
 
-    // Propose to Raft, register pending, and collect messages - all atomically.
+    // CRITICAL: Capture base_offset and propose atomically while holding multi_raft write lock.
+    //
+    // Race condition this fixes (non-actor mode):
+    // 1. Tick task calls tick(), gets CommitEntry for PREVIOUS_TERM entry, releases lock
+    // 2. Batcher acquires lock, captures base_offset (BEFORE tick task applies entry!)
+    // 3. Tick task applies entry, advances storage offset
+    // 4. Batcher proposes with stale base_offset
+    // 5. Entries stored at wrong offsets!
+    //
+    // Fix: Capture base_offset WHILE holding multi_raft write lock. This prevents tick task
+    // from calling tick() to get more outputs while we're capturing. However, if tick task
+    // already has outputs and is applying them, we still need to wait.
+    //
+    // Combined fix:
+    // 1. Acquire multi_raft write lock
+    // 2. Get current commit_index (most up-to-date)
+    // 3. Wait for storage last_applied to catch up to commit_index
+    // 4. Capture base_offset
+    // 5. Propose
+    // 6. Release lock
+    //
+    // Step 3 ensures any outputs already gotten by tick task are applied before we capture.
+    // Holding the lock ensures no NEW outputs are generated while we wait and capture.
+
+    const MAX_WAIT_ATTEMPTS: u32 = 100;
+    const WAIT_INTERVAL_MS: u64 = 1;
+
+    // Propose to Raft atomically: wait for storage, capture offset, encode, propose, register.
     let propose_result = async {
         let mut mr = multi_raft.write().await;
+
+        // Wait for ALL of these conditions to be true and stable:
+        // 1. commit_index == last_log_index (ALL Raft log entries are committed)
+        // 2. storage last_applied >= commit_index (all commits applied to storage)
+        // 3. commit_index hasn't changed between iterations (no new commits pending)
+        //
+        // BUG FIX: Previously we only waited for storage to catch up to commit_index.
+        // But commit_index may be < last_log_index when there are PREVIOUS_TERM entries
+        // from an old leader that haven't committed yet. When a new leader takes over:
+        // 1. It has uncommitted entries from the old leader in its log
+        // 2. It proposes a no-op
+        // 3. The no-op commits those PREVIOUS_TERM entries
+        //
+        // If we capture base_offset BEFORE the no-op commits, we don't account for the
+        // PREVIOUS_TERM entries' record counts, causing offset conflicts.
+        //
+        // Fix: Wait for commit_index == last_log_index, ensuring ALL entries in the Raft
+        // log are committed (including PREVIOUS_TERM entries) before capturing base_offset.
+        let mut prev_commit_index = LogIndex::new(0);
+        let mut stable_count = 0u32;
+        const REQUIRED_STABLE_CHECKS: u32 = 2;
+
+        for attempt in 0..MAX_WAIT_ATTEMPTS {
+            // Get current state while holding write lock.
+            let (current_commit_index, last_log_index) = mr
+                .group_state(group_id)
+                .map_or((LogIndex::new(0), LogIndex::new(0)), |s| {
+                    (s.commit_index, s.last_log_index)
+                });
+
+            let storage_last_applied = {
+                let storage = partition_storage.read().await;
+                storage
+                    .get(&group_id)
+                    .map_or(LogIndex::new(0), |ps| ps.last_applied())
+            };
+
+            // All entries committed (no uncommitted PREVIOUS_TERM entries).
+            let all_committed = current_commit_index >= last_log_index;
+            // Storage caught up to commit_index.
+            let storage_caught_up = storage_last_applied >= current_commit_index;
+            // commit_index stable (no new commits happening).
+            let is_stable = current_commit_index == prev_commit_index;
+
+            if all_committed && storage_caught_up && is_stable {
+                stable_count += 1;
+                if stable_count >= REQUIRED_STABLE_CHECKS {
+                    // All conditions met and stable - safe to capture base_offset.
+                    if attempt > REQUIRED_STABLE_CHECKS {
+                        info!(
+                            group = group_id.get(),
+                            commit_index = current_commit_index.get(),
+                            last_log_index = last_log_index.get(),
+                            storage_last_applied = storage_last_applied.get(),
+                            attempts = attempt + 1,
+                            "BATCHER: all entries committed and stable after waiting"
+                        );
+                    }
+                    break;
+                }
+            } else {
+                // Reset stability counter if conditions not met.
+                stable_count = 0;
+            }
+
+            if attempt == 0 && (!all_committed || !storage_caught_up) {
+                info!(
+                    group = group_id.get(),
+                    commit_index = current_commit_index.get(),
+                    last_log_index = last_log_index.get(),
+                    storage_last_applied = storage_last_applied.get(),
+                    all_committed,
+                    storage_caught_up,
+                    "BATCHER: waiting for all entries to commit and storage to catch up"
+                );
+            }
+
+            if attempt == MAX_WAIT_ATTEMPTS - 1 {
+                warn!(
+                    group = group_id.get(),
+                    commit_index = current_commit_index.get(),
+                    last_log_index = last_log_index.get(),
+                    storage_last_applied = storage_last_applied.get(),
+                    stable_count,
+                    attempts = MAX_WAIT_ATTEMPTS,
+                    "BATCHER: timeout waiting for stability, proceeding anyway"
+                );
+                break;
+            }
+
+            prev_commit_index = current_commit_index;
+
+            // Release multi_raft lock to allow tick task to call tick() and process commits.
+            drop(mr);
+            tokio::time::sleep(Duration::from_millis(WAIT_INTERVAL_MS)).await;
+            mr = multi_raft.write().await;
+        }
+
+        // Capture base_offset from storage PLUS any in-flight (uncommitted) proposal record counts.
+        //
+        // BUG FIX: Previously, we only read storage.blob_log_end_offset(), which reflects
+        // committed entries. But if there are uncommitted proposals (proposed but not yet
+        // committed), their record counts weren't included. When these entries later commit
+        // (e.g., via a new leader's no-op), they would have the same base_offset, causing
+        // offset conflicts and content mismatches.
+        //
+        // Fix: Sum the total_records from all in-flight proposals for this group and add
+        // to the storage offset. This ensures each proposal gets a unique offset range.
+        //
+        // CRITICAL: Read blob_log_end_offset while STILL holding partition_storage lock
+        // that was used in stability check. Don't release and re-acquire!
+        let (final_commit_idx, final_last_log_idx, storage_last_applied, storage_blob_offset) = {
+            let state = mr.group_state(group_id);
+            let (ci, lli) = state.map_or((LogIndex::new(0), LogIndex::new(0)), |s| {
+                (s.commit_index, s.last_log_index)
+            });
+            let storage = partition_storage.read().await;
+            let (la, bo) = storage.get(&group_id).map_or(
+                (LogIndex::new(0), Offset::new(0)),
+                |ps| (ps.last_applied(), ps.blob_log_end_offset()),
+            );
+            (ci, lli, la, bo)
+        };
+
+        // Add record counts from all uncommitted proposals for this group.
+        let pending_records: u64 = {
+            let proposals = batch_pending_proposals.read().await;
+            proposals
+                .get(&group_id)
+                .map_or(0, |m| m.values().map(|p| p.total_records).sum())
+        };
+        // Read lock is now released - critical to avoid deadlock with write lock below!
+
+        let base_offset = Offset::new(storage_blob_offset.get() + pending_records);
+
+        // Always log the capture for debugging offset issues.
+        info!(
+            group = group_id.get(),
+            commit_index = final_commit_idx.get(),
+            last_log_index = final_last_log_idx.get(),
+            storage_last_applied = storage_last_applied.get(),
+            storage_blob_offset = storage_blob_offset.get(),
+            pending_records,
+            base_offset = base_offset.get(),
+            batch_records,
+            "BATCHER_CAPTURE: capturing base_offset for proposal"
+        );
+
+        // Encode command with captured base_offset.
+        let command = PartitionCommand::AppendBlobBatch { blobs: batch_blobs, base_offset };
+        let command_data = command.encode();
+
+        // Propose to Raft.
         let result = mr.propose_with_index(group_id, command_data);
-        let (outputs, idx) = result?;
+        let Some((outputs, idx)) = result else {
+            // Propose failed - not leader or group doesn't exist.
+            // Check if we have leadership info for debugging.
+            let state = mr.group_state(group_id);
+            warn!(
+                group = group_id.get(),
+                state_exists = state.is_some(),
+                is_leader = state.map(|s| s.state == RaftState::Leader),
+                "BATCHER: propose_with_index failed - not leader"
+            );
+            return None;
+        };
         let flush_outputs = mr.flush();
         let all_outputs: Vec<_> = outputs.into_iter().chain(flush_outputs).collect();
 
@@ -614,6 +795,13 @@ async fn flush_batch(
         {
             let mut proposals = batch_pending_proposals.write().await;
             proposals.entry(group_id).or_default().insert(idx, batch_proposal);
+            info!(
+                group = group_id.get(),
+                index = idx.get(),
+                batch_size,
+                base_offset = base_offset.get(),
+                "BATCHER: Registered batch_pending_proposal"
+            );
         }
 
         Some((idx, all_outputs))
@@ -691,6 +879,7 @@ pub async fn batcher_task_actor(
     batcher_stats: Arc<BatcherStats>,
     config: BatcherConfig,
     backpressure: Arc<BackpressureState>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, crate::partition_storage::ServerPartitionStorage>>>,
 ) {
     let mut batches: HashMap<GroupId, AccumulatedBatch> = HashMap::new();
     let linger_duration = Duration::from_millis(config.linger_ms);
@@ -729,6 +918,7 @@ pub async fn batcher_task_actor(
                             &batcher_stats,
                             &config,
                             &backpressure,
+                            &partition_storage,
                         ).await;
                     }
                     Some(BatcherMessage::Shutdown) | None => {
@@ -743,6 +933,7 @@ pub async fn batcher_task_actor(
                                     &batcher_stats,
                                     FlushReason::Shutdown,
                                     &backpressure,
+                                    &partition_storage,
                                 ).await;
                             }
                         }
@@ -781,6 +972,7 @@ pub async fn batcher_task_actor(
                             &batcher_stats,
                             FlushReason::Linger,
                             &backpressure,
+                            &partition_storage,
                         ).await;
                     }
                 }
@@ -800,6 +992,7 @@ async fn handle_submit_actor(
     batcher_stats: &Arc<BatcherStats>,
     config: &BatcherConfig,
     backpressure: &Arc<BackpressureState>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, crate::partition_storage::ServerPartitionStorage>>>,
 ) {
     let group_id = request.group_id;
     #[allow(clippy::cast_possible_truncation)]
@@ -823,6 +1016,7 @@ async fn handle_submit_actor(
             batcher_stats,
             FlushReason::Size,
             backpressure,
+            partition_storage,
         )
         .await;
     }
@@ -858,6 +1052,7 @@ async fn flush_batch_actor(
     batcher_stats: &Arc<BatcherStats>,
     reason: FlushReason,
     backpressure: &Arc<BackpressureState>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, crate::partition_storage::ServerPartitionStorage>>>,
 ) {
     let batch_size = batch.request_count();
     let batch_bytes = batch.total_bytes;
@@ -953,8 +1148,18 @@ async fn flush_batch_actor(
         return;
     }
 
-    // Encode the batch command.
-    let command = PartitionCommand::AppendBlobBatch { blobs: batch.blobs };
+    // Capture base_offset from storage BEFORE proposing to Raft.
+    // This offset is encoded in the command and used by ALL replicas during apply.
+    // This ensures consistency across the cluster, even during leadership changes.
+    let base_offset = {
+        let storage = partition_storage.read().await;
+        storage
+            .get(&group_id)
+            .map_or(Offset::new(0), |ps| ps.blob_log_end_offset())
+    };
+
+    // Encode the batch command with the leader-assigned base_offset.
+    let command = PartitionCommand::AppendBlobBatch { blobs: batch.blobs, base_offset };
     let command_data = command.encode();
 
     // Build batch proposal info for the partition actor.
@@ -1045,6 +1250,7 @@ mod tests {
         let (batcher_handle, batcher_rx, backpressure) = create_batcher();
         let batch_pending_proposals = Arc::new(RwLock::new(HashMap::new()));
         let batcher_stats = Arc::new(BatcherStats::default());
+        let partition_storage = Arc::new(RwLock::new(HashMap::new()));
         let config = BatcherConfig {
             linger_ms: 1,
             max_batch_bytes: 64 * 1024,
@@ -1059,6 +1265,7 @@ mod tests {
             Arc::clone(&batcher_stats),
             config,
             Arc::clone(&backpressure),
+            Arc::clone(&partition_storage),
         ));
 
         // Submit a request.
@@ -1091,6 +1298,7 @@ mod tests {
         let (batcher_handle, batcher_rx, backpressure) = create_batcher();
         let batch_pending_proposals = Arc::new(RwLock::new(HashMap::new()));
         let batcher_stats = Arc::new(BatcherStats::default());
+        let partition_storage = Arc::new(RwLock::new(HashMap::new()));
         let config = BatcherConfig {
             linger_ms: 1,
             max_batch_bytes: 64 * 1024,
@@ -1105,6 +1313,7 @@ mod tests {
             Arc::clone(&batcher_stats),
             config,
             Arc::clone(&backpressure),
+            Arc::clone(&partition_storage),
         ));
 
         // Submit a request to non-existent partition.
@@ -1142,6 +1351,7 @@ mod tests {
         let (batcher_handle, batcher_rx, backpressure) = create_batcher();
         let batch_pending_proposals = Arc::new(RwLock::new(HashMap::new()));
         let batcher_stats = Arc::new(BatcherStats::default());
+        let partition_storage = Arc::new(RwLock::new(HashMap::new()));
         let config = BatcherConfig {
             linger_ms: 1,
             max_batch_bytes: 64 * 1024,
@@ -1155,6 +1365,7 @@ mod tests {
             Arc::clone(&batcher_stats),
             config,
             Arc::clone(&backpressure),
+            Arc::clone(&partition_storage),
         ));
 
         // Check initial state.

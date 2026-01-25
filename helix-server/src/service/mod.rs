@@ -872,6 +872,7 @@ impl HelixService {
                     Arc::clone(&batcher_stats),
                     batcher::BatcherConfig::default(),
                     Arc::clone(&backpressure_state),
+                    Arc::clone(&partition_storage),
                 ));
 
                 info!("Started request batcher for multi-node");

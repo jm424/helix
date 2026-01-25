@@ -1485,13 +1485,61 @@ async fn test_actor_mode_quorum_loss_recovery() {
     );
 }
 
-/// Rapid leader election stress test.
+/// Helper to set up a cluster with configurable actor mode.
+async fn setup_cluster_with_mode(
+    test_name: &str,
+    nodes: u32,
+    base_port: u16,
+    raft_base_port: u16,
+    actor_mode: bool,
+) -> RealCluster {
+    RealCluster::builder()
+        .nodes(nodes)
+        .base_port(base_port)
+        .raft_base_port(raft_base_port)
+        .binary_path(binary_path())
+        .data_dir(test_data_dir(test_name))
+        .auto_create_topics(true)
+        .default_replication_factor(3)
+        .actor_mode(actor_mode)
+        .build()
+        .expect("failed to start cluster")
+}
+
+/// Rapid failover stress test implementation.
 ///
-/// Rapidly kills and restarts nodes to stress leader election.
-/// Verifies no data loss or corruption under rapid failover.
-#[tokio::test]
-async fn test_actor_mode_rapid_failover_stress() {
-    let mut cluster = setup_actor_mode_cluster("rapid_failover", 3, 23800, 23900).await;
+/// # Test Design
+///
+/// This test validates Kafka's core offset guarantee under rapid failover:
+/// **If produce() returns Ok(offset), then consume(offset) MUST return that exact payload.**
+///
+/// # Cluster Configuration
+///
+/// - 3 nodes, replication factor 3
+/// - Only 1 node killed at a time → quorum (2/3) always maintained
+/// - Cluster should remain available throughout
+///
+/// # Expected Behavior
+///
+/// Since quorum is always available:
+/// - Initial/final writes: 100% success expected
+/// - Failover writes: High success rate (~90%+), only transient failures during leader election
+///
+/// # What We Validate
+///
+/// 1. **Core Kafka invariant**: Every acknowledged (offset, payload) pair is readable and correct
+/// 2. **No duplicate offsets**: Producer should never return same offset for different payloads
+/// 3. **No storage duplicates**: Same offset should not appear twice in consumed data
+///
+/// # What We DON'T Validate (not Kafka requirements)
+///
+/// - Sequential offsets in consumed data (gaps are expected when writes fail)
+async fn run_rapid_failover_stress_test(actor_mode: bool, base_port: u16, raft_base_port: u16) {
+    let mode_str = if actor_mode { "actor" } else { "non-actor" };
+    let test_name = format!("rapid_failover_{mode_str}");
+
+    let mut cluster =
+        setup_cluster_with_mode(&test_name, 3, base_port, raft_base_port, actor_mode).await;
 
     let bootstrap_servers = cluster.bootstrap_servers().to_string();
     let executor = RealExecutor::with_mode(&bootstrap_servers, ProducerMode::LowLatency)
@@ -1502,99 +1550,273 @@ async fn test_actor_mode_rapid_failover_stress() {
         .expect("cluster not ready");
 
     let topic = "rapid-failover-stress";
-    let num_partitions = 6i32;  // More partitions
+    let num_partitions = 6i32;
 
+    // Track all acknowledged writes: partition -> [(offset, payload)]
     let mut acknowledged: Vec<Vec<(u64, String)>> = vec![Vec::new(); num_partitions as usize];
+
+    // Track write statistics
+    let mut initial_attempts = 0u32;
+    let mut initial_successes = 0u32;
+    let mut failover_attempts = 0u32;
+    let mut failover_successes = 0u32;
+    let mut final_attempts = 0u32;
+    let mut final_successes = 0u32;
 
     // Wait for initial leaders
     for p in 0..num_partitions {
-        cluster.wait_for_leader(topic, p, Duration::from_secs(30)).await.expect("no leader");
+        cluster
+            .wait_for_leader(topic, p, Duration::from_secs(30))
+            .await
+            .expect("no leader");
     }
 
-    // Initial writes - 50 per partition = 300 total
-    println!("Initial writes (300 total)...");
+    // === Phase 1: Initial writes (stable cluster, expect 100% success) ===
+    println!("[{mode_str}] Phase 1: Initial writes (300 total, expect 100% success)...");
     for partition in 0..num_partitions {
         for i in 0..50u32 {
             let payload = format!("p{partition}-initial-{i:04}");
-            match executor.send(topic, partition, Bytes::from(payload.clone())).await {
-                Ok(offset) => acknowledged[partition as usize].push((offset, payload)),
-                Err(e) => panic!("Initial write failed: {e}"),
+            initial_attempts += 1;
+            match executor
+                .send(topic, partition, Bytes::from(payload.clone()))
+                .await
+            {
+                Ok(offset) => {
+                    initial_successes += 1;
+                    acknowledged[partition as usize].push((offset, payload));
+                }
+                Err(e) => {
+                    eprintln!("INITIAL_WRITE_FAILED: partition {partition} i={i}: {e}");
+                }
             }
         }
     }
+    println!(
+        "  Initial writes: {initial_successes}/{initial_attempts} succeeded ({:.1}%)",
+        100.0 * initial_successes as f64 / initial_attempts as f64
+    );
 
-    // Rapid failover cycles - 10 cycles instead of 5
-    println!("\nRapid failover cycles (10 cycles)...");
+    // === Phase 2: Rapid failover cycles ===
+    println!("\n[{mode_str}] Phase 2: Rapid failover cycles (10 cycles)...");
     for cycle in 1..=10u64 {
         let victim = ((cycle - 1) % 3) + 1; // Cycle through nodes 1, 2, 3
 
-        println!("  Cycle {cycle}: kill node {victim}, write, restart");
+        println!("  Cycle {cycle}: kill node {victim}, write 120 records, restart");
 
         cluster.kill_node(victim).expect("kill failed");
-        tokio::time::sleep(Duration::from_millis(300)).await;  // Faster cycles
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
-        // Write during failure - 20 per partition
+        // Write during failover - 20 per partition = 120 total per cycle
+        let mut cycle_successes = 0u32;
         for partition in 0..num_partitions {
             for i in 0..20u32 {
                 let payload = format!("p{partition}-cycle{cycle}-{i:04}");
-                match executor.send(topic, partition, Bytes::from(payload.clone())).await {
-                    Ok(offset) => acknowledged[partition as usize].push((offset, payload)),
-                    Err(_) => {} // Some failures expected during rapid failover
+                failover_attempts += 1;
+                match executor
+                    .send(topic, partition, Bytes::from(payload.clone()))
+                    .await
+                {
+                    Ok(offset) => {
+                        failover_successes += 1;
+                        cycle_successes += 1;
+                        acknowledged[partition as usize].push((offset, payload));
+                    }
+                    Err(_) => {
+                        // Transient failures during leader election are acceptable
+                    }
                 }
             }
         }
+        println!("    Cycle {cycle} writes: {cycle_successes}/120 succeeded");
 
         cluster.restart_node(victim).expect("restart failed");
-        tokio::time::sleep(Duration::from_secs(1)).await;  // Faster recovery
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
+    println!(
+        "  Failover writes total: {failover_successes}/{failover_attempts} succeeded ({:.1}%)",
+        100.0 * failover_successes as f64 / failover_attempts as f64
+    );
 
-    // Final writes - 50 per partition = 300 total
-    println!("\nFinal writes (300 total)...");
+    // === Phase 3: Final writes (stable cluster, expect 100% success) ===
+    println!("\n[{mode_str}] Phase 3: Final writes (300 total, expect 100% success)...");
     for partition in 0..num_partitions {
         for i in 0..50u32 {
             let payload = format!("p{partition}-final-{i:04}");
-            match executor.send(topic, partition, Bytes::from(payload.clone())).await {
-                Ok(offset) => acknowledged[partition as usize].push((offset, payload)),
-                Err(e) => panic!("Final write failed: {e}"),
+            final_attempts += 1;
+            match executor
+                .send(topic, partition, Bytes::from(payload.clone()))
+                .await
+            {
+                Ok(offset) => {
+                    final_successes += 1;
+                    acknowledged[partition as usize].push((offset, payload));
+                }
+                Err(e) => {
+                    eprintln!("FINAL_WRITE_FAILED: partition {partition} i={i}: {e}");
+                }
             }
         }
     }
+    println!(
+        "  Final writes: {final_successes}/{final_attempts} succeeded ({:.1}%)",
+        100.0 * final_successes as f64 / final_attempts as f64
+    );
 
-    // Verification
-    println!("\nVerifying all acknowledged writes...");
+    // === Phase 4: Verification ===
+    println!("\n[{mode_str}] Phase 4: Verifying Kafka invariants...");
+
+    let total_attempts = initial_attempts + failover_attempts + final_attempts;
+    let total_successes = initial_successes + failover_successes + final_successes;
     let total_acknowledged: usize = acknowledged.iter().map(Vec::len).sum();
+
+    // Sanity check: acknowledged count should match successes
+    assert_eq!(
+        total_acknowledged, total_successes as usize,
+        "BUG: acknowledged count mismatch"
+    );
+
     let mut verified = 0u32;
-    let mut errors = 0u32;
+    let mut content_mismatch_errors = 0u32;
+    let mut missing_offset_errors = 0u32;
+    let mut storage_duplicate_errors = 0u32;
+    let mut producer_duplicate_errors = 0u32;
 
     for partition in 0..num_partitions {
         let expected = &acknowledged[partition as usize];
+
+        // Check 1: Producer should not return same offset for different payloads
+        let mut offset_to_payload: std::collections::HashMap<u64, &str> =
+            std::collections::HashMap::new();
+        for (offset, payload) in expected {
+            if let Some(existing) = offset_to_payload.insert(*offset, payload.as_str()) {
+                if existing != payload.as_str() {
+                    eprintln!(
+                        "PRODUCER_DUPLICATE: partition {partition} offset {offset} returned for BOTH '{}' AND '{}'",
+                        existing, payload
+                    );
+                    producer_duplicate_errors += 1;
+                }
+            }
+        }
+
+        // Read back all data from storage
         let consumed = executor
-            .poll(topic, partition, 0, expected.len() as u32 + 10)
+            .poll(topic, partition, 0, expected.len() as u32 + 100)
             .await
             .expect("poll failed");
 
+        // Check 2: Storage should not have duplicate offsets
+        let mut seen_offsets: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for (offset, _) in &consumed {
+            if !seen_offsets.insert(*offset) {
+                eprintln!(
+                    "STORAGE_DUPLICATE: partition {partition} offset {offset} appears multiple times in storage"
+                );
+                storage_duplicate_errors += 1;
+            }
+        }
+
+        // Build map for content verification
         let consumed_map: std::collections::HashMap<u64, Bytes> = consumed.into_iter().collect();
 
+        // Check 3: THE CORE KAFKA INVARIANT
+        // Every acknowledged (offset, payload) must be readable with correct content
         for (offset, expected_payload) in expected {
             match consumed_map.get(offset) {
-                Some(actual) if String::from_utf8_lossy(actual) == expected_payload.as_str() => {
-                    verified += 1;
+                Some(actual) => {
+                    let actual_str = String::from_utf8_lossy(actual);
+                    if actual_str == expected_payload.as_str() {
+                        verified += 1;
+                    } else {
+                        eprintln!(
+                            "CONTENT_MISMATCH: partition {partition} offset {offset}: expected '{}', got '{}'",
+                            expected_payload, actual_str
+                        );
+                        content_mismatch_errors += 1;
+                    }
                 }
-                _ => {
-                    errors += 1;
+                None => {
+                    eprintln!(
+                        "MISSING_OFFSET: partition {partition} offset {offset} not found (expected '{expected_payload}')"
+                    );
+                    missing_offset_errors += 1;
                 }
             }
         }
     }
 
-    println!("\n=== Rapid Failover Stress Verification ===");
-    println!("  Total acknowledged: {total_acknowledged}");
-    println!("  Verified: {verified}");
-    println!("  Errors: {errors}");
+    // === Results Summary ===
+    let integrity_errors =
+        content_mismatch_errors + missing_offset_errors + storage_duplicate_errors + producer_duplicate_errors;
 
-    assert_eq!(errors, 0, "CRITICAL: {errors} data integrity errors after rapid failover");
+    println!("\n=== Rapid Failover Stress Test Results ({mode_str} mode) ===");
+    println!("Write Statistics:");
+    println!("  Initial:  {initial_successes}/{initial_attempts} ({:.1}%)",
+        100.0 * initial_successes as f64 / initial_attempts as f64);
+    println!("  Failover: {failover_successes}/{failover_attempts} ({:.1}%)",
+        100.0 * failover_successes as f64 / failover_attempts as f64);
+    println!("  Final:    {final_successes}/{final_attempts} ({:.1}%)",
+        100.0 * final_successes as f64 / final_attempts as f64);
+    println!("  Total:    {total_successes}/{total_attempts} ({:.1}%)",
+        100.0 * total_successes as f64 / total_attempts as f64);
+    println!();
+    println!("Verification:");
+    println!("  Acknowledged writes: {total_acknowledged}");
+    println!("  Verified correct:    {verified}");
+    println!();
+    println!("Integrity Errors:");
+    println!("  Content mismatches:    {content_mismatch_errors}");
+    println!("  Missing offsets:       {missing_offset_errors}");
+    println!("  Storage duplicates:    {storage_duplicate_errors}");
+    println!("  Producer duplicates:   {producer_duplicate_errors}");
+    println!("  TOTAL ERRORS:          {integrity_errors}");
+
+    // === Assertions ===
+
+    // 1. Initial and final writes should have 100% success (stable cluster)
+    assert_eq!(
+        initial_successes, initial_attempts,
+        "Initial writes failed unexpectedly ({initial_successes}/{initial_attempts}) - cluster should be stable"
+    );
+    assert_eq!(
+        final_successes, final_attempts,
+        "Final writes failed unexpectedly ({final_successes}/{final_attempts}) - cluster should be stable"
+    );
+
+    // 2. Failover writes should have high success rate (quorum always available)
+    let failover_success_rate = failover_successes as f64 / failover_attempts as f64;
+    assert!(
+        failover_success_rate >= 0.80,
+        "Failover write success rate too low ({:.1}%) - quorum should be available",
+        failover_success_rate * 100.0
+    );
+
+    // 3. Zero integrity errors (the core Kafka guarantee)
+    assert_eq!(
+        integrity_errors, 0,
+        "CRITICAL: {integrity_errors} data integrity errors - Kafka offset guarantee violated! \
+         (content_mismatch={content_mismatch_errors}, missing={missing_offset_errors}, \
+         storage_dup={storage_duplicate_errors}, producer_dup={producer_duplicate_errors})"
+    );
+
+    // 4. All acknowledged writes verified
     assert_eq!(
         verified as usize, total_acknowledged,
-        "Not all writes verified: {verified}/{total_acknowledged}"
+        "Not all acknowledged writes verified: {verified}/{total_acknowledged}"
     );
+}
+
+/// Rapid failover stress test - actor mode.
+#[tokio::test]
+async fn test_actor_mode_rapid_failover_stress() {
+    run_rapid_failover_stress_test(true, 23800, 23900).await;
+}
+
+/// Rapid failover stress test - non-actor mode.
+///
+/// Tests the same bug scenario as the actor mode test, but using the
+/// traditional tick-based processing path in helix-server.
+#[tokio::test]
+async fn test_non_actor_mode_rapid_failover_stress() {
+    run_rapid_failover_stress_test(false, 23950, 24050).await;
 }

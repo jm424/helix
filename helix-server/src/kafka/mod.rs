@@ -16,5 +16,5 @@ mod handler;
 mod server;
 
 pub use error::{KafkaError, KafkaResult};
-pub use handler::KafkaHandler;
+pub use handler::{extract_producer_info, KafkaHandler, ProducerInfo};
 pub use server::{KafkaServer, KafkaServerConfig};

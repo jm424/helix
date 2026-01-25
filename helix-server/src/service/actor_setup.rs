@@ -137,6 +137,7 @@ pub async fn setup_single_partition(
         Arc::clone(&batcher_stats),
         config.batcher_config,
         Arc::clone(&backpressure),
+        Arc::clone(&partition_storage),
     ));
 
     // Spawn the output processor.
@@ -249,6 +250,7 @@ pub async fn setup_multi_partition(
         Arc::clone(&batcher_stats),
         config.batcher_config,
         Arc::clone(&backpressure),
+        Arc::clone(&partition_storage),
     ));
 
     // Spawn the output processor.
@@ -443,12 +445,14 @@ mod tests {
         if is_leader {
             // Propose a command.
             use crate::storage::{BatchedBlob, BlobFormat, PartitionCommand};
+            use helix_core::Offset;
             let command = PartitionCommand::AppendBlobBatch {
                 blobs: vec![BatchedBlob {
                     blob: Bytes::from("test data"),
                     record_count: 1,
                     format: BlobFormat::Raw,
                 }],
+                base_offset: Offset::new(0),
             };
             let data = command.encode();
 
