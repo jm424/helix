@@ -135,7 +135,7 @@ impl HelixService {
                 };
                 ps_inner
             };
-            partition_storage.insert(group_id, ps);
+            partition_storage.insert(group_id, std::sync::Arc::new(tokio::sync::RwLock::new(ps)));
 
             // For single-node cluster, tick until the node becomes leader.
             // With default election_tick=10 and randomized timeout in [10, 20),
@@ -153,7 +153,8 @@ impl HelixService {
                         } = output
                         {
                             if *gid == group_id {
-                                if let Some(ps) = partition_storage.get_mut(&group_id) {
+                                if let Some(ps_lock) = partition_storage.get(&group_id) {
+                                    let mut ps = ps_lock.write().await;
                                     let _ = ps.apply_entry_async(*index, data).await;
                                 }
                             }

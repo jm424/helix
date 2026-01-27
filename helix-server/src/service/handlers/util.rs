@@ -122,8 +122,11 @@ impl HelixService {
         };
 
         // Get offsets from storage.
-        let storage = self.partition_storage.read().await;
-        let ps = storage.get(&group_id)?;
+        let ps_lock = {
+            let storage = self.partition_storage.read().await;
+            storage.get(&group_id).cloned()?
+        };
+        let ps = ps_lock.read().await;
 
         Some((
             ps.log_start_offset().get(),

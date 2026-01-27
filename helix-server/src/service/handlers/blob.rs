@@ -106,11 +106,14 @@ impl HelixService {
         // Capture base_offset BEFORE proposing to ensure consistency across all replicas.
         // The offset is encoded in the command and used by all replicas during apply.
         let base_offset = {
-            let storage = self.partition_storage.read().await;
-            let ps = storage.get(&group_id).ok_or_else(|| ServerError::PartitionNotFound {
-                topic: topic.to_string(),
-                partition,
-            })?;
+            let ps_lock = {
+                let storage = self.partition_storage.read().await;
+                storage.get(&group_id).cloned().ok_or_else(|| ServerError::PartitionNotFound {
+                    topic: topic.to_string(),
+                    partition,
+                })?
+            };
+            let ps = ps_lock.read().await;
             ps.blob_log_end_offset()
         };
 
@@ -158,14 +161,18 @@ impl HelixService {
 
             // Register the pending proposal so the tick task can notify us.
             {
-                let mut proposals = self.pending_proposals.write().await;
-                proposals
-                    .entry(group_id)
-                    .or_default()
-                    .insert(proposed_index, PendingProposal {
-                        log_index: proposed_index,
-                        result_tx,
-                    });
+                let inner_lock = {
+                    let mut proposals = self.pending_proposals.write().await;
+                    proposals
+                        .entry(group_id)
+                        .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())))
+                        .clone()
+                };
+                let mut inner = inner_lock.write().await;
+                inner.insert(proposed_index, PendingProposal {
+                    log_index: proposed_index,
+                    result_tx,
+                });
             }
 
             // Wait for commit with timeout.
@@ -225,8 +232,12 @@ impl HelixService {
                             "Processing CommitEntry"
                         );
                         if *gid == group_id {
-                            let mut storage = self.partition_storage.write().await;
-                            if let Some(ps) = storage.get_mut(&group_id) {
+                            let ps_lock = {
+                                let storage = self.partition_storage.read().await;
+                                storage.get(&group_id).cloned()
+                            };
+                            if let Some(ps_lock) = ps_lock {
+                                let mut ps = ps_lock.write().await;
                                 ps.apply_entry_async(*index, entry_data)
                                     .await
                                     .map_err(|e| ServerError::Internal {
@@ -369,8 +380,12 @@ impl HelixService {
 
         // Check producer sequence for idempotent deduplication BEFORE proposing.
         if let Some(ref info) = producer_info {
-            let storage = self.partition_storage.read().await;
-            if let Some(ps) = storage.get(&group_id) {
+            let ps_lock = {
+                let storage = self.partition_storage.read().await;
+                storage.get(&group_id).cloned()
+            };
+            if let Some(ps_lock) = ps_lock {
+                let ps = ps_lock.read().await;
                 match ps.check_producer_sequence(info.producer_id, info.epoch, info.base_sequence) {
                     SequenceCheckResult::Valid => {
                         // Continue with the proposal.
@@ -467,8 +482,12 @@ impl HelixService {
 
                 // Record producer sequence after successful commit.
                 if let Some(ref info) = producer_info {
-                    let mut storage = self.partition_storage.write().await;
-                    if let Some(ps) = storage.get_mut(&group_id) {
+                    let ps_lock = {
+                        let storage = self.partition_storage.read().await;
+                        storage.get(&group_id).cloned()
+                    };
+                    if let Some(ps_lock) = ps_lock {
+                        let mut ps = ps_lock.write().await;
                         ps.record_producer_sequence(
                             info.producer_id,
                             info.epoch,
@@ -493,11 +512,14 @@ impl HelixService {
             // Fallback: direct propose (if batcher not configured).
             // Capture base_offset BEFORE proposing to ensure consistency across all replicas.
             let base_offset = {
-                let storage = self.partition_storage.read().await;
-                let ps = storage.get(&group_id).ok_or_else(|| ServerError::PartitionNotFound {
-                    topic: topic.to_string(),
-                    partition,
-                })?;
+                let ps_lock = {
+                    let storage = self.partition_storage.read().await;
+                    storage.get(&group_id).cloned().ok_or_else(|| ServerError::PartitionNotFound {
+                        topic: topic.to_string(),
+                        partition,
+                    })?
+                };
+                let ps = ps_lock.read().await;
                 ps.blob_log_end_offset()
             };
 
@@ -539,14 +561,18 @@ impl HelixService {
 
             // Register the pending proposal so the tick task can notify us.
             {
-                let mut proposals = self.pending_proposals.write().await;
-                proposals
-                    .entry(group_id)
-                    .or_default()
-                    .insert(proposed_index, PendingProposal {
-                        log_index: proposed_index,
-                        result_tx,
-                    });
+                let inner_lock = {
+                    let mut proposals = self.pending_proposals.write().await;
+                    proposals
+                        .entry(group_id)
+                        .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())))
+                        .clone()
+                };
+                let mut inner = inner_lock.write().await;
+                inner.insert(proposed_index, PendingProposal {
+                    log_index: proposed_index,
+                    result_tx,
+                });
             }
 
             // Wait for commit with timeout.
@@ -564,8 +590,12 @@ impl HelixService {
 
             // Record producer sequence after successful commit.
             if let Some(ref info) = producer_info {
-                let mut storage = self.partition_storage.write().await;
-                if let Some(ps) = storage.get_mut(&group_id) {
+                let ps_lock = {
+                    let storage = self.partition_storage.read().await;
+                    storage.get(&group_id).cloned()
+                };
+                if let Some(ps_lock) = ps_lock {
+                    let mut ps = ps_lock.write().await;
                     ps.record_producer_sequence(
                         info.producer_id,
                         info.epoch,
@@ -589,11 +619,14 @@ impl HelixService {
             // Single-node: commit happens synchronously.
             // Capture base_offset BEFORE proposing to ensure consistency.
             let base_offset = {
-                let storage = self.partition_storage.read().await;
-                let ps = storage.get(&group_id).ok_or_else(|| ServerError::PartitionNotFound {
-                    topic: topic.to_string(),
-                    partition,
-                })?;
+                let ps_lock = {
+                    let storage = self.partition_storage.read().await;
+                    storage.get(&group_id).cloned().ok_or_else(|| ServerError::PartitionNotFound {
+                        topic: topic.to_string(),
+                        partition,
+                    })?
+                };
+                let ps = ps_lock.read().await;
                 ps.blob_log_end_offset()
             };
 
@@ -621,8 +654,12 @@ impl HelixService {
                     } = output
                     {
                         if *gid == group_id {
-                            let mut storage = self.partition_storage.write().await;
-                            if let Some(ps) = storage.get_mut(&group_id) {
+                            let ps_lock = {
+                                let storage = self.partition_storage.read().await;
+                                storage.get(&group_id).cloned()
+                            };
+                            if let Some(ps_lock) = ps_lock {
+                                let mut ps = ps_lock.write().await;
                                 ps.apply_entry_async(*index, entry_data)
                                     .await
                                     .map_err(|e| ServerError::Internal {
@@ -699,11 +736,14 @@ impl HelixService {
         };
 
         // Read blobs from storage.
-        let storage = self.partition_storage.read().await;
-        let ps = storage.get(&group_id).ok_or_else(|| ServerError::PartitionNotFound {
-            topic: topic.to_string(),
-            partition,
-        })?;
+        let ps_lock = {
+            let storage = self.partition_storage.read().await;
+            storage.get(&group_id).cloned().ok_or_else(|| ServerError::PartitionNotFound {
+                topic: topic.to_string(),
+                partition,
+            })?
+        };
+        let ps = ps_lock.read().await;
 
         let storage_end_offset = ps.blob_log_end_offset();
         info!(
@@ -792,8 +832,11 @@ impl HelixService {
         };
 
         // Get blob log end offset from storage.
-        let storage = self.partition_storage.read().await;
-        let ps = storage.get(&group_id)?;
+        let ps_lock = {
+            let storage = self.partition_storage.read().await;
+            storage.get(&group_id).cloned()?
+        };
+        let ps = ps_lock.read().await;
 
         let offset = match &ps.inner {
             PartitionStorageInner::InMemory(p) => p.blob_log_end_offset(),
@@ -830,10 +873,14 @@ impl HelixService {
         };
 
         // Check storage.
-        let storage = self.partition_storage.read().await;
-        let Some(ps) = storage.get(&group_id) else {
-            return false;
+        let ps_lock = {
+            let storage = self.partition_storage.read().await;
+            let Some(ps_lock) = storage.get(&group_id).cloned() else {
+                return false;
+            };
+            ps_lock
         };
+        let ps = ps_lock.read().await;
 
         match &ps.inner {
             // Check if any blobs exist (offset 0 always valid if partition has data).

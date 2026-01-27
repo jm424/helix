@@ -125,12 +125,14 @@ impl HelixService {
         };
 
         let multi_raft = self.multi_raft.read().await;
-        let storage = self.partition_storage.read().await;
-
-        let ps = storage.get(&group_id).ok_or_else(|| ServerError::PartitionNotFound {
-            topic: request.topic.clone(),
-            partition: request.partition,
-        })?;
+        let ps_lock = {
+            let storage = self.partition_storage.read().await;
+            storage.get(&group_id).cloned().ok_or_else(|| ServerError::PartitionNotFound {
+                topic: request.topic.clone(),
+                partition: request.partition,
+            })?
+        };
+        let ps = ps_lock.read().await;
 
         let leader = multi_raft
             .group_state(group_id)

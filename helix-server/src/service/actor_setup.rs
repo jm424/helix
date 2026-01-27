@@ -98,9 +98,9 @@ pub async fn setup_single_partition(
     group_id: GroupId,
     node_id: NodeId,
     cluster_nodes: Vec<NodeId>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
     group_map: Arc<RwLock<GroupMap>>,
-    batch_pending_proposals: Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, BatchPendingProposal>>>>,
+    batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
     transport_handle: Option<TransportHandle>,
     config: ActorSetupConfig,
 ) -> ActorSetupHandles {
@@ -197,12 +197,12 @@ pub async fn setup_multi_partition(
     node_id: NodeId,
     cluster_nodes: Vec<NodeId>,
     initial_groups: HashMap<GroupId, Vec<NodeId>>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
     group_map: Arc<RwLock<GroupMap>>,
     controller_state: Arc<RwLock<crate::controller::ControllerState>>,
-    pending_proposals: Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, super::PendingProposal>>>>,
+    pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, super::PendingProposal>>>>>>,
     pending_controller_proposals: Arc<RwLock<Vec<super::PendingControllerProposal>>>,
-    batch_pending_proposals: Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, BatchPendingProposal>>>>,
+    batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
     local_broker_heartbeats: Arc<RwLock<HashMap<NodeId, u64>>>,
     multi_raft: Arc<RwLock<helix_raft::multi::MultiRaft>>,
     transport_handle: TransportHandle,
@@ -352,9 +352,11 @@ mod tests {
         let node_id = NodeId::new(1);
         let cluster_nodes = vec![node_id];
 
-        let partition_storage = Arc::new(RwLock::new(HashMap::new()));
+        let partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
         let group_map = Arc::new(RwLock::new(GroupMap::new()));
-        let batch_pending_proposals = Arc::new(RwLock::new(HashMap::new()));
+        let batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
 
         // Add group mapping.
         {
@@ -366,7 +368,7 @@ mod tests {
         {
             let mut storage = partition_storage.write().await;
             let ps = ServerPartitionStorage::new_in_memory(TopicId::new(1), PartitionId::new(0));
-            storage.insert(group_id, ps);
+            storage.insert(group_id, Arc::new(RwLock::new(ps)));
         }
 
         let handles = setup_single_partition(
@@ -398,9 +400,11 @@ mod tests {
         let node_id = NodeId::new(1);
         let cluster_nodes = vec![node_id];
 
-        let partition_storage = Arc::new(RwLock::new(HashMap::new()));
+        let partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
         let group_map = Arc::new(RwLock::new(GroupMap::new()));
-        let batch_pending_proposals = Arc::new(RwLock::new(HashMap::new()));
+        let batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
 
         // Add group mapping.
         {
@@ -412,7 +416,7 @@ mod tests {
         {
             let mut storage = partition_storage.write().await;
             let ps = ServerPartitionStorage::new_in_memory(TopicId::new(1), PartitionId::new(0));
-            storage.insert(group_id, ps);
+            storage.insert(group_id, Arc::new(RwLock::new(ps)));
         }
 
         let handles = setup_single_partition(

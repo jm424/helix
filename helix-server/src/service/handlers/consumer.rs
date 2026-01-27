@@ -111,13 +111,16 @@ impl HelixService {
 
         // Check how many records are available from storage.
         let log_end = {
-            let storage = self.partition_storage.read().await;
-            let ps = storage.get(&raft_group_id).ok_or_else(|| {
-                ServerError::PartitionNotFound {
-                    topic: request.topic.clone(),
-                    partition: request.partition,
-                }
-            })?;
+            let ps_lock = {
+                let storage = self.partition_storage.read().await;
+                storage.get(&raft_group_id).cloned().ok_or_else(|| {
+                    ServerError::PartitionNotFound {
+                        topic: request.topic.clone(),
+                        partition: request.partition,
+                    }
+                })?
+            };
+            let ps = ps_lock.read().await;
             ps.log_end_offset()
         };
 
@@ -184,13 +187,16 @@ impl HelixService {
         };
 
         // Read the actual records from storage.
-        let storage = self.partition_storage.read().await;
-        let ps = storage.get(&raft_group_id).ok_or_else(|| {
-            ServerError::PartitionNotFound {
-                topic: request.topic.clone(),
-                partition: request.partition,
-            }
-        })?;
+        let ps_lock = {
+            let storage = self.partition_storage.read().await;
+            storage.get(&raft_group_id).cloned().ok_or_else(|| {
+                ServerError::PartitionNotFound {
+                    topic: request.topic.clone(),
+                    partition: request.partition,
+                }
+            })?
+        };
+        let ps = ps_lock.read().await;
 
         let log_end = ps.log_end_offset();
         let lease_to_offset = lease.to_offset.get().min(log_end.get().saturating_sub(1));

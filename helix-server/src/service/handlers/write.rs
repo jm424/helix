@@ -165,71 +165,73 @@ impl HelixService {
             const MAX_CONCURRENT_APPLY_RETRIES: u32 = 10_000;
             const RETRY_DELAY_MICROS: u64 = 100;
 
-            for retry in 0..MAX_CONCURRENT_APPLY_RETRIES {
-                let mut storage = self.partition_storage.write().await;
-                if let Some(ps) = storage.get_mut(&group_id) {
-                    let last_applied = ps.last_applied();
-                    let expected_next = helix_core::LogIndex::new(last_applied.get() + 1);
+            // Get the per-partition lock once outside the loop.
+            let ps_lock = {
+                let storage = self.partition_storage.read().await;
+                storage.get(&group_id).cloned().ok_or_else(|| ServerError::Internal {
+                    message: "partition storage not found".to_string(),
+                })?
+            };
 
-                    if proposed_index <= last_applied {
-                        // Already applied (shouldn't normally happen, but handle gracefully).
-                        debug!(
-                            topic = %request.topic,
-                            partition = partition_idx,
-                            index = proposed_index.get(),
-                            last_applied = last_applied.get(),
-                            "Entry already applied"
-                        );
-                        return Ok(WriteResponse {
+            for retry in 0..MAX_CONCURRENT_APPLY_RETRIES {
+                let mut ps = ps_lock.write().await;
+                let last_applied = ps.last_applied();
+                let expected_next = helix_core::LogIndex::new(last_applied.get() + 1);
+
+                if proposed_index <= last_applied {
+                    // Already applied (shouldn't normally happen, but handle gracefully).
+                    debug!(
+                        topic = %request.topic,
+                        partition = partition_idx,
+                        index = proposed_index.get(),
+                        last_applied = last_applied.get(),
+                        "Entry already applied"
+                    );
+                    return Ok(WriteResponse {
+                        base_offset: ps.log_end_offset().get(),
+                        record_count: record_count as u32,
+                        error_code: ErrorCode::None.into(),
+                        error_message: None,
+                    });
+                }
+
+                if proposed_index == expected_next {
+                    // It's our turn to apply.
+                    match ps.apply_entry_async(proposed_index, &entry_data).await {
+                        Ok(Some(offset)) => return Ok(WriteResponse {
+                            base_offset: offset.get(),
+                            record_count: record_count as u32,
+                            error_code: ErrorCode::None.into(),
+                            error_message: None,
+                        }),
+                        Ok(None) => return Ok(WriteResponse {
                             base_offset: ps.log_end_offset().get(),
                             record_count: record_count as u32,
                             error_code: ErrorCode::None.into(),
                             error_message: None,
-                        });
-                    }
-
-                    if proposed_index == expected_next {
-                        // It's our turn to apply.
-                        match ps.apply_entry_async(proposed_index, &entry_data).await {
-                            Ok(Some(offset)) => return Ok(WriteResponse {
-                                base_offset: offset.get(),
-                                record_count: record_count as u32,
-                                error_code: ErrorCode::None.into(),
-                                error_message: None,
-                            }),
-                            Ok(None) => return Ok(WriteResponse {
-                                base_offset: ps.log_end_offset().get(),
-                                record_count: record_count as u32,
-                                error_code: ErrorCode::None.into(),
-                                error_message: None,
-                            }),
-                            Err(e) => {
-                                return Err(ServerError::Internal {
-                                    message: format!("failed to apply: {e}"),
-                                });
-                            }
+                        }),
+                        Err(e) => {
+                            return Err(ServerError::Internal {
+                                message: format!("failed to apply: {e}"),
+                            });
                         }
                     }
-
-                    // Not our turn yet. Release lock, yield, and retry.
-                    // Another concurrent write should apply its entry, advancing last_applied.
-                    drop(storage);
-                    if retry % 100 == 0 && retry > 0 {
-                        debug!(
-                            topic = %request.topic,
-                            partition = partition_idx,
-                            index = proposed_index.get(),
-                            last_applied = last_applied.get(),
-                            retry,
-                            "Waiting for turn to apply"
-                        );
-                    }
-                    tokio::time::sleep(std::time::Duration::from_micros(RETRY_DELAY_MICROS)).await;
-                } else {
-                    return Err(ServerError::Internal {
-                        message: "partition storage not found".to_string(),
-                    });
                 }
+
+                // Not our turn yet. Release lock, yield, and retry.
+                // Another concurrent write should apply its entry, advancing last_applied.
+                drop(ps);
+                if retry % 100 == 0 && retry > 0 {
+                    debug!(
+                        topic = %request.topic,
+                        partition = partition_idx,
+                        index = proposed_index.get(),
+                        last_applied = last_applied.get(),
+                        retry,
+                        "Waiting for turn to apply"
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_micros(RETRY_DELAY_MICROS)).await;
             }
 
             // Exhausted retries - this indicates a bug or deadlock.
@@ -241,14 +243,18 @@ impl HelixService {
         } else {
             // Multi-node mode: register pending proposal and wait for tick task.
             {
-                let mut proposals = self.pending_proposals.write().await;
-                proposals
-                    .entry(group_id)
-                    .or_default()
-                    .insert(proposed_index, PendingProposal {
-                        log_index: proposed_index,
-                        result_tx,
-                    });
+                let inner_lock = {
+                    let mut proposals = self.pending_proposals.write().await;
+                    proposals
+                        .entry(group_id)
+                        .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())))
+                        .clone()
+                };
+                let mut inner = inner_lock.write().await;
+                inner.insert(proposed_index, PendingProposal {
+                    log_index: proposed_index,
+                    result_tx,
+                });
             }
 
             // Wait for commit and apply with timeout.

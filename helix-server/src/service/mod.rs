@@ -334,7 +334,8 @@ pub struct HelixService {
     /// Multi-Raft engine for consensus.
     pub(crate) multi_raft: Arc<RwLock<MultiRaft>>,
     /// Partition storage indexed by `GroupId`.
-    pub(crate) partition_storage: Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
+    /// Uses per-partition locks to enable parallel processing of different partitions.
+    pub(crate) partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
     /// Group ID mapping.
     pub(crate) group_map: Arc<RwLock<GroupMap>>,
     /// Topic name to metadata mapping.
@@ -365,7 +366,8 @@ pub struct HelixService {
     pub(crate) controller_state: Arc<RwLock<ControllerState>>,
     /// Pending proposals waiting for Raft commit (multi-node mode only).
     /// Indexed by (`GroupId`, `LogIndex`) for O(1) lookup on commit.
-    pub(crate) pending_proposals: Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, PendingProposal>>>>,
+    /// Uses per-partition locks to enable parallel processing of different partitions.
+    pub(crate) pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>>,
     /// Pending controller proposals waiting for Raft commit.
     pub(crate) pending_controller_proposals: Arc<RwLock<Vec<PendingControllerProposal>>>,
     /// Local broker heartbeat timestamps (soft state, not Raft-replicated).
@@ -383,8 +385,9 @@ pub struct HelixService {
     /// Pending batched proposals waiting for Raft commit (multi-node mode only).
     /// Indexed by (`GroupId`, `LogIndex`) for O(1) lookup on commit.
     /// Note: This field is shared via Arc with the tick task, not read directly here.
+    /// Uses per-partition locks to enable parallel processing of different partitions.
     #[allow(dead_code)]
-    pub(crate) batch_pending_proposals: Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, BatchPendingProposal>>>>,
+    pub(crate) batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
     /// Handle to submit requests to the batcher (multi-node mode only).
     pub(crate) batcher_handle: Option<batcher::BatcherHandle>,
     /// Aggregated batcher performance stats (multi-node mode only).
@@ -477,9 +480,9 @@ impl HelixService {
         let cluster_nodes = vec![node_id]; // Single node for now.
 
         let multi_raft = Arc::new(RwLock::new(MultiRaft::new(node_id)));
-        let partition_storage = Arc::new(RwLock::new(HashMap::new()));
+        let partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>> = Arc::new(RwLock::new(HashMap::new()));
         let group_map = Arc::new(RwLock::new(GroupMap::new()));
-        let pending_proposals = Arc::new(RwLock::new(HashMap::new()));
+        let pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>> = Arc::new(RwLock::new(HashMap::new()));
 
         // Create progress manager with simulated store.
         let progress_store = SimulatedProgressStore::new(node_id.get());
@@ -711,10 +714,10 @@ impl HelixService {
         let transport_handle = transport.start().await?;
 
         let multi_raft = Arc::new(RwLock::new(MultiRaft::new(node_id)));
-        let partition_storage = Arc::new(RwLock::new(HashMap::new()));
+        let partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>> = Arc::new(RwLock::new(HashMap::new()));
         let group_map = Arc::new(RwLock::new(GroupMap::new()));
         let controller_state = Arc::new(RwLock::new(ControllerState::new()));
-        let pending_proposals = Arc::new(RwLock::new(HashMap::new()));
+        let pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>> = Arc::new(RwLock::new(HashMap::new()));
         let pending_controller_proposals = Arc::new(RwLock::new(Vec::new()));
         let local_broker_heartbeats = Arc::new(RwLock::new(HashMap::new()));
 
@@ -792,7 +795,7 @@ impl HelixService {
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
         // Create batch pending proposals map.
-        let batch_pending_proposals = Arc::new(RwLock::new(HashMap::new()));
+        let batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>> = Arc::new(RwLock::new(HashMap::new()));
 
         // Branch based on actor mode.
         let (batcher_handle, batcher_stats, actor_router, actor_shutdown_tx, controller_shutdown_tx, actor_backpressure) =

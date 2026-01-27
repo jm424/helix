@@ -102,9 +102,9 @@ pub fn create_output_channel(
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
 pub async fn output_processor_task(
     mut output_rx: mpsc::Receiver<GroupedOutput>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
     group_map: Arc<RwLock<GroupMap>>,
-    batch_pending_proposals: Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, BatchPendingProposal>>>>,
+    batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
     transport_handle: Option<TransportHandle>,
     batcher_stats: Option<Arc<BatcherStats>>,
     batcher_backpressure: Option<Arc<BackpressureState>>,
@@ -199,9 +199,9 @@ async fn handle_entry_committed(
     index: LogIndex,
     data: &bytes::Bytes,
     batch_notify: Option<BatchNotifyInfo>,
-    partition_storage: &Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
     group_map: &Arc<RwLock<GroupMap>>,
-    batch_pending_proposals: &Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, BatchPendingProposal>>>>,
+    batch_pending_proposals: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
     batcher_stats: Option<&Arc<BatcherStats>>,
     batcher_backpressure: Option<&Arc<BackpressureState>>,
 ) {
@@ -236,10 +236,16 @@ async fn handle_entry_committed(
         })
     } else {
         // Fall back to shared map lookup.
-        let mut batch_proposals = batch_pending_proposals.write().await;
-        batch_proposals
-            .get_mut(&group_id)
-            .and_then(|m| m.remove(&index))
+        let inner_lock = {
+            let batch_proposals = batch_pending_proposals.read().await;
+            batch_proposals.get(&group_id).cloned()
+        };
+        if let Some(inner_lock) = inner_lock {
+            let mut inner = inner_lock.write().await;
+            inner.remove(&index)
+        } else {
+            None
+        }
     };
 
     if let Some(batch_proposal) = batch_proposal {
@@ -257,10 +263,16 @@ async fn handle_entry_committed(
                     "Failed to extract base_offset from command, falling back to storage"
                 );
                 // Fallback to storage for backwards compatibility with old commands.
-                let storage = partition_storage.read().await;
-                storage
-                    .get(&group_id)
-                    .map_or(Offset::new(0), ServerPartitionStorage::blob_log_end_offset)
+                let ps_lock = {
+                    let storage = partition_storage.read().await;
+                    storage.get(&group_id).cloned()
+                };
+                if let Some(ps_lock) = ps_lock {
+                    let ps = ps_lock.read().await;
+                    ps.blob_log_end_offset()
+                } else {
+                    Offset::new(0)
+                }
             }
         };
 
@@ -273,8 +285,12 @@ async fn handle_entry_committed(
 
         // Apply the batch entry.
         let apply_result = {
-            let mut storage = partition_storage.write().await;
-            if let Some(ps) = storage.get_mut(&group_id) {
+            let ps_lock = {
+                let storage = partition_storage.read().await;
+                storage.get(&group_id).cloned()
+            };
+            if let Some(ps_lock) = ps_lock {
+                let mut ps = ps_lock.write().await;
                 ps.apply_entry_async(index, data).await
             } else {
                 Err(ServerError::PartitionNotFound {
@@ -395,24 +411,29 @@ async fn handle_entry_committed(
         // Without this, a new leader won't know about producer sequences from
         // PREVIOUS_TERM entries, causing duplicate detection to fail.
 
+        // Get per-partition lock.
+        let ps_lock = {
+            let storage = partition_storage.read().await;
+            storage.get(&group_id).cloned()
+        };
+        let Some(ps_lock) = ps_lock else {
+            warn!(
+                group = group_id.get(),
+                index = index.get(),
+                "Partition storage not found for committed entry"
+            );
+            return;
+        };
+
         // Get base_offset BEFORE apply (needed for producer state recording).
         let base_offset = {
-            let storage = partition_storage.read().await;
-            storage
-                .get(&group_id)
-                .map_or(Offset::new(0), ServerPartitionStorage::blob_log_end_offset)
+            let ps = ps_lock.read().await;
+            ps.blob_log_end_offset()
         };
 
         let apply_result = {
-            let mut storage = partition_storage.write().await;
-            if let Some(ps) = storage.get_mut(&group_id) {
-                ps.apply_entry_async(index, data).await
-            } else {
-                Err(ServerError::PartitionNotFound {
-                    topic: topic_id.get().to_string(),
-                    partition: i32::try_from(partition_id.get()).unwrap_or(0),
-                })
-            }
+            let mut ps = ps_lock.write().await;
+            ps.apply_entry_async(index, data).await
         };
 
         if let Err(e) = apply_result {
@@ -463,10 +484,19 @@ pub async fn extract_and_record_producer_state(
     data: &Bytes,
     base_offset: Offset,
     group_id: GroupId,
-    partition_storage: &Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
 ) {
     // Decode the partition command to access blob data.
     let Some(command) = PartitionCommand::decode(data) else {
+        return;
+    };
+
+    // Get the per-partition lock once.
+    let ps_lock = {
+        let storage = partition_storage.read().await;
+        storage.get(&group_id).cloned()
+    };
+    let Some(ps_lock) = ps_lock else {
         return;
     };
 
@@ -480,24 +510,22 @@ pub async fn extract_and_record_producer_state(
             if format == BlobFormat::KafkaRecordBatch {
                 if let Some(info) = extract_producer_info(&blob) {
                     if info.is_idempotent() {
-                        let mut storage = partition_storage.write().await;
-                        if let Some(ps) = storage.get_mut(&group_id) {
-                            ps.record_producer_sequence(
-                                ProducerId::new(info.producer_id as u64),
-                                ProducerEpoch::new(info.epoch as u16),
-                                SequenceNum::new(info.base_sequence),
-                                base_offset,
-                            );
-                            debug!(
-                                group = group_id.get(),
-                                producer_id = info.producer_id,
-                                epoch = info.epoch,
-                                sequence = info.base_sequence,
-                                offset = base_offset.get(),
-                                record_count,
-                                "Recorded producer state from committed entry"
-                            );
-                        }
+                        let mut ps = ps_lock.write().await;
+                        ps.record_producer_sequence(
+                            ProducerId::new(info.producer_id as u64),
+                            ProducerEpoch::new(info.epoch as u16),
+                            SequenceNum::new(info.base_sequence),
+                            base_offset,
+                        );
+                        debug!(
+                            group = group_id.get(),
+                            producer_id = info.producer_id,
+                            epoch = info.epoch,
+                            sequence = info.base_sequence,
+                            offset = base_offset.get(),
+                            record_count,
+                            "Recorded producer state from committed entry"
+                        );
                     }
                 }
             }
@@ -509,24 +537,22 @@ pub async fn extract_and_record_producer_state(
                 if batched.format == BlobFormat::KafkaRecordBatch {
                     if let Some(info) = extract_producer_info(&batched.blob) {
                         if info.is_idempotent() {
-                            let mut storage = partition_storage.write().await;
-                            if let Some(ps) = storage.get_mut(&group_id) {
-                                ps.record_producer_sequence(
-                                    ProducerId::new(info.producer_id as u64),
-                                    ProducerEpoch::new(info.epoch as u16),
-                                    SequenceNum::new(info.base_sequence),
-                                    cumulative_offset,
-                                );
-                                debug!(
-                                    group = group_id.get(),
-                                    producer_id = info.producer_id,
-                                    epoch = info.epoch,
-                                    sequence = info.base_sequence,
-                                    offset = cumulative_offset.get(),
-                                    record_count = batched.record_count,
-                                    "Recorded producer state from batched entry"
-                                );
-                            }
+                            let mut ps = ps_lock.write().await;
+                            ps.record_producer_sequence(
+                                ProducerId::new(info.producer_id as u64),
+                                ProducerEpoch::new(info.epoch as u16),
+                                SequenceNum::new(info.base_sequence),
+                                cumulative_offset,
+                            );
+                            debug!(
+                                group = group_id.get(),
+                                producer_id = info.producer_id,
+                                epoch = info.epoch,
+                                sequence = info.base_sequence,
+                                offset = cumulative_offset.get(),
+                                record_count = batched.record_count,
+                                "Recorded producer state from batched entry"
+                            );
                         }
                     }
                 }
@@ -664,9 +690,11 @@ mod tests {
         let config = OutputProcessorConfig::default();
         let (tx, rx) = create_output_channel(config);
 
-        let partition_storage = Arc::new(RwLock::new(HashMap::new()));
+        let partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
         let group_map = Arc::new(RwLock::new(GroupMap::new()));
-        let batch_pending_proposals = Arc::new(RwLock::new(HashMap::new()));
+        let batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
 
         // Add a mapping.
         {
@@ -679,7 +707,7 @@ mod tests {
             let mut storage = partition_storage.write().await;
             let ps =
                 ServerPartitionStorage::new_in_memory(TopicId::new(1), PartitionId::new(0));
-            storage.insert(GroupId::new(1), ps);
+            storage.insert(GroupId::new(1), Arc::new(RwLock::new(ps)));
         }
 
         // Spawn processor.
@@ -717,9 +745,10 @@ mod tests {
         let config = OutputProcessorConfig::default();
         let (tx, rx) = create_output_channel(config);
 
-        let partition_storage = Arc::new(RwLock::new(HashMap::new()));
+        let partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
         let group_map = Arc::new(RwLock::new(GroupMap::new()));
-        let batch_pending_proposals: Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, BatchPendingProposal>>>> =
+        let batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let batcher_stats = Arc::new(BatcherStats::default());
         let backpressure = Arc::new(BackpressureState::default());
@@ -738,7 +767,7 @@ mod tests {
             let mut storage = partition_storage.write().await;
             let ps =
                 ServerPartitionStorage::new_in_memory(TopicId::new(1), PartitionId::new(0));
-            storage.insert(group_id, ps);
+            storage.insert(group_id, Arc::new(RwLock::new(ps)));
         }
 
         // Create a batch pending proposal.
@@ -764,8 +793,15 @@ mod tests {
 
         // Register the batch proposal.
         {
-            let mut proposals = batch_pending_proposals.write().await;
-            proposals.entry(group_id).or_default().insert(index, batch_proposal);
+            let inner_lock = {
+                let mut proposals = batch_pending_proposals.write().await;
+                proposals
+                    .entry(group_id)
+                    .or_insert_with(|| Arc::new(RwLock::new(HashMap::new())))
+                    .clone()
+            };
+            let mut inner = inner_lock.write().await;
+            inner.insert(index, batch_proposal);
         }
 
         // Spawn processor.

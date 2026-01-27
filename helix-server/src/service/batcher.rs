@@ -317,12 +317,12 @@ impl AccumulatedBatch {
 pub async fn batcher_task(
     mut rx: mpsc::Receiver<BatcherMessage>,
     multi_raft: Arc<RwLock<MultiRaft>>,
-    batch_pending_proposals: Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, BatchPendingProposal>>>>,
+    batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
     transport_handle: Option<TransportHandle>,
     batcher_stats: Arc<BatcherStats>,
     config: BatcherConfig,
     backpressure: Arc<BackpressureState>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, crate::partition_storage::ServerPartitionStorage>>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<crate::partition_storage::ServerPartitionStorage>>>>>,
 ) {
     let mut batches: HashMap<GroupId, AccumulatedBatch> = HashMap::new();
     let linger_duration = Duration::from_millis(config.linger_ms);
@@ -435,12 +435,12 @@ async fn handle_submit(
     request: PendingBatchRequest,
     batches: &mut HashMap<GroupId, AccumulatedBatch>,
     multi_raft: &Arc<RwLock<MultiRaft>>,
-    batch_pending_proposals: &Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, BatchPendingProposal>>>>,
+    batch_pending_proposals: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
     transport_handle: &Option<TransportHandle>,
     batcher_stats: &Arc<BatcherStats>,
     config: &BatcherConfig,
     backpressure: &Arc<BackpressureState>,
-    partition_storage: &Arc<RwLock<HashMap<GroupId, crate::partition_storage::ServerPartitionStorage>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<crate::partition_storage::ServerPartitionStorage>>>>>,
 ) {
     let group_id = request.group_id;
     #[allow(clippy::cast_possible_truncation)]
@@ -496,12 +496,12 @@ async fn flush_batch(
     group_id: GroupId,
     batch: AccumulatedBatch,
     multi_raft: &Arc<RwLock<MultiRaft>>,
-    batch_pending_proposals: &Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, BatchPendingProposal>>>>,
+    batch_pending_proposals: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
     transport_handle: &Option<TransportHandle>,
     batcher_stats: &Arc<BatcherStats>,
     reason: FlushReason,
     backpressure: &Arc<BackpressureState>,
-    partition_storage: &Arc<RwLock<HashMap<GroupId, crate::partition_storage::ServerPartitionStorage>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<crate::partition_storage::ServerPartitionStorage>>>>>,
 ) {
     let batch_size = batch.request_count();
     let batch_bytes = batch.total_bytes;
@@ -641,10 +641,16 @@ async fn flush_batch(
                 });
 
             let storage_last_applied = {
-                let storage = partition_storage.read().await;
-                storage
-                    .get(&group_id)
-                    .map_or(LogIndex::new(0), |ps| ps.last_applied())
+                let ps_lock = {
+                    let storage = partition_storage.read().await;
+                    storage.get(&group_id).cloned()
+                };
+                if let Some(ps_lock) = ps_lock {
+                    let ps = ps_lock.read().await;
+                    ps.last_applied()
+                } else {
+                    LogIndex::new(0)
+                }
             };
 
             // All entries committed (no uncommitted PREVIOUS_TERM entries).
@@ -726,20 +732,31 @@ async fn flush_batch(
             let (ci, lli) = state.map_or((LogIndex::new(0), LogIndex::new(0)), |s| {
                 (s.commit_index, s.last_log_index)
             });
-            let storage = partition_storage.read().await;
-            let (la, bo) = storage.get(&group_id).map_or(
-                (LogIndex::new(0), Offset::new(0)),
-                |ps| (ps.last_applied(), ps.blob_log_end_offset()),
-            );
+            let ps_lock = {
+                let storage = partition_storage.read().await;
+                storage.get(&group_id).cloned()
+            };
+            let (la, bo) = if let Some(ps_lock) = ps_lock {
+                let ps = ps_lock.read().await;
+                (ps.last_applied(), ps.blob_log_end_offset())
+            } else {
+                (LogIndex::new(0), Offset::new(0))
+            };
             (ci, lli, la, bo)
         };
 
         // Add record counts from all uncommitted proposals for this group.
         let pending_records: u64 = {
-            let proposals = batch_pending_proposals.read().await;
-            proposals
-                .get(&group_id)
-                .map_or(0, |m| m.values().map(|p| p.total_records).sum())
+            let inner_lock = {
+                let proposals = batch_pending_proposals.read().await;
+                proposals.get(&group_id).cloned()
+            };
+            if let Some(inner_lock) = inner_lock {
+                let inner = inner_lock.read().await;
+                inner.values().map(|p| p.total_records).sum()
+            } else {
+                0
+            }
         };
         // Read lock is now released - critical to avoid deadlock with write lock below!
 
@@ -793,8 +810,15 @@ async fn flush_batch(
             result_txs,
         };
         {
-            let mut proposals = batch_pending_proposals.write().await;
-            proposals.entry(group_id).or_default().insert(idx, batch_proposal);
+            let inner_lock = {
+                let mut proposals = batch_pending_proposals.write().await;
+                proposals
+                    .entry(group_id)
+                    .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())))
+                    .clone()
+            };
+            let mut inner = inner_lock.write().await;
+            inner.insert(idx, batch_proposal);
             info!(
                 group = group_id.get(),
                 index = idx.get(),
@@ -875,11 +899,11 @@ use crate::service::router::PartitionRouter;
 pub async fn batcher_task_actor(
     mut rx: mpsc::Receiver<BatcherMessage>,
     router: Arc<PartitionRouter>,
-    batch_pending_proposals: Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, BatchPendingProposal>>>>,
+    batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
     batcher_stats: Arc<BatcherStats>,
     config: BatcherConfig,
     backpressure: Arc<BackpressureState>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, crate::partition_storage::ServerPartitionStorage>>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<crate::partition_storage::ServerPartitionStorage>>>>>,
 ) {
     let mut batches: HashMap<GroupId, AccumulatedBatch> = HashMap::new();
     let linger_duration = Duration::from_millis(config.linger_ms);
@@ -988,11 +1012,11 @@ async fn handle_submit_actor(
     request: PendingBatchRequest,
     batches: &mut HashMap<GroupId, AccumulatedBatch>,
     router: &Arc<PartitionRouter>,
-    batch_pending_proposals: &Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, BatchPendingProposal>>>>,
+    batch_pending_proposals: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
     batcher_stats: &Arc<BatcherStats>,
     config: &BatcherConfig,
     backpressure: &Arc<BackpressureState>,
-    partition_storage: &Arc<RwLock<HashMap<GroupId, crate::partition_storage::ServerPartitionStorage>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<crate::partition_storage::ServerPartitionStorage>>>>>,
 ) {
     let group_id = request.group_id;
     #[allow(clippy::cast_possible_truncation)]
@@ -1048,11 +1072,11 @@ async fn flush_batch_actor(
     group_id: GroupId,
     batch: AccumulatedBatch,
     router: &Arc<PartitionRouter>,
-    batch_pending_proposals: &Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, BatchPendingProposal>>>>,
+    batch_pending_proposals: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
     batcher_stats: &Arc<BatcherStats>,
     reason: FlushReason,
     backpressure: &Arc<BackpressureState>,
-    partition_storage: &Arc<RwLock<HashMap<GroupId, crate::partition_storage::ServerPartitionStorage>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<crate::partition_storage::ServerPartitionStorage>>>>>,
 ) {
     let batch_size = batch.request_count();
     let batch_bytes = batch.total_bytes;
@@ -1152,10 +1176,16 @@ async fn flush_batch_actor(
     // This offset is encoded in the command and used by ALL replicas during apply.
     // This ensures consistency across the cluster, even during leadership changes.
     let base_offset = {
-        let storage = partition_storage.read().await;
-        storage
-            .get(&group_id)
-            .map_or(Offset::new(0), |ps| ps.blob_log_end_offset())
+        let ps_lock = {
+            let storage = partition_storage.read().await;
+            storage.get(&group_id).cloned()
+        };
+        if let Some(ps_lock) = ps_lock {
+            let ps = ps_lock.read().await;
+            ps.blob_log_end_offset()
+        } else {
+            Offset::new(0)
+        }
     };
 
     // Encode the batch command with the leader-assigned base_offset.

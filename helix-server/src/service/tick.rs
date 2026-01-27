@@ -87,9 +87,9 @@ fn extract_commit_payload_preview(data: &bytes::Bytes) -> String {
 #[allow(clippy::significant_drop_tightening)]
 pub async fn tick_task(
     multi_raft: Arc<RwLock<MultiRaft>>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
     group_map: Arc<RwLock<GroupMap>>,
-    pending_proposals: Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, PendingProposal>>>>,
+    pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
     let mut tick_interval =
@@ -127,12 +127,12 @@ pub async fn tick_task(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn tick_task_multi_node(
     multi_raft: Arc<RwLock<MultiRaft>>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
     group_map: Arc<RwLock<GroupMap>>,
     controller_state: Arc<RwLock<ControllerState>>,
-    pending_proposals: Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, PendingProposal>>>>,
+    pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>>,
     pending_controller_proposals: Arc<RwLock<Vec<PendingControllerProposal>>>,
-    batch_pending_proposals: Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, BatchPendingProposal>>>>,
+    batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
     local_broker_heartbeats: Arc<RwLock<HashMap<NodeId, u64>>>,
     cluster_nodes: Vec<NodeId>,
     transport_handle: TransportHandle,
@@ -338,10 +338,10 @@ pub async fn tick_task_multi_node(
 pub async fn tick_task_actor(
     router: Arc<super::router::PartitionRouter>,
     multi_raft: Arc<RwLock<MultiRaft>>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
     group_map: Arc<RwLock<GroupMap>>,
     controller_state: Arc<RwLock<ControllerState>>,
-    pending_proposals: Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, PendingProposal>>>>,
+    pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>>,
     pending_controller_proposals: Arc<RwLock<Vec<PendingControllerProposal>>>,
     local_broker_heartbeats: Arc<RwLock<HashMap<NodeId, u64>>>,
     node_id: NodeId,
@@ -480,10 +480,10 @@ pub async fn tick_task_actor(
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
 pub async fn tick_task_controller(
     multi_raft: Arc<RwLock<MultiRaft>>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
     group_map: Arc<RwLock<GroupMap>>,
     controller_state: Arc<RwLock<ControllerState>>,
-    pending_proposals: Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, PendingProposal>>>>,
+    pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>>,
     pending_controller_proposals: Arc<RwLock<Vec<PendingControllerProposal>>>,
     cluster_nodes: Vec<NodeId>,
     transport_handle: TransportHandle,
@@ -569,10 +569,10 @@ pub async fn tick_task_controller(
 async fn process_controller_outputs(
     outputs: &[MultiRaftOutput],
     multi_raft: &Arc<RwLock<MultiRaft>>,
-    partition_storage: &Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
     group_map: &Arc<RwLock<GroupMap>>,
     controller_state: &Arc<RwLock<ControllerState>>,
-    _pending_proposals: &Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, PendingProposal>>>>,
+    _pending_proposals: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>>,
     pending_controller_proposals: &Arc<RwLock<Vec<PendingControllerProposal>>>,
     cluster_nodes: &[NodeId],
     transport_handle: &TransportHandle,
@@ -689,7 +689,7 @@ async fn process_controller_outputs(
                             let mut storage = partition_storage.write().await;
                             if let std::collections::hash_map::Entry::Vacant(e) = storage.entry(data_group_id) {
                                 let ps = ServerPartitionStorage::new_in_memory(topic_id, partition_id);
-                                e.insert(ps);
+                                e.insert(Arc::new(RwLock::new(ps)));
                             }
                         }
 
@@ -831,9 +831,9 @@ async fn send_broker_heartbeats_to_peers(
 #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
 async fn process_outputs(
     outputs: &[MultiRaftOutput],
-    partition_storage: &Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
     group_map: &Arc<RwLock<GroupMap>>,
-    pending_proposals: &Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, PendingProposal>>>>,
+    pending_proposals: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>>,
 ) {
     for output in outputs {
         match output {
@@ -849,15 +849,25 @@ async fn process_outputs(
 
                 // Get base_offset BEFORE apply for producer state recording.
                 let base_offset = {
-                    let storage = partition_storage.read().await;
-                    storage
-                        .get(group_id)
-                        .map_or(Offset::new(0), ServerPartitionStorage::blob_log_end_offset)
+                    let ps_lock = {
+                        let storage = partition_storage.read().await;
+                        storage.get(group_id).cloned()
+                    };
+                    if let Some(ps_lock) = ps_lock {
+                        let ps = ps_lock.read().await;
+                        ps.blob_log_end_offset()
+                    } else {
+                        Offset::new(0)
+                    }
                 };
 
                 let apply_result = if let Some((topic_id, partition_id)) = key {
-                    let mut storage = partition_storage.write().await;
-                    if let Some(ps) = storage.get_mut(group_id) {
+                    let ps_lock = {
+                        let storage = partition_storage.read().await;
+                        storage.get(group_id).cloned()
+                    };
+                    if let Some(ps_lock) = ps_lock {
+                        let mut ps = ps_lock.write().await;
                         match ps.apply_entry_async(*index, data).await {
                             Ok(offset) => Ok(offset),
                             Err(e) => {
@@ -894,18 +904,26 @@ async fn process_outputs(
                 }
 
                 // Find and notify any pending proposal for this entry (O(1) lookup).
-                let mut proposals = pending_proposals.write().await;
-                if let Some(group_proposals) = proposals.get_mut(group_id) {
+                let inner_lock = {
+                    let proposals = pending_proposals.read().await;
+                    proposals.get(group_id).cloned()
+                };
+                if let Some(inner_lock) = inner_lock {
+                    let mut group_proposals = inner_lock.write().await;
                     if let Some(proposal) = group_proposals.remove(index) {
                         let result = match &apply_result {
                             Ok(Some(offset)) => Ok(*offset),
                             Ok(None) => {
                                 // No offset returned (e.g., empty entry), use current log end.
-                                let offset = {
+                                let ps_lock = {
                                     let storage = partition_storage.read().await;
-                                    storage
-                                        .get(group_id)
-                                        .map_or(Offset::new(0), ServerPartitionStorage::log_end_offset)
+                                    storage.get(group_id).cloned()
+                                };
+                                let offset = if let Some(ps_lock) = ps_lock {
+                                    let ps = ps_lock.read().await;
+                                    ps.log_end_offset()
+                                } else {
+                                    Offset::new(0)
                                 };
                                 Ok(offset)
                             }
@@ -979,12 +997,12 @@ async fn process_outputs_multi_node(
     outputs: &[MultiRaftOutput],
     node_id: NodeId,
     multi_raft: &Arc<RwLock<MultiRaft>>,
-    partition_storage: &Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
     group_map: &Arc<RwLock<GroupMap>>,
     controller_state: &Arc<RwLock<ControllerState>>,
-    pending_proposals: &Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, PendingProposal>>>>,
+    pending_proposals: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>>,
     pending_controller_proposals: &Arc<RwLock<Vec<PendingControllerProposal>>>,
-    batch_pending_proposals: &Arc<RwLock<HashMap<GroupId, HashMap<LogIndex, BatchPendingProposal>>>>,
+    batch_pending_proposals: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
     batcher_stats: &Option<Arc<BatcherStats>>,
     batcher_backpressure: &Option<Arc<crate::service::batcher::BackpressureState>>,
     cluster_nodes: &[NodeId],
@@ -1230,7 +1248,7 @@ async fn process_outputs_multi_node(
                                         };
                                         ps_inner
                                     };
-                                    e.insert(ps);
+                                    e.insert(Arc::new(RwLock::new(ps)));
                                 }
                             }
                         }
@@ -1247,22 +1265,44 @@ async fn process_outputs_multi_node(
                 if let Some((topic_id, partition_id)) = key {
                     // Check for batch pending proposal first.
                     let batch_proposal = {
-                        let mut batch_proposals = batch_pending_proposals.write().await;
-                        batch_proposals
-                            .get_mut(group_id)
-                            .and_then(|m| m.remove(index))
+                        let inner_lock = {
+                            let batch_proposals = batch_pending_proposals.read().await;
+                            batch_proposals.get(group_id).cloned()
+                        };
+                        if let Some(inner_lock) = inner_lock {
+                            let mut inner = inner_lock.write().await;
+                            inner.remove(index)
+                        } else {
+                            None
+                        }
                     };
 
                     // Also check for single pending proposal to determine entry type.
                     let has_single_proposal = {
-                        let proposals = pending_proposals.read().await;
-                        proposals.get(group_id).is_some_and(|m| m.contains_key(index))
+                        let inner_lock = {
+                            let proposals = pending_proposals.read().await;
+                            proposals.get(group_id).cloned()
+                        };
+                        if let Some(inner_lock) = inner_lock {
+                            let inner = inner_lock.read().await;
+                            inner.contains_key(index)
+                        } else {
+                            false
+                        }
                     };
 
                     // Log the offset BEFORE applying to detect interleaving.
                     let offset_before = {
-                        let storage = partition_storage.read().await;
-                        storage.get(group_id).map_or(0, |ps| ps.blob_log_end_offset().get())
+                        let ps_lock = {
+                            let storage = partition_storage.read().await;
+                            storage.get(group_id).cloned()
+                        };
+                        if let Some(ps_lock) = ps_lock {
+                            let ps = ps_lock.read().await;
+                            ps.blob_log_end_offset().get()
+                        } else {
+                            0
+                        }
                     };
 
                     // Determine entry type for logging
@@ -1303,9 +1343,13 @@ async fn process_outputs_multi_node(
                         // Batch proposal path: apply and use the returned base_offset.
                         // The apply_entry_async function returns the actual base_offset used,
                         // which is captured atomically during the apply operation.
-                        let apply_result = {
-                            let mut storage = partition_storage.write().await;
-                            if let Some(ps) = storage.get_mut(group_id) {
+                        let apply_result: Result<Option<Offset>, ServerError> = {
+                            let ps_lock = {
+                                let storage = partition_storage.read().await;
+                                storage.get(group_id).cloned()
+                            };
+                            if let Some(ps_lock) = ps_lock {
+                                let mut ps = ps_lock.write().await;
                                 let result = ps.apply_entry_async(*index, data).await;
                                 let offset_after = ps.blob_log_end_offset().get();
                                 info!(
@@ -1496,9 +1540,13 @@ async fn process_outputs_multi_node(
                         // Apply first, then use the returned offset for everything.
                         // This eliminates the TOCTOU race where base_offset could be
                         // captured before concurrent PREVIOUS_TERM entries are applied.
-                        let apply_result = {
-                            let mut storage = partition_storage.write().await;
-                            if let Some(ps) = storage.get_mut(group_id) {
+                        let apply_result: Result<Option<Offset>, ServerError> = {
+                            let ps_lock = {
+                                let storage = partition_storage.read().await;
+                                storage.get(group_id).cloned()
+                            };
+                            if let Some(ps_lock) = ps_lock {
+                                let mut ps = ps_lock.write().await;
                                 let result = ps.apply_entry_async(*index, data).await;
                                 let offset_after = ps.blob_log_end_offset().get();
                                 info!(
@@ -1533,11 +1581,18 @@ async fn process_outputs_multi_node(
                         }
 
                         // Find and notify any pending proposal (O(1) lookup).
-                        let mut proposals = pending_proposals.write().await;
-                        let had_proposal = proposals
-                            .get(group_id)
-                            .is_some_and(|m| m.contains_key(index));
-                        if let Some(group_proposals) = proposals.get_mut(group_id) {
+                        let inner_lock = {
+                            let proposals = pending_proposals.read().await;
+                            proposals.get(group_id).cloned()
+                        };
+                        let had_proposal = if let Some(ref inner_lock) = inner_lock {
+                            let inner = inner_lock.read().await;
+                            inner.contains_key(index)
+                        } else {
+                            false
+                        };
+                        if let Some(inner_lock) = inner_lock {
+                            let mut group_proposals = inner_lock.write().await;
                             if let Some(proposal) = group_proposals.remove(index) {
                                 let result = match &apply_result {
                                     Ok(Some(offset)) => {
@@ -1687,16 +1742,19 @@ async fn process_outputs_multi_node(
 ///
 /// * `partition_storage` - Map of group ID to partition storage
 async fn process_tiering(
-    partition_storage: &Arc<RwLock<HashMap<GroupId, ServerPartitionStorage>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
 ) {
     // Collect group IDs of partitions with tiering enabled.
-    let tiering_groups: Vec<GroupId> = {
+    let tiering_groups: Vec<(GroupId, Arc<RwLock<ServerPartitionStorage>>)> = {
         let storage = partition_storage.read().await;
-        storage
-            .iter()
-            .filter(|(_, ps)| ps.has_tiering())
-            .map(|(group_id, _)| *group_id)
-            .collect()
+        let mut groups = Vec::new();
+        for (group_id, ps_lock) in storage.iter() {
+            let ps = ps_lock.read().await;
+            if ps.has_tiering() {
+                groups.push((*group_id, ps_lock.clone()));
+            }
+        }
+        groups
     };
 
     if tiering_groups.is_empty() {
@@ -1709,51 +1767,47 @@ async fn process_tiering(
     );
 
     // `TigerStyle`: bounded iteration.
-    for group_id in tiering_groups.iter().take(100) {
+    for (group_id, ps_lock) in tiering_groups.iter().take(100) {
         // Register newly sealed segments.
         {
-            let mut storage = partition_storage.write().await;
-            if let Some(ps) = storage.get_mut(group_id) {
-                match ps.check_and_register_sealed_segments().await {
-                    Ok(count) if count > 0 => {
-                        info!(
-                            group = group_id.get(),
-                            registered = count,
-                            "Registered sealed segments for tiering"
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!(
-                            group = group_id.get(),
-                            error = %e,
-                            "Failed to register sealed segments"
-                        );
-                    }
+            let mut ps = ps_lock.write().await;
+            match ps.check_and_register_sealed_segments().await {
+                Ok(count) if count > 0 => {
+                    info!(
+                        group = group_id.get(),
+                        registered = count,
+                        "Registered sealed segments for tiering"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        group = group_id.get(),
+                        error = %e,
+                        "Failed to register sealed segments"
+                    );
                 }
             }
         }
 
         // Upload eligible segments.
         {
-            let storage = partition_storage.read().await;
-            if let Some(ps) = storage.get(group_id) {
-                match ps.tier_eligible_segments().await {
-                    Ok(count) if count > 0 => {
-                        info!(
-                            group = group_id.get(),
-                            tiered = count,
-                            "Tiered segments to object storage"
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!(
-                            group = group_id.get(),
-                            error = %e,
-                            "Failed to tier eligible segments"
-                        );
-                    }
+            let ps = ps_lock.read().await;
+            match ps.tier_eligible_segments().await {
+                Ok(count) if count > 0 => {
+                    info!(
+                        group = group_id.get(),
+                        tiered = count,
+                        "Tiered segments to object storage"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        group = group_id.get(),
+                        error = %e,
+                        "Failed to tier eligible segments"
+                    );
                 }
             }
         }
