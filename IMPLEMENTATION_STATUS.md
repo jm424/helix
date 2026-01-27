@@ -1,6 +1,8 @@
 # Helix Implementation Status
 
-This document tracks progress against the [implementation plan](../helix-implementation-plan.md).
+This document tracks progress against the implementation plan.
+
+**Last Updated:** 2026-01-27
 
 ## Summary
 
@@ -35,6 +37,13 @@ The plan requires:
 
 - **Multi-Raft**: ✅ DONE - `MultiRaft` engine manages multiple groups per node with message batching.
 - **Storage**: ✅ DONE - `DurablePartition` integrates `helix-wal` for crash-safe storage per RFC Tier 1 design.
+- **Controller Partition**: ✅ ~80% - Group 0 coordinates metadata across cluster nodes.
+- **Idempotent Producers**: ⚠️ Partial - ProducerId allocation and sequence tracking implemented.
+
+### 4. Additional Crates (Not in Original Plan)
+
+- **helix-workload**: E2E verifiable load testing with history tracking and violation detection.
+- **helix-tests**: Comprehensive DST test suite (not originally scoped as separate crate).
 
 ---
 
@@ -62,7 +71,7 @@ The plan requires:
 | Strongly-typed IDs | ✅ Done | NodeId, TopicId, PartitionId, etc. |
 | Configuration and limits | ✅ Done | `limits.rs` |
 | Error types hierarchy | ✅ Done | `error.rs` |
-| Message serialization (prost) | ⚠️ Partial | Using custom binary, not prost |
+| Message serialization (prost) | ⚠️ Partial | gRPC uses prost (helix.proto), Raft uses custom binary |
 
 #### 0.3 Bloodhound Integration
 
@@ -468,6 +477,111 @@ The plan requires:
 
 ---
 
+### Controller Partition (Multi-Node Coordination)
+
+**Status: ~80% Complete** - See `docs/design/controller-partition.md` for full design.
+
+The controller partition (Group 0) coordinates metadata across all cluster nodes using Raft consensus.
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `CONTROLLER_GROUP_ID` constant | ✅ Done | GroupId::new(0) in controller.rs |
+| `ControllerCommand` enum | ✅ Done | CreateTopic, DeleteTopic, AssignPartition |
+| `ControllerState` struct | ✅ Done | Topics, assignments, next IDs |
+| Command encoding/decoding | ✅ Done | Similar to PartitionCommand |
+| Controller initialization | ✅ Done | Created in `new_multi_node()` with all peers |
+| Replica assignment algorithm | ✅ Done | `assign_replicas()` distributes across nodes |
+| Topic creation via controller | ✅ Done | `create_topic_via_controller()` method |
+| Data partition creation | ✅ Done | Nodes create groups when in replica set |
+| Wait for Raft commit | ✅ Done | Oneshot channels with 30s timeout |
+| Leader tracking/failover | ❌ Not Started | Phase 7 of controller plan |
+| Metadata from controller state | ❌ Not Started | Currently uses local topic map |
+
+**Architecture:**
+```
+Controller Partition (Group 0) - ALL cluster nodes
+        │
+        ├─ CreateTopic → AssignPartition → Data Partitions (Group 1+)
+        │
+        └─ Each data partition: MultiRaft group with DurablePartition storage
+```
+
+**Testing:**
+- Unit tests for controller state machine (8 tests)
+- Integration tests updated to use controller-based topic creation
+
+---
+
+### Idempotent Producers
+
+**Status: ⚠️ Partial** - See `docs/design/idempotent-producers.md` for full design.
+
+Prevents duplicate entries when clients retry produce requests.
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `ProducerId` type | ✅ Done | In helix-core/src/types.rs |
+| `ProducerEpoch` type | ✅ Done | In helix-core/src/types.rs |
+| `producer_state.rs` module | ✅ Done | PartitionProducerState, SequenceCheckResult |
+| InitProducerId API (Kafka) | ✅ Done | Timestamp-based allocation |
+| Sequence tracking per partition | ⚠️ Partial | Basic impl, needs 5-batch window |
+| Dedup BEFORE Raft proposal | ⚠️ Partial | Design complete, partial implementation |
+| Persistent via Raft log replay | ⚠️ Partial | AppendBlobIdempotent variant defined |
+
+**Current Allocation Strategy (Simplified):**
+```rust
+// Format: (node_id << 48) | (timestamp_micros & 0x0000_FFFF_FFFF_FFFF)
+```
+
+**TODO for Production:**
+- Persist producer ID counter in controller partition
+- Full 5-batch deduplication window for out-of-order retries
+- Transactional ID support
+
+---
+
+### Vote State Persistence
+
+**Status: ✅ Complete** - See `docs/design/vote-state-persistence.md`.
+
+Persists Raft vote state (current_term, voted_for) across node restarts.
+
+| Item | Status | Notes |
+|------|--------|-------|
+| `VoteStore` trait | ✅ Done | Async persistence abstraction |
+| File-based implementation | ✅ Done | JSON serialization to data directory |
+| Integration with RaftState | ✅ Done | Loaded on startup, saved on vote |
+| Recovery after crash | ✅ Done | Prevents double-voting after restart |
+
+---
+
+### Actor Model Architecture
+
+**Status: ✅ Complete** - See `docs/design/actor-model-architecture.md`.
+
+Replaced global `Arc<RwLock<MultiRaft>>` lock with per-partition actors for scalability.
+
+| Item | Status | Notes |
+|------|--------|-------|
+| PartitionActor | ✅ Done | Per-partition tokio task with command channel |
+| WalActor with batching | ✅ Done | Batches writes from multiple partitions |
+| PartitionRouter | ✅ Done | Routes requests to partition actors |
+| Batcher integration | ✅ Done | Sends to actors instead of locking MultiRaft |
+| Transport integration | ✅ Done | Routes inbound Raft messages to actors |
+| DST testing | ✅ Done | Actor-aware simulation in helix-tests |
+| Performance validation | ✅ Done | Multi-partition throughput improved |
+
+**Problem Solved:**
+- Before: 8 partitions at 110 MB/s (10-15% lower than single partition)
+- After: Full parallelism across N partitions, no lock contention
+
+**Key Files:**
+- `helix-server/src/service/partition_actor.rs`
+- `helix-server/src/service/wal_actor.rs`
+- `helix-server/src/service/router.rs`
+
+---
+
 ### Phase 5: Production Readiness
 
 **Status: NOT STARTED**
@@ -482,8 +596,8 @@ The plan requires:
 | **Shard Movement** | TransferCoordinator, Snapshot support, InstallSnapshot RPC, transfer state machine |
 | **Tick-based Raft** | DST-friendly timing, randomized elections, heartbeats |
 | **Bloodhound DST** | 150+ seeds, property checking, fault injection |
-| **Multi-Raft** | Message batching, tick-based timing, group lifecycle |
-| **helix-server** | Multi-Raft integration, GroupMap, 11 tests |
+| **Multi-Raft** | Message batching, tick-based timing, group lifecycle, SharedWalPool |
+| **helix-server** | Multi-Raft integration, GroupMap, Controller partition, 11+ tests |
 | **helix-wal** | Disk persistence, crash recovery, 29 tests + 500-seed stress |
 | **DurablePartition** | WAL-backed storage, recovery, tiering hooks |
 | **Multi-node networking** | TCP transport, batch encoding, Docker 3-node cluster |
@@ -494,11 +608,19 @@ The plan requires:
 | **Consumer gRPC API** | Pull/Ack/CreateConsumerGroup RPCs, integrated with helix-progress, 3 new tests |
 | **helix-flow** | TokenBucket, WeightedFairQueue, AimdController, DST-compatible, 36 tests |
 | **Object Storage** | FilesystemObjectStorage, S3ObjectStorage (feature-gated), server integration via `--object-storage-dir` and `--s3-*` CLI flags |
+| **Controller Partition** | Multi-node metadata coordination via Raft group 0, topic/partition assignment |
+| **Idempotent Producers** | ProducerId/Epoch types, InitProducerId API, sequence tracking (partial) |
+| **Vote State Persistence** | Raft vote state survives restarts, prevents double-voting |
+| **helix-workload** | E2E verifiable load testing, history tracking, violation detection |
+| **Actor Model** | Per-partition actors eliminate lock contention, full parallelism |
 
 **Bugs Found via DST:**
 - helix-tier: orphaned data (seed 197562), ordering violation (seed 17)
 - helix-wal: in-memory truncation before sync (seed 2074002), recovery overlap bug (seed 2074002)
 - helix-tier/eviction: offset range never populated, segments without offset info evictable, off-by-one in boundary
+- helix-server: commit notification race in actor-based partition architecture
+- helix-server: non-actor mode storage duplicates during failover (commit 278ad0f)
+- helix-server: AppendEntries message size limit causing replication failures (commit f268f62)
 
 ---
 
@@ -534,6 +656,8 @@ The plan requires:
 - **io_uring storage** - High-performance Linux I/O
 - **Configuration changes** - Joint consensus for membership changes
 - **CI pipeline** - Run tests locally for now
+- **Controller leader failover** - Track partition leaders, handle failover
+- **Full idempotent producer** - 5-batch dedup window, controller-based PID allocation
 
 ---
 
@@ -554,3 +678,33 @@ The plan requires:
 | `helix-cli` | ❌ Missing | Need to create |
 | `helix-workload` | ✅ Complete | E2E verifiable load testing, history tracking, violation detection |
 | `helix-tests` | ✅ Good | DST-friendly tick-based tests, faults, 150+ seeds, WAL DST (29 tests + 500-seed stress), Tier tests (43 tests) |
+
+---
+
+## Design Documents
+
+All design documents are in `docs/design/`:
+
+| Document | Status | Description |
+|----------|--------|-------------|
+| `actor-model-architecture.md` | Complete | Per-partition actors for multi-partition scalability |
+| `controller-partition.md` | In Progress | Multi-node metadata coordination via Raft group 0 |
+| `idempotent-producers.md` | Partial | Deduplication for client retries |
+| `shared-wal.md` | Complete | SharedWalPool with amortized fsync |
+| `vote-state-persistence.md` | Complete | Persistent Raft vote state across restarts |
+| `object-storage.md` | Complete | S3 and filesystem storage backends |
+| `helix-workload.md` | Complete | E2E verifiable load testing infrastructure |
+| `throughput-improvement-plan.md` | In Progress | Analysis of multi-partition bottlenecks |
+| `e2e-tiering-tests.md` | Complete | Integration testing for tiered storage |
+
+## Architecture Decision Records
+
+All ADRs are in `docs/adr/`:
+
+| ADR | Status | Title |
+|-----|--------|-------|
+| 0001 | Accepted | Raft for Partition Replication |
+| 0002 | Accepted | Synchronous State Machines in Core |
+| 0003 | Accepted | Strongly-Typed Identifiers |
+| 0004 | Accepted | Tick-Based Raft Timing |
+| 0005 | Accepted | Conservative WAL Corruption Recovery |
