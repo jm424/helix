@@ -440,13 +440,17 @@ impl RealCluster {
     /// Starts a cluster with the given configuration.
     #[allow(clippy::too_many_lines)] // Tiering config added; splitting would reduce clarity.
     fn start(config: RealClusterConfig) -> Result<Self, ExecutorError> {
-        // Wait for all ports to be available before starting.
-        // This prevents failures from leftover processes or TIME_WAIT sockets.
+        // Reserve all ports upfront by holding TcpListeners.
+        // This prevents race conditions where another test could claim the same ports
+        // between our availability check and actual server startup.
+        // We use a longer timeout (30s) to handle TIME_WAIT sockets from previous runs.
+        let mut reserved_listeners: Vec<(TcpListener, TcpListener)> = Vec::new();
         for node_id in 1..=config.node_count {
             let kafka_port = config.base_port + u16::try_from(node_id).unwrap_or(0);
             let raft_port = config.raft_base_port + u16::try_from(node_id).unwrap_or(0);
-            wait_for_port_available(kafka_port, std::time::Duration::from_secs(5))?;
-            wait_for_port_available(raft_port, std::time::Duration::from_secs(5))?;
+            let kafka_listener = reserve_port(kafka_port, std::time::Duration::from_secs(30))?;
+            let raft_listener = reserve_port(raft_port, std::time::Duration::from_secs(30))?;
+            reserved_listeners.push((kafka_listener, raft_listener));
         }
 
         let mut processes = Vec::with_capacity(config.node_count as usize);
@@ -547,6 +551,14 @@ impl RealCluster {
             cmd.stdout(Stdio::null())
                 .stderr(Stdio::inherit())
                 .envs(std::env::vars());
+
+            // Drop the reserved listeners right before spawning to release the ports.
+            // The server process will bind immediately after spawn.
+            // This minimizes the window where another process could claim the port.
+            let (kafka_listener, raft_listener) =
+                reserved_listeners.remove(0);
+            drop(kafka_listener);
+            drop(raft_listener);
 
             let child = cmd.spawn().map_err(ExecutorError::SpawnFailed)?;
             eprintln!(
@@ -1383,20 +1395,23 @@ impl WorkloadExecutor for RealExecutor {
     }
 }
 
-/// Waits for a port to become available for binding.
+/// Reserves a port by binding a TcpListener and returning it.
 ///
-/// This is used before starting servers to ensure no leftover processes
-/// or `TIME_WAIT` sockets are holding the port.
-fn wait_for_port_available(port: u16, timeout: Duration) -> Result<(), ExecutorError> {
+/// The caller should hold the listener until the actual server process binds
+/// the port, then drop it. This prevents race conditions where another process
+/// could claim the port between checking availability and server startup.
+///
+/// Returns `Ok(listener)` if the port is available, or an error after timeout.
+fn reserve_port(port: u16, timeout: Duration) -> Result<TcpListener, ExecutorError> {
     let addr = format!("127.0.0.1:{port}");
     let deadline = std::time::Instant::now() + timeout;
     let poll_interval = Duration::from_millis(100);
 
     while std::time::Instant::now() < deadline {
         match TcpListener::bind(&addr) {
-            Ok(_listener) => {
-                // Port is available - listener is dropped immediately, releasing the port.
-                return Ok(());
+            Ok(listener) => {
+                // Port is available - return the listener to keep it reserved.
+                return Ok(listener);
             }
             Err(_) => {
                 // Port is in use - wait and retry.

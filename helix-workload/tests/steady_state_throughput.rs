@@ -65,19 +65,30 @@ fn test_data_dir(test_name: &str) -> PathBuf {
 
 fn find_available_base_port(start: u16, count: u16) -> u16 {
     let max_base = u16::MAX.saturating_sub(count);
-    for base in start..=max_base {
+    // Step by 10 to leave room between test clusters.
+    let step = 10u16;
+    let mut base = start;
+    while base <= max_base {
         let mut available = true;
+        let mut listeners = Vec::new();
         for offset in 1..=count {
             let port = base.saturating_add(offset);
             let addr = format!("127.0.0.1:{port}");
-            if std::net::TcpListener::bind(&addr).is_err() {
-                available = false;
-                break;
+            match std::net::TcpListener::bind(&addr) {
+                Ok(listener) => listeners.push(listener),
+                Err(_) => {
+                    available = false;
+                    break;
+                }
             }
         }
         if available {
+            // Hold listeners briefly to reserve the ports, then drop them.
+            // The RealCluster::start() will re-reserve them atomically.
+            drop(listeners);
             return base;
         }
+        base = base.saturating_add(step);
     }
     panic!("unable to find available port block (count={count}) starting at {start}");
 }

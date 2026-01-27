@@ -750,7 +750,9 @@ async fn test_actor_mode_stress_many_seeds() {
     let mut total_successes = 0u64;
 
     for seed in 0..20u64 {
-        let port_base = 22000 + (seed as u16 * 200);
+        // Use port range 25000+ to avoid conflicts with other tests.
+        // Each seed gets 200 ports (100 for kafka, 100 for raft).
+        let port_base = 25000 + (seed as u16 * 200);
         let cluster = setup_actor_mode_cluster(
             &format!("stress_seed_{seed}"),
             3,
