@@ -27,6 +27,9 @@
 //! - Parallel tick broadcast to all partitions
 //! - Decoupled output processing from consensus
 
+// Allow complex nested types for proposal maps - refactoring would require significant API changes.
+#![allow(clippy::type_complexity)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

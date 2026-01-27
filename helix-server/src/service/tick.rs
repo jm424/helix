@@ -2,6 +2,9 @@
 //!
 //! This module handles periodic ticks and message processing for Raft groups.
 
+// Allow complex nested types for proposal maps - refactoring would require significant API changes.
+#![allow(clippy::type_complexity)]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -45,10 +48,10 @@ pub const HEARTBEAT_INTERVAL_MS: u64 = 1_000; // 1 second.
 /// - Uploading eligible segments to object storage (S3/filesystem)
 pub const TIERING_INTERVAL_MS: u64 = 5_000; // 5 seconds.
 
-/// Extract a payload preview from a CommitEntry's data for diagnostic logging.
+/// Extract a payload preview from a `CommitEntry`'s data for diagnostic logging.
 ///
-/// Decodes the PartitionCommand and extracts the first ~30 bytes of ASCII text
-/// from the first blob (if present). This helps correlate NOTIFY_CLIENT logs
+/// Decodes the `PartitionCommand` and extracts the first ~30 bytes of ASCII text
+/// from the first blob (if present). This helps correlate `NOTIFY_CLIENT` logs
 /// with the actual data being committed.
 fn extract_commit_payload_preview(data: &bytes::Bytes) -> String {
     let Some(command) = PartitionCommand::decode(data) else {
@@ -1358,7 +1361,7 @@ async fn process_outputs_multi_node(
                                     index = index.get(),
                                     offset_before = offset_before,
                                     offset_after = offset_after,
-                                    returned_offset = ?result.as_ref().ok().and_then(|o| o.map(|x| x.get())),
+                                    returned_offset = ?result.as_ref().ok().and_then(|o| o.map(helix_core::Offset::get)),
                                     "BATCH: apply_entry_async completed"
                                 );
                                 result
@@ -1378,13 +1381,17 @@ async fn process_outputs_multi_node(
                                 // what we observed before apply. If they differ, something else
                                 // modified storage (indicates a race condition or bug).
                                 if base_offset.get() != offset_before {
+                                    // Safety: offsets are u64 but in practice will never exceed
+                                    // i64::MAX (9 exabytes). Cast to i64 for signed delta display.
+                                    #[allow(clippy::cast_possible_wrap)]
+                                    let delta = base_offset.get() as i64 - offset_before as i64;
                                     error!(
                                         node = node_id.get(),
                                         group = group_id.get(),
                                         index = index.get(),
                                         offset_before = offset_before,
                                         base_offset = base_offset.get(),
-                                        delta = base_offset.get() as i64 - offset_before as i64,
+                                        delta,
                                         "BUG: apply returned different offset than expected! \
                                          Storage was modified between offset capture and apply."
                                     );
@@ -1555,7 +1562,7 @@ async fn process_outputs_multi_node(
                                     index = index.get(),
                                     offset_before = offset_before,
                                     offset_after = offset_after,
-                                    returned_offset = ?result.as_ref().ok().and_then(|o| o.map(|x| x.get())),
+                                    returned_offset = ?result.as_ref().ok().and_then(|o| o.map(helix_core::Offset::get)),
                                     "NON-BATCH: apply_entry_async completed"
                                 );
                                 result
@@ -1741,10 +1748,13 @@ async fn process_outputs_multi_node(
 /// # Arguments
 ///
 /// * `partition_storage` - Map of group ID to partition storage
+#[allow(clippy::significant_drop_tightening)]
 async fn process_tiering(
     partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
 ) {
     // Collect group IDs of partitions with tiering enabled.
+    // Note: We hold the outer read lock while checking has_tiering() on each partition.
+    // This is intentional to get a consistent snapshot of which partitions have tiering.
     let tiering_groups: Vec<(GroupId, Arc<RwLock<ServerPartitionStorage>>)> = {
         let storage = partition_storage.read().await;
         let mut groups = Vec::new();

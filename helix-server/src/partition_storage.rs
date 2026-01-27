@@ -10,7 +10,7 @@ use helix_core::{LogIndex, Offset, PartitionId, ProducerEpoch, ProducerId, Recor
 use helix_wal::{SharedEntry, SharedWalHandle, Storage, TokioStorage};
 use tracing::{debug, info, warn};
 
-/// Extract a preview of the payload from a Kafka RecordBatch for debugging.
+/// Extract a preview of the payload from a Kafka `RecordBatch` for debugging.
 /// Returns the first ~30 bytes of the record value as a string.
 fn extract_payload_preview(blob: &Bytes) -> String {
     // Kafka RecordBatch structure:
@@ -350,7 +350,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     ///
     /// This is called from:
     /// - blob.rs handlers after batch commit (leader path)
-    /// - output_processor.rs when applying committed entries (follower/PREVIOUS_TERM path)
+    /// - `output_processor.rs` when applying committed entries (`follower/PREVIOUS_TERM` path)
     pub fn record_producer_sequence(
         &mut self,
         producer_id: ProducerId,

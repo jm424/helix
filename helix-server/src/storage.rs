@@ -931,7 +931,7 @@ impl Partition {
                     .rev()
                     .take(30)
                     .filter(|b| b.is_ascii_alphanumeric() || **b == b'-' || **b == b'_')
-                    .cloned()
+                    .copied()
                     .collect::<Vec<_>>()
                     .into_iter()
                     .rev()
@@ -943,7 +943,7 @@ impl Partition {
                     .rev()
                     .take(30)
                     .filter(|b| b.is_ascii_alphanumeric() || **b == b'-' || **b == b'_')
-                    .cloned()
+                    .copied()
                     .collect::<Vec<_>>()
                     .into_iter()
                     .rev()
@@ -979,7 +979,7 @@ impl Partition {
         }
 
         // Store the blob at the leader-assigned offset.
-        self.blobs.push(StoredBlob::new(base_offset, record_count, blob.clone()));
+        self.blobs.push(StoredBlob::new(base_offset, record_count, blob));
 
         // Update the log end offset to be after this blob.
         // This ensures consistency even if entries arrive out of order due to

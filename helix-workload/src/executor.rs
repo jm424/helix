@@ -1395,7 +1395,7 @@ impl WorkloadExecutor for RealExecutor {
     }
 }
 
-/// Reserves a port by binding a TcpListener and returning it.
+/// Reserves a port by binding a `TcpListener` and returning it.
 ///
 /// The caller should hold the listener until the actual server process binds
 /// the port, then drop it. This prevents race conditions where another process

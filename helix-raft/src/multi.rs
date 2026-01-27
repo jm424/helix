@@ -714,7 +714,7 @@ pub struct GroupStateInfo {
     pub commit_index: LogIndex,
     /// Last applied index.
     pub last_applied: LogIndex,
-    /// Last log index (may be > commit_index if there are uncommitted entries).
+    /// Last log index (may be > `commit_index` if there are uncommitted entries).
     pub last_log_index: LogIndex,
 }
 

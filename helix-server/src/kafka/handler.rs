@@ -1315,7 +1315,7 @@ impl ProducerInfo {
 /// Returns `None` if the batch is too short to contain producer info.
 ///
 /// This function is public to allow the output processor to extract producer
-/// state from committed entries (including PREVIOUS_TERM entries on new leaders).
+/// state from committed entries (including `PREVIOUS_TERM` entries on new leaders).
 pub fn extract_producer_info(bytes: &Bytes) -> Option<ProducerInfo> {
     // Minimum size to contain all fields through baseSequence.
     const MIN_SIZE: usize = 57; // baseSequence ends at offset 57

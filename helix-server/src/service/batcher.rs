@@ -20,6 +20,9 @@
 //! The batch is then proposed to Raft as a single `AppendBlobBatch` entry.
 //! When committed, the tick task notifies each waiter with their assigned offset.
 
+// Allow complex nested types for proposal maps - refactoring would require significant API changes.
+#![allow(clippy::type_complexity)]
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -606,6 +609,7 @@ async fn flush_batch(
 
     const MAX_WAIT_ATTEMPTS: u32 = 100;
     const WAIT_INTERVAL_MS: u64 = 1;
+    const REQUIRED_STABLE_CHECKS: u32 = 2;
 
     // Propose to Raft atomically: wait for storage, capture offset, encode, propose, register.
     let propose_result = async {
@@ -630,7 +634,6 @@ async fn flush_batch(
         // log are committed (including PREVIOUS_TERM entries) before capturing base_offset.
         let mut prev_commit_index = LogIndex::new(0);
         let mut stable_count = 0u32;
-        const REQUIRED_STABLE_CHECKS: u32 = 2;
 
         for attempt in 0..MAX_WAIT_ATTEMPTS {
             // Get current state while holding write lock.

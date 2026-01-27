@@ -35,6 +35,11 @@
 //! - Centralized commit processing with storage access
 //! - Decoupled from partition actor lifecycle
 
+// Allow complex nested types for proposal maps - refactoring would require significant API changes.
+#![allow(clippy::type_complexity)]
+// Allow implicit hasher for HashMap parameters - using standard hasher is intentional.
+#![allow(clippy::implicit_hasher)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -253,26 +258,28 @@ async fn handle_entry_committed(
         // at propose time and must be used by ALL replicas for consistency.
         // CRITICAL: Do NOT read base_offset from storage - that would be wrong on
         // followers where storage state differs from the original leader.
-        let base_offset = match PartitionCommand::decode(data) {
-            Some(PartitionCommand::AppendBlobBatch { base_offset, .. }) => base_offset,
-            Some(PartitionCommand::AppendBlob { base_offset, .. }) => base_offset,
-            _ => {
-                warn!(
-                    group = group_id.get(),
-                    index = index.get(),
-                    "Failed to extract base_offset from command, falling back to storage"
-                );
-                // Fallback to storage for backwards compatibility with old commands.
-                let ps_lock = {
-                    let storage = partition_storage.read().await;
-                    storage.get(&group_id).cloned()
-                };
-                if let Some(ps_lock) = ps_lock {
-                    let ps = ps_lock.read().await;
-                    ps.blob_log_end_offset()
-                } else {
-                    Offset::new(0)
-                }
+        let base_offset = if let Some(
+            PartitionCommand::AppendBlobBatch { base_offset, .. }
+            | PartitionCommand::AppendBlob { base_offset, .. },
+        ) = PartitionCommand::decode(data)
+        {
+            base_offset
+        } else {
+            warn!(
+                group = group_id.get(),
+                index = index.get(),
+                "Failed to extract base_offset from command, falling back to storage"
+            );
+            // Fallback to storage for backwards compatibility with old commands.
+            let ps_lock = {
+                let storage = partition_storage.read().await;
+                storage.get(&group_id).cloned()
+            };
+            if let Some(ps_lock) = ps_lock {
+                let ps = ps_lock.read().await;
+                ps.blob_log_end_offset()
+            } else {
+                Offset::new(0)
             }
         };
 
@@ -469,7 +476,7 @@ async fn handle_entry_committed(
 
 /// Extracts producer info from a committed entry and records it in the partition state.
 ///
-/// This is critical for handling PREVIOUS_TERM entries on a new leader. When a new
+/// This is critical for handling `PREVIOUS_TERM` entries on a new leader. When a new
 /// leader takes over, it commits uncommitted entries from the previous term via its
 /// no-op entry. Without recording producer state from these entries, the new leader
 /// would not know about the sequences accepted by the old leader, causing:
@@ -500,6 +507,10 @@ pub async fn extract_and_record_producer_state(
         return;
     };
 
+    // Safety: Kafka protocol uses signed types for producer_id (i64) and epoch (i16),
+    // but valid values are always non-negative. Negative values indicate "no producer"
+    // which is filtered by is_idempotent() check above.
+    #[allow(clippy::cast_sign_loss)]
     match command {
         PartitionCommand::AppendBlob {
             blob,
@@ -510,8 +521,7 @@ pub async fn extract_and_record_producer_state(
             if format == BlobFormat::KafkaRecordBatch {
                 if let Some(info) = extract_producer_info(&blob) {
                     if info.is_idempotent() {
-                        let mut ps = ps_lock.write().await;
-                        ps.record_producer_sequence(
+                        ps_lock.write().await.record_producer_sequence(
                             ProducerId::new(info.producer_id as u64),
                             ProducerEpoch::new(info.epoch as u16),
                             SequenceNum::new(info.base_sequence),
@@ -537,8 +547,7 @@ pub async fn extract_and_record_producer_state(
                 if batched.format == BlobFormat::KafkaRecordBatch {
                     if let Some(info) = extract_producer_info(&batched.blob) {
                         if info.is_idempotent() {
-                            let mut ps = ps_lock.write().await;
-                            ps.record_producer_sequence(
+                            ps_lock.write().await.record_producer_sequence(
                                 ProducerId::new(info.producer_id as u64),
                                 ProducerEpoch::new(info.epoch as u16),
                                 SequenceNum::new(info.base_sequence),

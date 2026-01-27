@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Bash",
+      "Read",
+      "Edit",
+      "Write",
+      "Glob",
+      "Grep",
+      "Task",
+      "WebFetch",
+      "WebSearch"
+    ],
+    "deny": [
+      "Bash(rm -rf:*)",
+      "Bash(rm -r:*)",
+      "Bash(rm -f:*)",
+      "Bash(sudo:*)"
+    ]
+  }
+}
