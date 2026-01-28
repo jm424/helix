@@ -1027,19 +1027,21 @@ impl HelixServiceActor {
                     self.transport.queue_batch(to, &messages);
                 }
                 PartitionOutput::EntryCommitted { index, data, batch_notify } => {
+                    let was_proposing_leader = batch_notify.is_some();
                     eprintln!(
                         "[ACTOR-MODE] {} committed entry: group={} index={} has_notify={}",
-                        self.name, group_id.get(), index.get(), batch_notify.is_some()
+                        self.name, group_id.get(), index.get(), was_proposing_leader
                     );
                     // Track notification status for verification.
-                    if batch_notify.is_some() {
+                    if was_proposing_leader {
                         self.actor_mode_commits_with_notify += 1;
                     } else {
                         self.actor_mode_commits_without_notify += 1;
                     }
 
                     // Apply to storage using the existing commit handling.
-                    self.handle_commit(group_id, index, &data, ctx);
+                    // Pass was_proposing_leader so client_acks are recorded correctly.
+                    self.handle_commit(group_id, index, &data, Some(was_proposing_leader), ctx);
                 }
                 PartitionOutput::BecameLeader => {
                     eprintln!(
@@ -1103,7 +1105,8 @@ impl HelixServiceActor {
         for output in outputs {
             match output {
                 MultiRaftOutput::CommitEntry { group_id, index, data } => {
-                    self.handle_commit(*group_id, *index, data, ctx);
+                    // Pass None - non-actor mode uses multi_raft.group_state() for leadership check.
+                    self.handle_commit(*group_id, *index, data, None, ctx);
                 }
                 MultiRaftOutput::SendMessages { to, messages } => {
                     // Queue messages for delivery via transport (sync).
@@ -1152,12 +1155,19 @@ impl HelixServiceActor {
     }
 
     /// Handles a committed entry.
+    ///
+    /// # Arguments
+    ///
+    /// * `was_proposing_leader` - In actor mode, `Some(true)` if we were the proposing leader
+    ///   (batch_notify was present), `Some(false)` if we were a follower. In non-actor mode,
+    ///   `None` and the leadership is determined from `multi_raft.group_state()`.
     #[allow(clippy::too_many_lines)]
     fn handle_commit(
         &mut self,
         group_id: GroupId,
         index: LogIndex,
         data: &Bytes,
+        was_proposing_leader: Option<bool>,
         ctx: &mut SimulationContext,
     ) {
         // TRACE-COMMIT: Log commits for high indices on partition 0
@@ -1277,9 +1287,14 @@ impl HelixServiceActor {
                         // Record client acknowledgments in shared state.
                         // Only record if we're the leader - the leader is the one that
                         // sends acks to clients in a real system.
-                        let is_leader = self.multi_raft
-                            .group_state(group_id)
-                            .is_some_and(|s| s.state == helix_raft::RaftState::Leader);
+                        //
+                        // In actor mode, `was_proposing_leader` tells us if we were the proposer.
+                        // In non-actor mode, we check multi_raft.group_state().
+                        let is_leader = was_proposing_leader.unwrap_or_else(|| {
+                            self.multi_raft
+                                .group_state(group_id)
+                                .is_some_and(|s| s.state == helix_raft::RaftState::Leader)
+                        });
 
                         if is_leader {
                             if let Ok(mut state) = self.property_state.lock() {

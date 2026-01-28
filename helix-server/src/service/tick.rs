@@ -7,15 +7,17 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use helix_core::{GroupId, LogIndex, NodeId, Offset};
+use helix_core::{GroupId, LogIndex, NodeId, Offset, TermId};
 use helix_raft::multi::{MultiRaft, MultiRaftOutput};
 use helix_raft::RaftState;
 use helix_runtime::{BrokerHeartbeat, IncomingMessage, TransportHandle};
 use helix_wal::TokioStorage;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
+
+use crate::vote_store::{LocalFileVoteStorage, VoteStore};
 
 use crate::controller::{ControllerCommand, ControllerState, CONTROLLER_GROUP_ID};
 use crate::error::ServerError;
@@ -147,6 +149,7 @@ pub async fn tick_task_multi_node(
     recovered_entries: Arc<RwLock<HashMap<helix_core::PartitionId, Vec<helix_wal::SharedEntry>>>>,
     batcher_stats: Option<Arc<BatcherStats>>,
     batcher_backpressure: Option<Arc<crate::service::batcher::BackpressureState>>,
+    vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
     mut incoming_rx: mpsc::Receiver<IncomingMessage>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
@@ -195,6 +198,7 @@ pub async fn tick_task_multi_node(
                     &tiering_config,
                     &shared_wal_pool,
                     &recovered_entries,
+                    vote_store.as_ref(),
                 ).await;
                 #[cfg(not(feature = "s3"))]
                 process_outputs_multi_node(
@@ -216,6 +220,7 @@ pub async fn tick_task_multi_node(
                     &tiering_config,
                     &shared_wal_pool,
                     &recovered_entries,
+                    vote_store.as_ref(),
                 ).await;
             }
             _ = heartbeat_interval.tick() => {
@@ -289,6 +294,7 @@ pub async fn tick_task_multi_node(
                     &tiering_config,
                     &shared_wal_pool,
                     &recovered_entries,
+                    vote_store.as_ref(),
                 ).await;
                 #[cfg(not(feature = "s3"))]
                 process_outputs_multi_node(
@@ -310,6 +316,7 @@ pub async fn tick_task_multi_node(
                     &tiering_config,
                     &shared_wal_pool,
                     &recovered_entries,
+                    vote_store.as_ref(),
                 ).await;
             }
         }
@@ -351,6 +358,7 @@ pub async fn tick_task_actor(
     cluster_nodes: Vec<NodeId>,
     transport_handle: TransportHandle,
     output_tx: mpsc::Sender<super::partition_actor::GroupedOutput>,
+    vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
     mut incoming_rx: mpsc::Receiver<IncomingMessage>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
@@ -437,6 +445,7 @@ pub async fn tick_task_actor(
                                 &transport_handle,
                                 &router,
                                 &output_tx,
+                                vote_store.as_ref(),
                             ).await;
                         }
 
@@ -492,6 +501,7 @@ pub async fn tick_task_controller(
     transport_handle: TransportHandle,
     router: Arc<super::router::PartitionRouter>,
     output_tx: mpsc::Sender<super::partition_actor::GroupedOutput>,
+    vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
     let mut tick_interval =
@@ -535,8 +545,20 @@ pub async fn tick_task_controller(
                             MultiRaftOutput::SteppedDown { group_id } => {
                                 info!(group = group_id.get(), "Tick: SteppedDown");
                             }
-                            MultiRaftOutput::VoteStateChanged { group_id, term, .. } => {
+                            MultiRaftOutput::VoteStateChanged { group_id, term, voted_for } => {
                                 info!(group = group_id.get(), term = term.get(), "Tick: VoteStateChanged");
+                                // Persist vote state change.
+                                if let Some(ref vs) = vote_store {
+                                    if let Ok(mut store) = vs.lock() {
+                                        if let Err(e) = store.save(*group_id, *term, *voted_for) {
+                                            error!(
+                                                group = group_id.get(),
+                                                error = %e,
+                                                "Failed to persist vote state"
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -555,6 +577,7 @@ pub async fn tick_task_controller(
                     &transport_handle,
                     &router,
                     &output_tx,
+                    vote_store.as_ref(),
                 ).await;
             }
         }
@@ -581,6 +604,7 @@ async fn process_controller_outputs(
     transport_handle: &TransportHandle,
     router: &Arc<super::router::PartitionRouter>,
     output_tx: &mpsc::Sender<super::partition_actor::GroupedOutput>,
+    vote_store: Option<&Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
 ) {
     for output in outputs {
         match output {
@@ -673,10 +697,20 @@ async fn process_controller_outputs(
                     };
 
                     if replicas.contains(&node_id) {
+                        // Look up any persisted vote state for this partition.
+                        let (term, voted_for, observation_mode) = vote_store
+                            .and_then(|vs| vs.lock().ok())
+                            .and_then(|store| {
+                                store.state().get_group(data_group_id).map(|v| (v.term, v.voted_for, false))
+                            })
+                            .unwrap_or((TermId::new(0), None, false));
+
                         info!(
                             topic = topic_id.get(),
                             partition = partition_id.get(),
                             group = data_group_id.get(),
+                            term = term.get(),
+                            voted_for = voted_for.map(NodeId::get),
                             replicas = ?replicas.iter().map(|n| n.get()).collect::<Vec<_>>(),
                             "Creating data partition from controller assignment (actor mode)"
                         );
@@ -696,11 +730,14 @@ async fn process_controller_outputs(
                             }
                         }
 
-                        // Create the partition actor and add it to the router.
-                        let partition_handle = super::actor_setup::create_partition_actor(
+                        // Create the partition actor with restored vote state and add it to the router.
+                        let partition_handle = super::actor_setup::create_partition_actor_with_state(
                             data_group_id,
                             node_id,
                             replicas.clone(),
+                            term,
+                            voted_for,
+                            observation_mode,
                             output_tx.clone(),
                             super::partition_actor::PartitionActorConfig::default(),
                         );
@@ -769,6 +806,18 @@ async fn process_controller_outputs(
                         voted_for = ?voted_for.map(helix_core::NodeId::get),
                         "Controller vote state changed (actor mode)"
                     );
+                    // Persist controller vote state.
+                    if let Some(vs) = vote_store {
+                        if let Ok(mut store) = vs.lock() {
+                            if let Err(e) = store.save(*group_id, *term, *voted_for) {
+                                error!(
+                                    group = group_id.get(),
+                                    error = %e,
+                                    "Failed to persist controller vote state"
+                                );
+                            }
+                        }
+                    }
                 }
                 // Ignore data partition vote changes - handled by OutputProcessor.
             }
@@ -1016,6 +1065,7 @@ async fn process_outputs_multi_node(
     tiering_config: &Option<TieringConfig>,
     shared_wal_pool: &Option<Arc<helix_wal::SharedWalPool<helix_wal::TokioStorage>>>,
     recovered_entries: &Arc<RwLock<HashMap<helix_core::PartitionId, Vec<helix_wal::SharedEntry>>>>,
+    vote_store: Option<&Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
 ) {
     for output in outputs {
         match output {
@@ -1122,19 +1172,36 @@ async fn process_outputs_multi_node(
                         };
 
                         if replicas.contains(&node_id) {
+                            // Look up any persisted vote state for this partition.
+                            let (term, voted_for, observation_mode) = vote_store
+                                .and_then(|vs| vs.lock().ok())
+                                .and_then(|store| {
+                                    store.state().get_group(data_group_id).map(|v| (v.term, v.voted_for, false))
+                                })
+                                .unwrap_or((TermId::new(0), None, false));
+
                             info!(
                                 topic = topic_id.get(),
                                 partition = partition_id.get(),
                                 group = data_group_id.get(),
+                                term = term.get(),
+                                voted_for = voted_for.map(NodeId::get),
                                 replicas = ?replicas.iter().map(|n| n.get()).collect::<Vec<_>>(),
                                 "Creating data partition from controller assignment"
                             );
 
-                            // Create the data Raft group if it doesn't exist.
+                            // Create the data Raft group with restored vote state if available.
                             let mut mr = multi_raft.write().await;
                             let existing_groups = mr.group_ids();
                             if !existing_groups.contains(&data_group_id) {
-                                if let Err(e) = mr.create_group(data_group_id, replicas.clone()) {
+                                let create_result = mr.create_group_with_state(
+                                    data_group_id,
+                                    replicas.clone(),
+                                    term,
+                                    voted_for,
+                                    observation_mode,
+                                );
+                                if let Err(e) = create_result {
                                     warn!(
                                         error = %e,
                                         group = data_group_id.get(),
@@ -1724,15 +1791,24 @@ async fn process_outputs_multi_node(
                 }
             }
             MultiRaftOutput::VoteStateChanged { group_id, term, voted_for } => {
-                // TODO: Integrate with VoteStore for persistence.
-                // For now, just log the change. Full VoteStore integration will
-                // persist this to local file + async S3 backup.
                 debug!(
                     group = group_id.get(),
                     term = term.get(),
                     voted_for = ?voted_for.map(helix_core::NodeId::get),
-                    "Vote state changed (persistence not yet implemented)"
+                    "Vote state changed (multi-node)"
                 );
+                // Persist vote state to local file + async S3 backup.
+                if let Some(vs) = vote_store {
+                    if let Ok(mut store) = vs.lock() {
+                        if let Err(e) = store.save(*group_id, *term, *voted_for) {
+                            error!(
+                                group = group_id.get(),
+                                error = %e,
+                                "Failed to persist vote state"
+                            );
+                        }
+                    }
+                }
             }
         }
     }

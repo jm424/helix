@@ -1822,3 +1822,226 @@ async fn test_actor_mode_rapid_failover_stress() {
 async fn test_non_actor_mode_rapid_failover_stress() {
     run_rapid_failover_stress_test(false, 23950, 24050).await;
 }
+
+// ============================================================================
+// Phase 3: Extended Stress Tests
+// ============================================================================
+//
+// These tests are for extended validation before making actor mode the default.
+// Run with: cargo test -p helix-workload --test actor_mode_correctness -- --ignored
+
+/// Extended stress test: 500 seeds, 500 operations per seed.
+///
+/// This is a 10x increase over the regular stress test to catch rare bugs.
+/// Expected runtime: 30-60 minutes depending on hardware.
+#[tokio::test]
+#[ignore = "extended stress test (Phase 3) - run with --ignored"]
+async fn test_actor_mode_stress_500_seeds() {
+    let mut total_violations = 0;
+    let mut total_successes = 0u64;
+    let mut seeds_completed = 0u64;
+
+    for seed in 0..500u64 {
+        // Use port range 30000+ to avoid conflicts.
+        // Each seed gets 200 ports (100 for kafka, 100 for raft).
+        let port_base = 30000 + ((seed % 100) as u16 * 200);
+        let cluster = setup_actor_mode_cluster(
+            &format!("ext_stress_{seed}"),
+            3,
+            port_base,
+            port_base + 100,
+        )
+        .await;
+
+        let executor = RealExecutor::new(&cluster).expect("failed to create executor");
+        executor
+            .wait_ready(Duration::from_secs(60))
+            .await
+            .expect("cluster not ready");
+
+        let mut workload = Workload::builder()
+            .seed(seed)
+            .topics(vec![TopicConfig::new(&format!("ext-stress-{seed}"), 8, 3)])
+            .operations(500)
+            .pattern(WorkloadPattern::ManyPartitions {
+                partition_count: 8,
+                operations_per_partition: 62, // 62 * 8 = 496, close to 500
+            })
+            .message_size(SizeDistribution::Fixed(256))
+            .build();
+
+        let stats: WorkloadStats = workload.run(&executor).await;
+
+        if !stats.violations.is_empty() {
+            eprintln!("Seed {seed} had violations: {:?}", stats.violations);
+            total_violations += stats.violations.len();
+        }
+        total_successes += stats.operations_ok;
+        seeds_completed += 1;
+
+        if seed % 50 == 0 {
+            let ops = stats.operations_ok;
+            println!("Completed seed {seed}/500: {ops} ops, total so far: {total_successes}");
+        }
+    }
+
+    println!("\n=== Extended Actor Mode Stress (500 Seeds) ===");
+    println!("  Seeds completed: {seeds_completed}");
+    println!("  Total successes: {total_successes}");
+    println!("  Total violations: {total_violations}");
+
+    assert_eq!(total_violations, 0, "Found violations across seeds");
+    assert!(
+        total_successes >= 200_000,
+        "Expected >=200,000 total successes, got {total_successes}"
+    );
+}
+
+/// Extended rapid failover: 100 seeds, 20 kill/restart cycles each.
+///
+/// This tests recovery under repeated failures to catch state corruption
+/// that only manifests after many failover cycles.
+#[tokio::test]
+#[ignore = "extended failover test (Phase 3) - run with --ignored"]
+async fn test_actor_mode_extended_rapid_failover() {
+    for seed in 0..100u64 {
+        // Use port range 35000+ to avoid conflicts.
+        let port_base = 35000 + ((seed % 50) as u16 * 200);
+
+        let mut cluster = setup_actor_mode_cluster(
+            &format!("ext_failover_{seed}"),
+            3,
+            port_base,
+            port_base + 100,
+        )
+        .await;
+
+        let executor = RealExecutor::new(&cluster).expect("failed to create executor");
+        executor
+            .wait_ready(Duration::from_secs(60))
+            .await
+            .expect("cluster not ready");
+
+        let topic_name = format!("ext-failover-{seed}");
+        let num_partitions = 4i32;
+
+        // Wait for leaders (triggers auto-creation with default partition count).
+        // Note: With auto_create_topics, partition count may vary.
+        // We write to partitions 0-3; if they don't exist, writes will fail.
+        for p in 0..num_partitions {
+            let _ = cluster
+                .wait_for_leader(&topic_name, p, Duration::from_secs(30))
+                .await;
+        }
+
+        // Track acknowledged writes per partition: Vec<(offset, payload)>
+        let mut acknowledged: Vec<Vec<(u64, String)>> = vec![Vec::new(); num_partitions as usize];
+        let mut write_index = 0u64;
+
+        // 20 cycles of: write, kill node, restart, write.
+        for cycle in 0..20u32 {
+            // Write some data.
+            for _ in 0..10 {
+                let partition = (write_index % 4) as i32;
+                let payload = format!("seed{seed}-cycle{cycle}-write{write_index}");
+
+                match executor
+                    .send(&topic_name, partition, Bytes::from(payload.clone()))
+                    .await
+                {
+                    Ok(offset) => {
+                        acknowledged[partition as usize].push((offset, payload));
+                    }
+                    Err(_e) => {
+                        // During failover, some writes may fail - that's OK.
+                    }
+                }
+                write_index += 1;
+            }
+
+            // Kill a node (rotate through nodes).
+            let node_to_kill = u64::from((cycle % 3) + 1);
+            cluster.kill_node(node_to_kill).expect("kill failed");
+
+            // Wait for leader election.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            // Restart the node.
+            cluster.restart_node(node_to_kill).expect("restart failed");
+
+            // Wait for rejoin.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        // Final verification: read back all acknowledged writes.
+        let total_acknowledged: usize = acknowledged.iter().map(Vec::len).sum();
+        let mut verified = 0u64;
+        let mut errors = 0u64;
+
+        for partition in 0..4i32 {
+            let expected = &acknowledged[partition as usize];
+            if expected.is_empty() {
+                continue;
+            }
+
+            // Read all messages for this partition.
+            let consumed = executor
+                .poll(&topic_name, partition, 0, expected.len() as u32 + 100)
+                .await
+                .expect("poll failed");
+
+            let consumed_map: std::collections::HashMap<u64, Bytes> =
+                consumed.into_iter().collect();
+
+            // Verify each acknowledged write.
+            for (offset, expected_payload) in expected {
+                match consumed_map.get(offset) {
+                    Some(actual) => {
+                        let actual_str = String::from_utf8_lossy(actual);
+                        if actual_str == expected_payload.as_str() {
+                            verified += 1;
+                        } else {
+                            eprintln!(
+                                "Seed {seed}: CONTENT_MISMATCH partition {partition} offset {offset}"
+                            );
+                            errors += 1;
+                        }
+                    }
+                    None => {
+                        eprintln!(
+                            "Seed {seed}: DATA_LOSS partition {partition} offset {offset}"
+                        );
+                        errors += 1;
+                    }
+                }
+            }
+        }
+
+        if seed % 10 == 0 {
+            println!(
+                "Seed {seed}/100: {verified}/{total_acknowledged} writes verified after 20 failover cycles"
+            );
+        }
+
+        assert_eq!(
+            errors, 0,
+            "Seed {seed}: Found {errors} data integrity errors"
+        );
+        assert_eq!(
+            verified as usize, total_acknowledged,
+            "Seed {seed}: Not all writes verified: {verified}/{total_acknowledged}"
+        );
+    }
+
+    println!("\n=== Extended Rapid Failover (100 seeds × 20 cycles) ===");
+    println!("  All seeds passed");
+}
+
+// Note: Fine-grained fault injection testing is done via DST in helix-tests/src/helix_service_dst.rs
+// with actor_mode: true. DST provides:
+// - Deterministic reproduction (same seed = same behavior)
+// - Fine-grained faults (disk write failures, message drops/delays)
+// - SimulatedStorage and SimulatedTransport
+// - Property-based validation (VERIFY_INTEGRITY, VERIFY_CONSUMER)
+//
+// The E2E tests here focus on real process behavior with coarse-grained faults (node kill/restart).

@@ -25,19 +25,21 @@ mod tick;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use helix_core::{GroupId, LogIndex, NodeId, Offset, PartitionId, TopicId, WriteDurability};
+use helix_core::{GroupId, LogIndex, NodeId, Offset, PartitionId, TermId, TopicId, WriteDurability};
 use helix_progress::{ProgressConfig, ProgressManager, SimulatedProgressStore};
 use helix_raft::multi::MultiRaft;
 use helix_runtime::{PeerInfo, TransportConfig, TransportError, TransportHandle};
+use helix_tier::SimulatedObjectStorage;
 use helix_wal::{PoolConfig, SharedEntry, SharedWalPool, TokioStorage};
 use tokio::sync::{mpsc, oneshot, RwLock};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::controller::{ControllerState, BROKER_HEARTBEAT_TIMEOUT_MS, CONTROLLER_GROUP_ID};
 use crate::group_map::GroupMap;
 use crate::partition_storage::ServerPartitionStorage;
+use crate::vote_store::{LocalFileVoteStorage, VoteState, VoteStore};
 
 use self::router::PartitionRouter;
 
@@ -426,6 +428,10 @@ pub struct HelixService {
     /// Backpressure state for actor mode.
     #[allow(dead_code)] // Used by handlers in follow-up integration.
     pub(crate) actor_backpressure: Option<Arc<batcher::BackpressureState>>,
+    /// Vote store for persisting Raft vote state (multi-node only).
+    /// Uses Arc<Mutex> for thread-safe access from tick tasks.
+    #[allow(dead_code)] // Used by tick tasks for vote persistence.
+    pub(crate) vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
 }
 
 impl HelixService {
@@ -597,6 +603,7 @@ impl HelixService {
             actor_shutdown_tx: None,
             controller_shutdown_tx: None,
             actor_backpressure: None,
+            vote_store: None, // Single-node mode doesn't persist vote state.
         }
     }
 
@@ -746,17 +753,92 @@ impl HelixService {
         // created. Auto-creating Raft groups on message receipt would cause
         // commits to be dropped because partition_storage doesn't exist yet.
 
+        // Initialize VoteStore for Raft vote state persistence.
+        // Uses local file for fast recovery + S3 backup for disk loss scenarios.
+        // Must be done before creating Raft groups so we can restore vote state.
+        let (vote_store, initial_vote_state, recovered_from_remote) = if let Some(ref dir) = data_dir {
+            let vote_file_path = dir.join("vote-state.bin");
+            let local_storage = Arc::new(LocalFileVoteStorage::new(vote_file_path));
+
+            // Use simulated object storage for S3 backup (can be upgraded to real S3 later).
+            let remote_storage = Arc::new(SimulatedObjectStorage::new(node_id.get()));
+
+            // Load existing vote state or start fresh.
+            let load_result = VoteStore::<LocalFileVoteStorage>::load(
+                node_id,
+                local_storage.as_ref(),
+                remote_storage.as_ref(),
+            )
+            .await;
+
+            let (initial_state, recovered_from_remote) = match load_result {
+                Ok(result) => {
+                    info!(
+                        node_id = node_id.get(),
+                        sequence = result.state.sequence,
+                        groups = result.state.group_count(),
+                        recovered_from_remote = result.recovered_from_remote,
+                        "Loaded vote state"
+                    );
+                    (result.state, result.recovered_from_remote)
+                }
+                Err(e) => {
+                    warn!(
+                        node_id = node_id.get(),
+                        error = %e,
+                        "Failed to load vote state, starting fresh"
+                    );
+                    (VoteState::new(), false)
+                }
+            };
+
+            // Create VoteStore and spawn background S3 worker.
+            let (store, handle) = VoteStore::new(
+                node_id,
+                local_storage,
+                remote_storage,
+                initial_state.clone(),
+            );
+
+            // Spawn background S3 upload worker.
+            tokio::spawn(handle.run());
+
+            (Some(Arc::new(Mutex::new(store))), initial_state, recovered_from_remote)
+        } else {
+            // In-memory mode - no vote persistence.
+            (None, VoteState::new(), false)
+        };
+
         // Create controller partition (group 0) with all cluster nodes.
-        {
-            let mut mr = multi_raft.write().await;
-            if let Err(e) = mr.create_group(CONTROLLER_GROUP_ID, cluster_nodes.clone()) {
-                error!(error = %e, "Failed to create controller partition");
-            } else {
+        // Use persisted vote state if available to restore term/voted_for.
+        let controller_vote = initial_vote_state.get_group(CONTROLLER_GROUP_ID);
+        let (term, voted_for) = controller_vote
+            .map_or((TermId::new(0), None), |v| (v.term, v.voted_for));
+
+        let create_result = multi_raft
+            .write()
+            .await
+            .create_group_with_state(
+                CONTROLLER_GROUP_ID,
+                cluster_nodes.clone(),
+                term,
+                voted_for,
+                recovered_from_remote, // observation mode if recovered from S3
+            );
+
+        match create_result {
+            Ok(()) => {
                 info!(
                     group_id = CONTROLLER_GROUP_ID.get(),
+                    term = term.get(),
+                    voted_for = voted_for.map(NodeId::get),
+                    observation_mode = recovered_from_remote,
                     nodes = ?cluster_nodes.iter().map(|n| n.get()).collect::<Vec<_>>(),
-                    "Created controller partition"
+                    "Created controller partition with restored vote state"
                 );
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to create controller partition");
             }
         }
 
@@ -839,6 +921,7 @@ impl HelixService {
                     transport_handle.clone(),
                     incoming_rx,
                     actor_setup::ActorSetupConfig::default(),
+                    vote_store.clone(),
                 )
                 .await;
 
@@ -859,6 +942,7 @@ impl HelixService {
                         transport_handle.clone(),
                         Arc::clone(&actor_handles.router),
                         actor_handles.output_tx.clone(),
+                        vote_store.clone(),
                         rx,
                     ));
                     tx
@@ -920,6 +1004,7 @@ impl HelixService {
                     Arc::clone(&recovered_entries),
                     Some(Arc::clone(&batcher_stats)),
                     Some(backpressure_state.clone()),
+                    vote_store.clone(),
                     incoming_rx,
                     shutdown_rx,
                 ));
@@ -942,6 +1027,7 @@ impl HelixService {
                     Arc::clone(&recovered_entries),
                     Some(Arc::clone(&batcher_stats)),
                     Some(backpressure_state.clone()),
+                    vote_store.clone(),
                     incoming_rx,
                     shutdown_rx,
                 ));
@@ -999,6 +1085,7 @@ impl HelixService {
             actor_shutdown_tx,
             controller_shutdown_tx,
             actor_backpressure,
+            vote_store,
         })
     }
 

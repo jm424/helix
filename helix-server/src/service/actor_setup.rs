@@ -31,13 +31,15 @@
 #![allow(clippy::type_complexity)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use helix_core::{GroupId, LogIndex, NodeId};
 use helix_raft::{RaftConfig, RaftNode};
 use helix_runtime::{IncomingMessage, TransportHandle};
 use tokio::sync::{mpsc, RwLock};
 use tracing::info;
+
+use crate::vote_store::{LocalFileVoteStorage, VoteStore};
 
 use crate::group_map::GroupMap;
 use crate::partition_storage::ServerPartitionStorage;
@@ -106,6 +108,7 @@ pub async fn setup_single_partition(
     batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
     transport_handle: Option<TransportHandle>,
     config: ActorSetupConfig,
+    vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
 ) -> ActorSetupHandles {
     // Create shared output channel.
     let (output_tx, output_rx) =
@@ -152,6 +155,7 @@ pub async fn setup_single_partition(
         transport_handle,
         Some(Arc::clone(&batcher_stats)),
         Some(Arc::clone(&backpressure)),
+        vote_store,
     ));
 
     info!(
@@ -211,6 +215,7 @@ pub async fn setup_multi_partition(
     transport_handle: TransportHandle,
     incoming_rx: mpsc::Receiver<IncomingMessage>,
     config: ActorSetupConfig,
+    vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
 ) -> ActorSetupHandles {
     let group_count = initial_groups.len();
 
@@ -265,6 +270,7 @@ pub async fn setup_multi_partition(
         Some(transport_handle.clone()),
         Some(Arc::clone(&batcher_stats)),
         Some(Arc::clone(&backpressure)),
+        vote_store.clone(),
     ));
 
     // Create shutdown channel for tick task.
@@ -284,6 +290,7 @@ pub async fn setup_multi_partition(
         cluster_nodes,
         transport_handle,
         output_tx.clone(),
+        vote_store,
         incoming_rx,
         shutdown_rx,
     ));
@@ -342,6 +349,27 @@ pub fn create_partition_actor(
     spawn_partition_actor_shared(group_id, raft_node, config, output_tx)
 }
 
+/// Creates a partition actor with restored vote state.
+///
+/// Used when creating partitions after recovering from a restart with persisted vote state.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn create_partition_actor_with_state(
+    group_id: GroupId,
+    node_id: NodeId,
+    replicas: Vec<NodeId>,
+    term: helix_core::TermId,
+    voted_for: Option<NodeId>,
+    observation_mode: bool,
+    output_tx: mpsc::Sender<GroupedOutput>,
+    config: PartitionActorConfig,
+) -> PartitionActorHandle {
+    let raft_config = RaftConfig::new(node_id, replicas);
+    let raft_node = RaftNode::with_vote_state(raft_config, term, voted_for, observation_mode);
+
+    spawn_partition_actor_shared(group_id, raft_node, config, output_tx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +411,7 @@ mod tests {
             batch_pending_proposals,
             None,
             ActorSetupConfig::default(),
+            None, // No vote persistence in tests.
         )
         .await;
 
@@ -431,6 +460,7 @@ mod tests {
             batch_pending_proposals,
             None,
             ActorSetupConfig::default(),
+            None, // No vote persistence in tests.
         )
         .await;
 

@@ -1315,10 +1315,15 @@ mod tests {
         let result = run_basic_simulation(&config);
         assert_simulation_ok(&result, "multi_partition_leader_failure", 1000);
 
-        // Verify we had client acks (data was actually written).
+        // Verify we had substantial client acks (data was actually written).
+        // With 500 produce operations, we expect a significant number of acks.
+        let min_expected_acks = result.property_result.total_committed_entries / 2;
         assert!(
-            result.property_result.total_client_acks > 0,
-            "Should have client acks from produces"
+            result.property_result.total_client_acks >= min_expected_acks as usize,
+            "Should have substantial client acks: got {}, expected at least {} (commits={})",
+            result.property_result.total_client_acks,
+            min_expected_acks,
+            result.property_result.total_committed_entries
         );
 
         // Verify data went to ALL 3 partitions (not just partition 0).
@@ -1672,6 +1677,371 @@ mod tests {
             total_produces, total_commits, total_violations
         );
         assert_eq!(total_violations, 0, "No violations across 500 seeds");
+    }
+
+    // =========================================================================
+    // Actor Mode DST Tests
+    // =========================================================================
+    //
+    // These tests use actor_mode: true to test the REAL production partition
+    // actor code path (PartitionActor, WalActor) with fine-grained fault injection.
+    //
+    // Actor mode tests the actual production implementation with:
+    // - SimulatedStorage for disk fault injection (torn writes, fsync failures)
+    // - SimulatedTransport for network fault injection (partitions, delays)
+    // - Deterministic timing via Bloodhound
+    // - Property-based validation (data integrity, consumer verification)
+
+    #[test]
+    fn test_helix_service_actor_mode_basic() {
+        // Basic actor mode test - verifies the production partition actor works.
+        let config = HelixTestConfig {
+            node_count: 3,
+            seed: 42,
+            max_time_secs: 30,
+            inject_client_traffic: true,
+            produce_interval_ms: 100,
+            produce_count: 200,
+            actor_mode: true,
+            ..Default::default()
+        };
+
+        let result = run_basic_simulation(&config);
+        assert_simulation_ok(&result, "actor_mode_basic", 500);
+    }
+
+    #[test]
+    fn test_helix_service_actor_mode_with_crashes() {
+        // Actor mode with process crash/recovery.
+        let config = HelixTestConfig {
+            node_count: 3,
+            seed: 1234,
+            max_time_secs: 45,
+            inject_crashes: true,
+            crash_time_ms: 10000,
+            recover_time_ms: 25000,
+            crash_node_index: 0,
+            inject_client_traffic: true,
+            produce_interval_ms: 100,
+            produce_count: 300,
+            actor_mode: true,
+            ..Default::default()
+        };
+
+        let result = run_basic_simulation(&config);
+        assert_simulation_ok(&result, "actor_mode_with_crashes", 800);
+    }
+
+    #[test]
+    fn test_helix_service_actor_mode_with_storage_faults() {
+        // Actor mode with storage faults (torn writes, fsync failures).
+        let config = HelixTestConfig {
+            node_count: 3,
+            seed: 5678,
+            max_time_secs: 45,
+            inject_storage_faults: true,
+            storage_fault_config: Some(FaultConfig::flaky()),
+            inject_client_traffic: true,
+            produce_interval_ms: 100,
+            produce_count: 300,
+            actor_mode: true,
+            ..Default::default()
+        };
+
+        let result = run_basic_simulation(&config);
+        assert_simulation_ok(&result, "actor_mode_with_storage_faults", 800);
+    }
+
+    #[test]
+    fn test_helix_service_actor_mode_with_partition() {
+        // Actor mode with network partition.
+        let config = HelixTestConfig {
+            node_count: 3,
+            seed: 9012,
+            max_time_secs: 45,
+            inject_partition: true,
+            partition_time_ms: 8000,
+            heal_time_ms: 25000,
+            inject_client_traffic: true,
+            produce_interval_ms: 100,
+            produce_count: 300,
+            actor_mode: true,
+            ..Default::default()
+        };
+
+        let result = run_basic_simulation(&config);
+        assert_simulation_ok(&result, "actor_mode_with_partition", 800);
+    }
+
+    #[test]
+    fn test_helix_service_actor_mode_all_faults() {
+        // Actor mode with all fault types - comprehensive test.
+        let config = HelixTestConfig {
+            node_count: 3,
+            seed: 3456,
+            max_time_secs: 60,
+            inject_crashes: true,
+            crash_time_ms: 15000,
+            recover_time_ms: 35000,
+            crash_node_index: 1,
+            inject_partition: true,
+            partition_time_ms: 10000,
+            heal_time_ms: 30000,
+            inject_storage_faults: true,
+            storage_fault_config: Some(FaultConfig::flaky()),
+            inject_client_traffic: true,
+            produce_interval_ms: 80,
+            produce_count: 500,
+            actor_mode: true,
+            ..Default::default()
+        };
+
+        let result = run_basic_simulation(&config);
+        assert_simulation_ok(&result, "actor_mode_all_faults", 1200);
+    }
+
+    #[test]
+    fn test_helix_service_actor_mode_stress_10_seeds() {
+        // Multi-seed stress test for actor mode.
+        let mut total_violations = 0usize;
+        let mut total_produces = 0u64;
+        let mut total_commits = 0u64;
+        let mut total_client_acks = 0usize;
+
+        for seed in 0..10 {
+            let config = HelixTestConfig {
+                node_count: 3,
+                seed,
+                max_time_secs: 45,
+                inject_crashes: seed % 3 == 0,
+                crash_time_ms: 10000,
+                recover_time_ms: 25000,
+                crash_node_index: (seed as usize) % 3,
+                inject_storage_faults: seed % 2 == 0,
+                storage_fault_config: if seed % 2 == 0 {
+                    Some(FaultConfig::flaky())
+                } else {
+                    None
+                },
+                inject_client_traffic: true,
+                produce_interval_ms: 100,
+                produce_count: 300,
+                actor_mode: true,
+                ..Default::default()
+            };
+
+            let result = run_basic_simulation(&config);
+            assert_simulation_ok(&result, &format!("actor_mode_stress_seed_{}", seed), 500);
+
+            total_violations += result.property_result.violations.len();
+            total_produces += result.property_result.total_produce_success;
+            total_commits += result.property_result.total_committed_entries;
+            total_client_acks += result.property_result.total_client_acks;
+        }
+
+        assert_eq!(total_violations, 0, "No violations across actor mode stress seeds");
+        println!(
+            "Actor mode stress: 10 seeds completed, {} produces, {} commits, {} client_acks, 0 violations",
+            total_produces, total_commits, total_client_acks
+        );
+    }
+
+    #[test]
+    fn test_helix_service_actor_mode_stress_30_seeds() {
+        // 30-seed stress test for actor mode (aligned with other modes).
+        let mut total_violations = 0usize;
+        let mut total_produces = 0u64;
+        let mut total_commits = 0u64;
+        let mut total_integrity_violations = 0usize;
+        let mut total_consumer_violations = 0usize;
+
+        for seed in 0..30 {
+            let config = HelixTestConfig {
+                node_count: 3,
+                seed,
+                max_time_secs: 45,
+                inject_crashes: seed % 3 == 0,
+                crash_time_ms: 10000,
+                recover_time_ms: 25000,
+                crash_node_index: (seed as usize) % 3,
+                inject_partition: seed % 5 == 0,
+                partition_time_ms: 8000,
+                heal_time_ms: 22000,
+                inject_storage_faults: seed % 2 == 0,
+                storage_fault_config: if seed % 2 == 0 {
+                    Some(FaultConfig::flaky())
+                } else {
+                    None
+                },
+                inject_client_traffic: true,
+                produce_interval_ms: 100,
+                produce_count: 300,
+                actor_mode: true,
+                ..Default::default()
+            };
+
+            let result = run_basic_simulation(&config);
+            assert_simulation_ok(&result, &format!("actor_mode_stress_seed_{}", seed), 500);
+
+            total_violations += result.property_result.violations.len();
+            total_produces += result.property_result.total_produce_success;
+            total_commits += result.property_result.total_committed_entries;
+            total_integrity_violations += result.property_result.data_integrity_violations.len();
+            total_consumer_violations += result.property_result.consumer_violations.len();
+        }
+
+        assert_eq!(total_violations, 0, "No consensus violations across actor mode 30-seed stress");
+        assert_eq!(total_integrity_violations, 0, "No data integrity violations across actor mode stress");
+        assert_eq!(total_consumer_violations, 0, "No consumer violations (data loss) across actor mode stress");
+        println!(
+            "Actor mode stress: 30 seeds completed, {} produces, {} commits, 0 violations",
+            total_produces, total_commits
+        );
+    }
+
+    #[test]
+    #[ignore] // Run manually with: cargo test actor_mode_stress_100 -- --ignored
+    fn test_helix_service_actor_mode_stress_100_seeds() {
+        // Comprehensive 100-seed stress test for actor mode.
+        let mut total_violations = 0usize;
+        let mut total_produces = 0u64;
+        let mut total_commits = 0u64;
+        let mut total_integrity_violations = 0usize;
+        let mut total_consumer_violations = 0usize;
+        let mut failures = Vec::new();
+
+        for seed in 0..100 {
+            let config = HelixTestConfig {
+                node_count: 3,
+                seed,
+                max_time_secs: 60,
+                inject_crashes: seed % 3 == 0,
+                crash_time_ms: 15000,
+                recover_time_ms: 35000,
+                crash_node_index: (seed as usize) % 3,
+                inject_partition: seed % 5 == 0,
+                partition_time_ms: 10000,
+                heal_time_ms: 30000,
+                inject_storage_faults: seed % 4 == 0,
+                storage_fault_config: if seed % 4 == 0 {
+                    Some(FaultConfig::flaky())
+                } else {
+                    None
+                },
+                inject_client_traffic: true,
+                produce_interval_ms: 80,
+                produce_count: 600,
+                actor_mode: true,
+                ..Default::default()
+            };
+
+            let result = run_basic_simulation(&config);
+
+            if seed % 10 == 0 {
+                println!(
+                    "Actor mode seed {}: produces={}, commits={}, violations={}, integrity={}, consumer={}",
+                    seed,
+                    result.property_result.total_produce_success,
+                    result.property_result.total_committed_entries,
+                    result.property_result.violations.len(),
+                    result.property_result.data_integrity_violations.len(),
+                    result.property_result.consumer_violations.len()
+                );
+            }
+
+            if !result.success || !result.property_result.is_ok() {
+                failures.push(seed);
+            }
+
+            total_violations += result.property_result.violations.len();
+            total_produces += result.property_result.total_produce_success;
+            total_commits += result.property_result.total_committed_entries;
+            total_integrity_violations += result.property_result.data_integrity_violations.len();
+            total_consumer_violations += result.property_result.consumer_violations.len();
+        }
+
+        assert!(failures.is_empty(), "Actor mode seeds failed: {:?}", failures);
+        assert_eq!(total_violations, 0, "No consensus violations across actor mode 100-seed stress");
+        assert_eq!(total_integrity_violations, 0, "No data integrity violations");
+        assert_eq!(total_consumer_violations, 0, "No consumer violations (data loss)");
+
+        println!(
+            "Actor mode stress: 100 seeds completed, {} produces, {} commits, 0 violations",
+            total_produces, total_commits
+        );
+    }
+
+    #[test]
+    fn test_helix_service_actor_mode_with_shared_wal() {
+        // Actor mode with SharedWAL - tests production WAL architecture.
+        let config = HelixTestConfig {
+            node_count: 3,
+            seed: 7890,
+            max_time_secs: 45,
+            inject_crashes: true,
+            crash_time_ms: 12000,
+            recover_time_ms: 28000,
+            crash_node_index: 0,
+            inject_storage_faults: true,
+            storage_fault_config: Some(FaultConfig::flaky()),
+            inject_client_traffic: true,
+            produce_interval_ms: 100,
+            produce_count: 300,
+            actor_mode: true,
+            wal_mode: WalMode::Shared,
+            shared_wal_count: 4,
+            ..Default::default()
+        };
+
+        let result = run_basic_simulation(&config);
+        assert_simulation_ok(&result, "actor_mode_with_shared_wal", 800);
+    }
+
+    #[test]
+    fn test_helix_service_actor_mode_leader_failure() {
+        // Actor mode with leader crash - verifies partition failover.
+        let config = HelixTestConfig {
+            node_count: 3,
+            seed: 8888,
+            max_time_secs: 60,
+            inject_crashes: true,
+            crash_time_ms: 15000,
+            recover_time_ms: 35000,
+            crash_node_index: 0,
+            inject_client_traffic: true,
+            produce_interval_ms: 80,
+            produce_count: 500,
+            actor_mode: true,
+            ..Default::default()
+        };
+
+        let result = run_basic_simulation(&config);
+        assert_simulation_ok(&result, "actor_mode_leader_failure", 1000);
+
+        // Verify we had substantial client acks (data was actually written).
+        // With 500 produce operations, we expect a significant number of acks.
+        // Client acks should be close to commits since all commits from our
+        // produces should have acks when we were the proposing leader.
+        let min_expected_acks = result.property_result.total_committed_entries / 2;
+        assert!(
+            result.property_result.total_client_acks >= min_expected_acks as usize,
+            "Should have substantial client acks: got {}, expected at least {} (commits={})",
+            result.property_result.total_client_acks,
+            min_expected_acks,
+            result.property_result.total_committed_entries
+        );
+
+        // Verify no data integrity violations.
+        assert!(
+            result.property_result.data_integrity_violations.is_empty(),
+            "Should have no data integrity violations"
+        );
+
+        // Verify no consumer violations (acknowledged data is consumable).
+        assert!(
+            result.property_result.consumer_violations.is_empty(),
+            "Should have no consumer violations (data loss)"
+        );
     }
 
 }

@@ -41,13 +41,15 @@
 #![allow(clippy::implicit_hasher)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use helix_core::{GroupId, LogIndex, Offset, ProducerEpoch, ProducerId, SequenceNum};
+use helix_core::{GroupId, LogIndex, Offset, ProducerEpoch, ProducerId, SequenceNum, TermId};
 use helix_runtime::TransportHandle;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
+
+use crate::vote_store::{LocalFileVoteStorage, VoteStore};
 
 use crate::error::ServerError;
 use crate::group_map::GroupMap;
@@ -113,6 +115,7 @@ pub async fn output_processor_task(
     transport_handle: Option<TransportHandle>,
     batcher_stats: Option<Arc<BatcherStats>>,
     batcher_backpressure: Option<Arc<BackpressureState>>,
+    vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
 ) {
     info!("Output processor started");
 
@@ -154,7 +157,7 @@ pub async fn output_processor_task(
                 handle_stepped_down(group_id, &group_map).await;
             }
             PartitionOutput::VoteStateChanged { term, voted_for } => {
-                handle_vote_state_changed(group_id, term, voted_for);
+                handle_vote_state_changed(group_id, term, voted_for, vote_store.as_ref());
             }
         }
     }
@@ -620,20 +623,32 @@ async fn handle_stepped_down(group_id: GroupId, group_map: &Arc<RwLock<GroupMap>
 
 /// Handles `VoteStateChanged` output.
 ///
-/// Currently just logs the change. Full `VoteStore` integration is future work.
+/// Persists vote state to local file with async S3 backup.
 fn handle_vote_state_changed(
     group_id: GroupId,
     term: u64,
     voted_for: Option<helix_core::NodeId>,
+    vote_store: Option<&Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
 ) {
     debug!(
         group = group_id.get(),
         term = term,
         voted_for = ?voted_for.map(helix_core::NodeId::get),
-        "Vote state changed (actor mode, persistence not yet implemented)"
+        "Vote state changed (actor mode)"
     );
-    // TODO: Integrate with VoteStore for persistence.
-    // The VoteStore will persist to local file + async S3 backup.
+    // Persist vote state to local file + async S3 backup.
+    if let Some(vs) = vote_store {
+        if let Ok(mut store) = vs.lock() {
+            let term_id = TermId::new(term);
+            if let Err(e) = store.save(group_id, term_id, voted_for) {
+                error!(
+                    group = group_id.get(),
+                    error = %e,
+                    "Failed to persist vote state"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -680,6 +695,7 @@ mod tests {
             None,
             None,
             None,
+            None, // No vote persistence in tests.
         ));
 
         // Send BecameLeader output.
@@ -728,6 +744,7 @@ mod tests {
             None,
             None,
             None,
+            None, // No vote persistence in tests.
         ));
 
         // Send EntryCommitted output (no batch proposal, so just applies).
@@ -822,6 +839,7 @@ mod tests {
             None,
             Some(Arc::clone(&batcher_stats)),
             Some(Arc::clone(&backpressure)),
+            None, // No vote persistence in tests.
         ));
 
         // Create valid batch entry data.
