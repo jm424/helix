@@ -1159,7 +1159,7 @@ impl HelixServiceActor {
     /// # Arguments
     ///
     /// * `was_proposing_leader` - In actor mode, `Some(true)` if we were the proposing leader
-    ///   (batch_notify was present), `Some(false)` if we were a follower. In non-actor mode,
+    ///   (`batch_notify` was present), `Some(false)` if we were a follower. In non-actor mode,
     ///   `None` and the leadership is determined from `multi_raft.group_state()`.
     #[allow(clippy::too_many_lines)]
     fn handle_commit(
