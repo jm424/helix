@@ -1,10 +1,17 @@
-//! SharedWAL integration tests for helix-server.
+//! `SharedWAL` integration tests for helix-server.
 //!
-//! These tests verify the SharedWalPool integration in HelixService:
+//! These tests verify the `SharedWalPool` integration in `HelixService`:
 //! - Basic write and read with shared WAL
 //! - Multi-partition concurrent writes
 //! - Recovery after restart
 //! - Different WAL count configurations
+//!
+//! NOTE: These tests use real TCP networking and are not compatible with `MadSim`.
+//! For deterministic testing, see the madsim_*_test.rs modules.
+#![cfg(not(madsim))]
+#![allow(clippy::significant_drop_tightening)]
+#![allow(clippy::items_after_statements)]
+#![allow(clippy::cast_possible_truncation)]
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -20,7 +27,7 @@ use tonic::transport::Server;
 /// Maximum time to wait for server operations.
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Starts a test server with SharedWAL on an available port.
+/// Starts a test server with `SharedWAL` on an available port.
 async fn start_test_server_with_shared_wal(
     data_dir: std::path::PathBuf,
     shared_wal_count: Option<u32>,
@@ -64,7 +71,7 @@ async fn start_test_server_with_shared_wal(
     (client, addr)
 }
 
-/// Test basic write and read operations with SharedWAL.
+/// Test basic write and read operations with `SharedWAL`.
 #[tokio::test]
 async fn test_shared_wal_basic_write_read() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -196,7 +203,7 @@ async fn test_shared_wal_multiple_partitions() {
 }
 
 /// Test concurrent writes to multiple partitions.
-/// This exercises the SharedWalPool's fsync amortization.
+/// This exercises the `SharedWalPool`'s fsync amortization.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_shared_wal_concurrent_writes() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -225,10 +232,7 @@ async fn test_shared_wal_concurrent_writes() {
                     .await
                     .unwrap();
 
-                assert_eq!(
-                    result.into_inner().error_code,
-                    i32::from(ErrorCode::None)
-                );
+                assert_eq!(result.into_inner().error_code, i32::from(ErrorCode::None));
             }
             partition
         }));
@@ -332,7 +336,7 @@ async fn test_shared_wal_different_wal_counts() {
     }
 }
 
-/// Test that multiple batches accumulate correctly in SharedWAL.
+/// Test that multiple batches accumulate correctly in `SharedWAL`.
 #[tokio::test]
 async fn test_shared_wal_multiple_batches() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -409,8 +413,8 @@ async fn test_shared_wal_multiple_batches() {
     assert_eq!(read_result.high_watermark, 3);
 }
 
-/// Test recovery after service restart using SharedWAL.
-/// This tests that data written to the SharedWAL is correctly recovered
+/// Test recovery after service restart using `SharedWAL`.
+/// This tests that data written to the `SharedWAL` is correctly recovered
 /// when a new service instance is created with the same data directory.
 ///
 /// Note: This test uses two sequential gRPC server instances on different ports.
@@ -578,7 +582,7 @@ async fn test_shared_wal_recovery_after_restart() {
     }
 }
 
-/// Test high-volume writes to stress the SharedWAL batching.
+/// Test high-volume writes to stress the `SharedWAL` batching.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_shared_wal_high_volume() {
     let temp_dir = tempfile::tempdir().unwrap();

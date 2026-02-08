@@ -180,16 +180,18 @@ impl PropertyChecker {
 
             // Verify each lease in consumer's list exists in some partition.
             for lease_id in &consumer_state.lease_ids {
-                let lease_exists = group.partitions.values().any(|p| {
-                    p.active_leases.contains_key(lease_id)
-                });
+                let lease_exists = group
+                    .partitions
+                    .values()
+                    .any(|p| p.active_leases.contains_key(lease_id));
 
                 if !lease_exists {
-                    self.violations.push(Violation::ConsumerLeaseNotInPartition {
-                        group_id: gid,
-                        consumer_id: consumer_id.get(),
-                        lease_id: lease_id.get(),
-                    });
+                    self.violations
+                        .push(Violation::ConsumerLeaseNotInPartition {
+                            group_id: gid,
+                            consumer_id: consumer_id.get(),
+                            lease_id: lease_id.get(),
+                        });
                 }
             }
         }
@@ -289,13 +291,14 @@ impl PropertyChecker {
         if current_watermark > 0 {
             let test_offset = current_watermark - 1;
             if !progress.is_committed(Offset::new(test_offset)) {
-                self.violations.push(Violation::OffsetBelowWatermarkNotCommitted {
-                    group_id,
-                    topic_id: tid,
-                    partition_id: pid,
-                    offset: test_offset,
-                    watermark: current_watermark,
-                });
+                self.violations
+                    .push(Violation::OffsetBelowWatermarkNotCommitted {
+                        group_id,
+                        topic_id: tid,
+                        partition_id: pid,
+                        offset: test_offset,
+                        watermark: current_watermark,
+                    });
             }
         }
     }
@@ -509,12 +512,14 @@ async fn test_invariants_after_every_operation() {
 
         // Operation sequence that exercises all state transitions.
         // 1. Create group.
-        manager
-            .get_or_create_group(group_id, 1000)
-            .await
-            .unwrap();
+        manager.get_or_create_group(group_id, 1000).await.unwrap();
         checker.check_all_invariants(manager.store());
-        assert!(checker.is_clean(), "seed {}: after create group: {:?}", seed, checker.violations());
+        assert!(
+            checker.is_clean(),
+            "seed {}: after create group: {:?}",
+            seed,
+            checker.violations()
+        );
 
         // 2. Register consumers.
         for i in 1..=3 {
@@ -523,7 +528,13 @@ async fn test_invariants_after_every_operation() {
                 .await
                 .unwrap();
             checker.check_all_invariants(manager.store());
-            assert!(checker.is_clean(), "seed {}: after register consumer {}: {:?}", seed, i, checker.violations());
+            assert!(
+                checker.is_clean(),
+                "seed {}: after register consumer {}: {:?}",
+                seed,
+                i,
+                checker.violations()
+            );
         }
 
         // 3. Create leases for each consumer.
@@ -544,7 +555,13 @@ async fn test_invariants_after_every_operation() {
                 .unwrap();
             leases.push(lease);
             checker.check_all_invariants(manager.store());
-            assert!(checker.is_clean(), "seed {}: after lease {}: {:?}", seed, i, checker.violations());
+            assert!(
+                checker.is_clean(),
+                "seed {}: after lease {}: {:?}",
+                seed,
+                i,
+                checker.violations()
+            );
         }
 
         // 4. Commit offsets (some contiguous, some sparse).
@@ -561,26 +578,46 @@ async fn test_invariants_after_every_operation() {
                 .await
                 .unwrap();
             checker.check_all_invariants(manager.store());
-            assert!(checker.is_clean(), "seed {}: after commit {}: {:?}", seed, i, checker.violations());
+            assert!(
+                checker.is_clean(),
+                "seed {}: after commit {}: {:?}",
+                seed,
+                i,
+                checker.violations()
+            );
         }
 
         // 5. Extend a lease.
         if let Some(Some(lease)) = leases.first() {
             let pk = PartitionKey::new(topic_id, partition_id);
             let _ = manager
-                .extend_lease(group_id, pk, ConsumerId::new(1), lease.lease_id, 30_000_000, 4000)
+                .extend_lease(
+                    group_id,
+                    pk,
+                    ConsumerId::new(1),
+                    lease.lease_id,
+                    30_000_000,
+                    4000,
+                )
                 .await;
             checker.check_all_invariants(manager.store());
-            assert!(checker.is_clean(), "seed {}: after extend: {:?}", seed, checker.violations());
+            assert!(
+                checker.is_clean(),
+                "seed {}: after extend: {:?}",
+                seed,
+                checker.violations()
+            );
         }
 
         // 6. Expire leases.
-        manager
-            .expire_leases(group_id, 100_000_000)
-            .await
-            .unwrap();
+        manager.expire_leases(group_id, 100_000_000).await.unwrap();
         checker.check_all_invariants(manager.store());
-        assert!(checker.is_clean(), "seed {}: after expire: {:?}", seed, checker.violations());
+        assert!(
+            checker.is_clean(),
+            "seed {}: after expire: {:?}",
+            seed,
+            checker.violations()
+        );
 
         // 7. Unregister a consumer.
         manager
@@ -588,7 +625,12 @@ async fn test_invariants_after_every_operation() {
             .await
             .unwrap();
         checker.check_all_invariants(manager.store());
-        assert!(checker.is_clean(), "seed {}: after unregister: {:?}", seed, checker.violations());
+        assert!(
+            checker.is_clean(),
+            "seed {}: after unregister: {:?}",
+            seed,
+            checker.violations()
+        );
     }
 }
 
@@ -617,8 +659,14 @@ async fn test_individual_mode_bitmap_invariants() {
         // Lease offsets.
         manager
             .lease_offsets(
-                group_id, topic_id, partition_id, consumer_id,
-                Offset::new(0), 100, 60_000_000, 1000,
+                group_id,
+                topic_id,
+                partition_id,
+                consumer_id,
+                Offset::new(0),
+                100,
+                60_000_000,
+                1000,
             )
             .await
             .unwrap();
@@ -626,11 +674,24 @@ async fn test_individual_mode_bitmap_invariants() {
         // Commit sparse offsets: 0, 2, 4, 6, 8 (gaps at 1, 3, 5, 7).
         for i in (0..10).step_by(2) {
             manager
-                .commit_offset(group_id, topic_id, partition_id, consumer_id, Offset::new(i), 2000)
+                .commit_offset(
+                    group_id,
+                    topic_id,
+                    partition_id,
+                    consumer_id,
+                    Offset::new(i),
+                    2000,
+                )
                 .await
                 .unwrap();
             checker.check_all_invariants(manager.store());
-            assert!(checker.is_clean(), "seed {}: after sparse commit {}: {:?}", seed, i, checker.violations());
+            assert!(
+                checker.is_clean(),
+                "seed {}: after sparse commit {}: {:?}",
+                seed,
+                i,
+                checker.violations()
+            );
         }
 
         // Verify watermark is at 1 (stopped at first gap).
@@ -644,11 +705,24 @@ async fn test_individual_mode_bitmap_invariants() {
         // Fill gaps one by one and check invariants.
         for i in [1, 3, 5, 7, 9] {
             manager
-                .commit_offset(group_id, topic_id, partition_id, consumer_id, Offset::new(i), 3000)
+                .commit_offset(
+                    group_id,
+                    topic_id,
+                    partition_id,
+                    consumer_id,
+                    Offset::new(i),
+                    3000,
+                )
                 .await
                 .unwrap();
             checker.check_all_invariants(manager.store());
-            assert!(checker.is_clean(), "seed {}: after fill gap {}: {:?}", seed, i, checker.violations());
+            assert!(
+                checker.is_clean(),
+                "seed {}: after fill gap {}: {:?}",
+                seed,
+                i,
+                checker.violations()
+            );
         }
 
         // Watermark should now be at 10.
@@ -688,8 +762,14 @@ async fn test_cumulative_mode_bitmap_empty() {
             let start = batch * 20;
             manager
                 .lease_offsets(
-                    group_id, topic_id, partition_id, consumer_id,
-                    Offset::new(start), 20, 60_000_000, 1000 + batch * 1000,
+                    group_id,
+                    topic_id,
+                    partition_id,
+                    consumer_id,
+                    Offset::new(start),
+                    20,
+                    60_000_000,
+                    1000 + batch * 1000,
                 )
                 .await
                 .unwrap();
@@ -697,14 +777,24 @@ async fn test_cumulative_mode_bitmap_empty() {
             // Commit at end of batch (cumulative).
             manager
                 .commit_offset(
-                    group_id, topic_id, partition_id, consumer_id,
-                    Offset::new(start + 19), 2000 + batch * 1000,
+                    group_id,
+                    topic_id,
+                    partition_id,
+                    consumer_id,
+                    Offset::new(start + 19),
+                    2000 + batch * 1000,
                 )
                 .await
                 .unwrap();
 
             checker.check_all_invariants(manager.store());
-            assert!(checker.is_clean(), "seed {}: batch {}: {:?}", seed, batch, checker.violations());
+            assert!(
+                checker.is_clean(),
+                "seed {}: batch {}: {:?}",
+                seed,
+                batch,
+                checker.violations()
+            );
 
             // Verify watermark jumped.
             let wm = manager
@@ -712,7 +802,13 @@ async fn test_cumulative_mode_bitmap_empty() {
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(wm.get(), start + 20, "seed {}: watermark after batch {}", seed, batch);
+            assert_eq!(
+                wm.get(),
+                start + 20,
+                "seed {}: watermark after batch {}",
+                seed,
+                batch
+            );
         }
     }
 }
@@ -745,7 +841,11 @@ async fn test_all_fault_injection_sites() {
 
         // 2. save_group (via register_consumer).
         stats.save_group_calls += 1;
-        if manager.register_consumer(group_id, consumer_id, 1000).await.is_err() {
+        if manager
+            .register_consumer(group_id, consumer_id, 1000)
+            .await
+            .is_err()
+        {
             stats.save_group_faults += 1;
         }
 
@@ -754,7 +854,11 @@ async fn test_all_fault_injection_sites() {
 
         // get_partition_progress.
         stats.get_partition_progress_calls += 1;
-        if store.get_partition_progress(group_id, partition_key).await.is_err() {
+        if store
+            .get_partition_progress(group_id, partition_key)
+            .await
+            .is_err()
+        {
             stats.get_partition_progress_faults += 1;
         }
 
@@ -805,9 +909,18 @@ async fn test_all_fault_injection_sites() {
     total_stats.print_summary();
 
     // Verify all sites were exercised with faults.
-    assert!(total_stats.get_group_faults > 0, "get_group should have faults");
-    assert!(total_stats.save_group_faults > 0, "save_group should have faults");
-    assert!(total_stats.remove_group_faults > 0, "remove_group should have faults");
+    assert!(
+        total_stats.get_group_faults > 0,
+        "get_group should have faults"
+    );
+    assert!(
+        total_stats.save_group_faults > 0,
+        "save_group should have faults"
+    );
+    assert!(
+        total_stats.remove_group_faults > 0,
+        "remove_group should have faults"
+    );
     // Note: partition-level faults may be 0 if no partitions created due to earlier failures.
 }
 
@@ -815,8 +928,7 @@ async fn test_all_fault_injection_sites() {
 #[tokio::test]
 async fn test_state_consistency_after_failures() {
     for seed in 0..20 {
-        let config = ProgressStoreFaultConfig::none()
-            .with_save_fail_rate(0.5); // 50% save failures
+        let config = ProgressStoreFaultConfig::none().with_save_fail_rate(0.5); // 50% save failures
 
         let manager = create_manager(seed * 12345, config);
         let mut checker = PropertyChecker::new();
@@ -832,8 +944,14 @@ async fn test_state_consistency_after_failures() {
             let _ = manager.register_consumer(group_id, consumer_id, 1000).await;
             let _ = manager
                 .lease_offsets(
-                    group_id, topic_id, partition_id, consumer_id,
-                    Offset::new(attempt * 10), 10, 60_000_000, 1000 + attempt * 100,
+                    group_id,
+                    topic_id,
+                    partition_id,
+                    consumer_id,
+                    Offset::new(attempt * 10),
+                    10,
+                    60_000_000,
+                    1000 + attempt * 100,
                 )
                 .await;
 
@@ -842,7 +960,9 @@ async fn test_state_consistency_after_failures() {
             assert!(
                 checker.is_clean(),
                 "seed {}, attempt {}: invariants violated after failure: {:?}",
-                seed, attempt, checker.violations()
+                seed,
+                attempt,
+                checker.violations()
             );
         }
     }
@@ -888,13 +1008,20 @@ async fn test_max_lease_duration_limit() {
     let partition_id = PartitionId::new(0);
 
     manager.get_or_create_group(group_id, 1000).await.unwrap();
-    manager.register_consumer(group_id, consumer_id, 1000).await.unwrap();
+    manager
+        .register_consumer(group_id, consumer_id, 1000)
+        .await
+        .unwrap();
 
     // Request lease with excessive duration.
     let result = manager
         .lease_offsets(
-            group_id, topic_id, partition_id, consumer_id,
-            Offset::new(0), 10,
+            group_id,
+            topic_id,
+            partition_id,
+            consumer_id,
+            Offset::new(0),
+            10,
             u64::MAX, // Excessive duration
             1000,
         )
@@ -916,12 +1043,18 @@ async fn test_max_offsets_per_lease_limit() {
     let partition_id = PartitionId::new(0);
 
     manager.get_or_create_group(group_id, 1000).await.unwrap();
-    manager.register_consumer(group_id, consumer_id, 1000).await.unwrap();
+    manager
+        .register_consumer(group_id, consumer_id, 1000)
+        .await
+        .unwrap();
 
     // Request more offsets than allowed (config has max_offsets_per_lease = 10000).
     let lease = manager
         .lease_offsets(
-            group_id, topic_id, partition_id, consumer_id,
+            group_id,
+            topic_id,
+            partition_id,
+            consumer_id,
             Offset::new(0),
             u32::MAX, // Request way too many
             60_000_000,
@@ -956,33 +1089,54 @@ async fn test_high_offset_values() {
     let partition_id = PartitionId::new(0);
 
     manager.get_or_create_group(group_id, 1000).await.unwrap();
-    manager.register_consumer(group_id, consumer_id, 1000).await.unwrap();
+    manager
+        .register_consumer(group_id, consumer_id, 1000)
+        .await
+        .unwrap();
 
     // Start at high offset.
     let high_offset = u64::MAX - 1000;
     let lease = manager
         .lease_offsets(
-            group_id, topic_id, partition_id, consumer_id,
-            Offset::new(high_offset), 10, 60_000_000, 1000,
+            group_id,
+            topic_id,
+            partition_id,
+            consumer_id,
+            Offset::new(high_offset),
+            10,
+            60_000_000,
+            1000,
         )
         .await
         .unwrap()
         .unwrap();
 
     checker.check_all_invariants(manager.store());
-    assert!(checker.is_clean(), "invariants after high offset lease: {:?}", checker.violations());
+    assert!(
+        checker.is_clean(),
+        "invariants after high offset lease: {:?}",
+        checker.violations()
+    );
 
     // Commit at high offset.
     manager
         .commit_offset(
-            group_id, topic_id, partition_id, consumer_id,
-            Offset::new(high_offset), 2000,
+            group_id,
+            topic_id,
+            partition_id,
+            consumer_id,
+            Offset::new(high_offset),
+            2000,
         )
         .await
         .unwrap();
 
     checker.check_all_invariants(manager.store());
-    assert!(checker.is_clean(), "invariants after high offset commit: {:?}", checker.violations());
+    assert!(
+        checker.is_clean(),
+        "invariants after high offset commit: {:?}",
+        checker.violations()
+    );
 }
 
 /// Tests empty group behavior.
@@ -1026,13 +1180,22 @@ async fn test_zero_count_lease_panics() {
     let partition_id = PartitionId::new(0);
 
     manager.get_or_create_group(group_id, 1000).await.unwrap();
-    manager.register_consumer(group_id, consumer_id, 1000).await.unwrap();
+    manager
+        .register_consumer(group_id, consumer_id, 1000)
+        .await
+        .unwrap();
 
     // Zero count should panic (TigerStyle assertion).
     let _ = manager
         .lease_offsets(
-            group_id, topic_id, partition_id, consumer_id,
-            Offset::new(0), 0, 60_000_000, 1000,
+            group_id,
+            topic_id,
+            partition_id,
+            consumer_id,
+            Offset::new(0),
+            0,
+            60_000_000,
+            1000,
         )
         .await;
 }
@@ -1048,24 +1211,47 @@ async fn test_duplicate_commit_rejected() {
     let partition_id = PartitionId::new(0);
 
     manager.get_or_create_group(group_id, 1000).await.unwrap();
-    manager.register_consumer(group_id, consumer_id, 1000).await.unwrap();
+    manager
+        .register_consumer(group_id, consumer_id, 1000)
+        .await
+        .unwrap();
     manager
         .lease_offsets(
-            group_id, topic_id, partition_id, consumer_id,
-            Offset::new(0), 10, 60_000_000, 1000,
+            group_id,
+            topic_id,
+            partition_id,
+            consumer_id,
+            Offset::new(0),
+            10,
+            60_000_000,
+            1000,
         )
         .await
         .unwrap();
 
     // First commit should succeed.
     manager
-        .commit_offset(group_id, topic_id, partition_id, consumer_id, Offset::new(0), 2000)
+        .commit_offset(
+            group_id,
+            topic_id,
+            partition_id,
+            consumer_id,
+            Offset::new(0),
+            2000,
+        )
         .await
         .unwrap();
 
     // Second commit of same offset should fail.
     let result = manager
-        .commit_offset(group_id, topic_id, partition_id, consumer_id, Offset::new(0), 3000)
+        .commit_offset(
+            group_id,
+            topic_id,
+            partition_id,
+            consumer_id,
+            Offset::new(0),
+            3000,
+        )
         .await;
 
     assert!(
@@ -1085,20 +1271,36 @@ async fn test_commit_without_lease_rejected() {
     let partition_id = PartitionId::new(0);
 
     manager.get_or_create_group(group_id, 1000).await.unwrap();
-    manager.register_consumer(group_id, consumer_id, 1000).await.unwrap();
+    manager
+        .register_consumer(group_id, consumer_id, 1000)
+        .await
+        .unwrap();
 
     // Create a lease for offsets 0-9.
     manager
         .lease_offsets(
-            group_id, topic_id, partition_id, consumer_id,
-            Offset::new(0), 10, 60_000_000, 1000,
+            group_id,
+            topic_id,
+            partition_id,
+            consumer_id,
+            Offset::new(0),
+            10,
+            60_000_000,
+            1000,
         )
         .await
         .unwrap();
 
     // Try to commit offset 20 which is not leased (beyond lease range).
     let result = manager
-        .commit_offset(group_id, topic_id, partition_id, consumer_id, Offset::new(20), 2000)
+        .commit_offset(
+            group_id,
+            topic_id,
+            partition_id,
+            consumer_id,
+            Offset::new(20),
+            2000,
+        )
         .await;
 
     assert!(
@@ -1137,18 +1339,28 @@ async fn test_comprehensive_stress_100_seeds() {
         // Initialize groups.
         for g in 1..=num_groups {
             let group_id = ConsumerGroupId::new(g);
-            let mode = if g % 2 == 0 { AckMode::Individual } else { AckMode::Cumulative };
-            let _ = manager.get_or_create_group_with_mode(group_id, 1000, mode).await;
+            let mode = if g % 2 == 0 {
+                AckMode::Individual
+            } else {
+                AckMode::Cumulative
+            };
+            let _ = manager
+                .get_or_create_group_with_mode(group_id, 1000, mode)
+                .await;
 
             for c in 1..=num_consumers {
-                let _ = manager.register_consumer(group_id, ConsumerId::new(c), 1000).await;
+                let _ = manager
+                    .register_consumer(group_id, ConsumerId::new(c), 1000)
+                    .await;
             }
         }
 
         // Track state per group.
         let mut next_offset: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
-        let mut active_leases: std::collections::HashMap<u64, Vec<(ConsumerId, LeaseId, u64, u64)>> =
-            std::collections::HashMap::new();
+        let mut active_leases: std::collections::HashMap<
+            u64,
+            Vec<(ConsumerId, LeaseId, u64, u64)>,
+        > = std::collections::HashMap::new();
 
         for g in 1..=num_groups {
             next_offset.insert(g, 0);
@@ -1169,8 +1381,14 @@ async fn test_comprehensive_stress_100_seeds() {
                     let offset = *next_offset.get(&group_idx).unwrap_or(&0);
                     match manager
                         .lease_offsets(
-                            group_id, topic_id, partition_id, consumer_id,
-                            Offset::new(offset), 10, 60_000_000, 1000 + op_num * 100,
+                            group_id,
+                            topic_id,
+                            partition_id,
+                            consumer_id,
+                            Offset::new(offset),
+                            10,
+                            60_000_000,
+                            1000 + op_num * 100,
                         )
                         .await
                     {
@@ -1194,8 +1412,12 @@ async fn test_comprehensive_stress_100_seeds() {
                             if offset >= *from && offset <= *to {
                                 match manager
                                     .commit_offset(
-                                        group_id, topic_id, partition_id, *cid,
-                                        Offset::new(offset), 1000 + op_num * 100,
+                                        group_id,
+                                        topic_id,
+                                        partition_id,
+                                        *cid,
+                                        Offset::new(offset),
+                                        1000 + op_num * 100,
                                     )
                                     .await
                                 {
@@ -1228,7 +1450,14 @@ async fn test_comprehensive_stress_100_seeds() {
                         if let Some((cid, lid, _, _)) = leases.first() {
                             let pk = PartitionKey::new(topic_id, partition_id);
                             if manager
-                                .extend_lease(group_id, pk, *cid, *lid, 30_000_000, 1000 + op_num * 100)
+                                .extend_lease(
+                                    group_id,
+                                    pk,
+                                    *cid,
+                                    *lid,
+                                    30_000_000,
+                                    1000 + op_num * 100,
+                                )
                                 .await
                                 .is_err()
                             {
@@ -1289,7 +1518,10 @@ async fn test_comprehensive_stress_100_seeds() {
         if base_seed % 20 == 19 {
             println!(
                 "Progress: {}/{} seeds, {} violations, {} faults",
-                base_seed + 1, NUM_SEEDS, total_violations, total_faults
+                base_seed + 1,
+                NUM_SEEDS,
+                total_violations,
+                total_faults
             );
         }
     }
@@ -1340,16 +1572,22 @@ async fn test_comprehensive_stress_500_seeds() {
             } else {
                 AckMode::Cumulative
             };
-            let _ = manager.get_or_create_group_with_mode(group_id, 1000, mode).await;
+            let _ = manager
+                .get_or_create_group_with_mode(group_id, 1000, mode)
+                .await;
 
             for c in 1..=num_consumers {
-                let _ = manager.register_consumer(group_id, ConsumerId::new(c), 1000).await;
+                let _ = manager
+                    .register_consumer(group_id, ConsumerId::new(c), 1000)
+                    .await;
             }
         }
 
         let mut next_offset: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
-        let mut active_leases: std::collections::HashMap<u64, Vec<(ConsumerId, LeaseId, u64, u64)>> =
-            std::collections::HashMap::new();
+        let mut active_leases: std::collections::HashMap<
+            u64,
+            Vec<(ConsumerId, LeaseId, u64, u64)>,
+        > = std::collections::HashMap::new();
 
         for g in 1..=num_groups {
             next_offset.insert(g, 0);
@@ -1370,8 +1608,14 @@ async fn test_comprehensive_stress_500_seeds() {
                     let offset = *next_offset.get(&group_idx).unwrap_or(&0);
                     match manager
                         .lease_offsets(
-                            group_id, topic_id, partition_id, consumer_id,
-                            Offset::new(offset), 10, 60_000_000, 1000 + op_num * 100,
+                            group_id,
+                            topic_id,
+                            partition_id,
+                            consumer_id,
+                            Offset::new(offset),
+                            10,
+                            60_000_000,
+                            1000 + op_num * 100,
                         )
                         .await
                     {
@@ -1396,8 +1640,12 @@ async fn test_comprehensive_stress_500_seeds() {
                             if offset >= *from && offset <= *to {
                                 match manager
                                     .commit_offset(
-                                        group_id, topic_id, partition_id, *cid,
-                                        Offset::new(offset), 1000 + op_num * 100,
+                                        group_id,
+                                        topic_id,
+                                        partition_id,
+                                        *cid,
+                                        Offset::new(offset),
+                                        1000 + op_num * 100,
                                     )
                                     .await
                                 {
@@ -1431,7 +1679,14 @@ async fn test_comprehensive_stress_500_seeds() {
                         if let Some((cid, lid, _, _)) = leases.first() {
                             let pk = PartitionKey::new(topic_id, partition_id);
                             if manager
-                                .extend_lease(group_id, pk, *cid, *lid, 30_000_000, 1000 + op_num * 100)
+                                .extend_lease(
+                                    group_id,
+                                    pk,
+                                    *cid,
+                                    *lid,
+                                    30_000_000,
+                                    1000 + op_num * 100,
+                                )
                                 .await
                                 .is_err()
                             {
@@ -1450,23 +1705,37 @@ async fn test_comprehensive_stress_500_seeds() {
                         faults_this_seed += 1;
                     }
                     // Re-register.
-                    let _ = manager.register_consumer(group_id, consumer_id, 1000 + op_num * 100).await;
+                    let _ = manager
+                        .register_consumer(group_id, consumer_id, 1000 + op_num * 100)
+                        .await;
                 }
                 12 => {
                     // Query watermark.
-                    if manager.get_low_watermark(group_id, topic_id, partition_id).await.is_err() {
+                    if manager
+                        .get_low_watermark(group_id, topic_id, partition_id)
+                        .await
+                        .is_err()
+                    {
                         faults_this_seed += 1;
                     }
                 }
                 13 => {
                     // Query safe eviction.
-                    if manager.get_safe_eviction_offset(topic_id, partition_id).await.is_err() {
+                    if manager
+                        .get_safe_eviction_offset(topic_id, partition_id)
+                        .await
+                        .is_err()
+                    {
                         faults_this_seed += 1;
                     }
                 }
                 _ => {
                     // Fetch committed.
-                    if manager.fetch_committed(group_id, topic_id, partition_id).await.is_err() {
+                    if manager
+                        .fetch_committed(group_id, topic_id, partition_id)
+                        .await
+                        .is_err()
+                    {
                         faults_this_seed += 1;
                     }
                 }
@@ -1494,7 +1763,12 @@ async fn test_comprehensive_stress_500_seeds() {
         if base_seed % 50 == 49 {
             println!(
                 "Progress: {}/{} seeds, {} violations, {} faults, {} leases, {} commits",
-                base_seed + 1, NUM_SEEDS, total_violations, total_faults, total_leases, total_commits
+                base_seed + 1,
+                NUM_SEEDS,
+                total_violations,
+                total_faults,
+                total_leases,
+                total_commits
             );
         }
     }

@@ -175,7 +175,11 @@ impl MultiRaftActor {
                     messages.len()
                 );
                 for gm in &messages {
-                    println!("  Group {}: {:?}", gm.group_id.get(), message_type(&gm.message));
+                    println!(
+                        "  Group {}: {:?}",
+                        gm.group_id.get(),
+                        message_type(&gm.message)
+                    );
                 }
             }
 
@@ -567,7 +571,12 @@ fn deserialize_message_with_len(payload: &[u8]) -> Option<(Message, usize)> {
             let vote_granted = payload[offset] != 0;
             offset += 1;
             Some((
-                Message::RequestVoteResponse(RequestVoteResponse::new(term, from, to, vote_granted)),
+                Message::RequestVoteResponse(RequestVoteResponse::new(
+                    term,
+                    from,
+                    to,
+                    vote_granted,
+                )),
                 offset,
             ))
         }
@@ -853,15 +862,11 @@ mod tests {
         let crash_actor = actor_ids[0];
         engine.schedule_after(
             Duration::from_millis(3000),
-            EventKind::ProcessCrash {
-                actor: crash_actor,
-            },
+            EventKind::ProcessCrash { actor: crash_actor },
         );
         engine.schedule_after(
             Duration::from_millis(8000),
-            EventKind::ProcessRecover {
-                actor: crash_actor,
-            },
+            EventKind::ProcessRecover { actor: crash_actor },
         );
 
         let result = engine.run();
@@ -979,10 +984,7 @@ mod tests {
         }
 
         if !violations.is_empty() {
-            panic!(
-                "SingleLeaderPerTerm VIOLATED!\n{}",
-                violations.join("\n")
-            );
+            panic!("SingleLeaderPerTerm VIOLATED!\n{}", violations.join("\n"));
         }
 
         println!(
@@ -996,8 +998,8 @@ mod tests {
 // Actor with Leader Tracking
 // ============================================================================
 
-use std::sync::{Arc, Mutex};
 use std::collections::HashMap as StdHashMap;
+use std::sync::{Arc, Mutex};
 
 /// Multi-Raft actor with leader tracking for property verification.
 struct MultiRaftActorWithTracking {

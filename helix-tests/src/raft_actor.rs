@@ -205,10 +205,7 @@ impl PropertyState {
 
     /// Records an applied entry.
     pub fn record_applied(&mut self, node_id: u64, entry: AppliedEntry) {
-        self.applied_entries
-            .entry(node_id)
-            .or_default()
-            .push(entry);
+        self.applied_entries.entry(node_id).or_default().push(entry);
     }
 
     /// Increments the event counter.
@@ -373,7 +370,10 @@ fn deserialize_pre_vote_response(data: &[u8]) -> Option<Message> {
     let to = NodeId::new(u64::from_le_bytes(data[16..24].try_into().ok()?));
     let vote_granted = data[24] != 0;
     Some(Message::PreVoteResponse(PreVoteResponse::new(
-        term, from, to, vote_granted,
+        term,
+        from,
+        to,
+        vote_granted,
     )))
 }
 
@@ -406,7 +406,10 @@ fn deserialize_request_vote_response(data: &[u8]) -> Option<Message> {
     let to = NodeId::new(u64::from_le_bytes(data[16..24].try_into().ok()?));
     let vote_granted = data[24] != 0;
     Some(Message::RequestVoteResponse(RequestVoteResponse::new(
-        term, from, to, vote_granted,
+        term,
+        from,
+        to,
+        vote_granted,
     )))
 }
 
@@ -429,12 +432,13 @@ fn deserialize_append_entries(data: &[u8]) -> Option<Message> {
         if offset + 20 > data.len() {
             return None;
         }
-        let entry_term =
-            TermId::new(u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?));
-        let entry_index =
-            LogIndex::new(u64::from_le_bytes(data[offset + 8..offset + 16].try_into().ok()?));
-        let data_len =
-            u32::from_le_bytes(data[offset + 16..offset + 20].try_into().ok()?) as usize;
+        let entry_term = TermId::new(u64::from_le_bytes(
+            data[offset..offset + 8].try_into().ok()?,
+        ));
+        let entry_index = LogIndex::new(u64::from_le_bytes(
+            data[offset + 8..offset + 16].try_into().ok()?,
+        ));
+        let data_len = u32::from_le_bytes(data[offset + 16..offset + 20].try_into().ok()?) as usize;
         offset += 20;
         if offset + data_len > data.len() {
             return None;
@@ -445,7 +449,13 @@ fn deserialize_append_entries(data: &[u8]) -> Option<Message> {
     }
 
     Some(Message::AppendEntries(AppendEntriesRequest::new(
-        term, leader_id, to, prev_log_index, prev_log_term, entries, leader_commit,
+        term,
+        leader_id,
+        to,
+        prev_log_index,
+        prev_log_term,
+        entries,
+        leader_commit,
     )))
 }
 
@@ -460,7 +470,11 @@ fn deserialize_append_entries_response(data: &[u8]) -> Option<Message> {
     let success = data[24] != 0;
     let match_index = LogIndex::new(u64::from_le_bytes(data[25..33].try_into().ok()?));
     Some(Message::AppendEntriesResponse(AppendEntriesResponse::new(
-        term, from, to, success, match_index,
+        term,
+        from,
+        to,
+        success,
+        match_index,
     )))
 }
 
@@ -906,7 +920,7 @@ impl SimulatedActor for RaftActor {
         // For basic testing, we'll checkpoint what we can access.
         let checkpoint = RaftActorCheckpoint {
             current_term: self.node.current_term().get(),
-            voted_for: None, // Not accessible from public API
+            voted_for: None,         // Not accessible from public API
             log_entries: Vec::new(), // Would need to iterate log
             commit_index: self.node.commit_index().get(),
             last_applied: self.node.last_applied().get(),

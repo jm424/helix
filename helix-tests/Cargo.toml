@@ -10,6 +10,10 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+madsim = ["dep:madsim"]
+
 [dependencies]
 helix-core = { workspace = true }
 helix-progress = { workspace = true }
@@ -30,6 +34,9 @@ bytes = { workspace = true }
 tracing = { workspace = true }
 tempfile = { workspace = true }
 futures = { workspace = true }
+
+# MadSim - optional, for deterministic async simulation.
+madsim = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

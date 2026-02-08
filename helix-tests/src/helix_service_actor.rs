@@ -30,23 +30,25 @@ use bytes::Bytes;
 use helix_core::{GroupId, LogIndex, NodeId, Offset, PartitionId, Record, TopicId};
 use helix_raft::multi::{MultiRaft, MultiRaftOutput};
 use helix_raft::{RaftConfig, RaftNode, RaftState};
-use tokio::sync::mpsc;
 use helix_server::controller::{ControllerCommand, ControllerState, CONTROLLER_GROUP_ID};
 use helix_server::group_map::GroupMap;
 use helix_server::partition_storage::PartitionStorage;
-use helix_server::storage::PartitionCommand;
-use helix_server::service::{HEARTBEAT_INTERVAL_MS, TICK_INTERVAL_MS};
 use helix_server::service::partition_actor::{
     spawn_partition_actor_shared, BatchProposalInfo, GroupedOutput, PartitionActorConfig,
     PartitionActorHandle, PartitionOutput,
 };
+use helix_server::service::{HEARTBEAT_INTERVAL_MS, TICK_INTERVAL_MS};
+use helix_server::storage::PartitionCommand;
 use helix_wal::{
     Entry, FaultConfig, FaultStats, PoolConfig, SharedEntry, SharedWalPool, SimulatedStorage, Wal,
     WalConfig,
 };
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::properties::{DataIntegrityViolationRecord, HelixNodeSnapshot, SharedHelixPropertyState};
+use crate::properties::{
+    DataIntegrityViolationRecord, HelixNodeSnapshot, SharedHelixPropertyState,
+};
 use crate::raft_actor::SharedNetworkState;
 use crate::simulated_transport::SimulatedTransport;
 
@@ -91,18 +93,17 @@ impl DstWal {
     ///
     /// Returns an error if the sync operation fails.
     pub fn sync(&mut self) -> Result<(), String> {
-        futures::executor::block_on(self.wal.sync())
-            .map_err(|e| format!("WAL sync failed: {e}"))
+        futures::executor::block_on(self.wal.sync()).map_err(|e| format!("WAL sync failed: {e}"))
     }
 
     /// Returns the first index in the WAL.
-    #[must_use] 
+    #[must_use]
     pub const fn first_index(&self) -> u64 {
         self.wal.first_index()
     }
 
     /// Returns the last index in the WAL (if any).
-    #[must_use] 
+    #[must_use]
     pub const fn last_index(&self) -> Option<u64> {
         self.wal.last_index()
     }
@@ -113,7 +114,10 @@ impl DstWal {
     ///
     /// Returns an error if the entry cannot be read.
     pub fn read(&self, index: u64) -> Result<Entry, String> {
-        self.wal.read(index).cloned().map_err(|e| format!("WAL read failed: {e}"))
+        self.wal
+            .read(index)
+            .cloned()
+            .map_err(|e| format!("WAL read failed: {e}"))
     }
 }
 
@@ -161,19 +165,39 @@ impl DstSharedWalPool {
             .enable_all()
             .build()
             .map_err(|e| format!("Failed to create Tokio runtime: {e}"))?;
+        const OPEN_RETRIES: usize = 8;
+        let mut last_error = String::new();
 
-        let pool = runtime
-            .block_on(SharedWalPool::open(storage, config))
-            .map_err(|e| format!("SharedWalPool open failed: {e}"))?;
+        for attempt in 1..=OPEN_RETRIES {
+            match runtime.block_on(SharedWalPool::open(storage.clone(), config.clone())) {
+                Ok(pool) => return Ok(Self { pool, runtime }),
+                Err(e) => {
+                    last_error = e.to_string();
+                    if attempt < OPEN_RETRIES {
+                        warn!(
+                            attempt,
+                            retries = OPEN_RETRIES,
+                            error = %last_error,
+                            "SharedWalPool open failed; retrying"
+                        );
+                    }
+                }
+            }
+        }
 
-        Ok(Self { pool, runtime })
+        Err(format!(
+            "SharedWalPool open failed after {OPEN_RETRIES} attempts: {last_error}"
+        ))
     }
 
     /// Gets a handle for a partition.
     ///
     /// The returned handle can be passed to `PartitionStorage::new_durable_with_shared_wal`.
     #[must_use]
-    pub fn handle(&self, partition_id: PartitionId) -> helix_wal::SharedWalHandle<SimulatedStorage> {
+    pub fn handle(
+        &self,
+        partition_id: PartitionId,
+    ) -> helix_wal::SharedWalHandle<SimulatedStorage> {
         self.pool.handle(partition_id)
     }
 
@@ -182,7 +206,9 @@ impl DstSharedWalPool {
     /// # Errors
     ///
     /// Returns an error if recovery fails.
-    pub fn recover(&self) -> Result<std::collections::HashMap<PartitionId, Vec<SharedEntry>>, String> {
+    pub fn recover(
+        &self,
+    ) -> Result<std::collections::HashMap<PartitionId, Vec<SharedEntry>>, String> {
         self.runtime
             .block_on(self.pool.recover())
             .map_err(|e| format!("SharedWal recover failed: {e}"))
@@ -235,8 +261,13 @@ impl std::fmt::Display for DataIntegrityViolation {
                 f,
                 "Data integrity violation on node {}: topic={}, partition={}, offset={} - \
                  expected hash {:x}, got {:x} ({})",
-                self.node_id, self.topic_id, self.partition_id, self.offset,
-                self.expected_hash, actual, self.reason
+                self.node_id,
+                self.topic_id,
+                self.partition_id,
+                self.offset,
+                self.expected_hash,
+                actual,
+                self.reason
             ),
             None => write!(
                 f,
@@ -363,6 +394,20 @@ pub struct HelixServiceActor {
 }
 
 impl HelixServiceActor {
+    fn build_per_partition_runtime() -> Option<tokio::runtime::Runtime> {
+        match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => Some(rt),
+            Err(e) => {
+                error!(error = %e, "Failed to create tokio runtime for per-partition mode");
+                None
+            }
+        }
+    }
+
     /// Creates a new Helix service actor.
     ///
     /// # Arguments
@@ -439,28 +484,21 @@ impl HelixServiceActor {
 
         // Create tokio runtime for per-partition WAL mode.
         // BufferedWal spawns background tasks that require a tokio runtime.
-        let per_partition_runtime = if wal_mode == WalMode::PerPartition {
-            match tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => Some(rt),
-                Err(e) => {
-                    error!(error = %e, "Failed to create tokio runtime for per-partition mode");
-                    None
-                }
-            }
-        } else {
-            None
+        let per_partition_runtime = match wal_mode {
+            WalMode::PerPartition => Self::build_per_partition_runtime(),
+            // If SharedWAL initialization fails, truly fall back to per-partition WAL mode.
+            WalMode::Shared if shared_wal_pool.is_none() => Self::build_per_partition_runtime(),
+            WalMode::Shared | WalMode::InMemory => None,
         };
 
         // Determine effective WAL mode (may fall back if pool creation failed).
-        let effective_wal_mode = match wal_mode {
-            WalMode::Shared if shared_wal_pool.is_some() => WalMode::Shared,
-            WalMode::PerPartition if per_partition_runtime.is_some() => WalMode::PerPartition,
-            // Fallback to InMemory if pool/runtime creation failed.
-            WalMode::Shared | WalMode::InMemory | WalMode::PerPartition => WalMode::InMemory,
+        let effective_wal_mode = if matches!(wal_mode, WalMode::Shared) && shared_wal_pool.is_some()
+        {
+            WalMode::Shared
+        } else if per_partition_runtime.is_some() {
+            WalMode::PerPartition
+        } else {
+            WalMode::InMemory
         };
 
         // Create actor mode infrastructure if enabled.
@@ -483,11 +521,20 @@ impl HelixServiceActor {
             };
 
             if runtime.is_some() {
-                eprintln!("[ACTOR-MODE] Node {} enabling actor mode with real partition actors", node_id.get());
-                info!(node = node_id.get(), "Actor mode enabled with real partition actors");
+                tracing::debug!(
+                    "[ACTOR-MODE] Node {} enabling actor mode with real partition actors",
+                    node_id.get()
+                );
+                info!(
+                    node = node_id.get(),
+                    "Actor mode enabled with real partition actors"
+                );
                 (Some(tx), Some(rx), runtime)
             } else {
-                warn!(node = node_id.get(), "Actor mode disabled - runtime creation failed");
+                warn!(
+                    node = node_id.get(),
+                    "Actor mode disabled - runtime creation failed"
+                );
                 (None, None, None)
             }
         } else {
@@ -760,7 +807,9 @@ impl HelixServiceActor {
 
         // Get all client acks from shared state.
         let client_acks: std::collections::BTreeMap<(u64, u64), Vec<(u64, u64)>> = {
-            if let Ok(state) = self.property_state.lock() { state.client_acked_produces.clone() } else {
+            if let Ok(state) = self.property_state.lock() {
+                state.client_acked_produces.clone()
+            } else {
                 warn!(actor = %self.name, "Failed to lock property state for consumer verification");
                 return;
             }
@@ -796,15 +845,17 @@ impl HelixServiceActor {
                             verified_count += 1;
                             // TRACE: Log successful verification for high offsets.
                             if offset >= 40 && *topic_id == 1 && *partition_id == 0 {
-                                eprintln!(
+                                tracing::debug!(
                                     "[TRACE-VERIFY] {} offset={} VERIFIED (hash={})",
-                                    self.name, offset, actual_hash
+                                    self.name,
+                                    offset,
+                                    actual_hash
                                 );
                             }
                         } else {
                             // TRACE: Log hash mismatch for high offsets.
                             if offset >= 40 && *topic_id == 1 && *partition_id == 0 {
-                                eprintln!(
+                                tracing::debug!(
                                     "[TRACE-VERIFY] {} offset={} HASH MISMATCH expected={} actual={}",
                                     self.name, offset, expected_hash, actual_hash
                                 );
@@ -815,7 +866,7 @@ impl HelixServiceActor {
                         // Can't read - don't mark as verified, other nodes might have it.
                         // TRACE: Log read failure for high offsets.
                         if offset >= 40 && *topic_id == 1 && *partition_id == 0 {
-                            eprintln!(
+                            tracing::debug!(
                                 "[TRACE-VERIFY] {} offset={} CANNOT READ (log_end={}, expected_hash={})",
                                 self.name, offset, ps.log_end_offset().get(), expected_hash
                             );
@@ -916,10 +967,7 @@ impl HelixServiceActor {
     /// Schedules the next tick timer.
     #[allow(clippy::unused_self)] // Kept as method for consistency with other handlers.
     fn schedule_tick(&self, ctx: &mut SimulationContext) {
-        ctx.set_timer(
-            Duration::from_millis(TICK_INTERVAL_MS),
-            timer_ids::TICK,
-        );
+        ctx.set_timer(Duration::from_millis(TICK_INTERVAL_MS), timer_ids::TICK);
     }
 
     /// Schedules the next heartbeat timer.
@@ -1009,9 +1057,10 @@ impl HelixServiceActor {
 
         // Now process all collected outputs.
         if !outputs.is_empty() {
-            eprintln!(
+            tracing::debug!(
                 "[ACTOR-MODE] {} processing {} outputs from partition actors",
-                self.name, outputs.len()
+                self.name,
+                outputs.len()
             );
         }
         for grouped in outputs {
@@ -1019,18 +1068,28 @@ impl HelixServiceActor {
 
             match grouped.output {
                 PartitionOutput::SendMessages { to, messages } => {
-                    eprintln!(
+                    tracing::debug!(
                         "[SEND] {} group={} sending {} messages to {:?}",
-                        self.name, group_id.get(), messages.len(), to.get()
+                        self.name,
+                        group_id.get(),
+                        messages.len(),
+                        to.get()
                     );
                     // Route through simulated network instead of real TCP.
                     self.transport.queue_batch(to, &messages);
                 }
-                PartitionOutput::EntryCommitted { index, data, batch_notify } => {
+                PartitionOutput::EntryCommitted {
+                    index,
+                    data,
+                    batch_notify,
+                } => {
                     let was_proposing_leader = batch_notify.is_some();
-                    eprintln!(
+                    tracing::debug!(
                         "[ACTOR-MODE] {} committed entry: group={} index={} has_notify={}",
-                        self.name, group_id.get(), index.get(), was_proposing_leader
+                        self.name,
+                        group_id.get(),
+                        index.get(),
+                        was_proposing_leader
                     );
                     // Track notification status for verification.
                     if was_proposing_leader {
@@ -1044,9 +1103,10 @@ impl HelixServiceActor {
                     self.handle_commit(group_id, index, &data, Some(was_proposing_leader), ctx);
                 }
                 PartitionOutput::BecameLeader => {
-                    eprintln!(
+                    tracing::debug!(
                         "[ACTOR-MODE] {} became leader of group {}",
-                        self.name, group_id.get()
+                        self.name,
+                        group_id.get()
                     );
                     info!(
                         actor = %self.name,
@@ -1104,7 +1164,11 @@ impl HelixServiceActor {
     fn process_outputs(&mut self, outputs: &[MultiRaftOutput], ctx: &mut SimulationContext) {
         for output in outputs {
             match output {
-                MultiRaftOutput::CommitEntry { group_id, index, data } => {
+                MultiRaftOutput::CommitEntry {
+                    group_id,
+                    index,
+                    data,
+                } => {
                     // Pass None - non-actor mode uses multi_raft.group_state() for leadership check.
                     self.handle_commit(*group_id, *index, data, None, ctx);
                 }
@@ -1116,12 +1180,13 @@ impl HelixServiceActor {
                     // TRACE-LEADER: Log leader election with Raft state
                     if *group_id == GroupId::new(1) {
                         let state = self.multi_raft.group_state(*group_id);
-                        let (commit_idx, last_applied) = state.map_or((0, 0), |s| {
-                            (s.commit_index.get(), s.last_applied.get())
-                        });
-                        let log_end = self.partition_storage.get(group_id)
+                        let (commit_idx, last_applied) =
+                            state.map_or((0, 0), |s| (s.commit_index.get(), s.last_applied.get()));
+                        let log_end = self
+                            .partition_storage
+                            .get(group_id)
                             .map_or(0, |ps| ps.log_end_offset().get());
-                        eprintln!(
+                        tracing::debug!(
                             "[TRACE-LEADER] {} BECAME LEADER: group={} raft_commit_idx={} raft_last_applied={} partition_log_end={}",
                             self.name, group_id.get(), commit_idx, last_applied, log_end
                         );
@@ -1139,7 +1204,11 @@ impl HelixServiceActor {
                         "stepped down"
                     );
                 }
-                MultiRaftOutput::VoteStateChanged { group_id, term, voted_for } => {
+                MultiRaftOutput::VoteStateChanged {
+                    group_id,
+                    term,
+                    voted_for,
+                } => {
                     // In DST, vote state persistence is handled by the simulated
                     // VoteStorage. For now, just track it for debugging.
                     debug!(
@@ -1172,9 +1241,11 @@ impl HelixServiceActor {
     ) {
         // TRACE-COMMIT: Log commits for high indices on partition 0
         if group_id == GroupId::new(1) && index.get() >= 45 {
-            eprintln!(
+            tracing::debug!(
                 "[TRACE-COMMIT] {} committing: group={} raft_index={}",
-                self.name, group_id.get(), index.get()
+                self.name,
+                group_id.get(),
+                index.get()
             );
         }
 
@@ -1191,31 +1262,36 @@ impl HelixServiceActor {
         // Regular data partition commit - apply to storage.
         if let Some((topic_id, partition_id)) = self.group_map.get_key(group_id) {
             if let Some(ps) = self.partition_storage.get_mut(&group_id) {
-                eprintln!(
+                tracing::debug!(
                     "[ACTOR-MODE-COMMIT] {} handling commit: group={} topic={} partition={} index={}",
                     self.name, group_id.get(), topic_id.get(), partition_id.get(), index.get()
                 );
                 // Decode the command to get the actual record payloads for tracking.
                 let record_payloads: Vec<Vec<u8>> = match PartitionCommand::decode(data) {
                     Some(PartitionCommand::Append { ref records, .. }) => {
-                        eprintln!(
+                        tracing::debug!(
                             "[DECODE] {} decoded Append with {} records, data len={}",
-                            self.name, records.len(), data.len()
+                            self.name,
+                            records.len(),
+                            data.len()
                         );
                         records.iter().map(|r| r.value.to_vec()).collect()
                     }
                     other => {
-                        eprintln!(
+                        tracing::debug!(
                             "[DECODE] {} command is {:?}, data len={}",
-                            self.name, other, data.len()
+                            self.name,
+                            other,
+                            data.len()
                         );
                         Vec::new()
                     }
                 };
 
                 // TRACE: Log state before apply for debugging offset 21.
-                if topic_id.get() == 1 && partition_id.get() == 0 && ps.log_end_offset().get() <= 22 {
-                    eprintln!(
+                if topic_id.get() == 1 && partition_id.get() == 0 && ps.log_end_offset().get() <= 22
+                {
+                    tracing::debug!(
                         "[TRACE] {} BEFORE apply: topic={} partition={} raft_index={} log_end={} ps_last_applied={}",
                         self.name, topic_id.get(), partition_id.get(), index.get(), ps.log_end_offset().get(), ps.last_applied().get()
                     );
@@ -1242,85 +1318,104 @@ impl HelixServiceActor {
                     }
                 };
 
-                eprintln!(
+                tracing::debug!(
                     "[APPLY] {} applying index={} record_payloads_len={} wal_mode={:?}",
-                    self.name, index.get(), record_payloads.len(), self.wal_mode
+                    self.name,
+                    index.get(),
+                    record_payloads.len(),
+                    self.wal_mode
                 );
                 match apply_result {
                     Ok(offset_opt) => {
-                        eprintln!(
+                        tracing::debug!(
                             "[APPLY-OK] {} applied index={} offset_opt={:?}",
-                            self.name, index.get(), offset_opt.map(helix_core::Offset::get)
+                            self.name,
+                            index.get(),
+                            offset_opt.map(helix_core::Offset::get)
                         );
                         // Track committed data for durability verification.
-                        let was_skipped = offset_opt.is_none();
-                        let base_offset = offset_opt.unwrap_or_else(|| ps.log_end_offset());
+                        // If apply returned None, the entry was skipped (already applied/replayed),
+                        // so it must not be recorded as a new committed offset.
+                        if let Some(base_offset) = offset_opt {
+                            // TRACE: Log entry applications for high offsets (>= 40) on ALL nodes.
+                            if topic_id.get() == 1
+                                && partition_id.get() == 0
+                                && base_offset.get() >= 40
+                            {
+                                tracing::debug!(
+                                    "[TRACE-APPLY] {} applied: topic={} partition={} raft_index={} base_offset={} records={} log_end={}",
+                                    self.name, topic_id.get(), partition_id.get(), index.get(), base_offset.get(), record_payloads.len(), ps.log_end_offset().get()
+                                );
+                            }
 
-                        // TRACE: Log entry applications for high offsets (>= 40) on ALL nodes.
-                        if topic_id.get() == 1 && partition_id.get() == 0 && base_offset.get() >= 40 {
-                            eprintln!(
-                                "[TRACE-APPLY] {} applied: topic={} partition={} raft_index={} base_offset={} records={} skipped={} log_end={}",
-                                self.name, topic_id.get(), partition_id.get(), index.get(), base_offset.get(), record_payloads.len(), was_skipped, ps.log_end_offset().get()
-                            );
-                        }
+                            // Collect records for tracking.
+                            let records_to_track: Vec<(Offset, u64)> = record_payloads
+                                .iter()
+                                .enumerate()
+                                .map(|(i, payload)| {
+                                    #[allow(clippy::cast_possible_truncation)]
+                                    let offset = Offset::new(base_offset.get() + i as u64);
+                                    let data_hash = Self::simple_hash(payload);
+                                    (offset, data_hash)
+                                })
+                                .collect();
 
-                        // Collect records for tracking.
-                        let records_to_track: Vec<(Offset, u64)> = record_payloads
-                            .iter()
-                            .enumerate()
-                            .map(|(i, payload)| {
-                                #[allow(clippy::cast_possible_truncation)]
-                                let offset = Offset::new(base_offset.get() + i as u64);
-                                let data_hash = Self::simple_hash(payload);
-                                (offset, data_hash)
-                            })
-                            .collect();
+                            // Update committed_data tracking.
+                            let committed = self
+                                .committed_data
+                                .entry((topic_id, partition_id))
+                                .or_default();
+                            for (offset, data_hash) in &records_to_track {
+                                committed.push((*offset, *data_hash));
+                            }
 
-                        // Update committed_data tracking.
-                        let committed = self.committed_data
-                            .entry((topic_id, partition_id))
-                            .or_default();
-                        for (offset, data_hash) in &records_to_track {
-                            committed.push((*offset, *data_hash));
-                        }
+                            // Record client acknowledgments in shared state.
+                            // Only record if we're the leader - the leader is the one that
+                            // sends acks to clients in a real system.
+                            //
+                            // In actor mode, `was_proposing_leader` tells us if we were the proposer.
+                            // In non-actor mode, we check multi_raft.group_state().
+                            let is_leader = was_proposing_leader.unwrap_or_else(|| {
+                                self.multi_raft
+                                    .group_state(group_id)
+                                    .is_some_and(|s| s.state == helix_raft::RaftState::Leader)
+                            });
 
-                        // Record client acknowledgments in shared state.
-                        // Only record if we're the leader - the leader is the one that
-                        // sends acks to clients in a real system.
-                        //
-                        // In actor mode, `was_proposing_leader` tells us if we were the proposer.
-                        // In non-actor mode, we check multi_raft.group_state().
-                        let is_leader = was_proposing_leader.unwrap_or_else(|| {
-                            self.multi_raft
-                                .group_state(group_id)
-                                .is_some_and(|s| s.state == helix_raft::RaftState::Leader)
-                        });
-
-                        if is_leader {
-                            if let Ok(mut state) = self.property_state.lock() {
-                                for (offset, data_hash) in &records_to_track {
-                                    // TRACE: Log ALL client acks for offsets >= 40 to catch the failing one.
-                                    if offset.get() >= 40 && topic_id.get() == 1 && partition_id.get() == 0 {
-                                        eprintln!(
-                                            "[TRACE-ACK] {} recording client ack: topic={} partition={} offset={} raft_index={} hash={}",
-                                            self.name, topic_id.get(), partition_id.get(), offset.get(), index.get(), data_hash
+                            if is_leader {
+                                if let Ok(mut state) = self.property_state.lock() {
+                                    for (offset, data_hash) in &records_to_track {
+                                        // TRACE: Log ALL client acks for offsets >= 40 to catch the failing one.
+                                        if offset.get() >= 40
+                                            && topic_id.get() == 1
+                                            && partition_id.get() == 0
+                                        {
+                                            tracing::debug!(
+                                                "[TRACE-ACK] {} recording client ack: topic={} partition={} offset={} raft_index={} hash={}",
+                                                self.name, topic_id.get(), partition_id.get(), offset.get(), index.get(), data_hash
+                                            );
+                                        }
+                                        state.record_client_ack(
+                                            topic_id.get(),
+                                            partition_id.get(),
+                                            offset.get(),
+                                            *data_hash,
                                         );
                                     }
-                                    state.record_client_ack(
-                                        topic_id.get(),
-                                        partition_id.get(),
-                                        offset.get(),
-                                        *data_hash,
-                                    );
                                 }
                             }
-                        }
 
-                        self.produce_success_count += 1;
-                        eprintln!(
-                            "[ACTOR-MODE-STAT] {} produce_success_count={} committed_data_len={} after commit index={}",
-                            self.name, self.produce_success_count, self.committed_data.values().map(Vec::len).sum::<usize>(), index.get()
-                        );
+                            self.produce_success_count += 1;
+                            tracing::debug!(
+                                "[ACTOR-MODE-STAT] {} produce_success_count={} committed_data_len={} after commit index={}",
+                                self.name, self.produce_success_count, self.committed_data.values().map(Vec::len).sum::<usize>(), index.get()
+                            );
+                        } else {
+                            tracing::debug!(
+                                "[APPLY-SKIP] {} skipped index={} (no new offset)",
+                                self.name,
+                                index.get()
+                            );
+                        }
                     }
                     Err(e) => {
                         let error_msg = e.to_string();
@@ -1328,7 +1423,8 @@ impl HelixServiceActor {
                         // A "torn write" error means the simulated process crashed during
                         // the write. Only crash if it won't violate quorum (majority survives).
                         if error_msg.contains("torn write") {
-                            let can_crash = self.network_state
+                            let can_crash = self
+                                .network_state
                                 .lock()
                                 .map(|ns| ns.can_crash_safely(self.actor_id))
                                 .unwrap_or(true);
@@ -1345,7 +1441,9 @@ impl HelixServiceActor {
                                 // Schedule recovery after a short delay.
                                 ctx.schedule_after(
                                     Duration::from_millis(50),
-                                    EventKind::ProcessRecover { actor: self.actor_id },
+                                    EventKind::ProcessRecover {
+                                        actor: self.actor_id,
+                                    },
                                 );
                                 return;
                             }
@@ -1377,7 +1475,11 @@ impl HelixServiceActor {
     /// Loads all persisted records for a partition from `SimulatedStorage`.
     ///
     /// Returns a map of offset -> record data.
-    fn load_persisted_records(&self, topic_id: TopicId, partition_id: PartitionId) -> BTreeMap<Offset, Vec<u8>> {
+    fn load_persisted_records(
+        &self,
+        topic_id: TopicId,
+        partition_id: PartitionId,
+    ) -> BTreeMap<Offset, Vec<u8>> {
         let mut records = BTreeMap::new();
         let dir_path = std::path::PathBuf::from(format!(
             "/partitions/{}/{}",
@@ -1440,7 +1542,11 @@ impl HelixServiceActor {
         if !follow_ups.is_empty() && self.is_controller_leader() {
             for follow_up in follow_ups {
                 let encoded = follow_up.encode();
-                if self.multi_raft.propose(CONTROLLER_GROUP_ID, encoded).is_none() {
+                if self
+                    .multi_raft
+                    .propose(CONTROLLER_GROUP_ID, encoded)
+                    .is_none()
+                {
                     warn!(
                         actor = %self.name,
                         command = ?follow_up,
@@ -1512,9 +1618,10 @@ impl HelixServiceActor {
 
         // TRACE: Log partition storage creation.
         if topic_id.get() == 1 && partition_id.get() == 0 {
-            eprintln!(
+            tracing::debug!(
                 "[TRACE] {} CREATING NEW partition_storage for topic=1 partition=0 group={}",
-                self.name, group_id.get()
+                self.name,
+                group_id.get()
             );
         }
 
@@ -1570,15 +1677,17 @@ impl HelixServiceActor {
                     let data_dir = std::path::PathBuf::from("/data");
 
                     // Use block_on since we're in a sync context but calling async API.
-                    match pool.runtime().block_on(PartitionStorage::new_durable_with_shared_wal(
-                        &data_dir,
-                        topic_id,
-                        partition_id,
-                        handle,
-                        recovered_entries,
-                        None, // No object storage for DST
-                        None, // No tiering config for DST
-                    )) {
+                    match pool
+                        .runtime()
+                        .block_on(PartitionStorage::new_durable_with_shared_wal(
+                            &data_dir,
+                            topic_id,
+                            partition_id,
+                            handle,
+                            recovered_entries,
+                            None, // No object storage for DST
+                            None, // No tiering config for DST
+                        )) {
                         Ok(ps) => ps,
                         Err(e) => {
                             warn!(
@@ -1649,7 +1758,7 @@ impl HelixServiceActor {
             spawn_partition_actor_shared(group_id, raft_node, actor_config, output_tx)
         });
 
-        eprintln!(
+        tracing::debug!(
             "[ACTOR-MODE] {} spawned REAL production partition actor: group={} topic={} partition={}",
             self.name, group_id.get(), topic_id.get(), partition_id.get()
         );
@@ -1688,10 +1797,9 @@ impl HelixServiceActor {
                             );
                         } else {
                             // Legacy mode or controller messages: use MultiRaft.
-                            let outputs = self.multi_raft.handle_message(
-                                group_msg.group_id,
-                                group_msg.message,
-                            );
+                            let outputs = self
+                                .multi_raft
+                                .handle_message(group_msg.group_id, group_msg.message);
                             self.process_outputs(&outputs, ctx);
                         }
                     }
@@ -1711,7 +1819,8 @@ impl HelixServiceActor {
                         "Received heartbeat"
                     );
                     // Update controller state with heartbeat.
-                    self.controller_state.record_heartbeat(heartbeat.node_id, heartbeat.timestamp_ms);
+                    self.controller_state
+                        .record_heartbeat(heartbeat.node_id, heartbeat.timestamp_ms);
                 }
                 Err(e) => {
                     warn!(actor = %self.name, error = %e, "Failed to decode heartbeat");
@@ -1738,9 +1847,11 @@ impl HelixServiceActor {
         if let Some(handle) = self.partition_actor_handles.get(&group_id) {
             // Send message to real partition actor.
             let from = message.from();
-            eprintln!(
+            tracing::debug!(
                 "[RECV] {} received raft message for group {} from node {}",
-                self.name, group_id.get(), from.get()
+                self.name,
+                group_id.get(),
+                from.get()
             );
             runtime.block_on(async {
                 let _ = handle.send_raft_message(from, message).await;
@@ -1826,7 +1937,10 @@ impl HelixServiceActor {
         // is also created. See comment in HelixServiceActor::new for details.
 
         // Recreate controller group.
-        if let Err(e) = self.multi_raft.create_group(CONTROLLER_GROUP_ID, self.cluster_nodes.clone()) {
+        if let Err(e) = self
+            .multi_raft
+            .create_group(CONTROLLER_GROUP_ID, self.cluster_nodes.clone())
+        {
             error!(actor = %self.name, error = %e, "Failed to recreate controller group");
         }
 
@@ -1843,8 +1957,13 @@ impl HelixServiceActor {
                 Err(e) => {
                     error!(error = %e, "Failed to recreate SharedWalPool on recovery");
                     self.shared_wal_pool = None;
-                    // Fall back to in-memory mode.
-                    self.wal_mode = WalMode::InMemory;
+                    // Fall back to per-partition WAL mode when shared pool isn't available.
+                    self.per_partition_runtime = Self::build_per_partition_runtime();
+                    self.wal_mode = if self.per_partition_runtime.is_some() {
+                        WalMode::PerPartition
+                    } else {
+                        WalMode::InMemory
+                    };
                 }
             }
         }
@@ -1913,7 +2032,8 @@ impl HelixServiceActor {
         };
 
         // Group files by (topic_id, partition_id).
-        let mut partition_files: BTreeMap<(TopicId, PartitionId), Vec<std::path::PathBuf>> = BTreeMap::new();
+        let mut partition_files: BTreeMap<(TopicId, PartitionId), Vec<std::path::PathBuf>> =
+            BTreeMap::new();
 
         for file_path in all_files {
             // Parse path: /partitions/{topic_id}/{partition_id}/offset_{offset}
@@ -1922,10 +2042,9 @@ impl HelixServiceActor {
 
             // Expected: ["", "partitions", "{topic_id}", "{partition_id}", "offset_{offset}"]
             if parts.len() >= 5 && parts[1] == "partitions" {
-                if let (Ok(topic_id), Ok(partition_id)) = (
-                    parts[2].parse::<u64>(),
-                    parts[3].parse::<u64>(),
-                ) {
+                if let (Ok(topic_id), Ok(partition_id)) =
+                    (parts[2].parse::<u64>(), parts[3].parse::<u64>())
+                {
                     let key = (TopicId::new(topic_id), PartitionId::new(partition_id));
                     partition_files.entry(key).or_default().push(file_path);
                 }
@@ -1948,7 +2067,8 @@ impl HelixServiceActor {
             let mut ps = SimulatedPartitionStorage::new_in_memory(topic_id, partition_id);
 
             // Rebuild committed_data tracking and partition storage.
-            let committed = self.committed_data
+            let committed = self
+                .committed_data
                 .entry((topic_id, partition_id))
                 .or_default();
 
@@ -1968,7 +2088,10 @@ impl HelixServiceActor {
             }
 
             // Recreate Raft group for this partition.
-            if let Err(e) = self.multi_raft.create_group(group_id, self.cluster_nodes.clone()) {
+            if let Err(e) = self
+                .multi_raft
+                .create_group(group_id, self.cluster_nodes.clone())
+            {
                 warn!(actor = %self.name, group = group_id.get(), error = %e, "Failed to recreate partition group");
             }
 
@@ -1992,7 +2115,8 @@ impl HelixServiceActor {
         };
 
         // Extract unique (topic_id, partition_id) pairs from paths.
-        let mut partitions: std::collections::BTreeSet<(TopicId, PartitionId)> = std::collections::BTreeSet::new();
+        let mut partitions: std::collections::BTreeSet<(TopicId, PartitionId)> =
+            std::collections::BTreeSet::new();
 
         for file_path in all_files {
             // Parse path: /node-{id}/partitions/{topic_id}/{partition_id}/...
@@ -2001,10 +2125,9 @@ impl HelixServiceActor {
 
             // Expected: ["", "node-{id}", "partitions", "{topic_id}", "{partition_id}", ...]
             if parts.len() >= 5 && parts[2] == "partitions" {
-                if let (Ok(topic_id), Ok(partition_id)) = (
-                    parts[3].parse::<u64>(),
-                    parts[4].parse::<u64>(),
-                ) {
+                if let (Ok(topic_id), Ok(partition_id)) =
+                    (parts[3].parse::<u64>(), parts[4].parse::<u64>())
+                {
                     partitions.insert((TopicId::new(topic_id), PartitionId::new(partition_id)));
                 }
             }
@@ -2062,7 +2185,10 @@ impl HelixServiceActor {
             };
 
             // Recreate Raft group for this partition.
-            if let Err(e) = self.multi_raft.create_group(group_id, self.cluster_nodes.clone()) {
+            if let Err(e) = self
+                .multi_raft
+                .create_group(group_id, self.cluster_nodes.clone())
+            {
                 warn!(
                     actor = %self.name,
                     group = group_id.get(),
@@ -2138,7 +2264,7 @@ impl HelixServiceActor {
                     entries.clone(),
                     None, // No object storage for DST
                     None, // No tiering config for DST
-                )
+                ),
             ) {
                 Ok(ps) => ps,
                 Err(e) => {
@@ -2157,7 +2283,10 @@ impl HelixServiceActor {
             // The DurablePartition cache is populated from SharedWAL recovery.
 
             // Recreate Raft group for this partition.
-            if let Err(e) = self.multi_raft.create_group(group_id, self.cluster_nodes.clone()) {
+            if let Err(e) = self
+                .multi_raft
+                .create_group(group_id, self.cluster_nodes.clone())
+            {
                 warn!(
                     actor = %self.name,
                     group = group_id.get(),
@@ -2247,9 +2376,11 @@ impl HelixServiceActor {
         };
 
         let Some(handle) = self.partition_actor_handles.get(&group_id) else {
-            eprintln!(
-                "[ACTOR-MODE] {} ERROR: No partition actor for group {} (have {} handles)",
-                self.name, group_id.get(), self.partition_actor_handles.len()
+            error!(
+                actor = %self.name,
+                group = group_id.get(),
+                handles = self.partition_actor_handles.len(),
+                "No partition actor for group (actor mode produce)"
             );
             debug!(
                 actor = %self.name,
@@ -2326,8 +2457,10 @@ impl HelixServiceActor {
             warn!(actor = %self.name, "Invalid create topic request: invalid UTF-8 name");
             return;
         };
-        let partition_count = u32::from_le_bytes(data[4 + name_len..4 + name_len + 4].try_into().unwrap());
-        let replication_factor = u32::from_le_bytes(data[4 + name_len + 4..4 + name_len + 8].try_into().unwrap());
+        let partition_count =
+            u32::from_le_bytes(data[4 + name_len..4 + name_len + 4].try_into().unwrap());
+        let replication_factor =
+            u32::from_le_bytes(data[4 + name_len + 4..4 + name_len + 8].try_into().unwrap());
 
         // Create controller command.
         let cmd = ControllerCommand::CreateTopic {
@@ -2338,7 +2471,11 @@ impl HelixServiceActor {
 
         // Propose to controller group.
         let encoded = cmd.encode();
-        if self.multi_raft.propose(CONTROLLER_GROUP_ID, encoded).is_none() {
+        if self
+            .multi_raft
+            .propose(CONTROLLER_GROUP_ID, encoded)
+            .is_none()
+        {
             debug!(
                 actor = %self.name,
                 "Not controller leader, cannot create topic"
@@ -2370,13 +2507,11 @@ impl SimulatedActor for HelixServiceActor {
                 self.schedule_heartbeat(ctx);
             }
 
-            EventKind::TimerFired { timer_id, .. } => {
-                match timer_id {
-                    timer_ids::TICK => self.handle_tick(ctx),
-                    timer_ids::HEARTBEAT => self.handle_heartbeat(ctx),
-                    _ => {}
-                }
-            }
+            EventKind::TimerFired { timer_id, .. } => match timer_id {
+                timer_ids::TICK => self.handle_tick(ctx),
+                timer_ids::HEARTBEAT => self.handle_heartbeat(ctx),
+                _ => {}
+            },
 
             EventKind::PacketDelivery { payload, from, .. } => {
                 // Check for partition before processing.
@@ -2397,20 +2532,18 @@ impl SimulatedActor for HelixServiceActor {
                 self.handle_message(&payload, ctx);
             }
 
-            EventKind::Custom { name, data, .. } => {
-                match name.as_str() {
-                    custom_events::PRODUCE => self.handle_produce(&data, ctx),
-                    custom_events::CREATE_TOPIC => self.handle_create_topic(&data, ctx),
-                    custom_events::COLLECT_STATE => self.handle_collect_state(),
-                    custom_events::APPLY_PARTITION => self.handle_apply_partition(&data),
-                    custom_events::HEAL_PARTITION => self.handle_heal_partition(&data),
-                    custom_events::VERIFY_INTEGRITY => self.handle_verify_integrity(),
-                    custom_events::VERIFY_CONSUMER => self.handle_verify_consumer(),
-                    _ => {
-                        debug!(actor = %self.name, event = %name, "unknown custom event");
-                    }
+            EventKind::Custom { name, data, .. } => match name.as_str() {
+                custom_events::PRODUCE => self.handle_produce(&data, ctx),
+                custom_events::CREATE_TOPIC => self.handle_create_topic(&data, ctx),
+                custom_events::COLLECT_STATE => self.handle_collect_state(),
+                custom_events::APPLY_PARTITION => self.handle_apply_partition(&data),
+                custom_events::HEAL_PARTITION => self.handle_heal_partition(&data),
+                custom_events::VERIFY_INTEGRITY => self.handle_verify_integrity(),
+                custom_events::VERIFY_CONSUMER => self.handle_verify_consumer(),
+                _ => {
+                    debug!(actor = %self.name, event = %name, "unknown custom event");
                 }
-            }
+            },
 
             _ => {}
         }

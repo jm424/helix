@@ -237,23 +237,29 @@ fn decode_raft_message(payload: &[u8]) -> Option<(Message, usize)> {
 
     macro_rules! read_u64 {
         () => {{
-            if payload.len() < offset + 8 { return None; }
-            let v = u64::from_le_bytes(payload[offset..offset+8].try_into().ok()?);
+            if payload.len() < offset + 8 {
+                return None;
+            }
+            let v = u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?);
             offset += 8;
             v
         }};
     }
     macro_rules! read_u32 {
         () => {{
-            if payload.len() < offset + 4 { return None; }
-            let v = u32::from_le_bytes(payload[offset..offset+4].try_into().ok()?);
+            if payload.len() < offset + 4 {
+                return None;
+            }
+            let v = u32::from_le_bytes(payload[offset..offset + 4].try_into().ok()?);
             offset += 4;
             v
         }};
     }
     macro_rules! read_bool {
         () => {{
-            if payload.len() < offset + 1 { return None; }
+            if payload.len() < offset + 1 {
+                return None;
+            }
             let v = payload[offset] != 0;
             offset += 1;
             v
@@ -261,37 +267,71 @@ fn decode_raft_message(payload: &[u8]) -> Option<(Message, usize)> {
     }
 
     match payload[0] {
-        0 => { // PreVote
+        0 => {
+            // PreVote
             let term = TermId::new(read_u64!());
             let candidate_id = NodeId::new(read_u64!());
             let to = NodeId::new(read_u64!());
             let last_log_index = LogIndex::new(read_u64!());
             let last_log_term = TermId::new(read_u64!());
-            Some((Message::PreVote(PreVoteRequest::new(term, candidate_id, to, last_log_index, last_log_term)), offset))
+            Some((
+                Message::PreVote(PreVoteRequest::new(
+                    term,
+                    candidate_id,
+                    to,
+                    last_log_index,
+                    last_log_term,
+                )),
+                offset,
+            ))
         }
-        1 => { // PreVoteResponse
+        1 => {
+            // PreVoteResponse
             let term = TermId::new(read_u64!());
             let from = NodeId::new(read_u64!());
             let to = NodeId::new(read_u64!());
             let vote_granted = read_bool!();
-            Some((Message::PreVoteResponse(PreVoteResponse::new(term, from, to, vote_granted)), offset))
+            Some((
+                Message::PreVoteResponse(PreVoteResponse::new(term, from, to, vote_granted)),
+                offset,
+            ))
         }
-        2 => { // RequestVote
+        2 => {
+            // RequestVote
             let term = TermId::new(read_u64!());
             let candidate_id = NodeId::new(read_u64!());
             let to = NodeId::new(read_u64!());
             let last_log_index = LogIndex::new(read_u64!());
             let last_log_term = TermId::new(read_u64!());
-            Some((Message::RequestVote(RequestVoteRequest::new(term, candidate_id, to, last_log_index, last_log_term)), offset))
+            Some((
+                Message::RequestVote(RequestVoteRequest::new(
+                    term,
+                    candidate_id,
+                    to,
+                    last_log_index,
+                    last_log_term,
+                )),
+                offset,
+            ))
         }
-        3 => { // RequestVoteResponse
+        3 => {
+            // RequestVoteResponse
             let term = TermId::new(read_u64!());
             let from = NodeId::new(read_u64!());
             let to = NodeId::new(read_u64!());
             let vote_granted = read_bool!();
-            Some((Message::RequestVoteResponse(RequestVoteResponse::new(term, from, to, vote_granted)), offset))
+            Some((
+                Message::RequestVoteResponse(RequestVoteResponse::new(
+                    term,
+                    from,
+                    to,
+                    vote_granted,
+                )),
+                offset,
+            ))
         }
-        4 => { // AppendEntries
+        4 => {
+            // AppendEntries
             let term = TermId::new(read_u64!());
             let leader_id = NodeId::new(read_u64!());
             let to = NodeId::new(read_u64!());
@@ -304,28 +344,56 @@ fn decode_raft_message(payload: &[u8]) -> Option<(Message, usize)> {
                 let index = LogIndex::new(read_u64!());
                 let entry_term = TermId::new(read_u64!());
                 let data_len = read_u32!() as usize;
-                if payload.len() < offset + data_len { return None; }
+                if payload.len() < offset + data_len {
+                    return None;
+                }
                 let data = Bytes::copy_from_slice(&payload[offset..offset + data_len]);
                 offset += data_len;
                 entries.push(LogEntry::new(entry_term, index, data));
             }
-            Some((Message::AppendEntries(AppendEntriesRequest::new(term, leader_id, to, prev_log_index, prev_log_term, entries, leader_commit)), offset))
+            Some((
+                Message::AppendEntries(AppendEntriesRequest::new(
+                    term,
+                    leader_id,
+                    to,
+                    prev_log_index,
+                    prev_log_term,
+                    entries,
+                    leader_commit,
+                )),
+                offset,
+            ))
         }
-        5 => { // AppendEntriesResponse
+        5 => {
+            // AppendEntriesResponse
             let term = TermId::new(read_u64!());
             let from = NodeId::new(read_u64!());
             let to = NodeId::new(read_u64!());
             let success = read_bool!();
             let match_index = LogIndex::new(read_u64!());
-            Some((Message::AppendEntriesResponse(AppendEntriesResponse::new(term, from, to, success, match_index)), offset))
+            Some((
+                Message::AppendEntriesResponse(AppendEntriesResponse::new(
+                    term,
+                    from,
+                    to,
+                    success,
+                    match_index,
+                )),
+                offset,
+            ))
         }
-        6 => { // TimeoutNow
+        6 => {
+            // TimeoutNow
             let term = TermId::new(read_u64!());
             let from = NodeId::new(read_u64!());
             let to = NodeId::new(read_u64!());
-            Some((Message::TimeoutNow(TimeoutNowRequest::new(term, from, to)), offset))
+            Some((
+                Message::TimeoutNow(TimeoutNowRequest::new(term, from, to)),
+                offset,
+            ))
         }
-        7 => { // InstallSnapshot
+        7 => {
+            // InstallSnapshot
             let term = TermId::new(read_u64!());
             let leader_id = NodeId::new(read_u64!());
             let to = NodeId::new(read_u64!());
@@ -333,19 +401,43 @@ fn decode_raft_message(payload: &[u8]) -> Option<(Message, usize)> {
             let last_included_term = TermId::new(read_u64!());
             let chunk_offset = read_u64!();
             let data_len = read_u64!() as usize;
-            if payload.len() < offset + data_len { return None; }
+            if payload.len() < offset + data_len {
+                return None;
+            }
             let data = Bytes::copy_from_slice(&payload[offset..offset + data_len]);
             offset += data_len;
             let done = read_bool!();
-            Some((Message::InstallSnapshot(InstallSnapshotRequest::new(term, leader_id, to, last_included_index, last_included_term, chunk_offset, data, done)), offset))
+            Some((
+                Message::InstallSnapshot(InstallSnapshotRequest::new(
+                    term,
+                    leader_id,
+                    to,
+                    last_included_index,
+                    last_included_term,
+                    chunk_offset,
+                    data,
+                    done,
+                )),
+                offset,
+            ))
         }
-        8 => { // InstallSnapshotResponse
+        8 => {
+            // InstallSnapshotResponse
             let term = TermId::new(read_u64!());
             let from = NodeId::new(read_u64!());
             let to = NodeId::new(read_u64!());
             let success = read_bool!();
             let next_offset = read_u64!();
-            Some((Message::InstallSnapshotResponse(InstallSnapshotResponse::new(term, from, to, success, next_offset)), offset))
+            Some((
+                Message::InstallSnapshotResponse(InstallSnapshotResponse::new(
+                    term,
+                    from,
+                    to,
+                    success,
+                    next_offset,
+                )),
+                offset,
+            ))
         }
         _ => None,
     }
@@ -427,7 +519,9 @@ impl ShardNode {
     ) -> Self {
         let mut multi_raft = MultiRaft::new(node_id);
         for &group_id in &groups {
-            multi_raft.create_group(group_id, all_nodes.clone()).expect("create group");
+            multi_raft
+                .create_group(group_id, all_nodes.clone())
+                .expect("create group");
         }
 
         Self {
@@ -482,7 +576,10 @@ impl ShardNode {
 
         // Start pending transfers.
         for (source, target, range) in self.pending_transfers.drain(..) {
-            if let Ok(_id) = self.coordinator.start_transfer(source, target, range, self.tick) {
+            if let Ok(_id) = self
+                .coordinator
+                .start_transfer(source, target, range, self.tick)
+            {
                 if let Ok(mut s) = self.stats.lock() {
                     s.transfers_initiated += 1;
                 }
@@ -503,7 +600,10 @@ impl ShardNode {
     fn schedule_next_tick(&self, ctx: &mut SimulationContext) {
         ctx.schedule_after(
             Duration::from_micros(TICK_INTERVAL_US),
-            EventKind::TimerFired { actor: self.actor_id, timer_id: 1 },
+            EventKind::TimerFired {
+                actor: self.actor_id,
+                timer_id: 1,
+            },
         );
     }
 
@@ -521,7 +621,11 @@ impl ShardNode {
         }
     }
 
-    fn process_transfer_outputs(&mut self, outputs: Vec<TransferOutput>, ctx: &mut SimulationContext) {
+    fn process_transfer_outputs(
+        &mut self,
+        outputs: Vec<TransferOutput>,
+        ctx: &mut SimulationContext,
+    ) {
         for output in outputs {
             match output {
                 TransferOutput::SendMessage { to_group, message } => {
@@ -530,7 +634,9 @@ impl ShardNode {
                         self.send_transfer_message(leader, message, ctx);
                     } else {
                         // Broadcast to all nodes.
-                        let targets: Vec<NodeId> = self.node_to_actor.keys()
+                        let targets: Vec<NodeId> = self
+                            .node_to_actor
+                            .keys()
                             .copied()
                             .filter(|&n| n != self.node_id)
                             .collect();
@@ -539,8 +645,15 @@ impl ShardNode {
                         }
                     }
                 }
-                TransferOutput::UpdateShardMap { shard_range, from_group, to_group, .. } => {
-                    let _ = self.shard_map.transfer_shard(shard_range, from_group, to_group);
+                TransferOutput::UpdateShardMap {
+                    shard_range,
+                    from_group,
+                    to_group,
+                    ..
+                } => {
+                    let _ = self
+                        .shard_map
+                        .transfer_shard(shard_range, from_group, to_group);
                 }
                 TransferOutput::TransferComplete { .. } => {
                     if let Ok(mut s) = self.stats.lock() {
@@ -556,7 +669,12 @@ impl ShardNode {
         }
     }
 
-    fn send_raft_messages(&mut self, to: NodeId, messages: Vec<GroupMessage>, ctx: &mut SimulationContext) {
+    fn send_raft_messages(
+        &mut self,
+        to: NodeId,
+        messages: Vec<GroupMessage>,
+        ctx: &mut SimulationContext,
+    ) {
         if self.crashed {
             return;
         }
@@ -585,7 +703,12 @@ impl ShardNode {
         }
     }
 
-    fn send_transfer_message(&mut self, to: NodeId, message: TransferMessage, ctx: &mut SimulationContext) {
+    fn send_transfer_message(
+        &mut self,
+        to: NodeId,
+        message: TransferMessage,
+        ctx: &mut SimulationContext,
+    ) {
         if self.crashed {
             return;
         }
@@ -638,7 +761,9 @@ impl ShardNode {
         // Generate response for requests.
         if let Some(response) = self.generate_transfer_response(&message) {
             // Send response back (broadcast for now).
-            let targets: Vec<NodeId> = self.node_to_actor.keys()
+            let targets: Vec<NodeId> = self
+                .node_to_actor
+                .keys()
                 .copied()
                 .filter(|&n| n != self.node_id)
                 .collect();
@@ -654,11 +779,18 @@ impl ShardNode {
 
     fn generate_transfer_response(&self, message: &TransferMessage) -> Option<TransferMessage> {
         match message {
-            TransferMessage::PrepareRequest { transfer_id, shard_range } => {
+            TransferMessage::PrepareRequest {
+                transfer_id,
+                shard_range,
+            } => {
                 // Use real MultiRaft snapshot creation.
                 if let Some(group_id) = self.shard_map.lookup(shard_range.start) {
-                    let snapshot_data = Bytes::from(format!("snapshot_{}_{}", transfer_id.get(), group_id.get()));
-                    if let Some(snapshot) = self.multi_raft.create_group_snapshot(group_id, snapshot_data) {
+                    let snapshot_data =
+                        Bytes::from(format!("snapshot_{}_{}", transfer_id.get(), group_id.get()));
+                    if let Some(snapshot) = self
+                        .multi_raft
+                        .create_group_snapshot(group_id, snapshot_data)
+                    {
                         return Some(TransferMessage::PrepareResponse {
                             transfer_id: *transfer_id,
                             snapshot_index: snapshot.last_included_index,
@@ -675,7 +807,11 @@ impl ShardNode {
                     snapshot_size: 1000,
                 })
             }
-            TransferMessage::SnapshotChunk { transfer_id, done: false, .. } => {
+            TransferMessage::SnapshotChunk {
+                transfer_id,
+                done: false,
+                ..
+            } => {
                 // Respond with final chunk.
                 Some(TransferMessage::SnapshotChunk {
                     transfer_id: *transfer_id,
@@ -711,12 +847,23 @@ impl SimulatedActor for ShardNode {
         }
     }
 
-    fn id(&self) -> ActorId { self.actor_id }
-    fn name(&self) -> &'static str { "shard-node" }
-    fn checkpoint(&self) -> Box<dyn Any + Send> { Box::new(self.tick) }
+    fn id(&self) -> ActorId {
+        self.actor_id
+    }
+    fn name(&self) -> &'static str {
+        "shard-node"
+    }
+    fn checkpoint(&self) -> Box<dyn Any + Send> {
+        Box::new(self.tick)
+    }
     fn restore(&mut self, _: Box<dyn Any + Send>) {}
     fn on_start(&mut self, ctx: &mut SimulationContext) {
-        ctx.schedule_after(Duration::from_nanos(0), EventKind::ActorStart { actor: self.actor_id });
+        ctx.schedule_after(
+            Duration::from_nanos(0),
+            EventKind::ActorStart {
+                actor: self.actor_id,
+            },
+        );
     }
 }
 
@@ -735,7 +882,11 @@ fn run_test(seed: u64, node_count: usize, transfers: usize, duration_secs: u64) 
     // Node and actor IDs.
     let node_ids: Vec<NodeId> = (1..=node_count as u64).map(NodeId::new).collect();
     let actor_ids: Vec<ActorId> = (1..=node_count as u64).map(ActorId::new).collect();
-    let node_to_actor: BTreeMap<NodeId, ActorId> = node_ids.iter().zip(actor_ids.iter()).map(|(&n, &a)| (n, a)).collect();
+    let node_to_actor: BTreeMap<NodeId, ActorId> = node_ids
+        .iter()
+        .zip(actor_ids.iter())
+        .map(|(&n, &a)| (n, a))
+        .collect();
 
     let groups = vec![GroupId::new(1), GroupId::new(2)];
 
@@ -831,9 +982,15 @@ mod tests {
 
         assert!(total_raft > 10000, "Expected significant Raft activity");
         // With aggressive 3%/0.5% fault rates, expect >90% success
-        assert!(success_rate > 90.0, "Expected >90% success rate, got {success_rate:.1}%");
+        assert!(
+            success_rate > 90.0,
+            "Expected >90% success rate, got {success_rate:.1}%"
+        );
         // Verify faults are actually being injected
-        assert!(total_crashes > 1000, "Expected >1000 crashes with 0.5% rate, got {total_crashes}");
+        assert!(
+            total_crashes > 1000,
+            "Expected >1000 crashes with 0.5% rate, got {total_crashes}"
+        );
     }
 
     #[test]
@@ -846,7 +1003,11 @@ mod tests {
             total_initiated += stats.transfers_initiated;
             total_completed += stats.transfers_completed;
 
-            assert!(stats.violations.is_empty(), "Seed {seed} violations: {:?}", stats.violations);
+            assert!(
+                stats.violations.is_empty(),
+                "Seed {seed} violations: {:?}",
+                stats.violations
+            );
 
             if seed % 100 == 99 {
                 println!("Completed {} seeds...", seed + 1);
@@ -860,6 +1021,9 @@ mod tests {
         println!("Success rate: {success_rate:.1}%");
 
         // With aggressive 3%/0.5% fault rates, expect >90% success
-        assert!(success_rate > 90.0, "Expected >90% success rate, got {success_rate:.1}%");
+        assert!(
+            success_rate > 90.0,
+            "Expected >90% success rate, got {success_rate:.1}%"
+        );
     }
 }

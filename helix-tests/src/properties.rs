@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use bytes::Bytes;
 use helix_core::LogIndex;
 use helix_raft::RaftState;
 
@@ -332,7 +333,10 @@ pub fn check_single_leader_per_term(actors: &[RaftActor]) -> bool {
 /// Counts the number of leaders in the cluster.
 #[must_use]
 pub fn leader_count(actors: &[RaftActor]) -> usize {
-    actors.iter().filter(|a| a.state() == RaftState::Leader).count()
+    actors
+        .iter()
+        .filter(|a| a.state() == RaftState::Leader)
+        .count()
 }
 
 /// Returns true if at least one leader exists.
@@ -398,11 +402,7 @@ pub fn check_log_matching_from_state(state: &PropertyState) -> Vec<PropertyViola
     let mut violations = Vec::new();
 
     // Get active (non-crashed) nodes.
-    let active_nodes: Vec<_> = state
-        .nodes
-        .values()
-        .filter(|n| !n.crashed)
-        .collect();
+    let active_nodes: Vec<_> = state.nodes.values().filter(|n| !n.crashed).collect();
 
     // Compare logs pairwise - only for committed entries.
     for (i, node_a) in active_nodes.iter().enumerate() {
@@ -462,8 +462,13 @@ impl std::fmt::Display for StateMachineSafetyViolation {
             f,
             "StateMachineSafety violated at index {}: node {} applied (term={}, hash={:x}), \
              node {} applied (term={}, hash={:x})",
-            self.index, self.node_a, self.term_a, self.hash_a,
-            self.node_b, self.term_b, self.hash_b
+            self.index,
+            self.node_a,
+            self.term_a,
+            self.hash_a,
+            self.node_b,
+            self.term_b,
+            self.hash_b
         )
     }
 }
@@ -661,8 +666,13 @@ impl std::fmt::Display for DataIntegrityViolationRecord {
                 f,
                 "Data integrity violation on node {}: topic={}, partition={}, offset={} - \
                  expected hash {:x}, got {:x} ({})",
-                self.node_id, self.topic_id, self.partition_id, self.offset,
-                self.expected_hash, actual, self.reason
+                self.node_id,
+                self.topic_id,
+                self.partition_id,
+                self.offset,
+                self.expected_hash,
+                actual,
+                self.reason
             ),
             None => write!(
                 f,
@@ -724,6 +734,11 @@ pub struct HelixPropertyState {
     pub consumer_violations: Vec<ConsumerViolation>,
     /// Whether consumer verification has been performed.
     pub consumer_verified: bool,
+    /// Expected payloads: (`topic_id`, `partition_id`, `offset`) -> payload bytes.
+    ///
+    /// Stores the raw payload bytes at produce time for direct comparison at consume time.
+    /// This eliminates reliance on fragile `RecordBatch` parsing.
+    pub expected_payloads: BTreeMap<(u64, u64, u64), Bytes>,
 }
 
 /// A violation where data was acknowledged to client but not consumable.
@@ -770,7 +785,12 @@ impl HelixPropertyState {
 
     /// Updates produce/commit stats from a node.
     /// Uses max to avoid double-counting when collecting from multiple nodes.
-    pub fn update_stats(&mut self, produce_success: u64, data_partitions: u64, committed_entries: u64) {
+    pub fn update_stats(
+        &mut self,
+        produce_success: u64,
+        data_partitions: u64,
+        committed_entries: u64,
+    ) {
         // Use max instead of add - all nodes see the same commits, so max gives accurate count.
         self.total_produce_success = self.total_produce_success.max(produce_success);
         self.total_data_partitions = self.total_data_partitions.max(data_partitions);
@@ -797,11 +817,107 @@ impl HelixPropertyState {
     ///
     /// This should be called when data is committed via Raft and the client
     /// would receive an acknowledgment.
-    pub fn record_client_ack(&mut self, topic_id: u64, partition_id: u64, offset: u64, payload_hash: u64) {
+    pub fn record_client_ack(
+        &mut self,
+        topic_id: u64,
+        partition_id: u64,
+        offset: u64,
+        payload_hash: u64,
+    ) {
         self.client_acked_produces
             .entry((topic_id, partition_id))
             .or_default()
             .push((offset, payload_hash));
+    }
+
+    /// Records the expected payload for an offset.
+    ///
+    /// This stores the raw payload bytes for direct comparison at consume time,
+    /// eliminating reliance on potentially fragile `RecordBatch` parsing.
+    pub fn record_expected_payload(
+        &mut self,
+        topic_id: u64,
+        partition_id: u64,
+        offset: u64,
+        payload: Bytes,
+    ) {
+        self.expected_payloads
+            .insert((topic_id, partition_id, offset), payload);
+    }
+
+    /// Gets the expected payload for an offset.
+    ///
+    /// Returns `None` if no payload was recorded for this offset.
+    #[must_use]
+    pub fn get_expected_payload(
+        &self,
+        topic_id: u64,
+        partition_id: u64,
+        offset: u64,
+    ) -> Option<&Bytes> {
+        self.expected_payloads
+            .get(&(topic_id, partition_id, offset))
+    }
+
+    /// Verifies a payload directly against the stored expected payload.
+    ///
+    /// This is the RELIABLE data integrity check that compares raw bytes:
+    /// - If payloads match exactly, marks offset as verified and returns `Ok(())`
+    /// - If payloads differ, returns `Err` with details of the mismatch
+    /// - If no expected payload is stored, returns `Err` (unexpected data)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - No expected payload is stored for this offset
+    /// - The actual payload doesn't match the expected payload
+    pub fn verify_payload_direct(
+        &mut self,
+        topic_id: u64,
+        partition_id: u64,
+        offset: u64,
+        actual_payload: &[u8],
+    ) -> Result<(), String> {
+        let expected = self
+            .expected_payloads
+            .get(&(topic_id, partition_id, offset));
+
+        match expected {
+            Some(expected_payload) if actual_payload == expected_payload.as_ref() => {
+                // Exact match - mark as verified.
+                self.verified_offsets
+                    .insert((topic_id, partition_id, offset));
+                Ok(())
+            }
+            Some(expected_payload) => {
+                // Payload mismatch - DATA CORRUPTION.
+                let expected_preview: String = expected_payload
+                    .iter()
+                    .take(32)
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                let actual_preview: String = actual_payload
+                    .iter()
+                    .take(32)
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                Err(format!(
+                    "DATA CORRUPTION at topic={topic_id} partition={partition_id} offset={offset}: \
+                     expected {} bytes [{expected_preview}...], got {} bytes [{actual_preview}...]",
+                    expected_payload.len(),
+                    actual_payload.len()
+                ))
+            }
+            None => {
+                // No expected payload recorded - this is unexpected data.
+                // This could indicate a test bug or data appearing from nowhere.
+                Err(format!(
+                    "UNEXPECTED DATA at topic={topic_id} partition={partition_id} offset={offset}: \
+                     no expected payload recorded (got {} bytes)",
+                    actual_payload.len()
+                ))
+            }
+        }
     }
 
     /// Records a consumer verification violation.
@@ -812,8 +928,59 @@ impl HelixPropertyState {
     /// Records that an offset was successfully verified by a node.
     ///
     /// Once ANY node verifies an offset, it's considered verified.
+    /// Note: This only marks the offset as "seen" - use `verify_offset_with_hash()`
+    /// for actual data integrity verification.
     pub fn record_verified_offset(&mut self, topic_id: u64, partition_id: u64, offset: u64) {
-        self.verified_offsets.insert((topic_id, partition_id, offset));
+        self.verified_offsets
+            .insert((topic_id, partition_id, offset));
+    }
+
+    /// Verifies an offset's data integrity by comparing actual vs expected hash.
+    ///
+    /// This is the core data integrity check:
+    /// - If `actual_hash` matches expected, marks offset as verified
+    /// - If hashes differ, records a `ConsumerViolation` for data corruption
+    ///
+    /// Returns `true` if verification passed (hash matched or offset not in acks).
+    pub fn verify_offset_with_hash(
+        &mut self,
+        topic_id: u64,
+        partition_id: u64,
+        offset: u64,
+        actual_hash: u64,
+    ) -> bool {
+        // Look up expected hash from client_acked_produces.
+        let expected = self
+            .client_acked_produces
+            .get(&(topic_id, partition_id))
+            .and_then(|acks| acks.iter().find(|(off, _)| *off == offset))
+            .map(|(_, hash)| *hash);
+
+        match expected {
+            Some(expected_hash) if actual_hash == expected_hash => {
+                // Hash matches - mark as verified.
+                self.verified_offsets
+                    .insert((topic_id, partition_id, offset));
+                true
+            }
+            Some(expected_hash) => {
+                // Hash mismatch - DATA CORRUPTION.
+                self.consumer_violations.push(ConsumerViolation {
+                    topic_id,
+                    partition_id,
+                    offset,
+                    expected_hash,
+                    actual_hash: Some(actual_hash),
+                    reason: "hash mismatch - data corruption".to_string(),
+                });
+                false
+            }
+            None => {
+                // Offset not in client acks - could be from different producer.
+                // Don't fail, but don't mark as verified either.
+                true
+            }
+        }
     }
 
     /// Finalizes consumer verification by checking which acks weren't verified.
@@ -831,7 +998,10 @@ impl HelixPropertyState {
 
         // Check each unique ack against verified offsets.
         for (topic_id, partition_id, offset, expected_hash) in unique_acks {
-            if !self.verified_offsets.contains(&(topic_id, partition_id, offset)) {
+            if !self
+                .verified_offsets
+                .contains(&(topic_id, partition_id, offset))
+            {
                 // No node could verify this offset - this is a real data loss.
                 self.consumer_violations.push(ConsumerViolation {
                     topic_id,
@@ -943,7 +1113,9 @@ impl HelixPropertyCheckResult {
     /// Returns total violation count (consensus + data integrity + consumer).
     #[must_use]
     pub fn total_violations(&self) -> usize {
-        self.violations.len() + self.data_integrity_violations.len() + self.consumer_violations.len()
+        self.violations.len()
+            + self.data_integrity_violations.len()
+            + self.consumer_violations.len()
     }
 }
 
@@ -1069,7 +1241,13 @@ mod tests {
         });
 
         assert_eq!(state.snapshots.len(), 1);
-        assert_eq!(state.leaders_by_term.get(&1).map(std::collections::BTreeSet::len), Some(1));
+        assert_eq!(
+            state
+                .leaders_by_term
+                .get(&1)
+                .map(std::collections::BTreeSet::len),
+            Some(1)
+        );
     }
 
     #[test]

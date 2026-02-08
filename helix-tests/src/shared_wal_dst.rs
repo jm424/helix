@@ -551,7 +551,11 @@ async fn test_dst_shared_wal_multi_partition_interleaved() {
         let phantom_violations = verify_no_phantoms(&state, &recovered);
         let content_violations = verify_content(&state, &recovered);
 
-        assert!(durability_violations.is_empty(), "{:?}", durability_violations);
+        assert!(
+            durability_violations.is_empty(),
+            "{:?}",
+            durability_violations
+        );
         assert!(ordering_violations.is_empty(), "{:?}", ordering_violations);
         assert!(phantom_violations.is_empty(), "{:?}", phantom_violations);
         assert!(content_violations.is_empty(), "{:?}", content_violations);
@@ -655,9 +659,7 @@ async fn test_dst_shared_wal_torn_write_recovery() {
 
         for i in 1..=20u64 {
             // Some appends may fail due to torn writes.
-            let _ = wal
-                .append(p1, 1, i, Bytes::from(format!("p1-{i}")))
-                .await;
+            let _ = wal.append(p1, 1, i, Bytes::from(format!("p1-{i}"))).await;
         }
 
         // Sync may partially succeed.
@@ -672,7 +674,10 @@ async fn test_dst_shared_wal_torn_write_recovery() {
         let result = SharedWal::open(storage.clone(), config).await;
 
         // Recovery should succeed (torn writes are truncated).
-        assert!(result.is_ok(), "Recovery should succeed despite torn writes");
+        assert!(
+            result.is_ok(),
+            "Recovery should succeed despite torn writes"
+        );
 
         let mut wal = result.unwrap();
         let recovered = wal.recover().unwrap();
@@ -1020,7 +1025,9 @@ async fn test_dst_shared_wal_multi_seed_sync_durability() {
                     .await
                     .expect("append should succeed without faults");
             }
-            wal.sync().await.expect("sync should succeed without faults");
+            wal.sync()
+                .await
+                .expect("sync should succeed without faults");
         }
 
         // Crash and recover.
@@ -1236,13 +1243,15 @@ async fn test_dst_shared_wal_comprehensive_stress() {
                     let payload = Bytes::from(format!("p{p}-{i}"));
                     match wal.append(partition_id, 1, i, payload.clone()).await {
                         Ok(()) => {
-                            state.appended.entry(partition_id).or_default().push(
-                                TrackedEntry {
+                            state
+                                .appended
+                                .entry(partition_id)
+                                .or_default()
+                                .push(TrackedEntry {
                                     term: 1,
                                     index: i,
                                     payload,
-                                },
-                            );
+                                });
                             entries_appended += 1;
                         }
                         Err(_) => {
@@ -1262,7 +1271,11 @@ async fn test_dst_shared_wal_comprehensive_stress() {
                 // Mark all successfully appended entries as synced.
                 for (partition_id, appended) in &state.appended {
                     for entry in appended {
-                        state.synced.entry(*partition_id).or_default().insert(entry.index);
+                        state
+                            .synced
+                            .entry(*partition_id)
+                            .or_default()
+                            .insert(entry.index);
                     }
                 }
             } else {
@@ -1877,7 +1890,11 @@ async fn test_dst_shared_wal_segment_rollover() {
     wal.sync().await.unwrap();
 
     let durable_idx = wal.durable_index();
-    assert_eq!(durable_idx, Some(entry_count), "All entries should be durable");
+    assert_eq!(
+        durable_idx,
+        Some(entry_count),
+        "All entries should be durable"
+    );
 
     drop(wal);
     storage.simulate_crash();
@@ -1925,7 +1942,9 @@ async fn test_dst_shared_wal_segment_rollover_with_faults() {
 
         let storage = SimulatedStorage::with_faults(seed, fault_config);
         let config = SharedWalConfig::new(format!("/test/rollover-fault-{seed}"))
-            .with_segment_config(helix_wal::SegmentConfig::new().with_max_size(SEGMENT_SIZE_BYTES_MIN));
+            .with_segment_config(
+                helix_wal::SegmentConfig::new().with_max_size(SEGMENT_SIZE_BYTES_MIN),
+            );
 
         let p1 = PartitionId::new(1);
 
@@ -2000,10 +2019,10 @@ async fn test_dst_shared_wal_segment_rollover_with_faults() {
                 let recovered_entries = recovered.get(&p1).unwrap();
                 for entry in recovered_entries.iter().take(10) {
                     let expected_index = entry.index();
-                    let payload_index =
-                        u64::from_le_bytes(entry.payload[0..8].try_into().unwrap());
+                    let payload_index = u64::from_le_bytes(entry.payload[0..8].try_into().unwrap());
                     assert_eq!(
-                        payload_index, expected_index,
+                        payload_index,
+                        expected_index,
                         "Seed {seed}: content mismatch at index {}",
                         entry.index()
                     );
@@ -2088,7 +2107,9 @@ async fn test_dst_shared_wal_high_fidelity_stress() {
         let mut p2_term = 1u64;
 
         for op_num in 0..OPS_PER_SEED {
-            let op_hash = seed.wrapping_add(op_num as u64).wrapping_mul(0x9e3779b97f4a7c15);
+            let op_hash = seed
+                .wrapping_add(op_num as u64)
+                .wrapping_mul(0x9e3779b97f4a7c15);
             let op_type = op_hash % 10;
 
             match op_type {
@@ -2169,8 +2190,7 @@ async fn test_dst_shared_wal_high_fidelity_stress() {
                             let recovered = w.recover().unwrap_or_default();
 
                             if let Some(durable) = p1_durable_before {
-                                let recovered_count =
-                                    recovered.get(&p1).map_or(0, Vec::len) as u64;
+                                let recovered_count = recovered.get(&p1).map_or(0, Vec::len) as u64;
                                 assert!(
                                     recovered_count >= durable,
                                     "seed {seed}, op {op_num}: P1 DURABILITY VIOLATION - \
@@ -2179,8 +2199,7 @@ async fn test_dst_shared_wal_high_fidelity_stress() {
                             }
 
                             if let Some(durable) = p2_durable_before {
-                                let recovered_count =
-                                    recovered.get(&p2).map_or(0, Vec::len) as u64;
+                                let recovered_count = recovered.get(&p2).map_or(0, Vec::len) as u64;
                                 assert!(
                                     recovered_count >= durable,
                                     "seed {seed}, op {op_num}: P2 DURABILITY VIOLATION - \

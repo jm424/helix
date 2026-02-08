@@ -35,8 +35,8 @@ use std::path::Path;
 
 use bytes::{Bytes, BytesMut};
 use helix_wal::{
-    Entry, FaultConfig, Segment, SegmentConfig, SegmentId, SimulatedStorage, Storage,
-    Wal, WalConfig, ENTRY_HEADER_SIZE, SEGMENT_HEADER_SIZE,
+    Entry, FaultConfig, Segment, SegmentConfig, SegmentId, SimulatedStorage, Storage, Wal,
+    WalConfig, ENTRY_HEADER_SIZE, SEGMENT_HEADER_SIZE,
 };
 
 /// Type alias for WAL with `SimulatedStorage` and standard `Entry` type.
@@ -83,8 +83,8 @@ fn test_wal_entry_corruption_detection() {
 
 #[test]
 fn test_wal_entry_truncated_data() {
-    let entry =
-        Entry::new(1, 1, Bytes::from("test data with more bytes")).expect("entry creation should succeed");
+    let entry = Entry::new(1, 1, Bytes::from("test data with more bytes"))
+        .expect("entry creation should succeed");
 
     let mut buf = BytesMut::new();
     entry.encode(&mut buf);
@@ -126,7 +126,9 @@ async fn test_crash_during_write_torn_at_header() {
 
     // Write some entries successfully.
     {
-        let mut wal = TestWal::open(storage.clone(), config.clone()).await.unwrap();
+        let mut wal = TestWal::open(storage.clone(), config.clone())
+            .await
+            .unwrap();
         for i in 1..=5 {
             let entry = Entry::new(1, i, Bytes::from(format!("data-{i}"))).unwrap();
             wal.append(entry).await.unwrap();
@@ -168,7 +170,9 @@ async fn test_crash_during_write_torn_at_payload() {
 
     // Write some entries.
     {
-        let mut wal = TestWal::open(storage.clone(), config.clone()).await.unwrap();
+        let mut wal = TestWal::open(storage.clone(), config.clone())
+            .await
+            .unwrap();
         for i in 1..=3 {
             let entry = Entry::new(1, i, Bytes::from("data")).unwrap();
             wal.append(entry).await.unwrap();
@@ -212,7 +216,9 @@ async fn test_crash_during_write_various_positions() {
             // Clear fault for initial writes.
             storage.fault_config().force_torn_write_at = None;
 
-            let mut wal = TestWal::open(storage.clone(), wal_config.clone()).await.unwrap();
+            let mut wal = TestWal::open(storage.clone(), wal_config.clone())
+                .await
+                .unwrap();
             for i in 1..=3 {
                 let entry = Entry::new(1, i, Bytes::from("data")).unwrap();
                 wal.append(entry).await.unwrap();
@@ -224,7 +230,9 @@ async fn test_crash_during_write_various_positions() {
         storage.fault_config().force_torn_write_at = Some(torn_offset);
 
         {
-            let mut wal = TestWal::open(storage.clone(), wal_config.clone()).await.unwrap();
+            let mut wal = TestWal::open(storage.clone(), wal_config.clone())
+                .await
+                .unwrap();
             let entry = Entry::new(1, 4, Bytes::from("this will be torn")).unwrap();
             // Write will succeed but be torn.
             let _ = wal.append(entry).await;
@@ -258,7 +266,9 @@ async fn test_crash_after_write_before_sync() {
 
     // Write and sync some entries.
     {
-        let mut wal = TestWal::open(storage.clone(), config.clone()).await.unwrap();
+        let mut wal = TestWal::open(storage.clone(), config.clone())
+            .await
+            .unwrap();
         for i in 1..=5 {
             let entry = Entry::new(1, i, Bytes::from("synced")).unwrap();
             wal.append(entry).await.unwrap();
@@ -268,7 +278,9 @@ async fn test_crash_after_write_before_sync() {
 
     // Write more entries but DON'T sync.
     {
-        let mut wal = TestWal::open(storage.clone(), config.clone()).await.unwrap();
+        let mut wal = TestWal::open(storage.clone(), config.clone())
+            .await
+            .unwrap();
         for i in 6..=10 {
             let entry = Entry::new(1, i, Bytes::from("unsynced")).unwrap();
             wal.append(entry).await.unwrap();
@@ -297,7 +309,9 @@ async fn test_fsync_failure_preserves_existing_data() {
 
     // Write and sync some entries.
     {
-        let mut wal = TestWal::open(storage.clone(), wal_config.clone()).await.unwrap();
+        let mut wal = TestWal::open(storage.clone(), wal_config.clone())
+            .await
+            .unwrap();
         for i in 1..=5 {
             let entry = Entry::new(1, i, Bytes::from("data")).unwrap();
             wal.append(entry).await.unwrap();
@@ -310,7 +324,9 @@ async fn test_fsync_failure_preserves_existing_data() {
 
     // Write more entries, sync will fail.
     {
-        let mut wal = TestWal::open(storage.clone(), wal_config.clone()).await.unwrap();
+        let mut wal = TestWal::open(storage.clone(), wal_config.clone())
+            .await
+            .unwrap();
         for i in 6..=8 {
             let entry = Entry::new(1, i, Bytes::from("data")).unwrap();
             wal.append(entry).await.unwrap();
@@ -342,7 +358,9 @@ async fn test_crash_during_segment_rotation() {
 
     // Write entries to fill first segment.
     {
-        let mut wal = TestWal::open(storage.clone(), config.clone()).await.unwrap();
+        let mut wal = TestWal::open(storage.clone(), config.clone())
+            .await
+            .unwrap();
 
         // Write enough data to approach segment limit.
         let large_payload = Bytes::from(vec![0u8; 100_000]);
@@ -358,7 +376,9 @@ async fn test_crash_during_segment_rotation() {
 
     // Now trigger rotation by writing more.
     {
-        let mut wal = TestWal::open(storage.clone(), config.clone()).await.unwrap();
+        let mut wal = TestWal::open(storage.clone(), config.clone())
+            .await
+            .unwrap();
         let large_payload = Bytes::from(vec![0u8; 100_000]);
 
         // This should trigger segment rotation.
@@ -391,7 +411,9 @@ async fn test_recovery_corrupted_segment_header_magic() {
 
     // Write some entries.
     {
-        let mut wal = TestWal::open(storage.clone(), config.clone()).await.unwrap();
+        let mut wal = TestWal::open(storage.clone(), config.clone())
+            .await
+            .unwrap();
         for i in 1..=5 {
             let entry = Entry::new(1, i, Bytes::from("data")).unwrap();
             wal.append(entry).await.unwrap();
@@ -418,7 +440,9 @@ async fn test_recovery_corrupted_segment_header_version() {
 
     // Write some entries.
     {
-        let mut wal = TestWal::open(storage.clone(), config.clone()).await.unwrap();
+        let mut wal = TestWal::open(storage.clone(), config.clone())
+            .await
+            .unwrap();
         for i in 1..=5 {
             let entry = Entry::new(1, i, Bytes::from("data")).unwrap();
             wal.append(entry).await.unwrap();
@@ -444,7 +468,9 @@ async fn test_recovery_truncated_segment_header() {
 
     // Write some entries.
     {
-        let mut wal = TestWal::open(storage.clone(), config.clone()).await.unwrap();
+        let mut wal = TestWal::open(storage.clone(), config.clone())
+            .await
+            .unwrap();
         for i in 1..=5 {
             let entry = Entry::new(1, i, Bytes::from("data")).unwrap();
             wal.append(entry).await.unwrap();
@@ -479,7 +505,9 @@ async fn test_recovery_corrupted_entry_middle() {
 
     // Write entries with fixed-size payload for predictable offsets.
     {
-        let mut wal = TestWal::open(storage.clone(), config.clone()).await.unwrap();
+        let mut wal = TestWal::open(storage.clone(), config.clone())
+            .await
+            .unwrap();
         for i in 1..=10 {
             // Use "data" (4 bytes) for all entries.
             let entry = Entry::new(1, i, Bytes::from("data")).unwrap();
@@ -516,7 +544,9 @@ async fn test_recovery_corrupted_entry_crc() {
 
     // Write entries.
     {
-        let mut wal = TestWal::open(storage.clone(), config.clone()).await.unwrap();
+        let mut wal = TestWal::open(storage.clone(), config.clone())
+            .await
+            .unwrap();
         for i in 1..=5 {
             let entry = Entry::new(1, i, Bytes::from("data")).unwrap();
             wal.append(entry).await.unwrap();
@@ -553,7 +583,9 @@ async fn test_recovery_multiple_segments_last_corrupted() {
 
     // Write enough to create multiple segments.
     {
-        let mut wal = TestWal::open(storage.clone(), config.clone()).await.unwrap();
+        let mut wal = TestWal::open(storage.clone(), config.clone())
+            .await
+            .unwrap();
         let payload = Bytes::from(vec![0u8; 200_000]);
         for i in 1..=15 {
             let entry = Entry::new(1, i, payload.clone()).unwrap();
@@ -577,7 +609,10 @@ async fn test_recovery_multiple_segments_last_corrupted() {
     // Should have at least some entries from uncorrupted segments.
     let last_idx = wal.last_index().unwrap_or(0);
     assert!(last_idx >= 1, "should recover entries from good segments");
-    assert!(last_idx < 15, "should not have all entries due to corruption");
+    assert!(
+        last_idx < 15,
+        "should not have all entries due to corruption"
+    );
 }
 
 /// Tests that good segments before a corrupted one are fully recoverable.
@@ -628,7 +663,9 @@ async fn test_sequential_read_write_interleaving() {
     let wal_dir = Path::new("/wal/interleave");
     let config = WalConfig::new(wal_dir);
 
-    let mut wal = TestWal::open(storage.clone(), config.clone()).await.unwrap();
+    let mut wal = TestWal::open(storage.clone(), config.clone())
+        .await
+        .unwrap();
 
     // Write and read interleaved.
     for batch in 0..5 {
@@ -699,7 +736,9 @@ async fn test_disk_full_error_handling() {
 
     // Write some entries successfully.
     {
-        let mut wal = TestWal::open(storage.clone(), config.clone()).await.unwrap();
+        let mut wal = TestWal::open(storage.clone(), config.clone())
+            .await
+            .unwrap();
         for i in 1..=5 {
             let entry = Entry::new(1, i, Bytes::from("data")).unwrap();
             wal.append(entry).await.unwrap();
@@ -712,7 +751,9 @@ async fn test_disk_full_error_handling() {
 
     // Next write should fail.
     {
-        let mut wal = TestWal::open(storage.clone(), config.clone()).await.unwrap();
+        let mut wal = TestWal::open(storage.clone(), config.clone())
+            .await
+            .unwrap();
         let entry = Entry::new(1, 6, Bytes::from("will_fail")).unwrap();
         let result = wal.append(entry).await;
         assert!(result.is_err());
@@ -733,7 +774,9 @@ async fn test_io_error_during_sync() {
     let wal_dir = Path::new("/wal/io_error");
     let config = WalConfig::new(wal_dir);
 
-    let mut wal = TestWal::open(storage.clone(), config.clone()).await.unwrap();
+    let mut wal = TestWal::open(storage.clone(), config.clone())
+        .await
+        .unwrap();
 
     // Write entries.
     for i in 1..=5 {
@@ -767,7 +810,9 @@ async fn test_repeated_fsync_failures() {
     let wal_dir = Path::new("/wal/repeated_fsync");
     let wal_config = WalConfig::new(wal_dir);
 
-    let mut wal = TestWal::open(storage.clone(), wal_config.clone()).await.unwrap();
+    let mut wal = TestWal::open(storage.clone(), wal_config.clone())
+        .await
+        .unwrap();
 
     // Try to write and sync entries, handling failures.
     let mut written = 0u64;
@@ -801,8 +846,8 @@ async fn test_random_faults_stress() {
     // Run with different seeds for variety.
     for seed in [1, 42, 123, 999, 12345] {
         let config = FaultConfig::none()
-            .with_torn_write_rate(0.02)      // 2% torn writes
-            .with_fsync_fail_rate(0.05);     // 5% fsync failures
+            .with_torn_write_rate(0.02) // 2% torn writes
+            .with_fsync_fail_rate(0.05); // 5% fsync failures
         let storage = SimulatedStorage::with_faults(seed, config);
         let wal_dir = Path::new("/wal/stress");
         let wal_config = WalConfig::new(wal_dir);
@@ -810,7 +855,9 @@ async fn test_random_faults_stress() {
         // Try to write entries, some may fail due to faults.
         let mut last_successful = 0u64;
         {
-            let mut wal = TestWal::open(storage.clone(), wal_config.clone()).await.unwrap();
+            let mut wal = TestWal::open(storage.clone(), wal_config.clone())
+                .await
+                .unwrap();
             for i in 1..=100 {
                 let entry = Entry::new(1, i, Bytes::from(format!("stress-{i}"))).unwrap();
                 match wal.append(entry).await {
@@ -894,10 +941,7 @@ struct InvariantContext {
     durable_before_crash: Option<u64>,
 }
 
-fn check_wal_invariants<S: Storage>(
-    wal: &Wal<S>,
-    ctx: &InvariantContext,
-) -> Result<(), String> {
+fn check_wal_invariants<S: Storage>(wal: &Wal<S>, ctx: &InvariantContext) -> Result<(), String> {
     let seed = ctx.seed;
     let op_num = ctx.op_num;
 
@@ -1044,7 +1088,9 @@ async fn test_comprehensive_wal_stress() {
         };
 
         for op_num in 0..OPS_PER_SEED {
-            let op_hash = seed.wrapping_add(op_num as u64).wrapping_mul(0x9e3779b97f4a7c15);
+            let op_hash = seed
+                .wrapping_add(op_num as u64)
+                .wrapping_mul(0x9e3779b97f4a7c15);
             let op_type = op_hash % 10;
 
             // Debug output for failing seed (disabled after fix)
@@ -1327,7 +1373,9 @@ async fn test_invariant_index_contiguity() {
 
         // Write entries with faults - track actual next index
         {
-            let mut wal = TestWal::open(storage.clone(), wal_config.clone()).await.unwrap();
+            let mut wal = TestWal::open(storage.clone(), wal_config.clone())
+                .await
+                .unwrap();
             let mut next_idx = 1u64;
             for _ in 0..50 {
                 let entry = Entry::new(1, next_idx, Bytes::from("data")).unwrap();
@@ -1361,8 +1409,7 @@ async fn test_invariant_index_contiguity() {
 #[tokio::test]
 async fn test_truncation_under_faults() {
     for seed in 0..100 {
-        let config = FaultConfig::none()
-            .with_fsync_fail_rate(0.15);
+        let config = FaultConfig::none().with_fsync_fail_rate(0.15);
         let storage = SimulatedStorage::with_faults(seed, config);
         let wal_dir = Path::new("/wal/truncate");
         let wal_config = WalConfig::new(wal_dir);
@@ -1370,7 +1417,9 @@ async fn test_truncation_under_faults() {
         // Write entries without write faults (to ensure we have data)
         let mut max_written = 0u64;
         {
-            let mut wal = TestWal::open(storage.clone(), wal_config.clone()).await.unwrap();
+            let mut wal = TestWal::open(storage.clone(), wal_config.clone())
+                .await
+                .unwrap();
             for i in 1..=20 {
                 let entry = Entry::new(1, i, Bytes::from(format!("data-{i}"))).unwrap();
                 if wal.append(entry).await.is_ok() {
@@ -1392,7 +1441,9 @@ async fn test_truncation_under_faults() {
         // Truncate with faults enabled
         let truncate_to = max_written / 2;
         {
-            let mut wal = TestWal::open(storage.clone(), wal_config.clone()).await.unwrap();
+            let mut wal = TestWal::open(storage.clone(), wal_config.clone())
+                .await
+                .unwrap();
             let _ = wal.truncate_after(truncate_to).await;
         }
 
@@ -1411,7 +1462,10 @@ async fn test_truncation_under_faults() {
             // All remaining entries should be readable and contiguous
             for i in 1..=last_idx {
                 let entry = wal.read(i);
-                assert!(entry.is_ok(), "seed {seed}: entry {i} unreadable after truncation");
+                assert!(
+                    entry.is_ok(),
+                    "seed {seed}: entry {i} unreadable after truncation"
+                );
                 assert_eq!(entry.unwrap().index(), i);
             }
         }
@@ -1437,7 +1491,9 @@ async fn test_segment_rotation_under_faults() {
         let mut next_idx = 1u64;
 
         {
-            let mut wal = TestWal::open(storage.clone(), wal_config.clone()).await.unwrap();
+            let mut wal = TestWal::open(storage.clone(), wal_config.clone())
+                .await
+                .unwrap();
 
             // Write entries to force segment rotation via max_entries limit
             for _ in 0..30 {
@@ -1486,15 +1542,16 @@ async fn test_segment_rotation_under_faults() {
 #[tokio::test]
 async fn test_invariant_term_monotonicity() {
     for seed in 0..50 {
-        let config = FaultConfig::none()
-            .with_torn_write_rate(0.1);
+        let config = FaultConfig::none().with_torn_write_rate(0.1);
         let storage = SimulatedStorage::with_faults(seed, config);
         let wal_dir = Path::new("/wal/term_mono");
         let wal_config = WalConfig::new(wal_dir);
 
         // Write entries with increasing terms - track actual next index
         {
-            let mut wal = TestWal::open(storage.clone(), wal_config.clone()).await.unwrap();
+            let mut wal = TestWal::open(storage.clone(), wal_config.clone())
+                .await
+                .unwrap();
             let mut term = 1u64;
             let mut next_idx = 1u64;
             for attempt in 0..30 {
@@ -1556,11 +1613,15 @@ async fn test_repro_seed_135837() {
 
     let mut current_term = 1u64;
 
-    let mut wal = TestWal::open(storage.clone(), wal_config.clone()).await.unwrap();
+    let mut wal = TestWal::open(storage.clone(), wal_config.clone())
+        .await
+        .unwrap();
 
     // Run operations until op 69
     for op_num in 0..=69 {
-        let op_hash = seed.wrapping_add(op_num as u64).wrapping_mul(0x9e3779b97f4a7c15);
+        let op_hash = seed
+            .wrapping_add(op_num as u64)
+            .wrapping_mul(0x9e3779b97f4a7c15);
         let op_type = op_hash % 10;
 
         eprintln!(
@@ -1639,7 +1700,9 @@ async fn test_repro_seed_135837() {
             let synced_paths = storage.synced_file_paths();
             eprintln!("  synced_files: {synced_paths:?}");
 
-            let recovered = TestWal::open(storage.clone(), wal_config.clone()).await.unwrap();
+            let recovered = TestWal::open(storage.clone(), wal_config.clone())
+                .await
+                .unwrap();
             eprintln!("After crash: recovered={:?}", recovered.last_index());
 
             if let (Some(r), Some(d)) = (recovered.last_index(), durable_before) {
@@ -1660,7 +1723,13 @@ async fn test_repro_seed_135837() {
                     // Debug: show files after sync
                     if sync_result.is_ok() {
                         if let Ok(files) = storage.list_files(wal_dir, "wal").await {
-                            eprintln!("    files: {:?}", files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>());
+                            eprintln!(
+                                "    files: {:?}",
+                                files
+                                    .iter()
+                                    .map(|p| p.display().to_string())
+                                    .collect::<Vec<_>>()
+                            );
                         }
                         for p in storage.synced_file_paths() {
                             if let Some(c) = storage.get_synced_content(&p) {
@@ -1739,7 +1808,9 @@ async fn test_repro_seed_135837() {
                     }
                 }
 
-                let w = TestWal::open(storage.clone(), wal_config.clone()).await.unwrap();
+                let w = TestWal::open(storage.clone(), wal_config.clone())
+                    .await
+                    .unwrap();
                 eprintln!("  Recovered: last={:?}", w.last_index());
 
                 // Debug: print files after recovery to see what was created

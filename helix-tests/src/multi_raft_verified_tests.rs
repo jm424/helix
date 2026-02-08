@@ -244,7 +244,8 @@ impl PropertyCheckResult {
         println!("Total applied entries: {}", self.total_applied);
         println!("Leader elections by group:");
         for (group, term) in &self.max_term_by_group {
-            let elections = self.leaders_summary
+            let elections = self
+                .leaders_summary
                 .iter()
                 .filter(|((g, _), _)| *g == *group)
                 .count();
@@ -279,11 +280,13 @@ pub fn check_all_properties(state: &MultiRaftPropertyState) -> PropertyCheckResu
             .insert((*group_id, *term), leader_list.clone());
 
         if leaders.len() > 1 {
-            result.violations.push(PropertyViolation::MultipleLeadersInTerm {
-                group_id: *group_id,
-                term: *term,
-                leaders: leader_list,
-            });
+            result
+                .violations
+                .push(PropertyViolation::MultipleLeadersInTerm {
+                    group_id: *group_id,
+                    term: *term,
+                    leaders: leader_list,
+                });
         }
     }
 
@@ -446,12 +449,7 @@ impl ChaoticNetwork {
     }
 
     /// Sets chaos parameters.
-    pub fn with_chaos(
-        mut self,
-        duplicate_prob: f64,
-        delay_prob: f64,
-        max_delay_us: u64,
-    ) -> Self {
+    pub fn with_chaos(mut self, duplicate_prob: f64, delay_prob: f64, max_delay_us: u64) -> Self {
         self.duplicate_probability = duplicate_prob;
         self.delay_probability = delay_prob;
         self.max_extra_delay_us = max_delay_us;
@@ -527,11 +525,7 @@ impl ChaoticNetwork {
             let dup_latency = latency + self.rng.gen_range(1_000..10_000);
             events.push((
                 Duration::from_micros(dup_latency),
-                EventKind::PacketDelivery {
-                    from,
-                    to,
-                    payload,
-                },
+                EventKind::PacketDelivery { from, to, payload },
             ));
             self.messages_duplicated += 1;
         }
@@ -735,16 +729,17 @@ impl VerifiedMultiRaftActor {
                     if let Some(voted_for_node) = voted_for {
                         let key = (group_id.get(), term.get());
                         if let Some(&previous_vote) = self.votes_granted.get(&key) {
-                            if previous_vote != voted_for_node {
-                                // DOUBLE VOTE DETECTED - critical safety violation!
-                                // This should NEVER happen if vote persistence is working.
-                                panic!(
-                                    "DOUBLE VOTE VIOLATION in {} group {} term {}: \
-                                     previously voted for {}, now voting for {}!",
-                                    self.name, group_id.get(), term.get(),
-                                    previous_vote.get(), voted_for_node.get()
-                                );
-                            }
+                            // DOUBLE VOTE DETECTED - critical safety violation!
+                            // This should NEVER happen if vote persistence is working.
+                            assert!(previous_vote == voted_for_node,
+                                                                "DOUBLE VOTE VIOLATION in {} group {} term {}: \
+                                                                 previously voted for {}, now voting for {}!",
+                                                                self.name,
+                                                                group_id.get(),
+                                                                term.get(),
+                                                                previous_vote.get(),
+                                                                voted_for_node.get()
+                                                            );
                         } else {
                             // Record this vote for double-vote detection.
                             self.votes_granted.insert(key, voted_for_node);
@@ -753,7 +748,8 @@ impl VerifiedMultiRaftActor {
 
                     // Persist vote state (simulates local disk persistence).
                     // This state survives crashes and is restored on recovery.
-                    self.persisted_vote_state.insert(group_id, (term, voted_for));
+                    self.persisted_vote_state
+                        .insert(group_id, (term, voted_for));
                 }
             }
         }
@@ -880,7 +876,12 @@ impl VerifiedMultiRaftActor {
     }
 
     /// Handles client request.
-    fn handle_client_request(&mut self, ctx: &mut SimulationContext, group_id: GroupId, data: Bytes) {
+    fn handle_client_request(
+        &mut self,
+        ctx: &mut SimulationContext,
+        group_id: GroupId,
+        data: Bytes,
+    ) {
         if self.crashed {
             return;
         }
@@ -941,12 +942,13 @@ impl SimulatedActor for VerifiedMultiRaftActor {
                 self.handle_batch(ctx, payload);
             }
 
-            EventKind::Custom { ref name, ref data, .. } if name == "client_request" => {
+            EventKind::Custom {
+                ref name, ref data, ..
+            } if name == "client_request" => {
                 // Parse group_id from first 8 bytes, rest is data.
                 if data.len() >= 8 {
-                    let group_id = GroupId::new(u64::from_le_bytes(
-                        data[..8].try_into().unwrap_or([0; 8]),
-                    ));
+                    let group_id =
+                        GroupId::new(u64::from_le_bytes(data[..8].try_into().unwrap_or([0; 8])));
                     let payload = Bytes::copy_from_slice(&data[8..]);
                     self.handle_client_request(ctx, group_id, payload);
                 }
@@ -1109,79 +1111,153 @@ fn deserialize_message_with_len(payload: &[u8]) -> Option<(Message, usize)> {
             if payload.len() < offset + 40 {
                 return None;
             }
-            let term = TermId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let term = TermId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            let candidate_id = NodeId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let candidate_id = NodeId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            let to = NodeId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let to = NodeId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            let last_log_index = LogIndex::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let last_log_index = LogIndex::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            let last_log_term = TermId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let last_log_term = TermId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            Some((Message::PreVote(PreVoteRequest::new(term, candidate_id, to, last_log_index, last_log_term)), offset))
+            Some((
+                Message::PreVote(PreVoteRequest::new(
+                    term,
+                    candidate_id,
+                    to,
+                    last_log_index,
+                    last_log_term,
+                )),
+                offset,
+            ))
         }
         2 => {
             if payload.len() < offset + 25 {
                 return None;
             }
-            let term = TermId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let term = TermId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            let from = NodeId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let from = NodeId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            let to = NodeId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let to = NodeId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
             let vote_granted = payload[offset] != 0;
             offset += 1;
-            Some((Message::PreVoteResponse(PreVoteResponse::new(term, from, to, vote_granted)), offset))
+            Some((
+                Message::PreVoteResponse(PreVoteResponse::new(term, from, to, vote_granted)),
+                offset,
+            ))
         }
         3 => {
             if payload.len() < offset + 40 {
                 return None;
             }
-            let term = TermId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let term = TermId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            let candidate_id = NodeId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let candidate_id = NodeId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            let to = NodeId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let to = NodeId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            let last_log_index = LogIndex::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let last_log_index = LogIndex::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            let last_log_term = TermId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let last_log_term = TermId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            Some((Message::RequestVote(RequestVoteRequest::new(term, candidate_id, to, last_log_index, last_log_term)), offset))
+            Some((
+                Message::RequestVote(RequestVoteRequest::new(
+                    term,
+                    candidate_id,
+                    to,
+                    last_log_index,
+                    last_log_term,
+                )),
+                offset,
+            ))
         }
         4 => {
             if payload.len() < offset + 25 {
                 return None;
             }
-            let term = TermId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let term = TermId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            let from = NodeId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let from = NodeId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            let to = NodeId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let to = NodeId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
             let vote_granted = payload[offset] != 0;
             offset += 1;
-            Some((Message::RequestVoteResponse(RequestVoteResponse::new(term, from, to, vote_granted)), offset))
+            Some((
+                Message::RequestVoteResponse(RequestVoteResponse::new(
+                    term,
+                    from,
+                    to,
+                    vote_granted,
+                )),
+                offset,
+            ))
         }
         5 => {
             if payload.len() < offset + 52 {
                 return None;
             }
-            let term = TermId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let term = TermId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            let leader_id = NodeId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let leader_id = NodeId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            let to = NodeId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let to = NodeId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            let prev_log_index = LogIndex::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let prev_log_index = LogIndex::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            let prev_log_term = TermId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let prev_log_term = TermId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            let leader_commit = LogIndex::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let leader_commit = LogIndex::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            let entry_count = u32::from_le_bytes(payload[offset..offset + 4].try_into().ok()?) as usize;
+            let entry_count =
+                u32::from_le_bytes(payload[offset..offset + 4].try_into().ok()?) as usize;
             offset += 4;
 
             let mut entries = Vec::with_capacity(entry_count);
@@ -1189,11 +1265,16 @@ fn deserialize_message_with_len(payload: &[u8]) -> Option<(Message, usize)> {
                 if payload.len() < offset + 20 {
                     return None;
                 }
-                let entry_term = TermId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+                let entry_term = TermId::new(u64::from_le_bytes(
+                    payload[offset..offset + 8].try_into().ok()?,
+                ));
                 offset += 8;
-                let entry_index = LogIndex::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+                let entry_index = LogIndex::new(u64::from_le_bytes(
+                    payload[offset..offset + 8].try_into().ok()?,
+                ));
                 offset += 8;
-                let data_len = u32::from_le_bytes(payload[offset..offset + 4].try_into().ok()?) as usize;
+                let data_len =
+                    u32::from_le_bytes(payload[offset..offset + 4].try_into().ok()?) as usize;
                 offset += 4;
                 if payload.len() < offset + data_len {
                     return None;
@@ -1203,35 +1284,72 @@ fn deserialize_message_with_len(payload: &[u8]) -> Option<(Message, usize)> {
                 entries.push(LogEntry::new(entry_term, entry_index, data));
             }
 
-            Some((Message::AppendEntries(AppendEntriesRequest::new(term, leader_id, to, prev_log_index, prev_log_term, entries, leader_commit)), offset))
+            Some((
+                Message::AppendEntries(AppendEntriesRequest::new(
+                    term,
+                    leader_id,
+                    to,
+                    prev_log_index,
+                    prev_log_term,
+                    entries,
+                    leader_commit,
+                )),
+                offset,
+            ))
         }
         6 => {
             if payload.len() < offset + 33 {
                 return None;
             }
-            let term = TermId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let term = TermId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            let from = NodeId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let from = NodeId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            let to = NodeId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let to = NodeId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
             let success = payload[offset] != 0;
             offset += 1;
-            let match_index = LogIndex::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let match_index = LogIndex::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            Some((Message::AppendEntriesResponse(AppendEntriesResponse::new(term, from, to, success, match_index)), offset))
+            Some((
+                Message::AppendEntriesResponse(AppendEntriesResponse::new(
+                    term,
+                    from,
+                    to,
+                    success,
+                    match_index,
+                )),
+                offset,
+            ))
         }
         7 => {
             if payload.len() < offset + 24 {
                 return None;
             }
-            let term = TermId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let term = TermId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            let from = NodeId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let from = NodeId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            let to = NodeId::new(u64::from_le_bytes(payload[offset..offset + 8].try_into().ok()?));
+            let to = NodeId::new(u64::from_le_bytes(
+                payload[offset..offset + 8].try_into().ok()?,
+            ));
             offset += 8;
-            Some((Message::TimeoutNow(TimeoutNowRequest::new(term, from, to)), offset))
+            Some((
+                Message::TimeoutNow(TimeoutNowRequest::new(term, from, to)),
+                offset,
+            ))
         }
         _ => None,
     }
@@ -1622,8 +1740,7 @@ mod tests {
 
         println!(
             "Crash during replication: {} events, {} applied entries",
-            result.stats.events_processed,
-            check.total_applied
+            result.stats.events_processed, check.total_applied
         );
     }
 
@@ -1817,7 +1934,7 @@ mod tests {
         let config = VerifiedTestConfig {
             network_mode: NetworkMode::Chaotic,
             duplicate_prob: 0.0,
-            delay_prob: 0.30,        // 30% delay
+            delay_prob: 0.30,            // 30% delay
             max_extra_delay_us: 100_000, // Up to 100ms extra
             max_time_secs: 25,
             ..Default::default()
@@ -1920,12 +2037,7 @@ mod tests {
         let (sent, dup, delayed, dropped) = network.lock().unwrap().stats();
         println!(
             "Full chaos: {} events, applied={}, msgs: sent={}, dup={}, delayed={}, dropped={}",
-            result.stats.events_processed,
-            check.total_applied,
-            sent,
-            dup,
-            delayed,
-            dropped
+            result.stats.events_processed, check.total_applied, sent, dup, delayed, dropped
         );
     }
 
@@ -2016,7 +2128,12 @@ mod tests {
         let state = property_state.lock().unwrap();
         println!("Applied entries breakdown:");
         for ((node_id, group_id), entries) in &state.applied_entries {
-            println!("  Node {} Group {}: {} entries applied", node_id, group_id, entries.len());
+            println!(
+                "  Node {} Group {}: {} entries applied",
+                node_id,
+                group_id,
+                entries.len()
+            );
         }
         drop(state);
 
@@ -2034,10 +2151,7 @@ mod tests {
                 nodes_with_commits += 1;
             }
         }
-        assert!(
-            nodes_with_commits > 0,
-            "No nodes have commit_index > 0!"
-        );
+        assert!(nodes_with_commits > 0, "No nodes have commit_index > 0!");
 
         assert_no_violations(&check, "protocol_verification_commits");
     }
@@ -2101,11 +2215,16 @@ mod tests {
                             for eb in entries_b.iter() {
                                 if ea.index == eb.index {
                                     assert_eq!(
-                                        ea.data_hash, eb.data_hash,
+                                        ea.data_hash,
+                                        eb.data_hash,
                                         "Inconsistent entries at index {} in group {}: \
                                          node {} has hash {:x}, node {} has hash {:x}",
-                                        ea.index, group_id, nodes[i], ea.data_hash,
-                                        nodes[j], eb.data_hash
+                                        ea.index,
+                                        group_id,
+                                        nodes[i],
+                                        ea.data_hash,
+                                        nodes[j],
+                                        eb.data_hash
                                     );
                                 }
                             }
@@ -2115,8 +2234,10 @@ mod tests {
             }
         }
 
-        println!("Replication consistency verified: {} entries replicated correctly",
-                 check.total_applied);
+        println!(
+            "Replication consistency verified: {} entries replicated correctly",
+            check.total_applied
+        );
     }
 
     #[test]
@@ -2373,7 +2494,7 @@ mod tests {
         // Schedule multiple crash/recovery cycles for each node.
         for cycle in 0..3 {
             for (i, &actor) in actor_ids.iter().enumerate() {
-                let base_time = (cycle * 12000 + i as u64 * 3000) as u64;
+                let base_time = cycle * 12000 + i as u64 * 3000;
                 engine.schedule_after(
                     Duration::from_millis(base_time + 1000),
                     EventKind::ProcessCrash { actor },
@@ -2393,7 +2514,8 @@ mod tests {
 
         println!(
             "Vote persistence multiple cycles: {} events, {} violations",
-            result.stats.events_processed, check.violations.len()
+            result.stats.events_processed,
+            check.violations.len()
         );
     }
 
@@ -2527,7 +2649,8 @@ mod tests {
 
         println!(
             "Vote persistence with partitions: {} events, {} violations",
-            result.stats.events_processed, check.violations.len()
+            result.stats.events_processed,
+            check.violations.len()
         );
     }
 
@@ -2568,7 +2691,9 @@ mod tests {
 
         println!(
             "Vote persistence election storm: {} events, {} (group,term) combos, {} violations",
-            result.stats.events_processed, check.leaders_summary.len(), check.violations.len()
+            result.stats.events_processed,
+            check.leaders_summary.len(),
+            check.violations.len()
         );
 
         // Should have many elections due to rapid crashes.

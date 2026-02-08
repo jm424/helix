@@ -5,6 +5,10 @@
 //! - Write and read operations
 //! - Error handling for invalid requests
 //! - Multi-client concurrent access
+//!
+//! NOTE: These tests use real TCP networking and are not compatible with `MadSim`.
+//! For deterministic testing, see the madsim_*_test.rs modules.
+#![cfg(not(madsim))]
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -511,11 +515,7 @@ async fn test_write_to_different_partitions() {
     .unwrap();
 
     assert_eq!(
-        read0.into_inner().records[0]
-            .record
-            .as_ref()
-            .unwrap()
-            .value,
+        read0.into_inner().records[0].record.as_ref().unwrap().value,
         b"partition-0"
     );
 
@@ -534,11 +534,7 @@ async fn test_write_to_different_partitions() {
     .unwrap();
 
     assert_eq!(
-        read1.into_inner().records[0]
-            .record
-            .as_ref()
-            .unwrap()
-            .value,
+        read1.into_inner().records[0].record.as_ref().unwrap().value,
         b"partition-1"
     );
 }

@@ -44,12 +44,12 @@ use bloodhound::buggify;
 use bytes::Bytes;
 use helix_core::{PartitionId, Record, TopicId};
 use helix_server::storage::{DurablePartition, DurablePartitionConfig};
-use helix_wal::TokioStorage;
 use helix_tier::{
     InMemoryMetadataStore, IntegratedTieringManager, MetadataStoreFaultConfig, ObjectKey,
     ObjectStorage, ObjectStorageFaultConfig, SegmentLocation, SegmentMetadata, SegmentReader,
     SimulatedObjectStorage, TierError, TierResult, TieringConfig, TieringManager,
 };
+use helix_wal::TokioStorage;
 use helix_wal::{Entry, SegmentConfig, SegmentId, Wal, WalConfig};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -217,7 +217,10 @@ async fn test_download_corruption_injection() {
 
     // Next download should be clean (one-shot corruption).
     let clean_data = manager.download_segment(test_segment_id(1)).await.unwrap();
-    assert_eq!(clean_data, original_data, "Data should be clean after one-shot");
+    assert_eq!(
+        clean_data, original_data,
+        "Data should be clean after one-shot"
+    );
 }
 
 // ============================================================================
@@ -245,7 +248,10 @@ async fn test_probabilistic_upload_failures() {
                 .await
                 .unwrap();
             manager.mark_sealed(test_segment_id(seg_id)).await.unwrap();
-            manager.mark_committed(test_segment_id(seg_id)).await.unwrap();
+            manager
+                .mark_committed(test_segment_id(seg_id))
+                .await
+                .unwrap();
 
             let result = manager
                 .upload_segment(test_segment_id(seg_id), Bytes::from(format!("data-{i}")))
@@ -380,7 +386,10 @@ async fn test_multi_partition_upload() {
                 .register_segment(test_metadata(segment_id, 1, u64::from(partition)))
                 .await
                 .unwrap();
-            manager.mark_sealed(test_segment_id(segment_id)).await.unwrap();
+            manager
+                .mark_sealed(test_segment_id(segment_id))
+                .await
+                .unwrap();
             manager
                 .mark_committed(test_segment_id(segment_id))
                 .await
@@ -399,10 +408,16 @@ async fn test_multi_partition_upload() {
     for partition in 0..3 {
         for segment in 1..=3 {
             let segment_id = partition * 10 + segment;
-            assert!(manager.exists_in_s3(test_segment_id(segment_id)).await.unwrap());
+            assert!(manager
+                .exists_in_s3(test_segment_id(segment_id))
+                .await
+                .unwrap());
 
             // Verify correct data.
-            let data = manager.download_segment(test_segment_id(segment_id)).await.unwrap();
+            let data = manager
+                .download_segment(test_segment_id(segment_id))
+                .await
+                .unwrap();
             assert_eq!(data, Bytes::from(format!("p{partition}-s{segment}")));
         }
     }
@@ -494,16 +509,12 @@ async fn test_multi_seed_stress() {
     for seed in seeds {
         // Use higher fault rates to actually trigger faults.
         let config = ObjectStorageFaultConfig::none()
-            .with_put_fail_rate(0.1)  // 10% upload failures
+            .with_put_fail_rate(0.1) // 10% upload failures
             .with_get_fail_rate(0.05); // 5% download failures
 
         let storage = SimulatedObjectStorage::with_faults(seed, config);
         let metadata = InMemoryMetadataStore::new();
-        let manager = TieringManager::new(
-            storage.clone(),
-            metadata,
-            TieringConfig::for_testing(),
-        );
+        let manager = TieringManager::new(storage.clone(), metadata, TieringConfig::for_testing());
 
         // Track outcomes for this seed.
         let mut upload_successes = 0u64;
@@ -633,7 +644,9 @@ async fn test_e2e_durable_partition_tiering_init() {
     let config = DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
         .with_tiering(TieringConfig::for_testing());
 
-    let partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
+    let partition = DurablePartition::open(TokioStorage::new(), config)
+        .await
+        .unwrap();
 
     // Tiering should be enabled.
     assert!(partition.tiering_backend().is_some());
@@ -647,7 +660,9 @@ async fn test_e2e_write_and_tiering_hooks() {
     let config = DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
         .with_tiering(TieringConfig::for_testing());
 
-    let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
+    let mut partition = DurablePartition::open(TokioStorage::new(), config)
+        .await
+        .unwrap();
 
     // Write some records.
     for i in 0..10 {
@@ -656,7 +671,10 @@ async fn test_e2e_write_and_tiering_hooks() {
     }
 
     // Call tiering hooks - should return 0 since no segments are sealed.
-    let registered = partition.check_and_register_sealed_segments().await.unwrap();
+    let registered = partition
+        .check_and_register_sealed_segments()
+        .await
+        .unwrap();
     assert_eq!(registered, 0, "No sealed segments expected");
 
     let committed = partition.on_entries_committed(100).await.unwrap();
@@ -674,7 +692,9 @@ async fn test_e2e_tiering_hooks_idempotent() {
     let config = DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
         .with_tiering(TieringConfig::for_testing());
 
-    let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
+    let mut partition = DurablePartition::open(TokioStorage::new(), config)
+        .await
+        .unwrap();
 
     // Write records.
     for i in 0..5 {
@@ -684,7 +704,10 @@ async fn test_e2e_tiering_hooks_idempotent() {
 
     // Call hooks multiple times - should be safe.
     for _ in 0..5 {
-        let _ = partition.check_and_register_sealed_segments().await.unwrap();
+        let _ = partition
+            .check_and_register_sealed_segments()
+            .await
+            .unwrap();
         let _ = partition.on_entries_committed(100).await.unwrap();
         let _ = partition.tier_eligible_segments().await.unwrap();
     }
@@ -699,10 +722,11 @@ async fn test_e2e_tiering_hooks_idempotent() {
 async fn test_e2e_partition_without_tiering() {
     let temp_dir = tempfile::tempdir().unwrap();
 
-    let config =
-        DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0));
+    let config = DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0));
 
-    let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
+    let mut partition = DurablePartition::open(TokioStorage::new(), config)
+        .await
+        .unwrap();
 
     // Tiering should be disabled.
     assert!(partition.tiering_backend().is_none());
@@ -714,7 +738,10 @@ async fn test_e2e_partition_without_tiering() {
     }
 
     // Hooks should return 0 (no-op when tiering disabled).
-    let registered = partition.check_and_register_sealed_segments().await.unwrap();
+    let registered = partition
+        .check_and_register_sealed_segments()
+        .await
+        .unwrap();
     assert_eq!(registered, 0);
 
     let committed = partition.on_entries_committed(100).await.unwrap();
@@ -732,7 +759,9 @@ async fn test_e2e_concurrent_writes_with_tiering() {
     let config = DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
         .with_tiering(TieringConfig::for_testing());
 
-    let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
+    let mut partition = DurablePartition::open(TokioStorage::new(), config)
+        .await
+        .unwrap();
 
     // Interleave writes and tiering hooks.
     for batch in 0..5 {
@@ -744,7 +773,9 @@ async fn test_e2e_concurrent_writes_with_tiering() {
 
         // Call tiering hooks between batches.
         let _ = partition.check_and_register_sealed_segments().await;
-        let _ = partition.on_entries_committed(u64::try_from(batch * 10 + 10).unwrap()).await;
+        let _ = partition
+            .on_entries_committed(u64::try_from(batch * 10 + 10).unwrap())
+            .await;
         let _ = partition.tier_eligible_segments().await;
     }
 
@@ -768,14 +799,19 @@ async fn test_e2e_tiering_config_variations() {
     let config = DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
         .with_tiering(custom_config);
 
-    let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
+    let mut partition = DurablePartition::open(TokioStorage::new(), config)
+        .await
+        .unwrap();
 
     // Write and verify.
     let records = vec![Record::new(Bytes::from("test-data"))];
     partition.append(records).await.unwrap();
 
     // Hooks should work with custom config.
-    let _ = partition.check_and_register_sealed_segments().await.unwrap();
+    let _ = partition
+        .check_and_register_sealed_segments()
+        .await
+        .unwrap();
 }
 
 /// Tests multi-partition tiering isolation.
@@ -784,13 +820,19 @@ async fn test_e2e_multi_partition_tiering_isolation() {
     let temp_dir = tempfile::tempdir().unwrap();
 
     // Create two partitions with tiering.
-    let config1 = DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
-        .with_tiering(TieringConfig::for_testing());
-    let config2 = DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(1))
-        .with_tiering(TieringConfig::for_testing());
+    let config1 =
+        DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
+            .with_tiering(TieringConfig::for_testing());
+    let config2 =
+        DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(1))
+            .with_tiering(TieringConfig::for_testing());
 
-    let mut partition1 = DurablePartition::open(TokioStorage::new(), config1).await.unwrap();
-    let mut partition2 = DurablePartition::open(TokioStorage::new(), config2).await.unwrap();
+    let mut partition1 = DurablePartition::open(TokioStorage::new(), config1)
+        .await
+        .unwrap();
+    let mut partition2 = DurablePartition::open(TokioStorage::new(), config2)
+        .await
+        .unwrap();
 
     // Write to each partition.
     partition1
@@ -803,8 +845,14 @@ async fn test_e2e_multi_partition_tiering_isolation() {
         .unwrap();
 
     // Tiering hooks should be independent.
-    let _ = partition1.check_and_register_sealed_segments().await.unwrap();
-    let _ = partition2.check_and_register_sealed_segments().await.unwrap();
+    let _ = partition1
+        .check_and_register_sealed_segments()
+        .await
+        .unwrap();
+    let _ = partition2
+        .check_and_register_sealed_segments()
+        .await
+        .unwrap();
 
     // Verify data isolation.
     let p1_records = partition1.read(helix_core::Offset::new(0), 10).unwrap();
@@ -830,7 +878,9 @@ async fn test_e2e_multi_seed_tiering_stress() {
             DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
                 .with_tiering(TieringConfig::for_testing());
 
-        let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
+        let mut partition = DurablePartition::open(TokioStorage::new(), config)
+            .await
+            .unwrap();
 
         // Write records with seed-based variation.
         for i in 0..10 {
@@ -846,7 +896,11 @@ async fn test_e2e_multi_seed_tiering_stress() {
 
         // Verify data integrity.
         let records = partition.read(helix_core::Offset::new(0), 20).unwrap();
-        assert_eq!(records.len(), 10, "All records should be readable for seed {seed}");
+        assert_eq!(
+            records.len(),
+            10,
+            "All records should be readable for seed {seed}"
+        );
     }
 }
 
@@ -872,16 +926,20 @@ impl TestSegmentReader {
 impl SegmentReader for TestSegmentReader {
     async fn read_segment_bytes(&self, segment_id: SegmentId) -> TierResult<Bytes> {
         let wal = self.wal.read().await;
-        wal.read_segment_bytes(segment_id).map_err(|e| TierError::Io {
-            operation: "read_segment_bytes",
-            message: e.to_string(),
-        })
+        wal.read_segment_bytes(segment_id)
+            .map_err(|e| TierError::Io {
+                operation: "read_segment_bytes",
+                message: e.to_string(),
+            })
     }
 
     fn is_segment_sealed(&self, segment_id: SegmentId) -> bool {
         self.wal
             .try_read()
-            .map(|wal| wal.segment_info(segment_id).is_some_and(|info| info.is_sealed))
+            .map(|wal| {
+                wal.segment_info(segment_id)
+                    .is_some_and(|info| info.is_sealed)
+            })
             .unwrap_or(false)
     }
 }
@@ -908,8 +966,13 @@ impl FaultingSegmentReader {
         if self.read_fail_rate <= 0.0 {
             return false;
         }
-        let counter = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let hash = self.seed.wrapping_add(counter).wrapping_mul(0x517c_c1b7_2722_0a95);
+        let counter = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let hash = self
+            .seed
+            .wrapping_add(counter)
+            .wrapping_mul(0x517c_c1b7_2722_0a95);
         #[allow(clippy::cast_precision_loss)]
         let normalized = (hash as f64) / (u64::MAX as f64);
         normalized < self.read_fail_rate
@@ -1017,7 +1080,10 @@ async fn test_real_segment_rotation_and_tiering() {
 
     // Tier each eligible segment using tier_segment (reads from WAL via SegmentReader).
     for metadata in &eligible {
-        tiering_manager.tier_segment(metadata.segment_id).await.unwrap();
+        tiering_manager
+            .tier_segment(metadata.segment_id)
+            .await
+            .unwrap();
     }
 
     // Verify segments are in S3 (location should be Both after tiering).
@@ -1033,7 +1099,10 @@ async fn test_real_segment_rotation_and_tiering() {
     // Download and verify data integrity.
     for segment_id in &sealed_ids {
         let downloaded = tiering_manager.download_segment(*segment_id).await.unwrap();
-        assert!(!downloaded.is_empty(), "Downloaded segment should not be empty");
+        assert!(
+            !downloaded.is_empty(),
+            "Downloaded segment should not be empty"
+        );
 
         // The downloaded bytes should be the encoded segment.
         let original = wal.read().await.read_segment_bytes(*segment_id).unwrap();
@@ -1176,7 +1245,10 @@ async fn test_real_tiering_corruption_detection() {
     // Download with corruption - data should be different.
     let corrupted = tiering_manager.download_segment(segment_id).await.unwrap();
     let original = wal.read().await.read_segment_bytes(segment_id).unwrap();
-    assert_ne!(corrupted, original, "Corrupted data should differ from original");
+    assert_ne!(
+        corrupted, original,
+        "Corrupted data should differ from original"
+    );
 
     // Clean download should match.
     let clean = tiering_manager.download_segment(segment_id).await.unwrap();
@@ -1205,7 +1277,10 @@ async fn test_real_multi_segment_tiering() {
 
     // Should have at least 4 sealed segments.
     let sealed_count = wal.read().await.sealed_segment_count();
-    assert!(sealed_count >= 4, "Expected at least 4 sealed segments, got {sealed_count}");
+    assert!(
+        sealed_count >= 4,
+        "Expected at least 4 sealed segments, got {sealed_count}"
+    );
 
     // Create tiering.
     let segment_reader = TestSegmentReader::new(wal.clone());
@@ -1626,7 +1701,10 @@ async fn test_manager_restart_recovery() {
     }
 
     let sealed_ids = wal.read().await.sealed_segment_ids();
-    assert!(sealed_ids.len() >= 2, "Need multiple segments for this test");
+    assert!(
+        sealed_ids.len() >= 2,
+        "Need multiple segments for this test"
+    );
 
     // Use shared object storage and metadata store (simulates persistent storage).
     let object_storage = SimulatedObjectStorage::new(42);
@@ -2023,7 +2101,12 @@ async fn test_interleaved_operations_with_faults() {
     for round in 0..MAX_ROUNDS {
         // Write enough entries to create a sealed segment.
         for _ in 0..4 {
-            let entry = Entry::new(1, entry_index, Bytes::from(format!("round-{round}-{entry_index}"))).unwrap();
+            let entry = Entry::new(
+                1,
+                entry_index,
+                Bytes::from(format!("round-{round}-{entry_index}")),
+            )
+            .unwrap();
             wal.write().await.append(entry).await.unwrap();
             entry_index += 1;
         }
@@ -2347,7 +2430,9 @@ async fn test_buggify_no_intermediate_states() {
         let stats = buggify::all_stats();
         let total_crashes: u64 = stats.values().map(|s| s.triggers).sum();
         if total_crashes > 0 {
-            println!("seed {seed}: BUGGIFY triggered {total_crashes} crashes, recovered {recovered}");
+            println!(
+                "seed {seed}: BUGGIFY triggered {total_crashes} crashes, recovered {recovered}"
+            );
         }
 
         buggify::reset();
@@ -2517,7 +2602,8 @@ async fn test_buggify_data_integrity_after_crashes() {
                 let downloaded = tiering_manager.download_segment(*segment_id).await.unwrap();
                 let original = wal.read().await.read_segment_bytes(*segment_id).unwrap();
                 assert_eq!(
-                    downloaded, original,
+                    downloaded,
+                    original,
                     "seed {seed}: DATA INTEGRITY VIOLATION! Segment {:?} data in S3 \
                      doesn't match WAL. Downloaded {} bytes, expected {} bytes.",
                     segment_id,
@@ -2585,11 +2671,7 @@ impl TierOp {
 ///
 /// Note: `Uploading` state is allowed - it's a transient state where S3 might or might not have data.
 async fn check_hard_invariants<R: SegmentReader>(
-    tiering_manager: &IntegratedTieringManager<
-        SimulatedObjectStorage,
-        InMemoryMetadataStore,
-        R,
-    >,
+    tiering_manager: &IntegratedTieringManager<SimulatedObjectStorage, InMemoryMetadataStore, R>,
     object_storage: &SimulatedObjectStorage,
     seed: u64,
     op_num: usize,
@@ -2678,11 +2760,7 @@ async fn check_hard_invariants<R: SegmentReader>(
 
 /// Check invariants that must hold AFTER recovery has run.
 async fn check_post_recovery_invariants<R: SegmentReader>(
-    tiering_manager: &IntegratedTieringManager<
-        SimulatedObjectStorage,
-        InMemoryMetadataStore,
-        R,
-    >,
+    tiering_manager: &IntegratedTieringManager<SimulatedObjectStorage, InMemoryMetadataStore, R>,
     wal: &Arc<RwLock<Wal<TokioStorage>>>,
     object_storage: &SimulatedObjectStorage,
     seed: u64,
@@ -2690,7 +2768,11 @@ async fn check_post_recovery_invariants<R: SegmentReader>(
     let sealed_ids = wal.read().await.sealed_segment_ids();
 
     for segment_id in &sealed_ids {
-        let location = tiering_manager.get_location(*segment_id).await.ok().flatten();
+        let location = tiering_manager
+            .get_location(*segment_id)
+            .await
+            .ok()
+            .flatten();
 
         // INVARIANT 1: No segments stuck in Uploading state after recovery.
         if matches!(location, Some(SegmentLocation::Uploading)) {
@@ -2857,13 +2939,8 @@ async fn test_randomized_operations_with_faults() {
             // We do NOT run recovery automatically - that would mask bugs!
             // Instead, we check invariants that must hold even without recovery.
 
-            if let Err(e) = check_hard_invariants(
-                &tiering_manager,
-                &object_storage,
-                seed,
-                op_num,
-            )
-            .await
+            if let Err(e) =
+                check_hard_invariants(&tiering_manager, &object_storage, seed, op_num).await
             {
                 panic!("{e}");
             }
@@ -2873,13 +2950,8 @@ async fn test_randomized_operations_with_faults() {
         let _ = tiering_manager.recover_stuck_uploads().await;
 
         // Now check that recovery cleaned everything up.
-        if let Err(e) = check_post_recovery_invariants(
-            &tiering_manager,
-            &wal,
-            &object_storage,
-            seed,
-        )
-        .await
+        if let Err(e) =
+            check_post_recovery_invariants(&tiering_manager, &wal, &object_storage, seed).await
         {
             panic!("{e}");
         }
@@ -3011,13 +3083,8 @@ async fn test_randomized_extended() {
             // Check hard invariants periodically (every 10 ops for performance).
             // We do NOT run recovery automatically - that would mask bugs!
             if op_num % 10 == 0 {
-                if let Err(e) = check_hard_invariants(
-                    &tiering_manager,
-                    &object_storage,
-                    seed,
-                    op_num,
-                )
-                .await
+                if let Err(e) =
+                    check_hard_invariants(&tiering_manager, &object_storage, seed, op_num).await
                 {
                     panic!("{e}");
                 }
@@ -3026,13 +3093,8 @@ async fn test_randomized_extended() {
 
         // AFTER all operations, run recovery and check final state.
         let _ = tiering_manager.recover_stuck_uploads().await;
-        if let Err(e) = check_post_recovery_invariants(
-            &tiering_manager,
-            &wal,
-            &object_storage,
-            seed,
-        )
-        .await
+        if let Err(e) =
+            check_post_recovery_invariants(&tiering_manager, &wal, &object_storage, seed).await
         {
             panic!("{e}");
         }
@@ -3073,8 +3135,7 @@ async fn test_complete_upload_failure_recovery() {
         let object_storage = SimulatedObjectStorage::with_faults(seed, storage_faults);
 
         // Metadata store with HIGH complete_upload failure rate.
-        let metadata_faults = MetadataStoreFaultConfig::none()
-            .with_complete_upload_fail_rate(0.5); // 50% failure rate
+        let metadata_faults = MetadataStoreFaultConfig::none().with_complete_upload_fail_rate(0.5); // 50% failure rate
         let metadata_store = InMemoryMetadataStore::with_faults(seed, metadata_faults);
 
         let segment_reader = TestSegmentReader::new(wal.clone());
@@ -3187,13 +3248,11 @@ async fn test_recovery_with_exists_failures() {
         }
 
         // S3 storage with high exists() failure rate but no other faults.
-        let storage_faults = ObjectStorageFaultConfig::none()
-            .with_exists_fail_rate(0.5); // 50% exists failure
+        let storage_faults = ObjectStorageFaultConfig::none().with_exists_fail_rate(0.5); // 50% exists failure
         let object_storage = SimulatedObjectStorage::with_faults(seed, storage_faults);
 
         // Metadata store with complete_upload failure to create stuck segments.
-        let metadata_faults = MetadataStoreFaultConfig::none()
-            .with_complete_upload_fail_rate(0.5);
+        let metadata_faults = MetadataStoreFaultConfig::none().with_complete_upload_fail_rate(0.5);
         let metadata_store = InMemoryMetadataStore::with_faults(seed, metadata_faults);
 
         let segment_reader = TestSegmentReader::new(wal.clone());
@@ -3391,13 +3450,8 @@ async fn test_comprehensive_stress() {
             }
 
             // CHECK HARD INVARIANTS AFTER EVERY OPERATION.
-            if let Err(e) = check_hard_invariants(
-                &tiering_manager,
-                &object_storage,
-                seed,
-                op_num,
-            )
-            .await
+            if let Err(e) =
+                check_hard_invariants(&tiering_manager, &object_storage, seed, op_num).await
             {
                 panic!("{e}");
             }
@@ -3409,13 +3463,8 @@ async fn test_comprehensive_stress() {
         }
 
         // Check post-recovery invariants.
-        if let Err(e) = check_post_recovery_invariants(
-            &tiering_manager,
-            &wal,
-            &object_storage,
-            seed,
-        )
-        .await
+        if let Err(e) =
+            check_post_recovery_invariants(&tiering_manager, &wal, &object_storage, seed).await
         {
             panic!("{e}");
         }
@@ -3495,10 +3544,7 @@ async fn test_concurrent_tier_same_segment() {
         let tm1 = tiering_manager.clone();
         let tm2 = tiering_manager.clone();
 
-        let (r1, r2) = tokio::join!(
-            tm1.tier_segment(segment_id),
-            tm2.tier_segment(segment_id),
-        );
+        let (r1, r2) = tokio::join!(tm1.tier_segment(segment_id), tm2.tier_segment(segment_id),);
 
         // At most one should succeed, the other should fail with NotEligible.
         let successes = [r1.is_ok(), r2.is_ok()].iter().filter(|&&x| x).count();

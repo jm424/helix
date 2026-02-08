@@ -36,12 +36,45 @@
 #![deny(clippy::all)]
 #![warn(clippy::pedantic)]
 #![warn(clippy::nursery)]
+#![allow(clippy::needless_pass_by_value)]
+#![allow(clippy::items_after_statements)]
+#![allow(clippy::format_collect)]
+#![allow(clippy::needless_update)]
+#![allow(clippy::match_same_arms)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::too_many_lines)]
+
+#[cfg(test)]
+use std::sync::OnceLock;
+
+#[cfg(test)]
+/// Initialize tracing for tests (no-op if already initialized).
+pub(crate) fn init_test_tracing() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_test_writer()
+            .try_init();
+    });
+}
 
 pub mod helix_service_actor;
 pub mod properties;
 pub mod raft_actor;
 pub mod scenarios;
 pub mod simulated_transport;
+
+// MadSim modules (requires madsim feature).
+#[cfg(feature = "madsim")]
+pub mod madsim_e2e_cluster;
+#[cfg(feature = "madsim")]
+pub mod madsim_scenarios;
+#[cfg(feature = "madsim")]
+pub mod madsim_transport;
 
 // DST test modules (deterministic simulation with fault injection).
 #[cfg(test)]
@@ -70,3 +103,6 @@ mod shard_transfer_tests;
 mod shared_wal_integration_tests;
 #[cfg(test)]
 mod tier_tests;
+
+// MadSim E2E DST tests.
+// Run with: RUSTFLAGS="--cfg madsim" cargo test -p helix-tests --features madsim madsim_e2e_cluster

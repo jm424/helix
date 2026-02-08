@@ -29,8 +29,8 @@
 #![allow(clippy::needless_pass_by_value)]
 #![allow(clippy::type_complexity)]
 
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bloodhound::simulation::discrete::actors::SimulatedActor;
 use bloodhound::simulation::discrete::engine::{DiscreteSimulationEngine, EngineConfig};
@@ -106,11 +106,11 @@ impl Default for HelixTestConfig {
             inject_storage_faults: false,
             storage_fault_config: None,
             inject_client_traffic: false,
-            produce_interval_ms: 100, // Faster produces
-            produce_count: 200, // Many more produces
+            produce_interval_ms: 100,    // Faster produces
+            produce_count: 200,          // Many more produces
             wal_mode: WalMode::InMemory, // Default to per-partition for backwards compatibility
-            shared_wal_count: 4, // Default K=4 shared WALs when using shared mode
-            actor_mode: false, // Default to standard mode
+            shared_wal_count: 4,         // Default K=4 shared WALs when using shared mode
+            actor_mode: false,           // Default to standard mode
         }
     }
 }
@@ -128,6 +128,14 @@ pub fn create_helix_simulation(
     SharedHelixPropertyState,
     SharedNetworkState,
 ) {
+    // Guard: storage faults require a durable WAL mode to be meaningful.
+    // With InMemory mode, fault injection is a no-op and tests provide false confidence.
+    assert!(
+        !config.inject_storage_faults || config.wal_mode != WalMode::InMemory,
+        "Storage fault injection requires WalMode::PerPartition or WalMode::Shared, \
+         not InMemory (faults would be a no-op)"
+    );
+
     let engine_config = EngineConfig::new(config.seed)
         .with_max_time(Duration::from_secs(config.max_time_secs))
         .with_stats(true)
@@ -143,7 +151,7 @@ pub fn create_helix_simulation(
         config
             .storage_fault_config
             .clone()
-            .unwrap_or_else(FaultConfig::flaky)
+            .unwrap_or_else(FaultConfig::flaky_runtime)
     } else {
         FaultConfig::default()
     };
@@ -179,6 +187,13 @@ mod tests {
     use super::*;
     use crate::helix_service_actor::custom_events;
 
+    /// Fault profile for runtime durability testing.
+    /// Keeps read/write/fsync/torn-write faults, but avoids startup metadata faults
+    /// that can prevent cluster bootstrap (`list_files/open/exists`).
+    fn runtime_storage_faults() -> FaultConfig {
+        FaultConfig::flaky_runtime()
+    }
+
     /// Result of running a simulation with property checking.
     struct SimulationResult {
         /// Whether the engine completed successfully.
@@ -191,8 +206,43 @@ mod tests {
 
     /// Runs a basic simulation and verifies safety properties.
     fn run_basic_simulation(config: &HelixTestConfig) -> SimulationResult {
+        crate::init_test_tracing();
+        let test_name = std::thread::current()
+            .name()
+            .unwrap_or("helix_service_dst")
+            .to_string();
+        let run_start = Instant::now();
+        eprintln!(
+            "[E2E_START] test={} seed={} nodes={} max_time={}s actor_mode={} wal_mode={:?}",
+            test_name,
+            config.seed,
+            config.node_count,
+            config.max_time_secs,
+            config.actor_mode,
+            config.wal_mode
+        );
         let (mut engine, actor_ids, property_state, _network_state) =
             create_helix_simulation(config);
+
+        // Wall-clock progress heartbeat while engine.run() executes.
+        let (progress_tx, progress_rx) = mpsc::channel::<()>();
+        let progress_test_name = test_name.clone();
+        let progress_seed = config.seed;
+        let progress_max_time_secs = config.max_time_secs;
+        let progress_thread = std::thread::spawn(move || loop {
+            match progress_rx.recv_timeout(Duration::from_secs(15)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    eprintln!(
+                        "[E2E_PROGRESS] test={} seed={} elapsed={}s sim_max={}s",
+                        progress_test_name,
+                        progress_seed,
+                        run_start.elapsed().as_secs(),
+                        progress_max_time_secs
+                    );
+                }
+            }
+        });
 
         // Inject faults if configured.
         if config.inject_crashes && config.crash_node_index < actor_ids.len() {
@@ -321,6 +371,8 @@ mod tests {
 
         // Run simulation.
         let result = engine.run();
+        let _ = progress_tx.send(());
+        let _ = progress_thread.join();
 
         // Finalize consumer verification - check which acks no node could verify.
         if let Ok(mut state) = property_state.lock() {
@@ -359,6 +411,13 @@ mod tests {
             property_result.consumer_verified,
             property_result.consumer_violations.len(),
         );
+        eprintln!(
+            "[E2E_DONE] test={} seed={} elapsed={}s events={}",
+            test_name,
+            config.seed,
+            run_start.elapsed().as_secs(),
+            result.stats.events_processed
+        );
 
         SimulationResult {
             success: result.success,
@@ -394,6 +453,10 @@ mod tests {
     // ------------------------------------------------------------------------
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_basic_startup() {
         let config = HelixTestConfig {
             node_count: 3,
@@ -410,6 +473,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_single_node() {
         let config = HelixTestConfig {
             node_count: 1,
@@ -426,6 +493,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_five_node_cluster() {
         let config = HelixTestConfig {
             node_count: 5,
@@ -446,6 +517,10 @@ mod tests {
     // ------------------------------------------------------------------------
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_leader_crash_recovery() {
         let config = HelixTestConfig {
             node_count: 3,
@@ -466,6 +541,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_follower_crash_recovery() {
         let config = HelixTestConfig {
             node_count: 3,
@@ -486,6 +565,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_rapid_crash_recovery() {
         let config = HelixTestConfig {
             node_count: 3,
@@ -510,6 +593,10 @@ mod tests {
     // ------------------------------------------------------------------------
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_minority_isolation() {
         // Create a 3-node cluster and partition node 0 from the majority.
         // This uses dynamic partition injection - partition applied at 5s, healed at 20s.
@@ -537,6 +624,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_partition_with_crash() {
         // Test partition combined with crash - more aggressive fault injection.
         let config = HelixTestConfig {
@@ -565,17 +656,24 @@ mod tests {
     // ------------------------------------------------------------------------
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_storage_faults_basic() {
         // Test with basic storage faults (flaky config).
+        // Uses SharedWAL since that's the preferred production setting.
         let config = HelixTestConfig {
             node_count: 3,
             seed: 1819,
             max_time_secs: 45,
             inject_storage_faults: true,
-            storage_fault_config: Some(FaultConfig::flaky()),
+            storage_fault_config: Some(runtime_storage_faults()),
             inject_client_traffic: true,
             produce_interval_ms: 100,
             produce_count: 300,
+            wal_mode: WalMode::Shared,
+            shared_wal_count: 4,
             ..Default::default()
         };
 
@@ -584,8 +682,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_storage_faults_with_crash() {
         // Combine storage faults with process crash - tests recovery under faulty storage.
+        // Uses SharedWAL since that's the preferred production setting.
         let config = HelixTestConfig {
             node_count: 3,
             seed: 2021,
@@ -595,10 +698,12 @@ mod tests {
             recover_time_ms: 25000,
             crash_node_index: 0,
             inject_storage_faults: true,
-            storage_fault_config: Some(FaultConfig::flaky()),
+            storage_fault_config: Some(runtime_storage_faults()),
             inject_client_traffic: true,
             produce_interval_ms: 100,
             produce_count: 300,
+            wal_mode: WalMode::Shared,
+            shared_wal_count: 4,
             ..Default::default()
         };
 
@@ -607,8 +712,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_storage_faults_all_fault_types() {
         // Test with all fault types enabled - aggressive storage testing.
+        // Uses SharedWAL since that's the preferred production setting.
         let config = HelixTestConfig {
             node_count: 3,
             seed: 2223,
@@ -621,10 +731,12 @@ mod tests {
             partition_time_ms: 8000,
             heal_time_ms: 25000,
             inject_storage_faults: true,
-            storage_fault_config: Some(FaultConfig::flaky()),
+            storage_fault_config: Some(runtime_storage_faults()),
             inject_client_traffic: true,
             produce_interval_ms: 100,
             produce_count: 400,
+            wal_mode: WalMode::Shared,
+            shared_wal_count: 4,
             ..Default::default()
         };
 
@@ -637,6 +749,10 @@ mod tests {
     // ------------------------------------------------------------------------
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_client_traffic_basic() {
         // Basic client traffic: topic creation + produce operations.
         let config = HelixTestConfig {
@@ -654,6 +770,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_client_traffic_with_crash() {
         // Client traffic during crash/recovery - tests durability.
         let config = HelixTestConfig {
@@ -675,6 +795,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_client_traffic_with_partition() {
         // Client traffic during network partition.
         let config = HelixTestConfig {
@@ -695,8 +819,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_client_traffic_all_faults() {
         // Client traffic with all fault types - comprehensive durability test.
+        // Uses SharedWAL since that's the preferred production setting.
         let config = HelixTestConfig {
             node_count: 3,
             seed: 3031,
@@ -709,10 +838,12 @@ mod tests {
             partition_time_ms: 10000,
             heal_time_ms: 40000,
             inject_storage_faults: true,
-            storage_fault_config: Some(FaultConfig::flaky()),
+            storage_fault_config: Some(runtime_storage_faults()),
             inject_client_traffic: true,
             produce_interval_ms: 80,
             produce_count: 800,
+            wal_mode: WalMode::Shared,
+            shared_wal_count: 4,
             ..Default::default()
         };
 
@@ -725,6 +856,10 @@ mod tests {
     // ------------------------------------------------------------------------
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_stress_10_seeds() {
         let mut total_property_events = 0u64;
         let mut total_violations = 0usize;
@@ -732,15 +867,27 @@ mod tests {
         let mut total_commits = 0u64;
 
         for seed in 0..10 {
+            // Use SharedWAL when storage faults are enabled (required by guard).
+            let use_storage_faults = seed % 3 == 0;
             let config = HelixTestConfig {
                 node_count: 3,
                 seed,
                 max_time_secs: 30,
-                inject_client_traffic: true,  // Always inject client traffic.
+                inject_client_traffic: true, // Always inject client traffic.
                 produce_interval_ms: 80,
                 produce_count: 250,
-                inject_storage_faults: seed % 3 == 0, // Storage faults every 3rd seed.
-                storage_fault_config: if seed % 3 == 0 { Some(FaultConfig::flaky()) } else { None },
+                inject_storage_faults: use_storage_faults,
+                storage_fault_config: if use_storage_faults {
+                    Some(runtime_storage_faults())
+                } else {
+                    None
+                },
+                wal_mode: if use_storage_faults {
+                    WalMode::Shared
+                } else {
+                    WalMode::InMemory
+                },
+                shared_wal_count: 4,
                 ..Default::default()
             };
 
@@ -761,13 +908,19 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_stress_30_seeds() {
-        // 30-seed stress test for InMemory mode (aligned with other WAL modes).
+        // 30-seed stress test.
+        // Uses SharedWAL when storage faults are enabled (required by guard).
         let mut total_violations = 0usize;
         let mut total_produces = 0u64;
         let mut total_commits = 0u64;
 
         for seed in 0..30 {
+            let use_storage_faults = seed % 4 == 0;
             let config = HelixTestConfig {
                 node_count: 3,
                 seed,
@@ -779,12 +932,18 @@ mod tests {
                 crash_time_ms: 8000,
                 recover_time_ms: 18000,
                 crash_node_index: (seed as usize) % 3,
-                inject_storage_faults: seed % 4 == 0,
-                storage_fault_config: if seed % 4 == 0 {
-                    Some(FaultConfig::flaky())
+                inject_storage_faults: use_storage_faults,
+                storage_fault_config: if use_storage_faults {
+                    Some(runtime_storage_faults())
                 } else {
                     None
                 },
+                wal_mode: if use_storage_faults {
+                    WalMode::Shared
+                } else {
+                    WalMode::InMemory
+                },
+                shared_wal_count: 4,
                 ..Default::default()
             };
 
@@ -796,14 +955,18 @@ mod tests {
             total_commits += result.property_result.total_committed_entries;
         }
 
-        assert_eq!(total_violations, 0, "No violations across InMemory 30-seed stress");
+        assert_eq!(total_violations, 0, "No violations across 30-seed stress");
         println!(
-            "InMemory stress: 30 seeds completed, {} produces, {} commits, 0 violations",
+            "30-seed stress completed: {} produces, {} commits, 0 violations",
             total_produces, total_commits
         );
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_stress_50_seeds() {
         let mut total_events = 0u64;
         let mut total_property_events = 0u64;
@@ -812,30 +975,41 @@ mod tests {
         let mut total_commits = 0u64;
 
         for seed in 0..50 {
+            // Use SharedWAL when storage faults are enabled (required by guard).
+            let use_storage_faults = seed % 4 == 0;
             let config = HelixTestConfig {
                 node_count: 3,
                 seed,
                 max_time_secs: 30,
-                inject_client_traffic: true,  // Always inject client traffic.
+                inject_client_traffic: true, // Always inject client traffic.
                 produce_interval_ms: 100,
                 produce_count: 200,
                 inject_crashes: seed % 5 == 0, // Crash every 5th seed.
                 crash_time_ms: 8000,
                 recover_time_ms: 18000,
                 crash_node_index: (seed as usize) % 3,
-                inject_storage_faults: seed % 4 == 0, // Storage faults every 4th seed.
-                storage_fault_config: if seed % 4 == 0 { Some(FaultConfig::flaky()) } else { None },
+                inject_storage_faults: use_storage_faults,
+                storage_fault_config: if use_storage_faults {
+                    Some(runtime_storage_faults())
+                } else {
+                    None
+                },
+                wal_mode: if use_storage_faults {
+                    WalMode::Shared
+                } else {
+                    WalMode::InMemory
+                },
+                shared_wal_count: 4,
                 ..Default::default()
             };
 
             let result = run_basic_simulation(&config);
 
-            assert!(
-                result.success,
-                "Seed {} should complete successfully",
-                seed
+            assert!(result.success, "Seed {} should complete successfully", seed);
+            assert_no_helix_violations(
+                &result.property_result,
+                &format!("stress_50_seed_{}", seed),
             );
-            assert_no_helix_violations(&result.property_result, &format!("stress_50_seed_{}", seed));
 
             total_events += result.events;
             total_property_events += result.property_result.events_processed;
@@ -852,7 +1026,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_stress_crash_recovery_10_seeds() {
+        // Uses SharedWAL since storage faults are always enabled.
         let mut total_violations = 0usize;
         let mut total_produces = 0u64;
         let mut total_commits = 0u64;
@@ -866,11 +1045,13 @@ mod tests {
                 crash_time_ms: 10000,
                 recover_time_ms: 25000,
                 crash_node_index: (seed as usize) % 3,
-                inject_client_traffic: true,  // Always inject client traffic during crashes.
+                inject_client_traffic: true, // Always inject client traffic during crashes.
                 produce_interval_ms: 80,
                 produce_count: 400,
                 inject_storage_faults: true, // Always inject storage faults during crash recovery.
-                storage_fault_config: Some(FaultConfig::flaky()),
+                storage_fault_config: Some(runtime_storage_faults()),
+                wal_mode: WalMode::Shared,
+                shared_wal_count: 4,
                 ..Default::default()
             };
 
@@ -882,7 +1063,10 @@ mod tests {
             total_commits += result.property_result.total_committed_entries;
         }
 
-        assert_eq!(total_violations, 0, "No violations across crash recovery seeds");
+        assert_eq!(
+            total_violations, 0,
+            "No violations across crash recovery seeds"
+        );
         println!(
             "Crash recovery stress: 10 seeds completed, {} produces, {} commits, 0 violations",
             total_produces, total_commits
@@ -894,6 +1078,10 @@ mod tests {
     // ------------------------------------------------------------------------
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_stress_100_seeds() {
         let mut total_events = 0u64;
         let mut total_property_events = 0u64;
@@ -906,26 +1094,34 @@ mod tests {
         let mut failures = Vec::new();
 
         for seed in 0..100 {
+            // Use SharedWAL when storage faults are enabled (required by guard).
+            let use_storage_faults = seed % 4 == 0;
             let config = HelixTestConfig {
                 node_count: 3,
                 seed,
-                max_time_secs: 60,  // 60 seconds per seed.
-                inject_crashes: seed % 3 == 0,           // Crash every 3rd seed.
+                max_time_secs: 60,             // 60 seconds per seed.
+                inject_crashes: seed % 3 == 0, // Crash every 3rd seed.
                 crash_time_ms: 15000,
                 recover_time_ms: 35000,
                 crash_node_index: (seed as usize) % 3,
-                inject_partition: seed % 5 == 0,         // Partition every 5th seed.
+                inject_partition: seed % 5 == 0, // Partition every 5th seed.
                 partition_time_ms: 10000,
                 heal_time_ms: 30000,
-                inject_storage_faults: seed % 4 == 0,    // Storage faults every 4th seed.
-                storage_fault_config: if seed % 4 == 0 {
-                    Some(FaultConfig::flaky())
+                inject_storage_faults: use_storage_faults,
+                storage_fault_config: if use_storage_faults {
+                    Some(runtime_storage_faults())
                 } else {
                     None
                 },
-                inject_client_traffic: true,             // Always inject client traffic.
+                inject_client_traffic: true, // Always inject client traffic.
                 produce_interval_ms: 80,
-                produce_count: 600,                      // 600 produces per seed (fills 60s at 80ms interval).
+                produce_count: 600, // 600 produces per seed (fills 60s at 80ms interval).
+                wal_mode: if use_storage_faults {
+                    WalMode::Shared
+                } else {
+                    WalMode::InMemory
+                },
+                shared_wal_count: 4,
                 ..Default::default()
             };
 
@@ -944,14 +1140,19 @@ mod tests {
             total_client_acks += result.property_result.total_client_acks;
         }
 
-        assert!(
-            failures.is_empty(),
-            "Seeds failed: {:?}",
-            failures
+        assert!(failures.is_empty(), "Seeds failed: {:?}", failures);
+        assert_eq!(
+            total_violations, 0,
+            "No consensus violations across 100 seeds"
         );
-        assert_eq!(total_violations, 0, "No consensus violations across 100 seeds");
-        assert_eq!(total_integrity_violations, 0, "No data integrity violations across 100 seeds");
-        assert_eq!(total_consumer_violations, 0, "No consumer violations (data loss) across 100 seeds");
+        assert_eq!(
+            total_integrity_violations, 0,
+            "No data integrity violations across 100 seeds"
+        );
+        assert_eq!(
+            total_consumer_violations, 0,
+            "No consumer violations (data loss) across 100 seeds"
+        );
 
         println!(
             "Stress test: 100 seeds completed, {} events, {} property events, {} produces, {} commits, \
@@ -961,14 +1162,16 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Run manually with: cargo test inmemory_stress_500 -- --ignored
+    #[ignore = "long-running stress test; run manually with --ignored"]
     fn test_helix_service_stress_500_seeds() {
-        // Comprehensive 500-seed stress test for InMemory mode.
+        // Comprehensive 500-seed stress test.
+        // Uses SharedWAL when storage faults are enabled (required by guard).
         let mut total_violations = 0usize;
         let mut total_produces = 0u64;
         let mut total_commits = 0u64;
 
         for seed in 0..500 {
+            let use_storage_faults = seed % 2 == 0;
             let config = HelixTestConfig {
                 node_count: 3,
                 seed,
@@ -977,22 +1180,29 @@ mod tests {
                 crash_time_ms: 10000,
                 recover_time_ms: 25000,
                 crash_node_index: (seed as usize) % 3,
-                inject_storage_faults: seed % 2 == 0,
-                storage_fault_config: if seed % 2 == 0 {
-                    Some(FaultConfig::flaky())
+                inject_storage_faults: use_storage_faults,
+                storage_fault_config: if use_storage_faults {
+                    Some(runtime_storage_faults())
                 } else {
                     None
                 },
                 inject_client_traffic: true,
                 produce_interval_ms: 100,
                 produce_count: 300,
+                wal_mode: if use_storage_faults {
+                    WalMode::Shared
+                } else {
+                    WalMode::InMemory
+                },
+                shared_wal_count: 4,
                 ..Default::default()
             };
 
             let result = run_basic_simulation(&config);
 
             if seed % 50 == 0 {
-                println!("InMemory seed {}: produces={}, commits={}, violations={}",
+                println!(
+                    "Seed {}: produces={}, commits={}, violations={}",
                     seed,
                     result.property_result.total_produce_success,
                     result.property_result.total_committed_entries,
@@ -1005,13 +1215,15 @@ mod tests {
             total_commits += result.property_result.total_committed_entries;
 
             assert_eq!(
-                result.property_result.violations.len(), 0,
-                "InMemory seed {} had violations", seed
+                result.property_result.violations.len(),
+                0,
+                "InMemory seed {} had violations",
+                seed
             );
         }
 
         println!(
-            "InMemory stress: 500 seeds completed, {} produces, {} commits, {} violations",
+            "500-seed stress completed: {} produces, {} commits, {} violations",
             total_produces, total_commits, total_violations
         );
         assert_eq!(total_violations, 0, "No violations across 500 seeds");
@@ -1024,6 +1236,10 @@ mod tests {
     // fault injection, providing coverage for the production WAL architecture.
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_shared_wal_basic() {
         let config = HelixTestConfig {
             node_count: 3,
@@ -1042,6 +1258,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_shared_wal_with_faults() {
         // Test SharedWAL with storage faults (torn writes, fsync failures).
         let config = HelixTestConfig {
@@ -1049,7 +1269,7 @@ mod tests {
             seed: 1234,
             max_time_secs: 45,
             inject_storage_faults: true,
-            storage_fault_config: Some(FaultConfig::flaky()),
+            storage_fault_config: Some(runtime_storage_faults()),
             inject_client_traffic: true,
             produce_interval_ms: 100,
             produce_count: 300,
@@ -1063,6 +1283,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_shared_wal_crash_recovery() {
         // Test SharedWAL with crash/recovery cycles.
         let config = HelixTestConfig {
@@ -1086,6 +1310,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_shared_wal_all_faults() {
         // Comprehensive SharedWAL test with all fault types.
         let config = HelixTestConfig {
@@ -1100,7 +1328,7 @@ mod tests {
             partition_time_ms: 10000,
             heal_time_ms: 30000,
             inject_storage_faults: true,
-            storage_fault_config: Some(FaultConfig::flaky()),
+            storage_fault_config: Some(runtime_storage_faults()),
             inject_client_traffic: true,
             produce_interval_ms: 80,
             produce_count: 500,
@@ -1114,6 +1342,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_shared_wal_stress_10_seeds() {
         // Multi-seed stress test for SharedWAL.
         let mut total_violations = 0usize;
@@ -1131,7 +1363,7 @@ mod tests {
                 crash_node_index: (seed as usize) % 3,
                 inject_storage_faults: seed % 2 == 0, // Storage faults every other seed.
                 storage_fault_config: if seed % 2 == 0 {
-                    Some(FaultConfig::flaky())
+                    Some(runtime_storage_faults())
                 } else {
                     None
                 },
@@ -1151,7 +1383,10 @@ mod tests {
             total_commits += result.property_result.total_committed_entries;
         }
 
-        assert_eq!(total_violations, 0, "No violations across SharedWAL stress seeds");
+        assert_eq!(
+            total_violations, 0,
+            "No violations across SharedWAL stress seeds"
+        );
         println!(
             "SharedWAL stress: 10 seeds completed, {} produces, {} commits, 0 violations",
             total_produces, total_commits
@@ -1159,6 +1394,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_shared_wal_stress_30_seeds() {
         // 30-seed stress test for SharedWAL (aligned with other WAL modes).
         let mut total_violations = 0usize;
@@ -1176,7 +1415,7 @@ mod tests {
                 crash_node_index: (seed as usize) % 3,
                 inject_storage_faults: seed % 2 == 0,
                 storage_fault_config: if seed % 2 == 0 {
-                    Some(FaultConfig::flaky())
+                    Some(runtime_storage_faults())
                 } else {
                     None
                 },
@@ -1196,7 +1435,10 @@ mod tests {
             total_commits += result.property_result.total_committed_entries;
         }
 
-        assert_eq!(total_violations, 0, "No violations across SharedWAL 30-seed stress");
+        assert_eq!(
+            total_violations, 0,
+            "No violations across SharedWAL 30-seed stress"
+        );
         println!(
             "SharedWAL stress: 30 seeds completed, {} produces, {} commits, 0 violations",
             total_produces, total_commits
@@ -1204,7 +1446,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Run manually with: cargo test shared_wal_stress_500 -- --ignored
+    #[ignore = "long-running stress test; run manually with --ignored"]
     fn test_helix_service_shared_wal_stress_500_seeds() {
         // Comprehensive 500-seed stress test for SharedWAL.
         let mut total_violations = 0usize;
@@ -1222,7 +1464,7 @@ mod tests {
                 crash_node_index: (seed as usize) % 3,
                 inject_storage_faults: seed % 2 == 0,
                 storage_fault_config: if seed % 2 == 0 {
-                    Some(FaultConfig::flaky())
+                    Some(runtime_storage_faults())
                 } else {
                     None
                 },
@@ -1237,7 +1479,8 @@ mod tests {
             let result = run_basic_simulation(&config);
 
             if seed % 50 == 0 {
-                println!("SharedWAL seed {}: produces={}, commits={}, violations={}",
+                println!(
+                    "SharedWAL seed {}: produces={}, commits={}, violations={}",
                     seed,
                     result.property_result.total_produce_success,
                     result.property_result.total_committed_entries,
@@ -1250,8 +1493,10 @@ mod tests {
             total_commits += result.property_result.total_committed_entries;
 
             assert_eq!(
-                result.property_result.violations.len(), 0,
-                "SharedWAL seed {} had violations", seed
+                result.property_result.violations.len(),
+                0,
+                "SharedWAL seed {} had violations",
+                seed
             );
         }
 
@@ -1263,6 +1508,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_shared_wal_different_pool_sizes() {
         // Test different SharedWAL pool sizes (K=1, 2, 4, 8).
         for wal_count in [1, 2, 4, 8] {
@@ -1279,11 +1528,7 @@ mod tests {
             };
 
             let result = run_basic_simulation(&config);
-            assert_simulation_ok(
-                &result,
-                &format!("shared_wal_pool_size_{}", wal_count),
-                500,
-            );
+            assert_simulation_ok(&result, &format!("shared_wal_pool_size_{}", wal_count), 500);
         }
     }
 
@@ -1294,6 +1539,10 @@ mod tests {
     // the node hosting them crashes, and that no data is lost.
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_multi_partition_leader_failure() {
         // 3-node cluster with client traffic to multiple partitions.
         // Crash node 0 (likely leader for some partitions) mid-test.
@@ -1303,12 +1552,12 @@ mod tests {
             seed: 8888,
             max_time_secs: 60,
             inject_crashes: true,
-            crash_time_ms: 15000,    // Crash at 15s
-            recover_time_ms: 35000,  // Recover at 35s
-            crash_node_index: 0,     // Crash node 0
+            crash_time_ms: 15000,   // Crash at 15s
+            recover_time_ms: 35000, // Recover at 35s
+            crash_node_index: 0,    // Crash node 0
             inject_client_traffic: true,
             produce_interval_ms: 80,
-            produce_count: 500,      // Many produces across partitions
+            produce_count: 500, // Many produces across partitions
             ..Default::default()
         };
 
@@ -1359,6 +1608,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_multi_partition_leader_failure_stress() {
         // Multi-seed stress test for partition leader failure.
         let mut total_violations = 0usize;
@@ -1372,9 +1625,9 @@ mod tests {
                 seed,
                 max_time_secs: 60,
                 inject_crashes: true,
-                crash_time_ms: 12000 + (seed % 5) * 2000,  // Vary crash time
+                crash_time_ms: 12000 + (seed % 5) * 2000, // Vary crash time
                 recover_time_ms: 35000,
-                crash_node_index: (seed as usize) % 3,     // Rotate crash node
+                crash_node_index: (seed as usize) % 3, // Rotate crash node
                 inject_client_traffic: true,
                 produce_interval_ms: 100,
                 produce_count: 400,
@@ -1390,7 +1643,8 @@ mod tests {
 
             total_violations += result.property_result.violations.len();
             total_client_acks += result.property_result.total_client_acks;
-            total_data_integrity_violations += result.property_result.data_integrity_violations.len();
+            total_data_integrity_violations +=
+                result.property_result.data_integrity_violations.len();
             total_consumer_violations += result.property_result.consumer_violations.len();
         }
 
@@ -1413,25 +1667,32 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_multi_partition_cascading_failure() {
         // Test cascading failure: crash one node, then partition another.
         // This exercises more complex failure scenarios.
+        // Uses SharedWAL since that's the preferred production setting.
         let config = HelixTestConfig {
             node_count: 3,
             seed: 9999,
             max_time_secs: 90,
             inject_crashes: true,
-            crash_time_ms: 15000,    // Crash node at 15s
-            recover_time_ms: 50000,  // Recover at 50s
+            crash_time_ms: 15000,   // Crash node at 15s
+            recover_time_ms: 50000, // Recover at 50s
             crash_node_index: 1,
             inject_partition: true,
             partition_time_ms: 25000, // Partition at 25s (while node is crashed)
             heal_time_ms: 45000,      // Heal partition at 45s
             inject_storage_faults: true,
-            storage_fault_config: Some(FaultConfig::flaky()),
+            storage_fault_config: Some(runtime_storage_faults()),
             inject_client_traffic: true,
             produce_interval_ms: 100,
             produce_count: 600,
+            wal_mode: WalMode::Shared,
+            shared_wal_count: 4,
             ..Default::default()
         };
 
@@ -1454,6 +1715,10 @@ mod tests {
     // =========================================================================
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_per_partition_basic() {
         let config = HelixTestConfig {
             node_count: 3,
@@ -1471,6 +1736,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_per_partition_with_faults() {
         let config = HelixTestConfig {
             node_count: 3,
@@ -1480,7 +1749,7 @@ mod tests {
             produce_interval_ms: 100,
             produce_count: 300,
             inject_storage_faults: true,
-            storage_fault_config: Some(FaultConfig::flaky()),
+            storage_fault_config: Some(runtime_storage_faults()),
             wal_mode: WalMode::PerPartition,
             ..Default::default()
         };
@@ -1490,6 +1759,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_per_partition_crash_recovery() {
         let config = HelixTestConfig {
             node_count: 3,
@@ -1511,6 +1784,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_per_partition_all_faults() {
         let config = HelixTestConfig {
             node_count: 3,
@@ -1524,7 +1801,7 @@ mod tests {
             recover_time_ms: 40000,
             crash_node_index: 1,
             inject_storage_faults: true,
-            storage_fault_config: Some(FaultConfig::flaky()),
+            storage_fault_config: Some(runtime_storage_faults()),
             wal_mode: WalMode::PerPartition,
             ..Default::default()
         };
@@ -1534,6 +1811,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_per_partition_stress_10_seeds() {
         // Multi-seed stress test for PerPartition WAL.
         let mut total_violations = 0usize;
@@ -1551,7 +1832,7 @@ mod tests {
                 crash_node_index: (seed as usize) % 3,
                 inject_storage_faults: seed % 2 == 0,
                 storage_fault_config: if seed % 2 == 0 {
-                    Some(FaultConfig::flaky())
+                    Some(runtime_storage_faults())
                 } else {
                     None
                 },
@@ -1570,7 +1851,10 @@ mod tests {
             total_commits += result.property_result.total_committed_entries;
         }
 
-        assert_eq!(total_violations, 0, "No violations across durable per-partition stress seeds");
+        assert_eq!(
+            total_violations, 0,
+            "No violations across durable per-partition stress seeds"
+        );
         println!(
             "PerPartition stress: 10 seeds completed, {} produces, {} commits, 0 violations",
             total_produces, total_commits
@@ -1578,6 +1862,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_per_partition_stress_30_seeds() {
         // 30-seed stress test for PerPartition WAL (aligned with other WAL modes).
         let mut total_violations = 0usize;
@@ -1595,7 +1883,7 @@ mod tests {
                 crash_node_index: (seed as usize) % 3,
                 inject_storage_faults: seed % 2 == 0,
                 storage_fault_config: if seed % 2 == 0 {
-                    Some(FaultConfig::flaky())
+                    Some(runtime_storage_faults())
                 } else {
                     None
                 },
@@ -1614,7 +1902,10 @@ mod tests {
             total_commits += result.property_result.total_committed_entries;
         }
 
-        assert_eq!(total_violations, 0, "No violations across durable per-partition 30-seed stress");
+        assert_eq!(
+            total_violations, 0,
+            "No violations across durable per-partition 30-seed stress"
+        );
         println!(
             "PerPartition stress: 30 seeds completed, {} produces, {} commits, 0 violations",
             total_produces, total_commits
@@ -1622,7 +1913,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Run manually with: cargo test per_partition_stress_500 -- --ignored
+    #[ignore = "long-running stress test; run manually with --ignored"]
     fn test_helix_service_per_partition_stress_500_seeds() {
         // Comprehensive 500-seed stress test for PerPartition WAL.
         let mut total_violations = 0usize;
@@ -1640,7 +1931,7 @@ mod tests {
                 crash_node_index: (seed as usize) % 3,
                 inject_storage_faults: seed % 2 == 0,
                 storage_fault_config: if seed % 2 == 0 {
-                    Some(FaultConfig::flaky())
+                    Some(runtime_storage_faults())
                 } else {
                     None
                 },
@@ -1654,7 +1945,8 @@ mod tests {
             let result = run_basic_simulation(&config);
 
             if seed % 50 == 0 {
-                println!("PerPartition seed {}: produces={}, commits={}, violations={}",
+                println!(
+                    "PerPartition seed {}: produces={}, commits={}, violations={}",
                     seed,
                     result.property_result.total_produce_success,
                     result.property_result.total_committed_entries,
@@ -1667,8 +1959,10 @@ mod tests {
             total_commits += result.property_result.total_committed_entries;
 
             assert_eq!(
-                result.property_result.violations.len(), 0,
-                "PerPartition seed {} had violations", seed
+                result.property_result.violations.len(),
+                0,
+                "PerPartition seed {} had violations",
+                seed
             );
         }
 
@@ -1693,6 +1987,10 @@ mod tests {
     // - Property-based validation (data integrity, consumer verification)
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_actor_mode_basic() {
         // Basic actor mode test - verifies the production partition actor works.
         let config = HelixTestConfig {
@@ -1711,6 +2009,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_actor_mode_with_crashes() {
         // Actor mode with process crash/recovery.
         let config = HelixTestConfig {
@@ -1733,18 +2035,25 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_actor_mode_with_storage_faults() {
         // Actor mode with storage faults (torn writes, fsync failures).
+        // Uses SharedWAL since that's the preferred production setting.
         let config = HelixTestConfig {
             node_count: 3,
             seed: 5678,
             max_time_secs: 45,
             inject_storage_faults: true,
-            storage_fault_config: Some(FaultConfig::flaky()),
+            storage_fault_config: Some(runtime_storage_faults()),
             inject_client_traffic: true,
             produce_interval_ms: 100,
             produce_count: 300,
             actor_mode: true,
+            wal_mode: WalMode::Shared,
+            shared_wal_count: 4,
             ..Default::default()
         };
 
@@ -1753,8 +2062,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_actor_mode_with_partition() {
-        // Actor mode with network partition.
+        // Actor mode with network partition using SharedWAL (production-like mode).
         let config = HelixTestConfig {
             node_count: 3,
             seed: 9012,
@@ -1766,6 +2079,8 @@ mod tests {
             produce_interval_ms: 100,
             produce_count: 300,
             actor_mode: true,
+            wal_mode: WalMode::Shared,
+            shared_wal_count: 4,
             ..Default::default()
         };
 
@@ -1774,8 +2089,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_actor_mode_all_faults() {
         // Actor mode with all fault types - comprehensive test.
+        // Uses SharedWAL since that's the preferred production setting.
         let config = HelixTestConfig {
             node_count: 3,
             seed: 3456,
@@ -1788,11 +2108,13 @@ mod tests {
             partition_time_ms: 10000,
             heal_time_ms: 30000,
             inject_storage_faults: true,
-            storage_fault_config: Some(FaultConfig::flaky()),
+            storage_fault_config: Some(runtime_storage_faults()),
             inject_client_traffic: true,
             produce_interval_ms: 80,
             produce_count: 500,
             actor_mode: true,
+            wal_mode: WalMode::Shared,
+            shared_wal_count: 4,
             ..Default::default()
         };
 
@@ -1801,14 +2123,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_actor_mode_stress_10_seeds() {
         // Multi-seed stress test for actor mode.
+        // Uses SharedWAL when storage faults are enabled (required by guard).
         let mut total_violations = 0usize;
         let mut total_produces = 0u64;
         let mut total_commits = 0u64;
         let mut total_client_acks = 0usize;
 
         for seed in 0..10 {
+            let use_storage_faults = seed % 2 == 0;
             let config = HelixTestConfig {
                 node_count: 3,
                 seed,
@@ -1817,9 +2145,9 @@ mod tests {
                 crash_time_ms: 10000,
                 recover_time_ms: 25000,
                 crash_node_index: (seed as usize) % 3,
-                inject_storage_faults: seed % 2 == 0,
-                storage_fault_config: if seed % 2 == 0 {
-                    Some(FaultConfig::flaky())
+                inject_storage_faults: use_storage_faults,
+                storage_fault_config: if use_storage_faults {
+                    Some(runtime_storage_faults())
                 } else {
                     None
                 },
@@ -1827,6 +2155,12 @@ mod tests {
                 produce_interval_ms: 100,
                 produce_count: 300,
                 actor_mode: true,
+                wal_mode: if use_storage_faults {
+                    WalMode::Shared
+                } else {
+                    WalMode::InMemory
+                },
+                shared_wal_count: 4,
                 ..Default::default()
             };
 
@@ -1839,7 +2173,10 @@ mod tests {
             total_client_acks += result.property_result.total_client_acks;
         }
 
-        assert_eq!(total_violations, 0, "No violations across actor mode stress seeds");
+        assert_eq!(
+            total_violations, 0,
+            "No violations across actor mode stress seeds"
+        );
         println!(
             "Actor mode stress: 10 seeds completed, {} produces, {} commits, {} client_acks, 0 violations",
             total_produces, total_commits, total_client_acks
@@ -1847,8 +2184,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_actor_mode_stress_30_seeds() {
         // 30-seed stress test for actor mode (aligned with other modes).
+        // Uses SharedWAL when storage faults are enabled (required by guard).
         let mut total_violations = 0usize;
         let mut total_produces = 0u64;
         let mut total_commits = 0u64;
@@ -1856,6 +2198,7 @@ mod tests {
         let mut total_consumer_violations = 0usize;
 
         for seed in 0..30 {
+            let use_storage_faults = seed % 2 == 0;
             let config = HelixTestConfig {
                 node_count: 3,
                 seed,
@@ -1867,9 +2210,9 @@ mod tests {
                 inject_partition: seed % 5 == 0,
                 partition_time_ms: 8000,
                 heal_time_ms: 22000,
-                inject_storage_faults: seed % 2 == 0,
-                storage_fault_config: if seed % 2 == 0 {
-                    Some(FaultConfig::flaky())
+                inject_storage_faults: use_storage_faults,
+                storage_fault_config: if use_storage_faults {
+                    Some(runtime_storage_faults())
                 } else {
                     None
                 },
@@ -1877,6 +2220,12 @@ mod tests {
                 produce_interval_ms: 100,
                 produce_count: 300,
                 actor_mode: true,
+                wal_mode: if use_storage_faults {
+                    WalMode::Shared
+                } else {
+                    WalMode::InMemory
+                },
+                shared_wal_count: 4,
                 ..Default::default()
             };
 
@@ -1890,9 +2239,18 @@ mod tests {
             total_consumer_violations += result.property_result.consumer_violations.len();
         }
 
-        assert_eq!(total_violations, 0, "No consensus violations across actor mode 30-seed stress");
-        assert_eq!(total_integrity_violations, 0, "No data integrity violations across actor mode stress");
-        assert_eq!(total_consumer_violations, 0, "No consumer violations (data loss) across actor mode stress");
+        assert_eq!(
+            total_violations, 0,
+            "No consensus violations across actor mode 30-seed stress"
+        );
+        assert_eq!(
+            total_integrity_violations, 0,
+            "No data integrity violations across actor mode stress"
+        );
+        assert_eq!(
+            total_consumer_violations, 0,
+            "No consumer violations (data loss) across actor mode stress"
+        );
         println!(
             "Actor mode stress: 30 seeds completed, {} produces, {} commits, 0 violations",
             total_produces, total_commits
@@ -1900,9 +2258,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Run manually with: cargo test actor_mode_stress_100 -- --ignored
+    #[ignore = "long-running stress test; run manually with --ignored"]
     fn test_helix_service_actor_mode_stress_100_seeds() {
         // Comprehensive 100-seed stress test for actor mode.
+        // Uses SharedWAL when storage faults are enabled (required by guard).
         let mut total_violations = 0usize;
         let mut total_produces = 0u64;
         let mut total_commits = 0u64;
@@ -1911,6 +2270,7 @@ mod tests {
         let mut failures = Vec::new();
 
         for seed in 0..100 {
+            let use_storage_faults = seed % 4 == 0;
             let config = HelixTestConfig {
                 node_count: 3,
                 seed,
@@ -1922,9 +2282,9 @@ mod tests {
                 inject_partition: seed % 5 == 0,
                 partition_time_ms: 10000,
                 heal_time_ms: 30000,
-                inject_storage_faults: seed % 4 == 0,
-                storage_fault_config: if seed % 4 == 0 {
-                    Some(FaultConfig::flaky())
+                inject_storage_faults: use_storage_faults,
+                storage_fault_config: if use_storage_faults {
+                    Some(runtime_storage_faults())
                 } else {
                     None
                 },
@@ -1932,6 +2292,12 @@ mod tests {
                 produce_interval_ms: 80,
                 produce_count: 600,
                 actor_mode: true,
+                wal_mode: if use_storage_faults {
+                    WalMode::Shared
+                } else {
+                    WalMode::InMemory
+                },
+                shared_wal_count: 4,
                 ..Default::default()
             };
 
@@ -1960,10 +2326,23 @@ mod tests {
             total_consumer_violations += result.property_result.consumer_violations.len();
         }
 
-        assert!(failures.is_empty(), "Actor mode seeds failed: {:?}", failures);
-        assert_eq!(total_violations, 0, "No consensus violations across actor mode 100-seed stress");
-        assert_eq!(total_integrity_violations, 0, "No data integrity violations");
-        assert_eq!(total_consumer_violations, 0, "No consumer violations (data loss)");
+        assert!(
+            failures.is_empty(),
+            "Actor mode seeds failed: {:?}",
+            failures
+        );
+        assert_eq!(
+            total_violations, 0,
+            "No consensus violations across actor mode 100-seed stress"
+        );
+        assert_eq!(
+            total_integrity_violations, 0,
+            "No data integrity violations"
+        );
+        assert_eq!(
+            total_consumer_violations, 0,
+            "No consumer violations (data loss)"
+        );
 
         println!(
             "Actor mode stress: 100 seeds completed, {} produces, {} commits, 0 violations",
@@ -1972,6 +2351,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_actor_mode_with_shared_wal() {
         // Actor mode with SharedWAL - tests production WAL architecture.
         let config = HelixTestConfig {
@@ -1983,7 +2366,7 @@ mod tests {
             recover_time_ms: 28000,
             crash_node_index: 0,
             inject_storage_faults: true,
-            storage_fault_config: Some(FaultConfig::flaky()),
+            storage_fault_config: Some(runtime_storage_faults()),
             inject_client_traffic: true,
             produce_interval_ms: 100,
             produce_count: 300,
@@ -1998,6 +2381,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "E2E DST tests are slow in debug; run: cargo test --release -p helix-tests --lib helix_service_dst"
+    )]
     fn test_helix_service_actor_mode_leader_failure() {
         // Actor mode with leader crash - verifies partition failover.
         let config = HelixTestConfig {
@@ -2043,5 +2430,4 @@ mod tests {
             "Should have no consumer violations (data loss)"
         );
     }
-
 }

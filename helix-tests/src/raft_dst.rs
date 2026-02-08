@@ -92,8 +92,8 @@ fn create_simulation(config: &SimulationTestConfig) -> (DiscreteSimulationEngine
     // With TICK_INTERVAL_US=10_000 (10ms), this is 50-100ms for elections.
     for (&node_id, &actor_id) in node_ids.iter().zip(actor_ids.iter()) {
         let raft_config = RaftConfig::new(node_id, node_ids.clone())
-            .with_tick_config(5, 1)  // election_tick=5, heartbeat_tick=1
-            .with_random_seed(config.seed + node_id.get());  // Per-node seed for determinism
+            .with_tick_config(5, 1) // election_tick=5, heartbeat_tick=1
+            .with_random_seed(config.seed + node_id.get()); // Per-node seed for determinism
         let actor = RaftActor::new(actor_id, raft_config, node_to_actor.clone());
         engine.register_actor(Box::new(actor));
     }
@@ -112,17 +112,13 @@ fn run_simulation_test(config: &SimulationTestConfig) -> bool {
         // Schedule process crash.
         engine.schedule_after(
             Duration::from_millis(config.crash_time_ms),
-            EventKind::ProcessCrash {
-                actor: crash_actor,
-            },
+            EventKind::ProcessCrash { actor: crash_actor },
         );
 
         // Schedule process recovery.
         engine.schedule_after(
             Duration::from_millis(config.recover_time_ms),
-            EventKind::ProcessRecover {
-                actor: crash_actor,
-            },
+            EventKind::ProcessRecover { actor: crash_actor },
         );
 
         tracing::info!(
@@ -204,9 +200,9 @@ fn test_simulation_leader_crash_recovery() {
         let config = SimulationTestConfig {
             seed,
             inject_faults: true,
-            crash_time_ms: 3000,   // Crash after 3 seconds (leader likely elected).
+            crash_time_ms: 3000, // Crash after 3 seconds (leader likely elected).
             recover_time_ms: 7000, // Recover after 7 seconds.
-            crash_node_index: 0,   // May or may not be leader.
+            crash_node_index: 0, // May or may not be leader.
             ..Default::default()
         };
         assert!(
@@ -359,7 +355,10 @@ fn test_property_checker_with_simulation() {
         if step_count % CHECK_INTERVAL == 0 {
             // Property checking would go here.
             // For now, we just track that we're progressing.
-            assert!(property_checker.is_valid(), "Property violation at step {step_count}");
+            assert!(
+                property_checker.is_valid(),
+                "Property violation at step {step_count}"
+            );
         }
     }
 
@@ -735,8 +734,8 @@ fn create_simulation_with_network_state(
     // Use tick-based timing.
     for (&node_id, &actor_id) in node_ids.iter().zip(actor_ids.iter()) {
         let raft_config = RaftConfig::new(node_id, node_ids.clone())
-            .with_tick_config(5, 1)  // election_tick=5, heartbeat_tick=1
-            .with_random_seed(seed + node_id.get());  // Per-node seed for determinism
+            .with_tick_config(5, 1) // election_tick=5, heartbeat_tick=1
+            .with_random_seed(seed + node_id.get()); // Per-node seed for determinism
         let mut actor = RaftActor::new(actor_id, raft_config, node_to_actor.clone());
         actor.set_network_state(Arc::clone(&network_state));
         engine.register_actor(Box::new(actor));
@@ -749,8 +748,7 @@ fn create_simulation_with_network_state(
 fn test_simulation_network_partition_minority() {
     // Partition one node from the other two. The majority should still elect a leader.
     let seed = 42;
-    let (mut engine, actor_ids, network_state) =
-        create_simulation_with_network_state(seed, 3, 15);
+    let (mut engine, actor_ids, network_state) = create_simulation_with_network_state(seed, 3, 15);
 
     // After 2 seconds, partition node 1 from nodes 2 and 3.
     // Node 1 is isolated, nodes 2 and 3 can communicate.
@@ -849,8 +847,7 @@ fn test_simulation_network_partition_leader_isolated() {
 fn test_simulation_network_partition_with_client_requests() {
     // Test client requests during partition - they should fail on isolated nodes.
     let seed = 42;
-    let (mut engine, actor_ids, _network_state) =
-        create_simulation_with_network_state(seed, 3, 20);
+    let (mut engine, actor_ids, _network_state) = create_simulation_with_network_state(seed, 3, 20);
 
     // Partition node 0 at 3s.
     engine.schedule_after(
@@ -988,8 +985,7 @@ fn test_simulation_split_brain_scenario() {
     // - Both groups try to elect leaders
     // - Only [2,3,4] should succeed (majority)
     let seed = 12345;
-    let (mut engine, actor_ids, _network_state) =
-        create_simulation_with_network_state(seed, 5, 20);
+    let (mut engine, actor_ids, _network_state) = create_simulation_with_network_state(seed, 5, 20);
 
     // Create partition: [0,1] <-> [2,3,4]
     let minority = &actor_ids[0..2];
@@ -1070,8 +1066,8 @@ fn create_verified_simulation(
     // Use tick-based timing.
     for (&node_id, &actor_id) in node_ids.iter().zip(actor_ids.iter()) {
         let raft_config = RaftConfig::new(node_id, node_ids.clone())
-            .with_tick_config(5, 1)  // election_tick=5, heartbeat_tick=1
-            .with_random_seed(seed + node_id.get());  // Per-node seed for determinism
+            .with_tick_config(5, 1) // election_tick=5, heartbeat_tick=1
+            .with_random_seed(seed + node_id.get()); // Per-node seed for determinism
         let mut actor = RaftActor::new(actor_id, raft_config, node_to_actor.clone());
         actor.set_network_state(Arc::clone(&network_state));
         actor.set_property_state(Arc::clone(&property_state));
@@ -1115,9 +1111,7 @@ fn test_verified_basic_election() {
     let state = property_state.lock().unwrap();
     println!(
         "Verified basic election: {} events, {} state updates, leaders by term: {:?}",
-        result.stats.events_processed,
-        state.events_processed,
-        state.leaders_by_term
+        result.stats.events_processed, state.events_processed, state.leaders_by_term
     );
 }
 
@@ -1243,8 +1237,7 @@ fn test_verified_split_brain_scenario() {
     let state = property_state.lock().unwrap();
     println!(
         "Verified split-brain: {} events, leaders by term: {:?}",
-        result.stats.events_processed,
-        state.leaders_by_term
+        result.stats.events_processed, state.leaders_by_term
     );
 }
 
@@ -1277,8 +1270,7 @@ fn test_verified_sustained_client_load() {
     let total_applied: usize = state.applied_entries.values().map(Vec::len).sum();
     println!(
         "Verified sustained load: {} events, {} entries applied",
-        result.stats.events_processed,
-        total_applied
+        result.stats.events_processed, total_applied
     );
 }
 
@@ -1382,8 +1374,7 @@ fn test_verified_load_with_partition() {
     let total_applied: usize = state.applied_entries.values().map(Vec::len).sum();
     println!(
         "Verified load with partition: {} events, {} applied",
-        result.stats.events_processed,
-        total_applied
+        result.stats.events_processed, total_applied
     );
 }
 
