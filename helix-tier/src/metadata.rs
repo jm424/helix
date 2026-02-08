@@ -492,7 +492,9 @@ impl InMemoryMetadataStore {
     ///
     /// Panics if the mutex is poisoned.
     pub fn fault_config(&self) -> std::sync::MutexGuard<'_, MetadataStoreFaultConfig> {
-        self.fault_config.lock().expect("fault config lock poisoned")
+        self.fault_config
+            .lock()
+            .expect("fault config lock poisoned")
     }
 
     /// Deterministic RNG based on seed and counter.
@@ -503,8 +505,13 @@ impl InMemoryMetadataStore {
         if rate >= 1.0 {
             return true;
         }
-        let counter = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let hash = self.seed.wrapping_add(counter).wrapping_mul(0x517c_c1b7_2722_0a95);
+        let counter = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let hash = self
+            .seed
+            .wrapping_add(counter)
+            .wrapping_mul(0x517c_c1b7_2722_0a95);
         #[allow(clippy::cast_precision_loss)]
         let normalized = (hash as f64) / (u64::MAX as f64);
         normalized < rate
@@ -658,7 +665,11 @@ impl MetadataStore for InMemoryMetadataStore {
         remote_key: ObjectKey,
     ) -> TierResult<()> {
         // Check for fault injection.
-        let fail_rate = self.fault_config.lock().expect("lock").complete_upload_fail_rate;
+        let fail_rate = self
+            .fault_config
+            .lock()
+            .expect("lock")
+            .complete_upload_fail_rate;
         if self.should_inject_fault(fail_rate) {
             return Err(crate::error::TierError::Io {
                 operation: "complete_upload",
@@ -691,7 +702,11 @@ impl MetadataStore for InMemoryMetadataStore {
 
     async fn abort_upload(&self, segment_id: SegmentId) -> TierResult<()> {
         // Check for fault injection.
-        let fail_rate = self.fault_config.lock().expect("lock").abort_upload_fail_rate;
+        let fail_rate = self
+            .fault_config
+            .lock()
+            .expect("lock")
+            .abort_upload_fail_rate;
         if self.should_inject_fault(fail_rate) {
             return Err(crate::error::TierError::Io {
                 operation: "abort_upload",
@@ -815,12 +830,7 @@ mod tests {
         assert_eq!(store.segment_count(), 0);
 
         // Set metadata.
-        let meta = SegmentMetadata::new(
-            segment_id,
-            test_topic_id(1),
-            test_partition_id(0),
-            0,
-        );
+        let meta = SegmentMetadata::new(segment_id, test_topic_id(1), test_partition_id(0), 0);
         store.set(meta.clone()).await.unwrap();
 
         // Get metadata.
@@ -943,12 +953,7 @@ mod tests {
         let store2 = store.clone();
 
         let segment_id = test_segment_id(1);
-        let meta = SegmentMetadata::new(
-            segment_id,
-            test_topic_id(1),
-            test_partition_id(0),
-            0,
-        );
+        let meta = SegmentMetadata::new(segment_id, test_topic_id(1), test_partition_id(0), 0);
 
         // Set via store.
         store.set(meta).await.unwrap();

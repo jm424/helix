@@ -261,7 +261,10 @@ impl<S: ObjectStorage, M: MetadataStore> TieringManager<S, M> {
 
                 // Success: complete the upload.
                 self.metadata.complete_upload(segment_id, key).await?;
-                info!(segment_id = segment_id.get(), "Segment uploaded successfully");
+                info!(
+                    segment_id = segment_id.get(),
+                    "Segment uploaded successfully"
+                );
                 Ok(())
             }
             Err(e) => {
@@ -303,9 +306,12 @@ impl<S: ObjectStorage, M: MetadataStore> TieringManager<S, M> {
         let metadata = self.get_metadata_or_error(segment_id).await?;
 
         // Precondition: segment must have a remote key.
-        let key = metadata.remote_key.as_ref().ok_or_else(|| TierError::NotFound {
-            key: format!("segment-{segment_id} has no remote key"),
-        })?;
+        let key = metadata
+            .remote_key
+            .as_ref()
+            .ok_or_else(|| TierError::NotFound {
+                key: format!("segment-{segment_id} has no remote key"),
+            })?;
 
         debug!(
             segment_id = segment_id.get(),
@@ -639,10 +645,7 @@ impl<S: ObjectStorage, M: MetadataStore, R: SegmentReader> IntegratedTieringMana
     /// # Errors
     ///
     /// Returns an error if metadata operations fail.
-    pub async fn evict_with_progress(
-        &self,
-        safe_offset: Option<Offset>,
-    ) -> TierResult<u32> {
+    pub async fn evict_with_progress(&self, safe_offset: Option<Offset>) -> TierResult<u32> {
         let Some(safe) = safe_offset else {
             // No consumer tracking yet - don't evict anything.
             return Ok(0);
@@ -880,7 +883,10 @@ mod tests {
         // Safe eviction offset = 150 means segments with end_offset < 150 can be evicted.
         let safe_offset = Offset::new(150);
 
-        let evicted = manager.evict_with_progress(Some(safe_offset)).await.unwrap();
+        let evicted = manager
+            .evict_with_progress(Some(safe_offset))
+            .await
+            .unwrap();
 
         // Only segment 1 (end_offset=99 < 150) should be evicted.
         // Segment 2 (end_offset=199 >= 150) should NOT be evicted.
@@ -892,9 +898,21 @@ mod tests {
         let loc2 = manager.get_location(test_segment_id(2)).await.unwrap();
         let loc3 = manager.get_location(test_segment_id(3)).await.unwrap();
 
-        assert_eq!(loc1, Some(SegmentLocation::Remote), "Segment 1 should be remote-only");
-        assert_eq!(loc2, Some(SegmentLocation::Both), "Segment 2 should still be local+remote");
-        assert_eq!(loc3, Some(SegmentLocation::Both), "Segment 3 should still be local+remote");
+        assert_eq!(
+            loc1,
+            Some(SegmentLocation::Remote),
+            "Segment 1 should be remote-only"
+        );
+        assert_eq!(
+            loc2,
+            Some(SegmentLocation::Both),
+            "Segment 2 should still be local+remote"
+        );
+        assert_eq!(
+            loc3,
+            Some(SegmentLocation::Both),
+            "Segment 3 should still be local+remote"
+        );
     }
 
     #[tokio::test]

@@ -72,20 +72,44 @@ macro_rules! define_id {
 }
 
 // Node and replica identification.
-define_id!(NodeId, "node", "Unique identifier for a Helix node in the cluster.");
-define_id!(ReplicaId, "replica", "Unique identifier for a replica within a Raft group.");
+define_id!(
+    NodeId,
+    "node",
+    "Unique identifier for a Helix node in the cluster."
+);
+define_id!(
+    ReplicaId,
+    "replica",
+    "Unique identifier for a replica within a Raft group."
+);
 
 // Topic and partition identification.
 define_id!(TopicId, "topic", "Unique identifier for a topic (stream).");
-define_id!(PartitionId, "partition", "Unique identifier for a partition within a topic.");
+define_id!(
+    PartitionId,
+    "partition",
+    "Unique identifier for a partition within a topic."
+);
 
 // Consumer tracking.
-define_id!(ConsumerGroupId, "cg", "Unique identifier for a consumer group.");
-define_id!(ConsumerId, "consumer", "Unique identifier for a consumer within a group.");
+define_id!(
+    ConsumerGroupId,
+    "cg",
+    "Unique identifier for a consumer group."
+);
+define_id!(
+    ConsumerId,
+    "consumer",
+    "Unique identifier for a consumer within a group."
+);
 define_id!(LeaseId, "lease", "Unique identifier for a batch lease.");
 
 // Batch and record identification.
-define_id!(BatchId, "batch", "Unique identifier for a batch of records.");
+define_id!(
+    BatchId,
+    "batch",
+    "Unique identifier for a batch of records."
+);
 
 // Raft consensus.
 define_id!(TermId, "term", "Raft term number for leader election.");
@@ -93,10 +117,18 @@ define_id!(LogIndex, "idx", "Index into the Raft log.");
 define_id!(GroupId, "group", "Unique identifier for a Raft group.");
 
 // Shard management.
-define_id!(TransferId, "xfer", "Unique identifier for a shard transfer operation.");
+define_id!(
+    TransferId,
+    "xfer",
+    "Unique identifier for a shard transfer operation."
+);
 
 // Idempotent producer support.
-define_id!(ProducerId, "pid", "Unique identifier for an idempotent producer.");
+define_id!(
+    ProducerId,
+    "pid",
+    "Unique identifier for an idempotent producer."
+);
 
 /// Producer epoch for fencing stale producer instances.
 ///

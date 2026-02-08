@@ -153,8 +153,8 @@ impl S3Config {
     ///
     /// Returns an error if `HELIX_S3_BUCKET` is not set.
     pub fn from_env() -> Result<Self, S3ConfigError> {
-        let bucket =
-            env::var("HELIX_S3_BUCKET").map_err(|_| S3ConfigError::MissingEnv("HELIX_S3_BUCKET"))?;
+        let bucket = env::var("HELIX_S3_BUCKET")
+            .map_err(|_| S3ConfigError::MissingEnv("HELIX_S3_BUCKET"))?;
 
         Ok(Self {
             bucket,
@@ -498,7 +498,10 @@ mod tests {
 
         assert_eq!(config.bucket, "my-bucket");
         assert_eq!(config.key_prefix, "custom/prefix/");
-        assert_eq!(config.endpoint_url, Some("http://localhost:4566".to_string()));
+        assert_eq!(
+            config.endpoint_url,
+            Some("http://localhost:4566".to_string())
+        );
         assert!(config.force_path_style);
         assert_eq!(config.region, Some("us-west-2".to_string()));
         assert_eq!(config.storage_class, S3StorageClass::StandardIa);

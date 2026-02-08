@@ -213,12 +213,13 @@ impl ObjectStorage for FilesystemObjectStorage {
 
         // Write data to temp file.
         let write_result = async {
-            let mut file = tokio::fs::File::create(&temp_path)
-                .await
-                .map_err(|e| TierError::UploadFailed {
-                    key: key.to_string(),
-                    message: format!("failed to create temp file: {e}"),
-                })?;
+            let mut file =
+                tokio::fs::File::create(&temp_path)
+                    .await
+                    .map_err(|e| TierError::UploadFailed {
+                        key: key.to_string(),
+                        message: format!("failed to create temp file: {e}"),
+                    })?;
 
             tokio::io::AsyncWriteExt::write_all(&mut file, &data)
                 .await

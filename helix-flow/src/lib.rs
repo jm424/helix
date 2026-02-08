@@ -73,7 +73,5 @@ pub mod token_bucket;
 pub use aimd::{AimdConfig, AimdController, AimdState, AimdStats, IntervalMetrics};
 pub use controller::{FlowController, FlowControllerConfig, FlowControllerStats, PendingOperation};
 pub use error::{FlowError, FlowResult};
-pub use fair_queue::{
-    FairQueueConfig, FairQueueStats, IoClass, IoOperation, WeightedFairQueue,
-};
+pub use fair_queue::{FairQueueConfig, FairQueueStats, IoClass, IoOperation, WeightedFairQueue};
 pub use token_bucket::{TokenBucket, TokenBucketConfig};

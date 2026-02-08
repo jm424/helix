@@ -180,8 +180,7 @@ impl<T> FlowController<T> {
         // Check per-stream rate limit.
         // First ensure the stream exists and get available tokens.
         let stream_available = {
-            let stream_limiter =
-                self.get_or_create_stream_limiter(stream_id, current_time_us)?;
+            let stream_limiter = self.get_or_create_stream_limiter(stream_id, current_time_us)?;
             stream_limiter.refill(current_time_us);
             stream_limiter.available_tokens()
         };
@@ -198,7 +197,10 @@ impl<T> FlowController<T> {
         // Consume tokens.
         self.global_limiter
             .try_consume(size_bytes, current_time_us)?;
-        let stream_limiter = self.stream_limiters.get_mut(&stream_id).expect("just created");
+        let stream_limiter = self
+            .stream_limiters
+            .get_mut(&stream_id)
+            .expect("just created");
         stream_limiter.try_consume(size_bytes, current_time_us)?;
 
         // Queue for I/O scheduling.
@@ -279,7 +281,10 @@ impl<T> FlowController<T> {
             let bucket = TokenBucket::new(&self.config.token_bucket, current_time_us);
             self.stream_limiters.insert(stream_id, bucket);
         }
-        Ok(self.stream_limiters.get_mut(&stream_id).expect("just inserted"))
+        Ok(self
+            .stream_limiters
+            .get_mut(&stream_id)
+            .expect("just inserted"))
     }
 
     /// Returns whether there are pending operations.
@@ -385,9 +390,7 @@ mod tests {
         let config = FlowControllerConfig::for_testing();
         let mut controller: FlowController<&str> = FlowController::new(config, 0);
 
-        controller
-            .submit(1, IoClass::Write, 100, "op1", 0)
-            .unwrap();
+        controller.submit(1, IoClass::Write, 100, "op1", 0).unwrap();
         controller
             .submit(2, IoClass::LiveRead, 100, "op2", 0)
             .unwrap();
@@ -506,9 +509,7 @@ mod tests {
         let mut controller: FlowController<i32> = FlowController::new(config, 0);
 
         for i in 0..5 {
-            controller
-                .submit(1, IoClass::Tiering, 10, i, 0)
-                .unwrap();
+            controller.submit(1, IoClass::Tiering, 10, i, 0).unwrap();
         }
 
         let drained = controller.drain_class(IoClass::Tiering);
@@ -538,8 +539,10 @@ mod tests {
         let op2 = controller.next_operation().unwrap();
 
         // Both should be returned in some order.
-        assert!((op1.payload == "write" && op2.payload == "tier")
-            || (op1.payload == "tier" && op2.payload == "write"));
+        assert!(
+            (op1.payload == "write" && op2.payload == "tier")
+                || (op1.payload == "tier" && op2.payload == "write")
+        );
     }
 
     #[test]
@@ -571,7 +574,9 @@ mod tests {
         assert_eq!(stats_after.active_streams, 0);
 
         // Should be able to submit again as if fresh.
-        controller.submit(1, IoClass::Write, 100, 1, 2_000_000).unwrap();
+        controller
+            .submit(1, IoClass::Write, 100, 1, 2_000_000)
+            .unwrap();
         assert_eq!(controller.stream_count(), 1);
     }
 
@@ -661,10 +666,13 @@ mod tests {
         // Now global has 10, stream also has 10 (same config).
         // Try 20 - should fail on global limit (10 available).
         let result2 = controller2.submit(1, IoClass::Write, 20, 2, 0);
-        assert!(matches!(result2, Err(FlowError::RateLimitExceeded {
-            tokens_available: 10,
-            ..
-        })));
+        assert!(matches!(
+            result2,
+            Err(FlowError::RateLimitExceeded {
+                tokens_available: 10,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -683,10 +691,13 @@ mod tests {
         // Global now has 20 left. Each stream has 60 left.
         // Stream 3 tries to consume 30 - should fail on global (only 20 available).
         let result = controller.submit(3, IoClass::Write, 30, 3, 0);
-        assert!(matches!(result, Err(FlowError::RateLimitExceeded {
-            tokens_available: 20,
-            ..
-        })));
+        assert!(matches!(
+            result,
+            Err(FlowError::RateLimitExceeded {
+                tokens_available: 20,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -706,10 +717,14 @@ mod tests {
         assert!(matches!(result, Err(FlowError::RateLimitExceeded { .. })));
 
         // Wait 0.5 seconds (500_000 us) - should refill 50 tokens.
-        controller.submit(1, IoClass::Write, 50, 3, 500_000).unwrap();
+        controller
+            .submit(1, IoClass::Write, 50, 3, 500_000)
+            .unwrap();
 
         // Wait another 0.5 seconds - refill another 50 tokens.
-        controller.submit(1, IoClass::Write, 50, 4, 1_000_000).unwrap();
+        controller
+            .submit(1, IoClass::Write, 50, 4, 1_000_000)
+            .unwrap();
     }
 
     #[test]
@@ -758,7 +773,9 @@ mod tests {
         // Submit one of each I/O class.
         controller.submit(1, IoClass::Write, 10, 1, 0).unwrap();
         controller.submit(2, IoClass::LiveRead, 10, 2, 0).unwrap();
-        controller.submit(3, IoClass::BackfillRead, 10, 3, 0).unwrap();
+        controller
+            .submit(3, IoClass::BackfillRead, 10, 3, 0)
+            .unwrap();
         controller.submit(4, IoClass::Tiering, 10, 4, 0).unwrap();
 
         assert_eq!(controller.pending_count(), 4);

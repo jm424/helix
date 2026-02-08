@@ -127,7 +127,10 @@ async fn test_s3_overwrite() {
     storage.put(&key, data1).await.expect("put v1 failed");
 
     // Overwrite with second version.
-    storage.put(&key, data2.clone()).await.expect("put v2 failed");
+    storage
+        .put(&key, data2.clone())
+        .await
+        .expect("put v2 failed");
 
     // Should get second version.
     let retrieved = storage.get(&key).await.expect("get failed");

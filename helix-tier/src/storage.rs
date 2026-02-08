@@ -342,7 +342,9 @@ impl SimulatedObjectStorage {
     ///
     /// Panics if the mutex is poisoned.
     pub fn fault_config(&self) -> std::sync::MutexGuard<'_, ObjectStorageFaultConfig> {
-        self.fault_config.lock().expect("fault config lock poisoned")
+        self.fault_config
+            .lock()
+            .expect("fault config lock poisoned")
     }
 
     /// Gets the raw object content for inspection in tests.
@@ -416,7 +418,10 @@ impl SimulatedObjectStorage {
         }
         let counter = self.counter.fetch_add(1, Ordering::Relaxed);
         // Hash seed+counter together for proper pseudo-random distribution.
-        let hash = self.seed.wrapping_add(counter).wrapping_mul(0x5851_f42d_4c95_7f2d);
+        let hash = self
+            .seed
+            .wrapping_add(counter)
+            .wrapping_mul(0x5851_f42d_4c95_7f2d);
         // Safety: precision loss is acceptable for probability calculation.
         #[allow(clippy::cast_precision_loss)]
         let normalized = (hash as f64) / (u64::MAX as f64);
@@ -430,7 +435,10 @@ impl SimulatedObjectStorage {
         }
         let counter = self.counter.fetch_add(1, Ordering::Relaxed);
         // Different multiplier for independent randomness from fault injection.
-        let hash = self.seed.wrapping_add(counter).wrapping_mul(0xc6a4_a793_5bd1_e995);
+        let hash = self
+            .seed
+            .wrapping_add(counter)
+            .wrapping_mul(0xc6a4_a793_5bd1_e995);
         // Safety: truncation is acceptable since we immediately take modulo len.
         #[allow(clippy::cast_possible_truncation)]
         let idx = hash as usize;
@@ -459,7 +467,10 @@ impl ObjectStorage for SimulatedObjectStorage {
         assert!(!data.is_empty(), "data must not be empty");
 
         // Check for forced failure first.
-        let mut config = self.fault_config.lock().expect("fault config lock poisoned");
+        let mut config = self
+            .fault_config
+            .lock()
+            .expect("fault config lock poisoned");
         if config.force_put_fail {
             config.force_put_fail = false;
             drop(config);
@@ -497,7 +508,10 @@ impl ObjectStorage for SimulatedObjectStorage {
         assert!(!key.as_str().is_empty(), "object key must not be empty");
 
         // Check for forced failure first.
-        let mut config = self.fault_config.lock().expect("fault config lock poisoned");
+        let mut config = self
+            .fault_config
+            .lock()
+            .expect("fault config lock poisoned");
         if config.force_get_fail {
             config.force_get_fail = false;
             drop(config);
@@ -548,7 +562,10 @@ impl ObjectStorage for SimulatedObjectStorage {
         assert!(!key.as_str().is_empty(), "object key must not be empty");
 
         // Check for forced failure first.
-        let mut config = self.fault_config.lock().expect("fault config lock poisoned");
+        let mut config = self
+            .fault_config
+            .lock()
+            .expect("fault config lock poisoned");
         if config.force_delete_fail {
             config.force_delete_fail = false;
             drop(config);
@@ -573,7 +590,10 @@ impl ObjectStorage for SimulatedObjectStorage {
         objects.remove(key);
 
         // TigerStyle: Assert postcondition - key no longer exists.
-        assert!(!objects.contains_key(key), "key should not exist after delete");
+        assert!(
+            !objects.contains_key(key),
+            "key should not exist after delete"
+        );
         Ok(())
     }
 
@@ -599,7 +619,10 @@ impl ObjectStorage for SimulatedObjectStorage {
         assert!(!key.as_str().is_empty(), "object key must not be empty");
 
         // Check for forced failure first.
-        let mut config = self.fault_config.lock().expect("fault config lock poisoned");
+        let mut config = self
+            .fault_config
+            .lock()
+            .expect("fault config lock poisoned");
         if config.force_exists_fail {
             config.force_exists_fail = false;
             drop(config);

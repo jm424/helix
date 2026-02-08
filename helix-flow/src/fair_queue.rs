@@ -31,7 +31,12 @@ impl IoClass {
     /// Returns all I/O classes.
     #[must_use]
     pub const fn all() -> [Self; 4] {
-        [Self::Write, Self::LiveRead, Self::BackfillRead, Self::Tiering]
+        [
+            Self::Write,
+            Self::LiveRead,
+            Self::BackfillRead,
+            Self::Tiering,
+        ]
     }
 
     /// Returns the default weight for this I/O class.
