@@ -27,6 +27,8 @@ use bytes::{Bytes, BytesMut};
 use helix_core::NodeId;
 use helix_raft::multi::GroupMessage;
 use helix_raft::Message;
+// socket2 is only used for production TCP binding (not under MadSim).
+#[cfg(not(madsim))]
 use socket2::{Domain, Socket, Type};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -217,11 +219,7 @@ impl TransportHandle {
     /// Returns an error if the peer is unknown, the send queue is full, or
     /// encoding fails.
     #[allow(clippy::significant_drop_tightening)]
-    pub async fn send_batch(
-        &self,
-        to: NodeId,
-        messages: Vec<GroupMessage>,
-    ) -> TransportResult<()> {
+    pub async fn send_batch(&self, to: NodeId, messages: Vec<GroupMessage>) -> TransportResult<()> {
         // Precondition: can't send to self.
         debug_assert!(to != self.node_id, "cannot send batch to self");
 
@@ -253,7 +251,11 @@ impl TransportHandle {
     /// Returns an error if the peer is unknown, the send queue is full, or
     /// encoding fails.
     #[allow(clippy::significant_drop_tightening)]
-    pub async fn send_heartbeat(&self, to: NodeId, heartbeat: &BrokerHeartbeat) -> TransportResult<()> {
+    pub async fn send_heartbeat(
+        &self,
+        to: NodeId,
+        heartbeat: &BrokerHeartbeat,
+    ) -> TransportResult<()> {
         // Precondition: can't send to self.
         debug_assert!(to != self.node_id, "cannot send heartbeat to self");
 
@@ -342,12 +344,21 @@ impl Transport {
     /// Returns an error if binding fails.
     pub async fn start(self) -> TransportResult<TransportHandle> {
         // Bind the listener with SO_REUSEADDR to allow quick restarts.
+        // Under MadSim, use the async madsim-compatible version.
+        #[cfg(not(madsim))]
         let listener = create_reusable_listener(self.config.listen_addr).map_err(|e| {
             TransportError::BindFailed {
                 addr: self.config.listen_addr,
                 source: e,
             }
         })?;
+        #[cfg(madsim)]
+        let listener = create_reusable_listener_madsim(self.config.listen_addr)
+            .await
+            .map_err(|e| TransportError::BindFailed {
+                addr: self.config.listen_addr,
+                source: e,
+            })?;
 
         info!(
             node_id = self.config.node_id.get(),
@@ -363,7 +374,8 @@ impl Transport {
 
         // Initialize peer connections.
         for peer in &self.config.peers {
-            self.init_peer_connection(peer.node_id, peer.addr.clone()).await;
+            self.init_peer_connection(peer.node_id, peer.addr.clone())
+                .await;
         }
 
         // Spawn the accept loop.
@@ -372,7 +384,13 @@ impl Transport {
         let accept_node_id = self.config.node_id;
 
         tokio::spawn(async move {
-            Self::accept_loop(listener, accept_incoming_tx, accept_shutdown, accept_node_id).await;
+            Self::accept_loop(
+                listener,
+                accept_incoming_tx,
+                accept_shutdown,
+                accept_node_id,
+            )
+            .await;
         });
 
         Ok(handle)
@@ -384,10 +402,13 @@ impl Transport {
 
         {
             let mut peers = self.peers.write().await;
-            peers.insert(peer_id, PeerConnection {
-                addr: addr.clone(),
-                sender: tx,
-            });
+            peers.insert(
+                peer_id,
+                PeerConnection {
+                    addr: addr.clone(),
+                    sender: tx,
+                },
+            );
         }
 
         // Spawn the sender task.
@@ -448,6 +469,7 @@ impl Transport {
         let mut stream: Option<TcpStream> = None;
         let mut reconnect_delay_ms: u64 = 100;
         const MAX_RECONNECT_DELAY_MS: u64 = 10000;
+        let mut pending: Option<OutgoingData> = None;
 
         loop {
             if *shutdown.lock().await {
@@ -459,10 +481,14 @@ impl Transport {
                 break;
             }
 
-            // Wait for data to send.
-            let Some(data) = rx.recv().await else {
-                break; // Channel closed.
-            };
+            // Keep one message "in hand" until it is successfully sent.
+            // This avoids dropping messages on connect/send failures.
+            if pending.is_none() {
+                let Some(data) = rx.recv().await else {
+                    break; // Channel closed.
+                };
+                pending = Some(data);
+            }
 
             // Ensure we have a connection.
             if stream.is_none() {
@@ -494,8 +520,11 @@ impl Transport {
             }
 
             // Send the data.
+            let Some(data) = pending.as_ref() else {
+                continue;
+            };
             if let Some(ref mut s) = stream {
-                let result = match &data {
+                let result = match data {
                     OutgoingData::Single(message) => {
                         let encoded = encode_message(message);
                         match encoded {
@@ -510,7 +539,7 @@ impl Transport {
 
                 match result {
                     Ok(()) => {
-                        let msg_desc = match &data {
+                        let msg_desc = match data {
                             OutgoingData::Single(m) => {
                                 format!("single:{:?}", std::mem::discriminant(m))
                             }
@@ -518,6 +547,8 @@ impl Transport {
                             OutgoingData::Heartbeat(_) => "heartbeat".to_string(),
                         };
                         debug!(peer_id = peer_id.get(), msg = %msg_desc, "Sent data");
+                        pending = None;
+                        reconnect_delay_ms = 100;
                     }
                     Err(e) => {
                         warn!(
@@ -526,6 +557,10 @@ impl Transport {
                             "Failed to send data, reconnecting"
                         );
                         stream = None;
+                        // Retry the same pending message after backoff.
+                        tokio::time::sleep(tokio::time::Duration::from_millis(reconnect_delay_ms))
+                            .await;
+                        reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
                     }
                 }
             }
@@ -623,9 +658,12 @@ impl Transport {
                             break;
                         }
                         Err(e) => {
-                            let hex_dump: String = buffer.iter().take(64)
+                            let hex_dump: String = buffer
+                                .iter()
+                                .take(64)
                                 .map(|b| format!("{b:02x}"))
-                                .collect::<Vec<_>>().join(" ");
+                                .collect::<Vec<_>>()
+                                .join(" ");
                             error!(
                                 error = %e,
                                 buffer_len = buffer.len(),
@@ -659,9 +697,12 @@ impl Transport {
                             break;
                         }
                         Err(e) => {
-                            let hex_dump: String = buffer.iter().take(64)
+                            let hex_dump: String = buffer
+                                .iter()
+                                .take(64)
                                 .map(|b| format!("{b:02x}"))
-                                .collect::<Vec<_>>().join(" ");
+                                .collect::<Vec<_>>()
+                                .join(" ");
                             error!(
                                 error = %e,
                                 buffer_len = buffer.len(),
@@ -695,9 +736,12 @@ impl Transport {
                             break;
                         }
                         Err(e) => {
-                            let hex_dump: String = buffer.iter().take(64)
+                            let hex_dump: String = buffer
+                                .iter()
+                                .take(64)
                                 .map(|b| format!("{b:02x}"))
-                                .collect::<Vec<_>>().join(" ");
+                                .collect::<Vec<_>>()
+                                .join(" ");
                             error!(
                                 error = %e,
                                 buffer_len = buffer.len(),
@@ -728,6 +772,11 @@ impl Transport {
 ///
 /// This allows the transport to bind to a port that is in `TIME_WAIT` state,
 /// which is essential for fast restarts during testing.
+///
+/// NOTE: This function is not available under `MadSim` because `madsim-tokio`
+/// doesn't support `TcpListener::from_std()`. Under `MadSim`, use `MadSimTransport`
+/// instead of this production TCP transport.
+#[cfg(not(madsim))]
 fn create_reusable_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
     let domain = if addr.is_ipv4() {
         Domain::IPV4
@@ -748,6 +797,13 @@ fn create_reusable_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
 
     let std_listener: std::net::TcpListener = socket.into();
     TcpListener::from_std(std_listener)
+}
+
+/// `MadSim` stub - uses madsim's native `TcpListener::bind()`.
+/// This is simpler because `MadSim` simulates the network layer entirely.
+#[cfg(madsim)]
+async fn create_reusable_listener_madsim(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    TcpListener::bind(addr).await
 }
 
 /// Builder for transport configuration.
@@ -775,7 +831,9 @@ impl TransportBuilder {
     ///
     /// # Errors
     /// Returns an error if binding fails.
-    pub async fn build(self) -> TransportResult<(TransportHandle, mpsc::Receiver<IncomingMessage>)> {
+    pub async fn build(
+        self,
+    ) -> TransportResult<(TransportHandle, mpsc::Receiver<IncomingMessage>)> {
         let (transport, incoming_rx) = Transport::new(self.config);
         let handle = transport.start().await?;
         Ok((handle, incoming_rx))
@@ -810,11 +868,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_transport_builder() {
-        let (handle, _incoming_rx) = TransportBuilder::new(NodeId::new(1), "127.0.0.1:0".parse().unwrap())
-            .with_peer(NodeId::new(2), "127.0.0.1:9002")
-            .build()
-            .await
-            .unwrap();
+        let (handle, _incoming_rx) =
+            TransportBuilder::new(NodeId::new(1), "127.0.0.1:0".parse().unwrap())
+                .with_peer(NodeId::new(2), "127.0.0.1:9002")
+                .build()
+                .await
+                .unwrap();
 
         assert!(!handle.is_shutdown().await);
     }
@@ -859,8 +918,8 @@ mod tests {
         assert!(result.is_ok(), "Failed to send: {result:?}");
 
         // Wait for the message to be received.
-        let received = tokio::time::timeout(tokio::time::Duration::from_secs(2), incoming2.recv())
-            .await;
+        let received =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), incoming2.recv()).await;
 
         assert!(received.is_ok(), "Timeout waiting for message");
         let received_message = received.unwrap();
@@ -907,8 +966,8 @@ mod tests {
         assert!(result.is_ok(), "Failed to send batch: {result:?}");
 
         // Wait for the batch to be received.
-        let received = tokio::time::timeout(tokio::time::Duration::from_secs(2), incoming2.recv())
-            .await;
+        let received =
+            tokio::time::timeout(tokio::time::Duration::from_secs(2), incoming2.recv()).await;
 
         assert!(received.is_ok(), "Timeout waiting for batch");
         let received_msg = received.unwrap();
@@ -924,6 +983,46 @@ mod tests {
             }
             IncomingMessage::Single(_) => panic!("Expected batch, got single message"),
             IncomingMessage::Heartbeat(_) => panic!("Expected batch, got heartbeat"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_message_survives_initial_connect_failure() {
+        // Use unique ports for this test.
+        let node1_addr: SocketAddr = "127.0.0.1:19301".parse().unwrap();
+        let node2_addr: SocketAddr = "127.0.0.1:19302".parse().unwrap();
+
+        // Start node 1 first, with node 2 configured as a peer but not yet running.
+        let (transport1, _incoming1) = Transport::new(
+            TransportConfig::new(NodeId::new(1), node1_addr)
+                .with_peer(NodeId::new(2), "127.0.0.1:19302"),
+        );
+        let handle1 = transport1.start().await.unwrap();
+
+        // Queue a message while node 2 is still down.
+        let message = make_test_message(1, 2);
+        let result = handle1.send(NodeId::new(2), message.clone()).await;
+        assert!(result.is_ok(), "Failed to enqueue message: {result:?}");
+
+        // Let sender_loop attempt (and fail) at least one connect.
+        tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+
+        // Start node 2 after the initial failure.
+        let (transport2, mut incoming2) =
+            Transport::new(TransportConfig::new(NodeId::new(2), node2_addr));
+        let _handle2 = transport2.start().await.unwrap();
+
+        // The original message should still be delivered once connection succeeds.
+        let received =
+            tokio::time::timeout(tokio::time::Duration::from_secs(5), incoming2.recv()).await;
+        assert!(received.is_ok(), "Timeout waiting for recovered delivery");
+        let received_message = received.unwrap();
+        assert!(received_message.is_some(), "Channel closed");
+
+        match received_message.unwrap() {
+            IncomingMessage::Single(msg) => assert_eq!(msg, message),
+            IncomingMessage::Batch(_) => panic!("Expected single message, got batch"),
+            IncomingMessage::Heartbeat(_) => panic!("Expected single message, got heartbeat"),
         }
     }
 

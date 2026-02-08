@@ -197,7 +197,9 @@ impl SimulatedProgressStore {
     ///
     /// Panics if the mutex is poisoned.
     pub fn fault_config(&self) -> std::sync::MutexGuard<'_, ProgressStoreFaultConfig> {
-        self.fault_config.lock().expect("fault config lock poisoned")
+        self.fault_config
+            .lock()
+            .expect("fault config lock poisoned")
     }
 
     /// Deterministic RNG following helix-tier pattern.
@@ -276,10 +278,7 @@ impl ProgressStore for SimulatedProgressStore {
 
     async fn save_group(&self, state: &ConsumerGroupState) -> ProgressResult<()> {
         // TigerStyle: Assert precondition.
-        assert!(
-            state.group_id.get() != 0,
-            "group_id must be non-zero"
-        );
+        assert!(state.group_id.get() != 0, "group_id must be non-zero");
 
         // Check for forced failure.
         {

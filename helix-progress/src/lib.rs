@@ -109,6 +109,6 @@ pub use error::{ProgressError, ProgressResult};
 pub use manager::ProgressManager;
 pub use storage::{ProgressStore, ProgressStoreFaultConfig, SimulatedProgressStore};
 pub use types::{
-    AckMode, ConsumerGroupState, ConsumerState, Lease, LeaseState, PartitionKey, PartitionProgress,
-    ProgressConfig,
+    AckMode, ConsumerGroupState, ConsumerState, KafkaCommit, Lease, LeaseState, PartitionKey,
+    PartitionProgress, ProgressConfig,
 };

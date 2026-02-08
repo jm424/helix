@@ -169,6 +169,17 @@ impl Lease {
 // Partition Progress
 // -----------------------------------------------------------------------------
 
+/// Kafka commit metadata tracked for a consumer group partition.
+#[derive(Debug, Clone)]
+pub struct KafkaCommit {
+    /// The committed offset (next offset to read).
+    pub offset: Offset,
+    /// Commit metadata (optional).
+    pub metadata: Option<String>,
+    /// Leader epoch for the committed offset (or -1 if unknown).
+    pub leader_epoch: i32,
+}
+
 /// Per-partition progress within a consumer group.
 ///
 /// Tracks committed offsets using a bitmap for efficient sparse tracking,
@@ -189,6 +200,8 @@ pub struct PartitionProgress {
     pub active_leases: HashMap<LeaseId, Lease>,
     /// Next offset available for leasing.
     pub next_lease_offset: Offset,
+    /// Kafka commit info for this partition (if committed via Kafka API).
+    pub kafka_commit: Option<KafkaCommit>,
 }
 
 impl PartitionProgress {
@@ -202,6 +215,7 @@ impl PartitionProgress {
             committed_bitmap: RoaringBitmap::new(),
             active_leases: HashMap::new(),
             next_lease_offset: start_offset,
+            kafka_commit: None,
         }
     }
 
@@ -490,7 +504,7 @@ impl ProgressConfig {
         Self {
             max_groups_per_partition: 100,
             max_consumers_per_group: 10,
-            max_lease_duration_us: 60_000_000, // 1 minute.
+            max_lease_duration_us: 60_000_000,     // 1 minute.
             default_lease_duration_us: 10_000_000, // 10 seconds.
             max_offsets_per_lease: 1000,
             default_ack_mode: AckMode::Cumulative,
@@ -644,8 +658,7 @@ mod tests {
 
     #[test]
     fn test_consumer_group_state() {
-        let mut group =
-            ConsumerGroupState::new(ConsumerGroupId::new(1), 1000, AckMode::Cumulative);
+        let mut group = ConsumerGroupState::new(ConsumerGroupId::new(1), 1000, AckMode::Cumulative);
 
         let key = PartitionKey::new(TopicId::new(1), PartitionId::new(0));
         let progress = group.get_or_create_partition(key, Offset::new(0));

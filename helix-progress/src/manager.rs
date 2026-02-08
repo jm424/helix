@@ -366,13 +366,15 @@ impl<S: ProgressStore> ProgressManager<S> {
             .await?
             .ok_or(ProgressError::GroupNotFound { group_id })?;
 
-        let progress = group.partitions.get_mut(&partition_key).ok_or(
-            ProgressError::PartitionNotFound {
-                group_id,
-                topic_id: partition_key.topic_id,
-                partition_id: partition_key.partition_id,
-            },
-        )?;
+        let progress =
+            group
+                .partitions
+                .get_mut(&partition_key)
+                .ok_or(ProgressError::PartitionNotFound {
+                    group_id,
+                    topic_id: partition_key.topic_id,
+                    partition_id: partition_key.partition_id,
+                })?;
 
         let lease = progress
             .active_leases
@@ -439,13 +441,15 @@ impl<S: ProgressStore> ProgressManager<S> {
             .await?
             .ok_or(ProgressError::GroupNotFound { group_id })?;
 
-        let progress = group.partitions.get_mut(&partition_key).ok_or(
-            ProgressError::PartitionNotFound {
-                group_id,
-                topic_id: partition_key.topic_id,
-                partition_id: partition_key.partition_id,
-            },
-        )?;
+        let progress =
+            group
+                .partitions
+                .get_mut(&partition_key)
+                .ok_or(ProgressError::PartitionNotFound {
+                    group_id,
+                    topic_id: partition_key.topic_id,
+                    partition_id: partition_key.partition_id,
+                })?;
 
         let lease = progress
             .active_leases
@@ -501,13 +505,15 @@ impl<S: ProgressStore> ProgressManager<S> {
             .ok_or(ProgressError::GroupNotFound { group_id })?;
 
         let partition_key = PartitionKey::new(topic_id, partition_id);
-        let progress = group.partitions.get_mut(&partition_key).ok_or(
-            ProgressError::PartitionNotFound {
-                group_id,
-                topic_id,
-                partition_id,
-            },
-        )?;
+        let progress =
+            group
+                .partitions
+                .get_mut(&partition_key)
+                .ok_or(ProgressError::PartitionNotFound {
+                    group_id,
+                    topic_id,
+                    partition_id,
+                })?;
 
         // Check if already committed.
         if progress.is_committed(offset) {
@@ -586,13 +592,15 @@ impl<S: ProgressStore> ProgressManager<S> {
             .ok_or(ProgressError::GroupNotFound { group_id })?;
 
         let partition_key = PartitionKey::new(topic_id, partition_id);
-        let progress = group.partitions.get_mut(&partition_key).ok_or(
-            ProgressError::PartitionNotFound {
-                group_id,
-                topic_id,
-                partition_id,
-            },
-        )?;
+        let progress =
+            group
+                .partitions
+                .get_mut(&partition_key)
+                .ok_or(ProgressError::PartitionNotFound {
+                    group_id,
+                    topic_id,
+                    partition_id,
+                })?;
 
         for &offset in offsets {
             // Check if already committed.
@@ -665,13 +673,15 @@ impl<S: ProgressStore> ProgressManager<S> {
             .ok_or(ProgressError::GroupNotFound { group_id })?;
 
         let partition_key = PartitionKey::new(topic_id, partition_id);
-        let progress = group.partitions.get_mut(&partition_key).ok_or(
-            ProgressError::PartitionNotFound {
-                group_id,
-                topic_id,
-                partition_id,
-            },
-        )?;
+        let progress =
+            group
+                .partitions
+                .get_mut(&partition_key)
+                .ok_or(ProgressError::PartitionNotFound {
+                    group_id,
+                    topic_id,
+                    partition_id,
+                })?;
 
         // Find and validate the lease.
         let lease = progress
@@ -875,13 +885,14 @@ impl<S: ProgressStore> ProgressManager<S> {
     // - Commits don't require leases (cumulative semantics)
     // - Fetch returns None for non-existent partitions (not error)
 
-    /// Commits an offset using Kafka-style cumulative semantics.
+    /// Commits an offset using Kafka-style semantics.
     ///
     /// Unlike the standard `commit_offset`, this method:
     /// - Auto-creates the consumer group if it doesn't exist
     /// - Auto-creates the partition progress if it doesn't exist
     /// - Does NOT require a lease (direct commit)
-    /// - Uses cumulative mode (watermark advances directly)
+    /// - Stores the committed offset as "next to read"
+    /// - Optionally stores commit metadata and leader epoch
     ///
     /// This is designed for Kafka protocol compatibility where clients
     /// don't use the lease mechanism.
@@ -889,12 +900,15 @@ impl<S: ProgressStore> ProgressManager<S> {
     /// # Errors
     ///
     /// Returns error if storage operation fails.
+    #[allow(clippy::too_many_arguments)] // Kafka commit API naturally carries topic/partition/offset metadata.
     pub async fn commit_offset_kafka(
         &self,
         group_id: ConsumerGroupId,
         topic_id: TopicId,
         partition_id: PartitionId,
         offset: Offset,
+        metadata: Option<String>,
+        leader_epoch: i32,
         current_time_us: u64,
     ) -> ProgressResult<()> {
         // Get or create group with cumulative mode.
@@ -910,18 +924,22 @@ impl<S: ProgressStore> ProgressManager<S> {
         let partition_key = PartitionKey::new(topic_id, partition_id);
 
         // Get or create partition progress.
-        let progress = group
-            .partitions
-            .entry(partition_key)
-            .or_insert_with(|| PartitionProgress::new(partition_key, Offset::new(0), AckMode::Cumulative));
+        let progress = group.partitions.entry(partition_key).or_insert_with(|| {
+            PartitionProgress::new(partition_key, Offset::new(0), AckMode::Cumulative)
+        });
 
-        // Cumulative commit: advance watermark directly to offset + 1.
-        // This means "I've processed everything up to and including this offset".
-        let new_watermark = Offset::new(offset.get().saturating_add(1));
+        // Kafka commit offset semantics: offset is the next offset to read.
+        let new_watermark = offset;
         if new_watermark > progress.low_watermark {
             progress.low_watermark = new_watermark;
             progress.next_lease_offset = progress.next_lease_offset.max(new_watermark);
         }
+
+        progress.kafka_commit = Some(crate::types::KafkaCommit {
+            offset,
+            metadata,
+            leader_epoch,
+        });
 
         // Save updated group.
         self.store.save_group(&group).await?;
@@ -932,7 +950,7 @@ impl<S: ProgressStore> ProgressManager<S> {
             partition_id = %partition_id,
             offset = %offset,
             new_watermark = %new_watermark,
-            "Kafka-style offset commit"
+            "Kafka-style offset commit (next-to-read)"
         );
 
         Ok(())
@@ -944,7 +962,7 @@ impl<S: ProgressStore> ProgressManager<S> {
     /// - Returns `None` if the group doesn't exist (not an error)
     /// - Returns `None` if the partition doesn't exist (not an error)
     ///
-    /// The returned offset is the last committed offset (watermark - 1).
+    /// The returned offset is the committed offset (next to read).
     /// Returns `None` if no offset has been committed.
     ///
     /// # Errors
@@ -955,7 +973,7 @@ impl<S: ProgressStore> ProgressManager<S> {
         group_id: ConsumerGroupId,
         topic_id: TopicId,
         partition_id: PartitionId,
-    ) -> ProgressResult<Option<Offset>> {
+    ) -> ProgressResult<Option<crate::types::KafkaCommit>> {
         let Some(group) = self.store.get_group(group_id).await? else {
             return Ok(None);
         };
@@ -965,13 +983,7 @@ impl<S: ProgressStore> ProgressManager<S> {
             return Ok(None);
         };
 
-        // Watermark is "next offset to be committed", so committed = watermark - 1.
-        // If watermark is 0, nothing has been committed.
-        if progress.low_watermark.get() == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(Offset::new(progress.low_watermark.get() - 1)))
-        }
+        Ok(progress.kafka_commit.clone())
     }
 }
 
@@ -1166,6 +1178,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(watermark, Some(Offset::new(6)));
+    }
+
+    #[tokio::test]
+    async fn test_commit_offset_kafka_next_to_read_with_metadata() {
+        let manager = create_manager(42);
+
+        let group_id = ConsumerGroupId::new(1);
+        let topic_id = TopicId::new(1);
+        let partition_id = PartitionId::new(0);
+        let current_time_us = 1000;
+
+        manager
+            .commit_offset_kafka(
+                group_id,
+                topic_id,
+                partition_id,
+                Offset::new(10),
+                Some("meta".to_string()),
+                7,
+                current_time_us,
+            )
+            .await
+            .unwrap();
+
+        let low_watermark = manager
+            .get_low_watermark(group_id, topic_id, partition_id)
+            .await
+            .unwrap();
+        assert_eq!(low_watermark, Some(Offset::new(10)));
+
+        let commit = manager
+            .fetch_committed_kafka(group_id, topic_id, partition_id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(commit.offset, Offset::new(10));
+        assert_eq!(commit.metadata.as_deref(), Some("meta"));
+        assert_eq!(commit.leader_epoch, 7);
     }
 
     #[tokio::test]

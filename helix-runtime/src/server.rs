@@ -84,7 +84,11 @@ impl ServerHandle {
     ///
     /// # Errors
     /// Returns an error if the server is not available or not the leader.
-    pub async fn submit(&self, data: Bytes, request_id: RequestId) -> Result<ClientResult, ServerError> {
+    pub async fn submit(
+        &self,
+        data: Bytes,
+        request_id: RequestId,
+    ) -> Result<ClientResult, ServerError> {
         let (tx, rx) = oneshot::channel();
 
         self.commands
@@ -386,10 +390,13 @@ impl RaftServer {
                 info!(index = index.get(), "Entry committed");
 
                 // Send event.
-                let _ = self.events.send(ServerEvent::Committed {
-                    index,
-                    data: data.clone(),
-                }).await;
+                let _ = self
+                    .events
+                    .send(ServerEvent::Committed {
+                        index,
+                        data: data.clone(),
+                    })
+                    .await;
 
                 // Complete pending request if any.
                 if let Some(request_id) = self.pending.complete(index) {

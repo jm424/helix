@@ -185,10 +185,7 @@ pub fn decode_message(data: &[u8]) -> CodecResult<(Message, usize)> {
 
     let payload = &data[4..total_len];
     if payload.is_empty() {
-        return Err(CodecError::InsufficientData {
-            need: 1,
-            have: 0,
-        });
+        return Err(CodecError::InsufficientData { need: 1, have: 0 });
     }
 
     let tag = payload[0];
@@ -471,7 +468,13 @@ fn decode_install_snapshot_response(buf: &mut &[u8]) -> CodecResult<InstallSnaps
     let success = buf.get_u8() != 0;
     let next_offset = buf.get_u64_le();
 
-    Ok(InstallSnapshotResponse::new(term, from, to, success, next_offset))
+    Ok(InstallSnapshotResponse::new(
+        term,
+        from,
+        to,
+        success,
+        next_offset,
+    ))
 }
 
 /// Encodes a log entry.
@@ -643,10 +646,7 @@ pub fn decode_group_batch(data: &[u8]) -> CodecResult<(Vec<GroupMessage>, usize)
 
     let payload = &data[4..total_len];
     if payload.is_empty() {
-        return Err(CodecError::InsufficientData {
-            need: 1,
-            have: 0,
-        });
+        return Err(CodecError::InsufficientData { need: 1, have: 0 });
     }
 
     let tag = payload[0];
@@ -691,7 +691,9 @@ fn decode_message_payload(buf: &mut &[u8]) -> CodecResult<Message> {
         TAG_PRE_VOTE => Message::PreVote(decode_pre_vote(buf)?),
         TAG_PRE_VOTE_RESPONSE => Message::PreVoteResponse(decode_pre_vote_response(buf)?),
         TAG_REQUEST_VOTE => Message::RequestVote(decode_request_vote(buf)?),
-        TAG_REQUEST_VOTE_RESPONSE => Message::RequestVoteResponse(decode_request_vote_response(buf)?),
+        TAG_REQUEST_VOTE_RESPONSE => {
+            Message::RequestVoteResponse(decode_request_vote_response(buf)?)
+        }
         TAG_APPEND_ENTRIES => Message::AppendEntries(decode_append_entries(buf)?),
         TAG_APPEND_ENTRIES_RESPONSE => {
             Message::AppendEntriesResponse(decode_append_entries_response(buf)?)
@@ -882,10 +884,7 @@ pub fn decode_transfer_message(data: &[u8]) -> CodecResult<(TransferMessage, usi
 
     let payload = &data[4..total_len];
     if payload.is_empty() {
-        return Err(CodecError::InsufficientData {
-            need: 1,
-            have: 0,
-        });
+        return Err(CodecError::InsufficientData { need: 1, have: 0 });
     }
 
     let tag = payload[0];
@@ -1001,7 +1000,8 @@ fn decode_transfer_cancel_request(buf: &mut &[u8]) -> CodecResult<TransferMessag
 #[must_use]
 pub fn is_transfer_message(data: &[u8]) -> bool {
     // Need at least 5 bytes: 4 (length) + 1 (tag).
-    data.len() >= 5 && (TAG_TRANSFER_PREPARE_REQUEST..=TAG_TRANSFER_CANCEL_REQUEST).contains(&data[4])
+    data.len() >= 5
+        && (TAG_TRANSFER_PREPARE_REQUEST..=TAG_TRANSFER_CANCEL_REQUEST).contains(&data[4])
 }
 
 // =============================================================================
@@ -1239,7 +1239,10 @@ mod tests {
         // Valid length but unknown tag.
         let data = [1, 0, 0, 0, 255]; // length=1, tag=255
         let result = decode_message(&data);
-        assert!(matches!(result, Err(CodecError::UnknownMessageType { tag: 255 })));
+        assert!(matches!(
+            result,
+            Err(CodecError::UnknownMessageType { tag: 255 })
+        ));
     }
 
     #[test]
@@ -1254,10 +1257,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_group_batch_single() {
-        let messages = vec![GroupMessage::new(
-            GroupId::new(42),
-            make_request_vote(),
-        )];
+        let messages = vec![GroupMessage::new(GroupId::new(42), make_request_vote())];
         let encoded = encode_group_batch(&messages).unwrap();
         let (decoded, consumed) = decode_group_batch(&encoded).unwrap();
 
@@ -1305,11 +1305,8 @@ mod tests {
         assert!(!is_group_batch(&regular));
 
         // Group batch.
-        let batch = encode_group_batch(&[GroupMessage::new(
-            GroupId::new(1),
-            make_request_vote(),
-        )])
-        .unwrap();
+        let batch =
+            encode_group_batch(&[GroupMessage::new(GroupId::new(1), make_request_vote())]).unwrap();
         assert!(is_group_batch(&batch));
 
         // Empty batch.

@@ -48,7 +48,9 @@ pub use codec::{
     CodecResult,
 };
 pub use config::{ConfigError, PeerConfig, ServerConfig, TimingConfig};
-pub use server::{OutgoingMessage, RaftServer, ServerCommand, ServerError, ServerEvent, ServerHandle};
+pub use server::{
+    OutgoingMessage, RaftServer, ServerCommand, ServerError, ServerEvent, ServerHandle,
+};
 pub use transport::{
     IncomingMessage, PeerInfo, Transport, TransportBuilder, TransportConfig, TransportError,
     TransportHandle, TransportResult,
