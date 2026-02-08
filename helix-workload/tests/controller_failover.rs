@@ -2,33 +2,41 @@
 //!
 //! These tests verify that the controller partition (Raft group 0) correctly
 //! handles leader failover. The controller manages critical cluster metadata:
-//! - Topic creation (CreateTopic → AssignPartition commands)
+//! - Topic creation (`CreateTopic` → `AssignPartition` commands)
 //! - Partition assignments (which nodes host which partitions)
-//! - Leader tracking (UpdatePartitionLeader)
+//! - Leader tracking (`UpdatePartitionLeader`)
 //!
 //! # Test Strategy
 //!
-//! We query Kafka metadata to identify the actual controller leader, then:
-//! 1. Kill the controller leader specifically (not random nodes)
-//! 2. Verify operations fail initially or recover correctly
-//! 3. Test quorum loss scenarios (kill 2 of 3 nodes)
-//!
-//! # Skepticism Notes
-//!
-//! These tests are designed to actually exercise failure paths:
-//! - We identify and target the controller leader, not random nodes
-//! - We verify operations fail when quorum is lost
-//! - We don't just test the happy path
+//! We cover two classes of scenarios:
+//! 1. Generic node failures while validating controller-mediated operations
+//!    (topic creation, metadata convergence, and write continuity).
+//! 2. Explicit controller-leader failover by identifying the active controller
+//!    and killing that node.
+//! 3. Quorum loss behavior (2/3 nodes down) and recovery semantics.
 
 #![allow(clippy::too_many_lines)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::unused_async)]
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use helix_workload::{ProducerMode, RealCluster, RealExecutor, WorkloadExecutor};
+use kafka_protocol::messages::{
+    ApiKey, MetadataRequest, MetadataResponse, RequestHeader, ResponseHeader,
+};
+use kafka_protocol::protocol::{Decodable, Encodable, StrBytes};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::types::RDKafkaRespErr;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 // ============================================================================
 // Test Helpers
@@ -78,6 +86,7 @@ async fn setup_cluster(test_name: &str, base_port: u16, raft_base_port: u16) -> 
         .data_dir(test_data_dir(test_name))
         .auto_create_topics(true)
         .default_replication_factor(3)
+        .log_level("debug")
         .actor_mode(true)
         .build()
         .expect("failed to start cluster")
@@ -86,31 +95,215 @@ async fn setup_cluster(test_name: &str, base_port: u16, raft_base_port: u16) -> 
 /// Fetches the controller leader ID from Kafka metadata.
 ///
 /// Returns the node ID of the current controller leader, or an error if unavailable.
-#[allow(dead_code)]
-fn get_controller_leader(bootstrap_servers: &str) -> Result<i32, String> {
-    let consumer: BaseConsumer = ClientConfig::new()
-        .set("bootstrap.servers", bootstrap_servers)
-        .set("group.id", "controller-checker")
-        .create()
-        .map_err(|e| format!("failed to create consumer: {e}"))?;
-
-    let metadata = consumer
-        .fetch_metadata(None, Duration::from_secs(10))
-        .map_err(|e| format!("failed to fetch metadata: {e}"))?;
-
-    let controller_id = metadata.orig_broker_id();
-    // rdkafka returns the broker we connected to, not controller.
-    // We need to check the brokers list for controller info.
-    // Unfortunately rdkafka doesn't expose controller_id directly.
-    // Let's use a workaround: try each broker and see which one handles creates.
-
-    // For now, return the broker we're connected to as a starting point.
-    // The real test is whether operations work after killing nodes.
-    if controller_id >= 0 {
-        Ok(controller_id)
-    } else {
-        Err("no controller available".to_string())
+async fn get_controller_leader(bootstrap_servers: &str) -> Result<i32, String> {
+    let (live, errors) = fetch_live_controller_ids(bootstrap_servers).await;
+    if live.is_empty() {
+        return Err(format!(
+            "no live brokers with controller id: {}",
+            errors.join(" | ")
+        ));
     }
+
+    let mut votes_by_controller: std::collections::HashMap<i32, usize> =
+        std::collections::HashMap::new();
+    for (_, controller_id) in &live {
+        *votes_by_controller.entry(*controller_id).or_insert(0) += 1;
+    }
+
+    if let Some((&controller_id, &votes)) =
+        votes_by_controller.iter().max_by_key(|(_, votes)| *votes)
+    {
+        if votes * 2 > live.len() {
+            return Ok(controller_id);
+        }
+    }
+
+    Err(format!(
+        "no controller majority among live brokers: {:?}; errors: {}",
+        live,
+        errors.join(" | ")
+    ))
+}
+
+/// Returns live broker observations `(broker_addr, controller_id)` and per-broker errors.
+async fn fetch_live_controller_ids(bootstrap_servers: &str) -> (Vec<(String, i32)>, Vec<String>) {
+    let brokers: Vec<String> = bootstrap_servers
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    let mut live = Vec::new();
+    let mut errors = Vec::new();
+
+    for broker in &brokers {
+        match fetch_controller_id_from_broker(broker).await {
+            Ok(controller_id) if controller_id >= 0 => {
+                live.push((broker.clone(), controller_id));
+            }
+            Ok(controller_id) => {
+                errors.push(format!("{broker}: invalid controller id {controller_id}"));
+            }
+            Err(e) => {
+                errors.push(format!("{broker}: {e}"));
+            }
+        }
+    }
+
+    (live, errors)
+}
+
+/// Returns `controller_id` by issuing a raw Metadata request to one broker.
+async fn fetch_controller_id_from_broker(bootstrap_server: &str) -> Result<i32, String> {
+    let mut stream = TcpStream::connect(bootstrap_server)
+        .await
+        .map_err(|e| format!("connect failed: {e}"))?;
+
+    let api_key = ApiKey::Metadata as i16;
+    let api_version = 8i16; // includes controller_id and avoids flexible encoding.
+    let request_header_version = 1i16;
+    let response_header_version = 0i16;
+    let correlation_id = 42i32;
+
+    let mut header = RequestHeader::default();
+    header.request_api_key = api_key;
+    header.request_api_version = api_version;
+    header.correlation_id = correlation_id;
+    header.client_id = Some(StrBytes::from_string("controller-checker".to_string()));
+
+    let request = MetadataRequest::default();
+
+    let mut payload = Vec::new();
+    header
+        .encode(&mut payload, request_header_version)
+        .map_err(|e| format!("request header encode failed: {e}"))?;
+    request
+        .encode(&mut payload, api_version)
+        .map_err(|e| format!("metadata request encode failed: {e}"))?;
+
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    #[allow(clippy::cast_possible_truncation)]
+    let payload_len = payload.len() as u32;
+    frame.extend_from_slice(&payload_len.to_be_bytes());
+    frame.extend_from_slice(&payload);
+    stream
+        .write_all(&frame)
+        .await
+        .map_err(|e| format!("write failed: {e}"))?;
+
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(|e| format!("read frame length failed: {e}"))?;
+    #[allow(clippy::cast_sign_loss)]
+    let response_len = u32::from_be_bytes(len_buf) as usize;
+    let mut response_buf = vec![0u8; response_len];
+    stream
+        .read_exact(&mut response_buf)
+        .await
+        .map_err(|e| format!("read frame payload failed: {e}"))?;
+
+    let mut bytes = bytes::Bytes::from(response_buf);
+    let response_header = ResponseHeader::decode(&mut bytes, response_header_version)
+        .map_err(|e| format!("response header decode failed: {e}"))?;
+    if response_header.correlation_id != correlation_id {
+        return Err(format!(
+            "correlation mismatch: expected {correlation_id}, got {}",
+            response_header.correlation_id
+        ));
+    }
+
+    let response = MetadataResponse::decode(&mut bytes, api_version)
+        .map_err(|e| format!("metadata response decode failed: {e}"))?;
+    Ok(i32::from(response.controller_id))
+}
+
+/// Waits until all live brokers converge to a single controller ID.
+///
+/// If `expected_controller` is provided, convergence must match it.
+async fn wait_for_controller_convergence_across_live_brokers(
+    bootstrap_servers: &str,
+    expected_controller: Option<i32>,
+    min_live_brokers: usize,
+    timeout: Duration,
+) -> Result<(i32, Vec<(String, i32)>), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last_observation = String::new();
+
+    while std::time::Instant::now() < deadline {
+        let (live, errors) = fetch_live_controller_ids(bootstrap_servers).await;
+        if live.len() < min_live_brokers {
+            last_observation = format!(
+                "only {} live broker controller observations (need {min_live_brokers}); errors: {}",
+                live.len(),
+                errors.join(" | ")
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+
+        let first = live[0].1;
+        let converged = live
+            .iter()
+            .all(|(_, controller_id)| *controller_id == first);
+        if !converged {
+            last_observation = format!("controller disagreement across live brokers: {live:?}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+
+        if let Some(expected) = expected_controller {
+            if first != expected {
+                last_observation =
+                    format!("converged controller {first} does not match expected {expected}");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
+        }
+
+        return Ok((first, live));
+    }
+
+    Err(format!(
+        "timeout waiting for controller convergence: {last_observation}"
+    ))
+}
+
+/// Waits for controller leadership to move away from `previous_controller`.
+async fn wait_for_controller_leader_change(
+    bootstrap_servers: &str,
+    previous_controller: i32,
+    min_live_brokers: usize,
+    timeout: Duration,
+) -> Result<i32, String> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last_observation = String::new();
+    while std::time::Instant::now() < deadline {
+        match wait_for_controller_convergence_across_live_brokers(
+            bootstrap_servers,
+            None,
+            min_live_brokers,
+            Duration::from_secs(2),
+        )
+        .await
+        {
+            Ok((current, _)) if current >= 0 && current != previous_controller => {
+                return Ok(current);
+            }
+            Ok((current, _)) => {
+                last_observation = format!("controller still {current}");
+            }
+            Err(e) => {
+                last_observation = e;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    Err(format!(
+        "timeout waiting for controller leader change from {previous_controller}: {last_observation}"
+    ))
 }
 
 /// Fetches topic metadata and returns partition count and replica assignments.
@@ -133,19 +326,161 @@ fn fetch_topic_metadata(
 
     for t in metadata.topics() {
         if t.name() == topic {
-            let partitions: Vec<_> = t
-                .partitions()
-                .iter()
-                .map(|p| {
-                    let replicas: Vec<i32> = p.replicas().to_vec();
-                    (p.id(), p.leader(), replicas)
-                })
-                .collect();
+            if let Some(topic_error) = t.error() {
+                if topic_error != RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR {
+                    return Err(format!("topic '{topic}' metadata error: {topic_error:?}"));
+                }
+            }
+
+            let mut partitions = Vec::with_capacity(t.partitions().len());
+            for p in t.partitions() {
+                if let Some(partition_error) = p.error() {
+                    if partition_error != RDKafkaRespErr::RD_KAFKA_RESP_ERR_NO_ERROR {
+                        return Err(format!(
+                            "topic '{topic}' partition {} metadata error: {partition_error:?}",
+                            p.id()
+                        ));
+                    }
+                }
+                let replicas: Vec<i32> = p.replicas().to_vec();
+                partitions.push((p.id(), p.leader(), replicas));
+            }
+
+            if partitions.is_empty() {
+                return Err(format!("topic '{topic}' metadata has no partitions yet"));
+            }
+
             return Ok((partitions.len(), partitions));
         }
     }
 
     Err(format!("topic '{topic}' not found in metadata"))
+}
+
+/// Fetches topic metadata from each bootstrap broker individually.
+fn fetch_topic_metadata_per_broker(
+    bootstrap_servers: &str,
+    topic: &str,
+) -> Vec<(String, Result<(usize, Vec<(i32, i32, Vec<i32>)>), String>)> {
+    bootstrap_servers
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|broker| (broker.to_string(), fetch_topic_metadata(broker, topic)))
+        .collect()
+}
+
+fn normalize_partition_metadata(partitions: &[(i32, i32, Vec<i32>)]) -> Vec<(i32, i32, Vec<i32>)> {
+    let mut normalized = partitions.to_vec();
+    normalized.sort_by_key(|(partition_id, _, _)| *partition_id);
+    for (_, _, replicas) in &mut normalized {
+        replicas.sort_unstable();
+    }
+    normalized
+}
+
+fn validate_partition_layout(
+    partitions: &[(i32, i32, Vec<i32>)],
+    expected_partitions: usize,
+) -> Result<(), String> {
+    if partitions.len() != expected_partitions {
+        return Err(format!(
+            "expected {expected_partitions} partitions, got {}",
+            partitions.len()
+        ));
+    }
+
+    for expected_partition_id in 0..expected_partitions as i32 {
+        let Some((_, leader, replicas)) = partitions
+            .iter()
+            .find(|(partition_id, _, _)| *partition_id == expected_partition_id)
+        else {
+            return Err(format!("missing partition {expected_partition_id}"));
+        };
+
+        if *leader < 0 {
+            return Err(format!(
+                "partition {expected_partition_id} has no leader (leader={leader})"
+            ));
+        }
+
+        if replicas.is_empty() {
+            return Err(format!("partition {expected_partition_id} has no replicas"));
+        }
+
+        if !replicas.contains(leader) {
+            return Err(format!(
+                "partition {expected_partition_id} leader {leader} not in replicas {replicas:?}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Waits until all brokers report identical topic metadata.
+///
+/// This enforces cluster-wide convergence semantics, not just "one broker works".
+async fn wait_for_topic_convergence_across_brokers(
+    bootstrap_servers: &str,
+    topic: &str,
+    expected_partitions: usize,
+    timeout: Duration,
+) -> Result<Vec<(String, Vec<(i32, i32, Vec<i32>)>)>, String> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last_observation = String::new();
+
+    while std::time::Instant::now() < deadline {
+        let results = fetch_topic_metadata_per_broker(bootstrap_servers, topic);
+        let mut broker_layouts: Vec<(String, Vec<(i32, i32, Vec<i32>)>)> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+
+        for (broker, result) in results {
+            match result {
+                Ok((count, partitions)) => {
+                    if count != expected_partitions {
+                        errors.push(format!(
+                            "{broker}: expected {expected_partitions} partitions, got {count}"
+                        ));
+                        continue;
+                    }
+
+                    let normalized = normalize_partition_metadata(&partitions);
+                    if let Err(e) = validate_partition_layout(&normalized, expected_partitions) {
+                        errors.push(format!("{broker}: {e}"));
+                        continue;
+                    }
+
+                    broker_layouts.push((broker, normalized));
+                }
+                Err(e) => {
+                    errors.push(format!("{broker}: {e}"));
+                }
+            }
+        }
+
+        if broker_layouts.is_empty() {
+            errors.push("no broker metadata responses available".to_string());
+        }
+
+        if errors.is_empty() {
+            let first_layout = &broker_layouts[0].1;
+            let all_match = broker_layouts
+                .iter()
+                .all(|(_, layout)| layout == first_layout);
+            if all_match {
+                return Ok(broker_layouts);
+            }
+            errors.push("brokers disagree on partition metadata layout".to_string());
+        }
+
+        last_observation = errors.join(" | ");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    Err(format!(
+        "timeout waiting for cluster-wide metadata convergence for topic '{topic}': {last_observation}"
+    ))
 }
 
 /// Waits for a topic to appear in metadata with the expected partition count.
@@ -187,7 +522,7 @@ async fn wait_for_topic(
 /// Tests that controller failover works correctly.
 ///
 /// This test:
-/// 1. Creates a topic (requires controller to process CreateTopic)
+/// 1. Creates a topic (requires controller to process `CreateTopic`)
 /// 2. Verifies we can write to it
 /// 3. Kills each node one at a time, checking topic creation still works
 /// 4. Verifies all previously created topics still work
@@ -267,7 +602,9 @@ async fn test_controller_failover_basic() {
         println!("  Original topic '{topic1}' still works");
 
         // Restart the node before next iteration
-        cluster.restart_node(victim).expect("failed to restart node");
+        cluster
+            .restart_node(victim)
+            .expect("failed to restart node");
         println!("  Restarted node {victim}");
 
         // Wait for node to rejoin
@@ -285,7 +622,7 @@ async fn test_controller_failover_basic() {
     ];
 
     for topic in &topics_to_check {
-        let result = executor.send(&topic, 0, Bytes::from("final-check")).await;
+        let result = executor.send(topic, 0, Bytes::from("final-check")).await;
         assert!(result.is_ok(), "Failed to write to {topic}: {result:?}");
         println!("  Write to '{topic}' succeeded");
     }
@@ -300,7 +637,7 @@ async fn test_controller_failover_basic() {
 /// Tests controller failover during topic creation with multiple partitions.
 ///
 /// This test creates a topic with many partitions, which generates multiple
-/// AssignPartition commands. We verify that even if the controller leader
+/// `AssignPartition` commands. We verify that even if the controller leader
 /// fails mid-creation, the topic is eventually created correctly.
 #[tokio::test]
 async fn test_controller_failover_during_create() {
@@ -323,8 +660,23 @@ async fn test_controller_failover_during_create() {
         .expect("warmup topic leader not elected");
     println!("  Warmup topic created");
 
+    let (initial_controller, initial_controller_view) =
+        wait_for_controller_convergence_across_live_brokers(
+            &bootstrap_servers,
+            None,
+            3,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("controller did not converge before failover");
+    let killed_controller_node =
+        u64::try_from(initial_controller).expect("controller id should convert to u64");
+    println!(
+        "  Initial controller leader = node {initial_controller} ({initial_controller_view:?})"
+    );
+
     // Now test: create topic with 8 partitions while killing a node
-    println!("\n=== Test: Create 8-partition topic while killing node ===");
+    println!("\n=== Test: Create 8-partition topic while killing controller ===");
     let test_topic = "multi-partition-failover";
     let num_partitions = 8i32;
 
@@ -338,7 +690,7 @@ async fn test_controller_failover_during_create() {
             for p in 0..num_partitions {
                 let consumer: BaseConsumer = ClientConfig::new()
                     .set("bootstrap.servers", &bootstrap)
-                    .set("group.id", &format!("creator-{p}"))
+                    .set("group.id", format!("creator-{p}"))
                     .create()
                     .expect("consumer creation failed");
 
@@ -349,10 +701,22 @@ async fn test_controller_failover_during_create() {
         })
     };
 
-    // Kill node 1 shortly after starting creation
+    // Kill the active controller leader shortly after starting creation.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    println!("  Killing node 1 during topic creation...");
-    cluster.kill_node(1).expect("failed to kill node 1");
+    println!("  Killing controller node {killed_controller_node} during topic creation...");
+    cluster
+        .kill_node(killed_controller_node)
+        .expect("failed to kill controller node");
+
+    let new_controller = wait_for_controller_leader_change(
+        &bootstrap_servers,
+        initial_controller,
+        2,
+        Duration::from_secs(45),
+    )
+    .await
+    .expect("controller leader did not change after targeted kill");
+    println!("  Controller failover: {initial_controller} -> {new_controller}");
 
     // Wait for creation attempt to complete
     let _ = create_handle.await;
@@ -363,15 +727,12 @@ async fn test_controller_failover_during_create() {
     // Verify topic was created (may need to retry after controller failover)
     println!("\n=== Verification: Check topic metadata ===");
 
-    // The topic should eventually exist, though it may have fewer partitions
-    // if auto-create only created what was requested
+    // The topic should eventually exist with the requested partition count.
     let mut topic_found = false;
     for attempt in 1..=10 {
         match fetch_topic_metadata(&bootstrap_servers, test_topic) {
             Ok((count, partitions)) => {
-                println!(
-                    "  Attempt {attempt}: Topic '{test_topic}' has {count} partition(s)"
-                );
+                println!("  Attempt {attempt}: Topic '{test_topic}' has {count} partition(s)");
                 for (pid, leader, replicas) in &partitions {
                     println!("    Partition {pid}: leader={leader}, replicas={replicas:?}");
                 }
@@ -397,18 +758,47 @@ async fn test_controller_failover_during_create() {
         }
     }
 
-    assert!(topic_found, "Topic '{test_topic}' was never created after failover");
+    assert!(
+        topic_found,
+        "Topic '{test_topic}' was never created after failover"
+    );
 
-    // Restart killed node
-    cluster.restart_node(1).expect("failed to restart node 1");
+    // Restart killed node.
+    cluster
+        .restart_node(killed_controller_node)
+        .expect("failed to restart killed controller node");
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // Final verification: topic should have stable metadata
-    let (final_count, _) = fetch_topic_metadata(&bootstrap_servers, test_topic)
-        .expect("failed to fetch final metadata");
-    println!("\n=== Final state: {final_count} partition(s) ===");
+    let (post_restart_controller, post_restart_view) =
+        wait_for_controller_convergence_across_live_brokers(
+            &bootstrap_servers,
+            None,
+            3,
+            Duration::from_secs(45),
+        )
+        .await
+        .expect("controller did not converge across all brokers after restart");
+    println!(
+        "  Post-restart controller convergence: node {post_restart_controller} ({post_restart_view:?})"
+    );
 
-    assert!(final_count > 0, "Topic should have at least 1 partition");
+    // Final verification: all brokers must converge to identical metadata.
+    let converged = wait_for_topic_convergence_across_brokers(
+        &bootstrap_servers,
+        test_topic,
+        num_partitions as usize,
+        Duration::from_secs(45),
+    )
+    .await
+    .expect("failed to reach cluster-wide metadata convergence");
+
+    println!("\n=== Final metadata convergence ===");
+    for (broker, layout) in &converged {
+        println!("  {broker}: {} partitions", layout.len());
+    }
+    println!(
+        "\n=== Final state: converged on {num_partitions} partition(s) across all brokers ==="
+    );
 
     println!("\n=== Controller failover during create test PASSED ===");
 }
@@ -445,7 +835,7 @@ async fn test_controller_failover_under_load() {
         cluster
             .wait_for_leader(data_topic, p, Duration::from_secs(30))
             .await
-            .expect(&format!("no leader for partition {p}"));
+            .unwrap_or_else(|_| panic!("no leader for partition {p}"));
     }
     println!("  Data topic created with {num_partitions} partitions");
 
@@ -457,7 +847,10 @@ async fn test_controller_failover_under_load() {
     for p in 0..num_partitions {
         for i in 0..25u32 {
             let payload = format!("phase1-p{p}-{i:04}");
-            match executor.send(data_topic, p, Bytes::from(payload.clone())).await {
+            match executor
+                .send(data_topic, p, Bytes::from(payload.clone()))
+                .await
+            {
                 Ok(offset) => {
                     acknowledged.push((p, offset, payload));
                 }
@@ -482,7 +875,10 @@ async fn test_controller_failover_under_load() {
         for p in 0..num_partitions {
             for i in 0..10u32 {
                 let payload = format!("during-kill{victim}-p{p}-{i:04}");
-                match executor.send(data_topic, p, Bytes::from(payload.clone())).await {
+                match executor
+                    .send(data_topic, p, Bytes::from(payload.clone()))
+                    .await
+                {
                     Ok(offset) => {
                         acknowledged.push((p, offset, payload));
                         writes_during += 1;
@@ -493,9 +889,7 @@ async fn test_controller_failover_under_load() {
                 }
             }
         }
-        println!(
-            "    Writes during kill-{victim}: {writes_during} ok, {failures_during} failed"
-        );
+        println!("    Writes during kill-{victim}: {writes_during} ok, {failures_during} failed");
 
         // Restart node
         cluster.restart_node(victim).expect("failed to restart");
@@ -531,7 +925,10 @@ async fn test_controller_failover_under_load() {
     let mut by_partition: std::collections::HashMap<i32, Vec<(u64, String)>> =
         std::collections::HashMap::new();
     for (p, offset, payload) in &acknowledged {
-        by_partition.entry(*p).or_default().push((*offset, payload.clone()));
+        by_partition
+            .entry(*p)
+            .or_default()
+            .push((*offset, payload.clone()));
     }
 
     for (partition, expected) in &by_partition {
@@ -540,8 +937,7 @@ async fn test_controller_failover_under_load() {
             .await
             .expect("poll failed");
 
-        let consumed_map: std::collections::HashMap<u64, Bytes> =
-            consumed.into_iter().collect();
+        let consumed_map: std::collections::HashMap<u64, Bytes> = consumed.into_iter().collect();
 
         for (offset, expected_payload) in expected {
             match consumed_map.get(offset) {
@@ -608,7 +1004,7 @@ async fn test_controller_state_consistency() {
         cluster
             .wait_for_leader(topic, 0, Duration::from_secs(30))
             .await
-            .expect(&format!("failed to create topic {topic}"));
+            .unwrap_or_else(|_| panic!("failed to create topic {topic}"));
         println!("  Created: {topic}");
     }
 
@@ -647,7 +1043,7 @@ async fn test_controller_state_consistency() {
                 }
             }
         }
-        println!("  Node {node_id}: {:?}", this_node);
+        println!("  Node {node_id}: {this_node:?}");
         node_metadata.push(this_node);
     }
 
@@ -655,7 +1051,8 @@ async fn test_controller_state_consistency() {
     let reference = &node_metadata[0];
     for (node_idx, metadata) in node_metadata.iter().enumerate().skip(1) {
         assert_eq!(
-            reference, metadata,
+            reference,
+            metadata,
             "Node {} has different metadata than node 1",
             node_idx + 1
         );
@@ -676,20 +1073,12 @@ async fn test_controller_state_consistency() {
 // Test 1.5: Quorum Loss - Operations MUST Fail
 // ============================================================================
 
-/// Tests that operations fail when quorum is lost.
+/// Tests that operations fail when quorum is lost, then recover once quorum is restored.
 ///
-/// This is a critical test - it verifies that:
-/// 1. With 2 of 3 nodes dead, topic creation FAILS ✅ (working)
-/// 2. After restoring quorum, topic creation recovers ❌ (NOT WORKING - see below)
-///
-/// KNOWN ISSUE: Quorum recovery after full quorum loss doesn't work reliably.
-/// After killing 2 of 3 nodes and restarting them, the cluster doesn't recover
-/// within the expected timeframe. This needs investigation.
-///
-/// The test is marked `ignore` until this is fixed, but the first part (quorum loss
-/// detection) has been verified to work correctly.
+/// This validates a critical safety and recovery property:
+/// 1. With 2 of 3 nodes dead, topic creation/write fail.
+/// 2. After both nodes restart, metadata and writes recover eventually.
 #[tokio::test]
-#[ignore = "quorum recovery not working - needs investigation"]
 async fn test_controller_quorum_loss_must_fail() {
     let mut cluster = setup_cluster("controller_quorum_loss", 24900, 25000).await;
 
@@ -709,6 +1098,19 @@ async fn test_controller_quorum_loss_must_fail() {
         .await
         .expect("setup topic creation failed");
     println!("  Setup topic created - cluster is healthy");
+
+    let setup_converged = wait_for_topic_convergence_across_brokers(
+        &bootstrap_servers,
+        setup_topic,
+        8,
+        Duration::from_secs(60),
+    )
+    .await
+    .expect("setup topic did not converge across brokers before quorum-loss step");
+    println!(
+        "  Setup topic converged across {} broker(s)",
+        setup_converged.len()
+    );
 
     // Kill 2 of 3 nodes - this MUST break quorum
     println!("\n=== Kill 2 nodes to break quorum ===");
@@ -730,11 +1132,7 @@ async fn test_controller_quorum_loss_must_fail() {
 
     match result {
         Ok(leader) => {
-            // This is unexpected - quorum should be lost
-            println!("  WARNING: Topic creation succeeded with leader={leader}");
-            println!("  This might indicate quorum is not actually required, or");
-            println!("  the surviving node cached enough state to respond.");
-            // Don't panic - but flag this as suspicious
+            panic!("Topic creation unexpectedly succeeded without quorum; leader={leader}");
         }
         Err(e) => {
             println!("  EXPECTED: Topic creation failed: {e}");
@@ -749,8 +1147,7 @@ async fn test_controller_quorum_loss_must_fail() {
         .await;
     match write_result {
         Ok(offset) => {
-            println!("  WARNING: Write succeeded at offset {offset}");
-            println!("  This is unexpected - RF=3 with 2 nodes dead should fail");
+            panic!("Write unexpectedly succeeded without quorum at offset {offset}");
         }
         Err(e) => {
             println!("  EXPECTED: Write failed: {e}");
@@ -767,16 +1164,46 @@ async fn test_controller_quorum_loss_must_fail() {
     cluster.restart_node(2).expect("failed to restart node 2");
     println!("  Restarted node 2");
 
-    // Wait for cluster to recover - this may take time for Raft to re-establish
-    println!("  Waiting for cluster recovery (15s)...");
-    tokio::time::sleep(Duration::from_secs(15)).await;
+    // Wait for controller to converge across all brokers.
+    let (controller_after_restore, controller_view_after_restore) =
+        wait_for_controller_convergence_across_live_brokers(
+            &bootstrap_servers,
+            None,
+            3,
+            Duration::from_secs(90),
+        )
+        .await
+        .expect("controller did not converge after quorum restore");
+    println!(
+        "  Controller convergence after restore: node {} ({:?})",
+        controller_after_restore, controller_view_after_restore
+    );
+
+    // Keep using the original long-lived client and wait for metadata to recover.
+    executor
+        .wait_ready(Duration::from_secs(90))
+        .await
+        .expect("cluster did not become ready after quorum restore");
+
+    let setup_recovered = wait_for_topic_convergence_across_brokers(
+        &bootstrap_servers,
+        setup_topic,
+        8,
+        Duration::from_secs(90),
+    )
+    .await
+    .expect("setup topic metadata did not recover cluster-wide after quorum restore");
+    println!(
+        "  Existing topic recovered across {} broker(s)",
+        setup_recovered.len()
+    );
 
     // Now topic creation should work
     println!("\n=== Verify recovery: create topic after quorum restored ===");
     let recovery_topic = "quorum-recovery-topic";
 
     let result = cluster
-        .wait_for_leader(recovery_topic, 0, Duration::from_secs(60))
+        .wait_for_leader(recovery_topic, 0, Duration::from_secs(120))
         .await;
 
     match result {
@@ -788,20 +1215,210 @@ async fn test_controller_quorum_loss_must_fail() {
         }
     }
 
-    // Verify write works
-    let result = executor
-        .send(recovery_topic, 0, Bytes::from("recovery-test"))
-        .await;
-    assert!(result.is_ok(), "Write failed after quorum restored: {result:?}");
-    println!("  Write to recovery topic succeeded");
+    let recovery_converged = wait_for_topic_convergence_across_brokers(
+        &bootstrap_servers,
+        recovery_topic,
+        8,
+        Duration::from_secs(120),
+    )
+    .await
+    .expect("recovery topic metadata did not converge cluster-wide");
+    println!(
+        "  Recovery topic converged across {} broker(s)",
+        recovery_converged.len()
+    );
+
+    // Verify write works with eventual success semantics.
+    let send_deadline = std::time::Instant::now() + Duration::from_secs(90);
+    let mut attempts = 0usize;
+    let mut last_err = None;
+    let write_offset = loop {
+        attempts += 1;
+        match executor
+            .send(recovery_topic, 0, Bytes::from("recovery-test"))
+            .await
+        {
+            Ok(offset) => break Some(offset),
+            Err(e) => {
+                last_err = Some(e);
+                if std::time::Instant::now() >= send_deadline {
+                    break None;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    };
+    let Some(offset) = write_offset else {
+        panic!(
+            "Write failed after quorum restored (attempts={attempts}): {:?}",
+            last_err
+        );
+    };
+    println!("  Write to recovery topic succeeded at offset {offset} (attempts={attempts})");
 
     println!("\n=== Controller quorum loss test PASSED ===");
 }
 
 // ============================================================================
-// Test 1.6: Targeted Controller Leader Kill
+// Test 1.6: Quorum Loss During Bootstrap
 // ============================================================================
 
+/// Tests quorum loss during early metadata bootstrap, then eventual recovery.
+///
+/// This scenario intentionally injects quorum loss while a first topic operation
+/// is in-flight (before any cluster-wide convergence checks), then asserts:
+/// 1. No-quorum operations fail.
+/// 2. After quorum restore, controller and metadata converge again.
+/// 3. The same long-lived client can produce successfully.
+#[tokio::test]
+async fn test_controller_quorum_loss_during_bootstrap_recovers() {
+    let mut cluster = setup_cluster("controller_quorum_loss_during_bootstrap", 25300, 25400).await;
+
+    let bootstrap_servers = cluster.bootstrap_servers().to_string();
+    let executor = Arc::new(
+        RealExecutor::with_mode(&bootstrap_servers, ProducerMode::LowLatency)
+            .expect("failed to create executor"),
+    );
+    executor
+        .wait_ready(Duration::from_secs(60))
+        .await
+        .expect("cluster not ready");
+
+    println!("\n=== Step 1: Start bootstrap write, then break quorum immediately ===");
+    let bootstrap_topic = "quorum-bootstrap-topic";
+    let in_flight = {
+        let executor = Arc::clone(&executor);
+        tokio::spawn(async move {
+            executor
+                .send(bootstrap_topic, 0, Bytes::from("bootstrap-in-flight"))
+                .await
+        })
+    };
+
+    // Intentionally break quorum quickly, before waiting for any convergence.
+    cluster.kill_node(1).expect("failed to kill node 1");
+    cluster.kill_node(2).expect("failed to kill node 2");
+    println!("  Killed nodes 1 and 2");
+
+    // The in-flight operation may succeed or fail depending on exact timing,
+    // but it must complete (no indefinite hang).
+    match tokio::time::timeout(Duration::from_secs(40), in_flight).await {
+        Ok(Ok(Ok(offset))) => {
+            println!("  In-flight bootstrap write acknowledged at offset {offset}");
+        }
+        Ok(Ok(Err(e))) => {
+            println!("  In-flight bootstrap write failed (acceptable under fault): {e}");
+        }
+        Ok(Err(join_err)) => {
+            panic!("bootstrap write task panicked/join failed: {join_err}");
+        }
+        Err(_) => {
+            panic!("in-flight bootstrap write did not complete within timeout");
+        }
+    }
+
+    println!("\n=== Step 2: Without quorum, operations must fail ===");
+    let no_quorum_topic = "quorum-bootstrap-noquorum-topic";
+    let create_without_quorum = cluster
+        .wait_for_leader(no_quorum_topic, 0, Duration::from_secs(12))
+        .await;
+    assert!(
+        create_without_quorum.is_err(),
+        "Topic creation unexpectedly succeeded without quorum: {create_without_quorum:?}"
+    );
+    println!("  EXPECTED: topic creation failed without quorum");
+
+    let write_without_quorum = executor
+        .send(
+            bootstrap_topic,
+            0,
+            Bytes::from("should-fail-without-quorum"),
+        )
+        .await;
+    assert!(
+        write_without_quorum.is_err(),
+        "Write unexpectedly succeeded without quorum: {write_without_quorum:?}"
+    );
+    println!("  EXPECTED: write failed without quorum");
+
+    println!("\n=== Step 3: Restore quorum and require convergence ===");
+    cluster.restart_node(1).expect("failed to restart node 1");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    cluster.restart_node(2).expect("failed to restart node 2");
+
+    let (controller_after_restore, controller_view_after_restore) =
+        wait_for_controller_convergence_across_live_brokers(
+            &bootstrap_servers,
+            None,
+            3,
+            Duration::from_secs(90),
+        )
+        .await
+        .expect("controller did not converge after restore");
+    println!(
+        "  Controller convergence after restore: node {} ({:?})",
+        controller_after_restore, controller_view_after_restore
+    );
+
+    executor
+        .wait_ready(Duration::from_secs(90))
+        .await
+        .expect("cluster did not become ready after restore");
+
+    println!("\n=== Step 4: Verify new topic creation and writes recover ===");
+    let recovery_topic = "quorum-bootstrap-recovery-topic";
+    let recovery_leader = cluster
+        .wait_for_leader(recovery_topic, 0, Duration::from_secs(120))
+        .await
+        .expect("failed to create recovery topic after quorum restore");
+    println!("  Recovery topic leader = node {recovery_leader}");
+
+    let recovery_converged = wait_for_topic_convergence_across_brokers(
+        &bootstrap_servers,
+        recovery_topic,
+        8,
+        Duration::from_secs(120),
+    )
+    .await
+    .expect("recovery topic metadata did not converge cluster-wide");
+    println!(
+        "  Recovery topic converged across {} broker(s)",
+        recovery_converged.len()
+    );
+
+    let send_deadline = std::time::Instant::now() + Duration::from_secs(90);
+    let mut attempts = 0usize;
+    let mut last_err = None;
+    let final_offset = loop {
+        attempts += 1;
+        match executor
+            .send(recovery_topic, 0, Bytes::from("recovery-write"))
+            .await
+        {
+            Ok(offset) => break Some(offset),
+            Err(e) => {
+                last_err = Some(e);
+                if std::time::Instant::now() >= send_deadline {
+                    break None;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    };
+    let Some(final_offset) = final_offset else {
+        panic!(
+            "Write failed after quorum restore (attempts={attempts}): {:?}",
+            last_err
+        );
+    };
+    println!("  Recovery write succeeded at offset {final_offset} (attempts={attempts})");
+
+    println!("\n=== Controller quorum-loss-during-bootstrap test PASSED ===");
+}
+
+// ============================================================================
+// Test 1.7: Targeted Controller Leader Kill
+// ============================================================================
 /// Tests killing the actual controller leader (not random nodes).
 ///
 /// This test:
@@ -821,36 +1438,98 @@ async fn test_targeted_controller_leader_kill() {
         .await
         .expect("cluster not ready");
 
-    // Create initial topic
+    // Create initial topic.
     println!("\n=== Setup: Create initial topic ===");
     let topic1 = "targeted-topic-1";
-    let initial_leader = cluster
+    let topic1_data_leader = cluster
         .wait_for_leader(topic1, 0, Duration::from_secs(30))
         .await
         .expect("initial topic creation failed");
-    println!("  Topic '{topic1}' created, data leader = {initial_leader}");
+    println!("  Topic '{topic1}' created, data leader = {topic1_data_leader}");
 
-    // The data partition leader might be the controller leader, or not.
-    // Since we can't directly query controller leader via rdkafka,
-    // we'll kill the data partition leader and see what happens.
-    //
-    // This is still useful because:
-    // - With 3 nodes, there's a 1/3 chance we hit the controller leader
-    // - Even if we miss, we test failover of data partition leadership
-    //
-    // For a more targeted test, we'd need admin API access.
+    let (initial_controller, initial_controller_view) =
+        wait_for_controller_convergence_across_live_brokers(
+            &bootstrap_servers,
+            None,
+            3,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("controller did not converge before kill");
+    let majority_controller = get_controller_leader(&bootstrap_servers)
+        .await
+        .expect("failed to determine controller majority");
+    assert_eq!(
+        initial_controller, majority_controller,
+        "controller majority and convergence should match"
+    );
+    assert!(
+        initial_controller > 0,
+        "invalid controller id {initial_controller}"
+    );
+    let initial_controller_u64 =
+        u64::try_from(initial_controller).expect("controller id should convert to u64");
+    println!(
+        "  Initial controller leader = node {initial_controller} ({initial_controller_view:?})"
+    );
 
-    println!("\n=== Kill data partition leader (node {initial_leader}) ===");
+    // Acknowledged writes across failover must remain readable by offset.
+    let mut acknowledged: Vec<(u64, String)> = Vec::new();
+    for i in 0..20u32 {
+        let payload = format!("pre-failover-{i:04}");
+        let offset = executor
+            .send(topic1, 0, Bytes::from(payload.clone()))
+            .await
+            .expect("pre-failover write failed");
+        acknowledged.push((offset, payload));
+    }
+    println!("  Pre-failover acknowledged writes: {}", acknowledged.len());
+
+    println!("\n=== Kill controller leader (node {initial_controller}) ===");
     cluster
-        .kill_node(initial_leader)
-        .expect("failed to kill leader");
-    println!("  Killed node {initial_leader}");
+        .kill_node(initial_controller_u64)
+        .expect("failed to kill controller leader");
+    println!("  Killed controller leader node {initial_controller}");
 
-    // Wait for new leader election
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    let mut during_failover_acks = 0u32;
+    let mut during_failover_failures = 0u32;
+    for i in 0..60u32 {
+        let payload = format!("during-failover-{i:04}");
+        match executor.send(topic1, 0, Bytes::from(payload.clone())).await {
+            Ok(offset) => {
+                acknowledged.push((offset, payload));
+                during_failover_acks += 1;
+            }
+            Err(_) => {
+                during_failover_failures += 1;
+            }
+        }
+    }
+    println!(
+        "  During-failover writes: {during_failover_acks} acknowledged, {during_failover_failures} failed"
+    );
 
-    // Create new topic - requires controller
-    println!("\n=== Create new topic after killing node {initial_leader} ===");
+    let new_controller = wait_for_controller_leader_change(
+        &bootstrap_servers,
+        initial_controller,
+        2,
+        Duration::from_secs(45),
+    )
+    .await
+    .expect("controller leader did not change after kill");
+    println!("  New controller leader = node {new_controller}");
+    let (_, post_kill_view) = wait_for_controller_convergence_across_live_brokers(
+        &bootstrap_servers,
+        Some(new_controller),
+        2,
+        Duration::from_secs(20),
+    )
+    .await
+    .expect("controller did not converge on surviving brokers after kill");
+    println!("  Post-kill controller convergence (survivors): {post_kill_view:?}");
+
+    // Create new topic - must succeed under the new controller leader.
+    println!("\n=== Create new topic after killing controller node {initial_controller} ===");
     let topic2 = "targeted-topic-2";
     let new_leader = cluster
         .wait_for_leader(topic2, 0, Duration::from_secs(60))
@@ -858,15 +1537,19 @@ async fn test_targeted_controller_leader_kill() {
         .expect("topic creation failed after leader kill");
     println!("  Topic '{topic2}' created, new leader = {new_leader}");
 
-    // Verify the leader changed (or at least operations work)
+    // Verify the killed controller is not reported as topic leader.
     assert_ne!(
-        new_leader, initial_leader,
-        "New topic should not have killed node as leader"
+        new_leader as i32, initial_controller,
+        "New topic should not have killed controller node as leader"
     );
 
-    // Verify writes work to both topics
-    let result = executor.send(topic1, 0, Bytes::from("after-kill")).await;
-    assert!(result.is_ok(), "Write to {topic1} failed: {result:?}");
+    // Verify writes work to both topics and keep tracking acked durability writes.
+    let post_payload = "after-kill";
+    let result = executor
+        .send(topic1, 0, Bytes::from(post_payload))
+        .await
+        .expect("post-failover write to topic1 failed");
+    acknowledged.push((result, post_payload.to_string()));
     println!("  Write to '{topic1}' succeeded");
 
     let result = executor.send(topic2, 0, Bytes::from("new-topic")).await;
@@ -875,9 +1558,42 @@ async fn test_targeted_controller_leader_kill() {
 
     // Restart killed node
     cluster
-        .restart_node(initial_leader)
+        .restart_node(initial_controller_u64)
         .expect("restart failed");
     tokio::time::sleep(Duration::from_secs(3)).await;
+    let (post_restart_controller, post_restart_view) =
+        wait_for_controller_convergence_across_live_brokers(
+            &bootstrap_servers,
+            None,
+            3,
+            Duration::from_secs(45),
+        )
+        .await
+        .expect("controller did not converge across all brokers after restart");
+    println!(
+        "  Post-restart controller convergence: node {post_restart_controller} ({post_restart_view:?})"
+    );
+
+    // Verify no acknowledged writes were lost.
+    let consumed = executor
+        .poll(topic1, 0, 0, acknowledged.len() as u32 + 50)
+        .await
+        .expect("poll failed for durability verification");
+    let consumed_map: std::collections::HashMap<u64, Bytes> = consumed.into_iter().collect();
+    for (offset, expected_payload) in &acknowledged {
+        let actual = consumed_map
+            .get(offset)
+            .unwrap_or_else(|| panic!("acknowledged offset {offset} missing after failover"));
+        assert_eq!(
+            String::from_utf8_lossy(actual),
+            expected_payload.as_str(),
+            "payload mismatch at offset {offset}"
+        );
+    }
+    println!(
+        "  Durability verified for {} acknowledged writes",
+        acknowledged.len()
+    );
 
     // Final verification
     println!("\n=== Final verification ===");

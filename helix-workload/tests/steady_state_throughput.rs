@@ -17,6 +17,18 @@
 //! HELIX_PROFILE_FILE=my_profile.toml cargo test ...
 //! ```
 
+// Test-only throughput harness with intentionally verbose setup/reporting.
+#![allow(clippy::ignore_without_reason)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::significant_drop_tightening)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::literal_string_with_formatting_args)]
+#![allow(non_fmt_panics)]
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -74,12 +86,11 @@ fn find_available_base_port(start: u16, count: u16) -> u16 {
         for offset in 1..=count {
             let port = base.saturating_add(offset);
             let addr = format!("127.0.0.1:{port}");
-            match std::net::TcpListener::bind(&addr) {
-                Ok(listener) => listeners.push(listener),
-                Err(_) => {
-                    available = false;
-                    break;
-                }
+            if let Ok(listener) = std::net::TcpListener::bind(&addr) {
+                listeners.push(listener);
+            } else {
+                available = false;
+                break;
             }
         }
         if available {
@@ -135,9 +146,9 @@ async fn run_phase(
             let exec = Arc::clone(&executor);
             let payload = payload.clone();
             let topic = Arc::clone(&topic);
-            inflight_set.push(tokio::spawn(async move {
-                exec.send(&topic, 0, payload).await
-            }));
+            inflight_set.push(tokio::spawn(
+                async move { exec.send(&topic, 0, payload).await },
+            ));
         }
 
         if let Some(result) = inflight_set.next().await {
@@ -216,10 +227,9 @@ async fn test_single_partition_steady_state_throughput() {
     );
     std::env::set_var("HELIX_BENCH_REPORT_INTERVAL_MS", "1000");
 
-    // Configure producer based on profile
+    // Configure producer based on profile.
     if profile.producer.compression != "none" {
-        std::env::set_var("HELIX_USE_LIBSTREAMING_DEFAULTS", "1");
-        std::env::set_var("HELIX_LIBSTREAMING_COMPRESSION", &profile.producer.compression);
+        // Compression is configured by the selected benchmark profile.
     }
 
     let cluster = RealCluster::builder()
@@ -265,7 +275,10 @@ async fn test_single_partition_steady_state_throughput() {
     println!();
     println!("Cluster:");
     println!("  nodes: {}", profile.cluster.nodes);
-    println!("  replication_factor: {}", profile.cluster.replication_factor);
+    println!(
+        "  replication_factor: {}",
+        profile.cluster.replication_factor
+    );
     println!("  partitions: {}", profile.cluster.partitions);
     println!();
     println!("Execution:");
@@ -344,8 +357,12 @@ async fn test_single_partition_steady_state_throughput() {
     println!("Measured duration: {:.2}s", measure_elapsed.as_secs_f64());
     println!("Successful: {success_count}");
     println!("Errors: {error_count}");
-    println!("Throughput: {:.1} ops/sec", throughput_ops);
-    println!("Throughput: {:.1} bytes/sec ({:.1} MB/s)", throughput_bytes, throughput_bytes / 1_000_000.0);
+    println!("Throughput: {throughput_ops:.1} ops/sec");
+    println!(
+        "Throughput: {:.1} bytes/sec ({:.1} MB/s)",
+        throughput_bytes,
+        throughput_bytes / 1_000_000.0
+    );
     println!("=== Batcher Stats ===");
     for node_id in 1..=node_count {
         let report_path = report_dir.join(format!("batcher-stats-{node_id}.json"));
@@ -427,8 +444,9 @@ async fn test_multi_partition_throughput() {
         .build()
         .expect("failed to start cluster");
 
-    let wait_executor = RealExecutor::with_mode(cluster.bootstrap_servers(), ProducerMode::HighThroughput)
-        .expect("failed to create executor");
+    let wait_executor =
+        RealExecutor::with_mode(cluster.bootstrap_servers(), ProducerMode::HighThroughput)
+            .expect("failed to create executor");
     wait_executor
         .wait_ready(Duration::from_secs(60))
         .await
@@ -449,10 +467,10 @@ async fn test_multi_partition_throughput() {
     let topic_name = Arc::new(topic.to_string());
 
     println!("=== Multi-Partition Throughput Test ===");
-    println!("Cluster: {} nodes, {} partitions, RF=3", node_count, partition_count);
-    println!("Producers: {}, Inflight per producer: {}", producer_count, inflight);
-    println!("Message size: {} bytes", message_size);
-    println!("Duration: {}s (warmup: {}s)", duration_secs, warmup_secs);
+    println!("Cluster: {node_count} nodes, {partition_count} partitions, RF=3");
+    println!("Producers: {producer_count}, Inflight per producer: {inflight}");
+    println!("Message size: {message_size} bytes");
+    println!("Duration: {duration_secs}s (warmup: {warmup_secs}s)");
     println!();
 
     let warmup_duration = Duration::from_secs(warmup_secs);
@@ -471,7 +489,8 @@ async fn test_multi_partition_throughput() {
         let total_errors = Arc::clone(&total_errors);
         let topic_name = Arc::clone(&topic_name);
         let error_samples = Arc::clone(&error_samples);
-        let partition_success: Vec<Arc<AtomicU64>> = partition_success.iter().map(Arc::clone).collect();
+        let partition_success: Vec<Arc<AtomicU64>> =
+            partition_success.iter().map(Arc::clone).collect();
 
         let handle = tokio::spawn(async move {
             let executor = Arc::new(
@@ -491,7 +510,8 @@ async fn test_multi_partition_throughput() {
                     let exec = Arc::clone(&executor);
                     let payload = payload.clone();
                     let topic = Arc::clone(&topic_name);
-                    let partition = ((producer_id as i32 * 1000) + (warmup_seq as i32)) % partition_count;
+                    let partition =
+                        ((producer_id as i32 * 1000) + (warmup_seq as i32)) % partition_count;
                     warmup_seq += 1;
                     inflight_set.push(tokio::spawn(async move {
                         (partition, exec.send(&topic, partition, payload).await)
@@ -518,7 +538,8 @@ async fn test_multi_partition_throughput() {
                     let payload = payload.clone();
                     let topic = Arc::clone(&topic_name);
                     // Round-robin across partitions with producer offset for distribution.
-                    let partition = ((producer_id as i32 * 1000) + (measure_seq as i32)) % partition_count;
+                    let partition =
+                        ((producer_id as i32 * 1000) + (measure_seq as i32)) % partition_count;
                     measure_seq += 1;
                     local_inflight.push(tokio::spawn(async move {
                         (partition, exec.send(&topic, partition, payload).await)
@@ -565,15 +586,16 @@ async fn test_multi_partition_throughput() {
     let success_count = total_success.load(Ordering::Relaxed);
     let error_count = total_errors.load(Ordering::Relaxed);
     let throughput_ops = success_count as f64 / measure_elapsed.as_secs_f64();
-    let throughput_bytes = (success_count as f64 * message_size as f64) / measure_elapsed.as_secs_f64();
+    let throughput_bytes =
+        (success_count as f64 * message_size as f64) / measure_elapsed.as_secs_f64();
     let throughput_mb = throughput_bytes / 1_000_000.0;
 
     println!("=== Results ===");
     println!("Measured duration: {:.2}s", measure_elapsed.as_secs_f64());
     println!("Successful: {success_count}");
     println!("Errors: {error_count}");
-    println!("Throughput: {:.1} ops/sec", throughput_ops);
-    println!("Throughput: {:.1} MB/s", throughput_mb);
+    println!("Throughput: {throughput_ops:.1} ops/sec");
+    println!("Throughput: {throughput_mb:.1} MB/s");
 
     // Per-partition distribution.
     println!();
@@ -586,10 +608,10 @@ async fn test_multi_partition_throughput() {
     partition_counts.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
     for (partition, count) in &partition_counts {
         let pct = (*count as f64 / success_count as f64) * 100.0;
-        let partition_throughput = (*count as f64 * message_size as f64) / measure_elapsed.as_secs_f64() / 1_000_000.0;
+        let partition_throughput =
+            (*count as f64 * message_size as f64) / measure_elapsed.as_secs_f64() / 1_000_000.0;
         println!(
-            "  Partition {}: {} ops ({:.1}%), {:.1} MB/s",
-            partition, count, pct, partition_throughput
+            "  Partition {partition}: {count} ops ({pct:.1}%), {partition_throughput:.1} MB/s"
         );
     }
 
@@ -617,8 +639,8 @@ async fn test_multi_partition_throughput() {
 
     println!();
     println!("=== Verification ===");
-    println!("Target throughput: {:.0} MB/s", target_throughput_mb);
-    println!("Actual throughput: {:.1} MB/s", throughput_mb);
+    println!("Target throughput: {target_throughput_mb:.0} MB/s");
+    println!("Actual throughput: {throughput_mb:.1} MB/s");
 
     // Allow small error rate (<0.1%) for high-throughput tests under load.
     let max_error_rate = std::env::var("HELIX_MAX_ERROR_RATE")
@@ -630,7 +652,11 @@ async fn test_multi_partition_throughput() {
     } else {
         0.0
     };
-    println!("Error rate: {:.4}% (max: {:.2}%)", error_rate * 100.0, max_error_rate * 100.0);
+    println!(
+        "Error rate: {:.4}% (max: {:.2}%)",
+        error_rate * 100.0,
+        max_error_rate * 100.0
+    );
     assert!(
         error_rate <= max_error_rate,
         "Error rate {:.3}% exceeds max {:.3}%",
@@ -640,13 +666,12 @@ async fn test_multi_partition_throughput() {
     assert!(success_count > 0, "No successful operations recorded");
 
     // Check throughput meets target (can be disabled for CI).
-    let skip_throughput_check = std::env::var("HELIX_SKIP_THROUGHPUT_CHECK").ok().as_deref() == Some("1");
+    let skip_throughput_check =
+        std::env::var("HELIX_SKIP_THROUGHPUT_CHECK").ok().as_deref() == Some("1");
     if !skip_throughput_check {
         assert!(
             throughput_mb >= target_throughput_mb,
-            "Throughput {:.1} MB/s below target {:.0} MB/s",
-            throughput_mb,
-            target_throughput_mb
+            "Throughput {throughput_mb:.1} MB/s below target {target_throughput_mb:.0} MB/s"
         );
     }
 }
@@ -696,10 +721,9 @@ async fn test_single_partition_actor_mode_throughput() {
     );
     std::env::set_var("HELIX_BENCH_REPORT_INTERVAL_MS", "1000");
 
-    // Configure producer based on profile
+    // Configure producer based on profile.
     if profile.producer.compression != "none" {
-        std::env::set_var("HELIX_USE_LIBSTREAMING_DEFAULTS", "1");
-        std::env::set_var("HELIX_LIBSTREAMING_COMPRESSION", &profile.producer.compression);
+        // Compression is configured by the selected benchmark profile.
     }
 
     let cluster = RealCluster::builder()
@@ -746,7 +770,10 @@ async fn test_single_partition_actor_mode_throughput() {
     println!();
     println!("Cluster:");
     println!("  nodes: {}", profile.cluster.nodes);
-    println!("  replication_factor: {}", profile.cluster.replication_factor);
+    println!(
+        "  replication_factor: {}",
+        profile.cluster.replication_factor
+    );
     println!("  partitions: {}", profile.cluster.partitions);
     println!("  actor_mode: ENABLED");
     println!();
@@ -826,8 +853,12 @@ async fn test_single_partition_actor_mode_throughput() {
     println!("Measured duration: {:.2}s", measure_elapsed.as_secs_f64());
     println!("Successful: {success_count}");
     println!("Errors: {error_count}");
-    println!("Throughput: {:.1} ops/sec", throughput_ops);
-    println!("Throughput: {:.1} bytes/sec ({:.1} MB/s)", throughput_bytes, throughput_bytes / 1_000_000.0);
+    println!("Throughput: {throughput_ops:.1} ops/sec");
+    println!(
+        "Throughput: {:.1} bytes/sec ({:.1} MB/s)",
+        throughput_bytes,
+        throughput_bytes / 1_000_000.0
+    );
     println!("=== Batcher Stats ===");
     for node_id in 1..=node_count {
         let report_path = report_dir.join(format!("batcher-stats-{node_id}.json"));
@@ -905,8 +936,9 @@ async fn test_multi_partition_actor_mode_throughput() {
         .build()
         .expect("failed to start cluster");
 
-    let wait_executor = RealExecutor::with_mode(cluster.bootstrap_servers(), ProducerMode::HighThroughput)
-        .expect("failed to create executor");
+    let wait_executor =
+        RealExecutor::with_mode(cluster.bootstrap_servers(), ProducerMode::HighThroughput)
+            .expect("failed to create executor");
     wait_executor
         .wait_ready(Duration::from_secs(60))
         .await
@@ -927,10 +959,10 @@ async fn test_multi_partition_actor_mode_throughput() {
     let topic_name = Arc::new(topic.to_string());
 
     println!("=== Multi-Partition Throughput Test (ACTOR MODE) ===");
-    println!("Cluster: {} nodes, {} partitions, RF=3", node_count, partition_count);
-    println!("Producers: {}, Inflight per producer: {}", producer_count, inflight);
-    println!("Message size: {} bytes", message_size);
-    println!("Duration: {}s (warmup: {}s)", duration_secs, warmup_secs);
+    println!("Cluster: {node_count} nodes, {partition_count} partitions, RF=3");
+    println!("Producers: {producer_count}, Inflight per producer: {inflight}");
+    println!("Message size: {message_size} bytes");
+    println!("Duration: {duration_secs}s (warmup: {warmup_secs}s)");
     println!("Actor mode: ENABLED");
     println!();
 
@@ -950,7 +982,8 @@ async fn test_multi_partition_actor_mode_throughput() {
         let total_errors = Arc::clone(&total_errors);
         let topic_name = Arc::clone(&topic_name);
         let error_samples = Arc::clone(&error_samples);
-        let partition_success: Vec<Arc<AtomicU64>> = partition_success.iter().map(Arc::clone).collect();
+        let partition_success: Vec<Arc<AtomicU64>> =
+            partition_success.iter().map(Arc::clone).collect();
 
         let handle = tokio::spawn(async move {
             let executor = Arc::new(
@@ -970,7 +1003,8 @@ async fn test_multi_partition_actor_mode_throughput() {
                     let exec = Arc::clone(&executor);
                     let payload = payload.clone();
                     let topic = Arc::clone(&topic_name);
-                    let partition = ((producer_id as i32 * 1000) + (warmup_seq as i32)) % partition_count;
+                    let partition =
+                        ((producer_id as i32 * 1000) + (warmup_seq as i32)) % partition_count;
                     warmup_seq += 1;
                     inflight_set.push(tokio::spawn(async move {
                         (partition, exec.send(&topic, partition, payload).await)
@@ -997,7 +1031,8 @@ async fn test_multi_partition_actor_mode_throughput() {
                     let payload = payload.clone();
                     let topic = Arc::clone(&topic_name);
                     // Round-robin across partitions with producer offset for distribution.
-                    let partition = ((producer_id as i32 * 1000) + (measure_seq as i32)) % partition_count;
+                    let partition =
+                        ((producer_id as i32 * 1000) + (measure_seq as i32)) % partition_count;
                     measure_seq += 1;
                     local_inflight.push(tokio::spawn(async move {
                         (partition, exec.send(&topic, partition, payload).await)
@@ -1044,15 +1079,16 @@ async fn test_multi_partition_actor_mode_throughput() {
     let success_count = total_success.load(Ordering::Relaxed);
     let error_count = total_errors.load(Ordering::Relaxed);
     let throughput_ops = success_count as f64 / measure_elapsed.as_secs_f64();
-    let throughput_bytes = (success_count as f64 * message_size as f64) / measure_elapsed.as_secs_f64();
+    let throughput_bytes =
+        (success_count as f64 * message_size as f64) / measure_elapsed.as_secs_f64();
     let throughput_mb = throughput_bytes / 1_000_000.0;
 
     println!("=== Results (ACTOR MODE) ===");
     println!("Measured duration: {:.2}s", measure_elapsed.as_secs_f64());
     println!("Successful: {success_count}");
     println!("Errors: {error_count}");
-    println!("Throughput: {:.1} ops/sec", throughput_ops);
-    println!("Throughput: {:.1} MB/s", throughput_mb);
+    println!("Throughput: {throughput_ops:.1} ops/sec");
+    println!("Throughput: {throughput_mb:.1} MB/s");
 
     // Per-partition distribution.
     println!();
@@ -1065,10 +1101,10 @@ async fn test_multi_partition_actor_mode_throughput() {
     partition_counts.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
     for (partition, count) in &partition_counts {
         let pct = (*count as f64 / success_count as f64) * 100.0;
-        let partition_throughput = (*count as f64 * message_size as f64) / measure_elapsed.as_secs_f64() / 1_000_000.0;
+        let partition_throughput =
+            (*count as f64 * message_size as f64) / measure_elapsed.as_secs_f64() / 1_000_000.0;
         println!(
-            "  Partition {}: {} ops ({:.1}%), {:.1} MB/s",
-            partition, count, pct, partition_throughput
+            "  Partition {partition}: {count} ops ({pct:.1}%), {partition_throughput:.1} MB/s"
         );
     }
 
@@ -1094,8 +1130,8 @@ async fn test_multi_partition_actor_mode_throughput() {
 
     println!();
     println!("=== Verification ===");
-    println!("Target throughput: {:.0} MB/s", target_throughput_mb);
-    println!("Actual throughput: {:.1} MB/s", throughput_mb);
+    println!("Target throughput: {target_throughput_mb:.0} MB/s");
+    println!("Actual throughput: {throughput_mb:.1} MB/s");
 
     // Allow small error rate (<0.1%) for high-throughput tests under load.
     let max_error_rate = std::env::var("HELIX_MAX_ERROR_RATE")
@@ -1107,7 +1143,11 @@ async fn test_multi_partition_actor_mode_throughput() {
     } else {
         0.0
     };
-    println!("Error rate: {:.4}% (max: {:.2}%)", error_rate * 100.0, max_error_rate * 100.0);
+    println!(
+        "Error rate: {:.4}% (max: {:.2}%)",
+        error_rate * 100.0,
+        max_error_rate * 100.0
+    );
     assert!(
         error_rate <= max_error_rate,
         "Error rate {:.3}% exceeds max {:.3}%",
@@ -1117,13 +1157,12 @@ async fn test_multi_partition_actor_mode_throughput() {
     assert!(success_count > 0, "No successful operations recorded");
 
     // Check throughput meets target (can be disabled for CI).
-    let skip_throughput_check = std::env::var("HELIX_SKIP_THROUGHPUT_CHECK").ok().as_deref() == Some("1");
+    let skip_throughput_check =
+        std::env::var("HELIX_SKIP_THROUGHPUT_CHECK").ok().as_deref() == Some("1");
     if !skip_throughput_check {
         assert!(
             throughput_mb >= target_throughput_mb,
-            "Throughput {:.1} MB/s below target {:.0} MB/s",
-            throughput_mb,
-            target_throughput_mb
+            "Throughput {throughput_mb:.1} MB/s below target {target_throughput_mb:.0} MB/s"
         );
     }
 }

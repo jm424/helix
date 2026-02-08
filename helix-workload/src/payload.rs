@@ -187,12 +187,8 @@ impl VerifiablePayload {
     /// Verifies the checksum is correct.
     #[must_use]
     pub fn verify_checksum(&self) -> bool {
-        let computed = Self::compute_checksum(
-            self.operation_id,
-            self.sequence,
-            self.timestamp,
-            &self.data,
-        );
+        let computed =
+            Self::compute_checksum(self.operation_id, self.sequence, self.timestamp, &self.data);
         self.checksum == computed
     }
 

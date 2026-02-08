@@ -92,8 +92,7 @@ impl Default for SizeDistribution {
 }
 
 /// Workload pattern to execute.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub enum WorkloadPattern {
     /// Sequential writes to single partition, then read back.
     #[default]
@@ -139,7 +138,6 @@ pub enum WorkloadPattern {
         operations_per_partition: u32,
     },
 }
-
 
 /// Workload configuration.
 #[derive(Debug, Clone)]
@@ -389,13 +387,16 @@ impl Workload {
         let topic = self
             .config
             .topics
-            .first().map_or_else(|| "test".to_string(), |t| t.name.clone());
+            .first()
+            .map_or_else(|| "test".to_string(), |t| t.name.clone());
         let partition = 0;
 
         // Send phase.
         for _ in 0..self.config.operations {
             let payload = self.generate_payload();
-            let latency = self.execute_send(executor, &topic, partition, payload).await;
+            let latency = self
+                .execute_send(executor, &topic, partition, payload)
+                .await;
             if let Some(us) = latency {
                 let _ = send_latencies.record(us);
             }
@@ -429,7 +430,8 @@ impl Workload {
         let topic = self
             .config
             .topics
-            .first().map_or_else(|| "test".to_string(), |t| t.name.clone());
+            .first()
+            .map_or_else(|| "test".to_string(), |t| t.name.clone());
 
         let partitions: i32 = self.config.topics.first().map_or(1, |t| t.partitions);
 
@@ -438,7 +440,9 @@ impl Workload {
         while Instant::now() < deadline {
             let partition = self.rng.gen_range(0..partitions);
             let payload = self.generate_payload();
-            let latency = self.execute_send(executor, &topic, partition, payload).await;
+            let latency = self
+                .execute_send(executor, &topic, partition, payload)
+                .await;
             if let Some(us) = latency {
                 let _ = send_latencies.record(us);
             }
@@ -459,7 +463,8 @@ impl Workload {
         let topic = self
             .config
             .topics
-            .first().map_or_else(|| "test".to_string(), |t| t.name.clone());
+            .first()
+            .map_or_else(|| "test".to_string(), |t| t.name.clone());
 
         // Generate partition order randomly for deterministic but varied access.
         let mut partitions: Vec<i32> = (0..partition_count).collect();
@@ -469,7 +474,9 @@ impl Workload {
         for partition in &partitions {
             for _ in 0..operations_per_partition {
                 let payload = self.generate_payload();
-                let latency = self.execute_send(executor, &topic, *partition, payload).await;
+                let latency = self
+                    .execute_send(executor, &topic, *partition, payload)
+                    .await;
                 if let Some(us) = latency {
                     let _ = send_latencies.record(us);
                 }
@@ -709,7 +716,9 @@ impl Workload {
             invoked_at,
         );
 
-        let result = executor.poll(topic, partition, start_offset, max_messages).await;
+        let result = executor
+            .poll(topic, partition, start_offset, max_messages)
+            .await;
         let completed_at = executor.now();
 
         let op_result = match result {
@@ -782,8 +791,11 @@ impl WorkloadStats {
         println!("=== Workload Statistics ===");
         println!(
             "Operations: {} total, {} ok, {} failed (sends: {}, polls: {})",
-            self.operations_total, self.operations_ok, self.operations_failed,
-            self.sends_ok, self.polls_ok
+            self.operations_total,
+            self.operations_ok,
+            self.operations_failed,
+            self.sends_ok,
+            self.polls_ok
         );
         println!(
             "Send latency: p50={:.2}ms p95={:.2}ms p99={:.2}ms max={:.2}ms",

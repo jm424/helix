@@ -2,6 +2,8 @@
 //!
 //! Runs verification workloads against real Helix server processes.
 
+#![allow(clippy::too_many_lines)]
+
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -181,7 +183,10 @@ async fn verify_and_report_results(
 
     eprintln!("  Polling offsets {min_offset} to {max_offset} ({expected_count} messages)");
 
-    let messages = match executor.poll(topic, partition, min_offset, expected_count).await {
+    let messages = match executor
+        .poll(topic, partition, min_offset, expected_count)
+        .await
+    {
         Ok(m) => m,
         Err(e) => {
             eprintln!("ERROR: Failed to poll messages: {e}");
@@ -257,8 +262,16 @@ async fn test_leader_failover() -> bool {
         std::collections::HashMap::new();
 
     eprintln!("\nPhase 1: Sending 10 messages before failover...");
-    send_messages(&executor, topic, partition, "message-before-failover", 10,
-        &mut acknowledged_offsets, &mut payloads).await;
+    send_messages(
+        &executor,
+        topic,
+        partition,
+        "message-before-failover",
+        10,
+        &mut acknowledged_offsets,
+        &mut payloads,
+    )
+    .await;
 
     if acknowledged_offsets.is_empty() {
         eprintln!("ERROR: No messages were acknowledged before failover");
@@ -296,11 +309,29 @@ async fn test_leader_failover() -> bool {
     tokio::time::sleep(Duration::from_secs(8)).await;
 
     eprintln!("\nPhase 3: Sending 10 messages after failover...");
-    send_messages(&executor, topic, partition, "message-after-failover", 10,
-        &mut acknowledged_offsets, &mut payloads).await;
-    eprintln!("  Total acknowledged: {} messages", acknowledged_offsets.len());
+    send_messages(
+        &executor,
+        topic,
+        partition,
+        "message-after-failover",
+        10,
+        &mut acknowledged_offsets,
+        &mut payloads,
+    )
+    .await;
+    eprintln!(
+        "  Total acknowledged: {} messages",
+        acknowledged_offsets.len()
+    );
 
-    verify_and_report_results(&executor, topic, partition, &acknowledged_offsets, &payloads).await
+    verify_and_report_results(
+        &executor,
+        topic,
+        partition,
+        &acknowledged_offsets,
+        &payloads,
+    )
+    .await
 }
 
 async fn test_multi_node() -> bool {
@@ -494,7 +525,14 @@ async fn test_full_cluster_restart() -> bool {
     eprintln!("  Leader elected after restart");
 
     // Phase 4: Verify all data survived the restart.
-    verify_and_report_results(&executor, topic, partition, &acknowledged_offsets, &payloads).await
+    verify_and_report_results(
+        &executor,
+        topic,
+        partition,
+        &acknowledged_offsets,
+        &payloads,
+    )
+    .await
 }
 
 #[tokio::main]

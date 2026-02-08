@@ -33,6 +33,9 @@ thiserror.workspace = true
 # Logging.
 tracing.workspace = true
 
+# Networking.
+socket2.workspace = true
+
 # Time and statistics.
 hdrhistogram.workspace = true
 
@@ -49,3 +52,4 @@ path = "src/bin/integration_test.rs"
 [dev-dependencies]
 futures.workspace = true
 tempfile.workspace = true
+kafka-protocol.workspace = true

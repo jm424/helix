@@ -68,7 +68,12 @@ impl History {
     ///
     /// Panics if the operation ID is invalid.
     #[allow(clippy::cast_possible_truncation)] // op_id is always within Vec bounds.
-    pub fn record_complete(&mut self, op_id: u64, completed_at: Timestamp, result: OperationResult) {
+    pub fn record_complete(
+        &mut self,
+        op_id: u64,
+        completed_at: Timestamp,
+        result: OperationResult,
+    ) {
         let op = self
             .operations
             .get_mut(op_id as usize)
@@ -78,7 +83,9 @@ impl History {
         match (&op.kind, &result) {
             (
                 OperationKind::Send {
-                    topic, partition, payload,
+                    topic,
+                    partition,
+                    payload,
                 },
                 OperationResult::SendOk { offset },
             ) => {
@@ -94,7 +101,9 @@ impl History {
             }
 
             (
-                OperationKind::Poll { topic, partition, .. },
+                OperationKind::Poll {
+                    topic, partition, ..
+                },
                 OperationResult::PollOk { messages },
             ) => {
                 for (offset, payload) in messages {
@@ -196,9 +205,7 @@ impl History {
     pub fn ops_for_partition(&self, topic: &str, partition: i32) -> Vec<&Operation> {
         self.operations
             .iter()
-            .filter(|op| {
-                op.kind.topic() == Some(topic) && op.kind.partition() == Some(partition)
-            })
+            .filter(|op| op.kind.topic() == Some(topic) && op.kind.partition() == Some(partition))
             .collect()
     }
 
@@ -208,12 +215,20 @@ impl History {
     ///
     /// Panics if the operation ID stored in sends is invalid.
     #[must_use]
-    pub fn sends_for_partition(&self, topic: &str, partition: i32) -> Vec<(u64, &Operation, &Bytes)> {
+    pub fn sends_for_partition(
+        &self,
+        topic: &str,
+        partition: i32,
+    ) -> Vec<(u64, &Operation, &Bytes)> {
         self.sends
             .iter()
             .filter(|((t, p, _), _)| t == topic && *p == partition)
             .map(|((_, _, offset), (op_id, payload))| {
-                (*offset, self.get_operation(*op_id).expect("valid op_id"), payload)
+                (
+                    *offset,
+                    self.get_operation(*op_id).expect("valid op_id"),
+                    payload,
+                )
             })
             .collect()
     }

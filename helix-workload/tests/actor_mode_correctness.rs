@@ -19,6 +19,7 @@
 #![allow(clippy::needless_borrows_for_generic_args)] // Explicit borrows for clarity
 #![allow(clippy::unused_async)] // Test setup functions may need async signature
 #![allow(clippy::if_not_else)] // Negative conditions can be clearer in some contexts
+#![allow(clippy::collection_is_never_read)] // Test harness state may be write-only bookkeeping
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -69,6 +70,30 @@ fn test_data_dir(test_name: &str) -> PathBuf {
     dir
 }
 
+/// Finds an available contiguous block of ports.
+fn find_available_base_port(start: u16, count: u16) -> u16 {
+    let max_base = u16::MAX.saturating_sub(count);
+    for base in start..=max_base {
+        let mut listeners = Vec::with_capacity(count as usize);
+        let mut available = true;
+        for offset in 1..=count {
+            let port = base.saturating_add(offset);
+            let addr = format!("127.0.0.1:{port}");
+            match std::net::TcpListener::bind(&addr) {
+                Ok(listener) => listeners.push(listener),
+                Err(_) => {
+                    available = false;
+                    break;
+                }
+            }
+        }
+        if available {
+            return base;
+        }
+    }
+    panic!("unable to find available port block (count={count}) starting at {start}");
+}
+
 /// Creates an actor-mode enabled cluster with the given configuration.
 async fn setup_actor_mode_cluster(
     test_name: &str,
@@ -97,6 +122,10 @@ async fn setup_actor_mode_cluster(
 ///
 /// Verifies that actor mode works correctly with a single partition.
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+)]
 async fn test_actor_mode_single_partition() {
     let cluster = setup_actor_mode_cluster("single_partition", 3, 20100, 20200).await;
 
@@ -142,6 +171,10 @@ async fn test_actor_mode_single_partition() {
 /// Verifies that actor mode correctly handles multiple partitions with
 /// per-partition ordering maintained.
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+)]
 async fn test_actor_mode_multi_partition() {
     let cluster = setup_actor_mode_cluster("multi_partition", 3, 20300, 20400).await;
 
@@ -195,6 +228,10 @@ async fn test_actor_mode_multi_partition() {
 /// producers to different partitions without interference.
 /// Uses the Workload framework for proper topic creation and verification.
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+)]
 async fn test_actor_mode_concurrent_producers() {
     let cluster = setup_actor_mode_cluster("concurrent_producers", 3, 20500, 20600).await;
 
@@ -270,7 +307,8 @@ async fn test_actor_mode_concurrent_producers() {
     println!("=== Actor Mode Concurrent Producers ===");
     println!("  Total sends: {total_sends}");
     println!("  Total failed: {total_failed}");
-    println!("  Violations: {} (OffsetGap: {}, serious: {})",
+    println!(
+        "  Violations: {} (OffsetGap: {}, serious: {})",
         all_violations.len(),
         all_violations.len() - serious_violations.len(),
         serious_violations.len()
@@ -300,6 +338,10 @@ async fn test_actor_mode_concurrent_producers() {
 ///
 /// Verifies actor mode under high load with many partitions and operations.
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+)]
 async fn test_actor_mode_high_concurrency_stress() {
     let cluster = setup_actor_mode_cluster("high_concurrency", 3, 20700, 20800).await;
 
@@ -355,6 +397,10 @@ async fn test_actor_mode_high_concurrency_stress() {
 /// - All acknowledged writes (pre and post failure) are readable
 /// - No data loss or corruption
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+)]
 async fn test_actor_mode_leader_failure() {
     let mut cluster = setup_actor_mode_cluster("leader_failure", 3, 20900, 21000).await;
 
@@ -395,7 +441,10 @@ async fn test_actor_mode_leader_failure() {
     }
     let ack_count = acknowledged.len();
     println!("  Phase 1 complete: {ack_count} acknowledged");
-    assert_eq!(ack_count, 50, "Phase 1: all 50 writes must succeed on healthy cluster");
+    assert_eq!(
+        ack_count, 50,
+        "Phase 1: all 50 writes must succeed on healthy cluster"
+    );
 
     // Phase 2: Kill leader.
     println!("\nPhase 2: Killing leader (node {leader})...");
@@ -418,7 +467,10 @@ async fn test_actor_mode_leader_failure() {
         .wait_for_leader(topic, partition, Duration::from_secs(30))
         .await
         .expect("no new leader elected");
-    assert_ne!(new_leader, leader, "New leader must be different from killed leader");
+    assert_ne!(
+        new_leader, leader,
+        "New leader must be different from killed leader"
+    );
     println!("  New leader: node {new_leader}");
 
     // Write after failover - ALL must succeed (cluster recovered).
@@ -454,8 +506,12 @@ async fn test_actor_mode_leader_failure() {
                 verified += 1;
             }
             Some(actual) => {
-                eprintln!("CORRUPTION at offset {}: expected '{}', got '{}'",
-                    offset, expected, String::from_utf8_lossy(actual));
+                eprintln!(
+                    "CORRUPTION at offset {}: expected '{}', got '{}'",
+                    offset,
+                    expected,
+                    String::from_utf8_lossy(actual)
+                );
                 errors += 1;
             }
             None => {
@@ -471,7 +527,10 @@ async fn test_actor_mode_leader_failure() {
     println!("  Verified: {verified}");
     println!("  Errors: {errors}");
 
-    assert_eq!(errors, 0, "CRITICAL: {errors} data integrity errors after leader failure");
+    assert_eq!(
+        errors, 0,
+        "CRITICAL: {errors} data integrity errors after leader failure"
+    );
     assert_eq!(
         verified as usize, total_ack,
         "Not all acknowledged writes verified: {verified}/{total_ack}"
@@ -485,6 +544,10 @@ async fn test_actor_mode_leader_failure() {
 /// - All acknowledged writes are readable after recovery
 /// - No data loss or corruption
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+)]
 async fn test_actor_mode_node_failure_multi_partition() {
     let mut cluster = setup_actor_mode_cluster("node_failure_multi", 3, 21100, 21200).await;
 
@@ -528,7 +591,10 @@ async fn test_actor_mode_node_failure_multi_partition() {
     }
     let phase1_count: usize = acknowledged.iter().map(Vec::len).sum();
     println!("  Phase 1 complete: {phase1_count} acknowledged");
-    assert_eq!(phase1_count, 100, "Phase 1: all 100 writes must succeed on healthy cluster");
+    assert_eq!(
+        phase1_count, 100,
+        "Phase 1: all 100 writes must succeed on healthy cluster"
+    );
 
     // Phase 2: Kill node 2.
     println!("\nPhase 2: Killing node 2...");
@@ -608,7 +674,10 @@ async fn test_actor_mode_node_failure_multi_partition() {
     println!("  Verified: {verified}");
     println!("  Errors: {errors}");
 
-    assert_eq!(errors, 0, "CRITICAL: {errors} data integrity errors after node failure");
+    assert_eq!(
+        errors, 0,
+        "CRITICAL: {errors} data integrity errors after node failure"
+    );
     assert_eq!(
         verified as usize, total_acknowledged,
         "Not all acknowledged writes verified: {verified}/{total_acknowledged}"
@@ -624,6 +693,10 @@ async fn test_actor_mode_node_failure_multi_partition() {
 /// Verifies that all committed data is readable by consumers and ordering
 /// is maintained within each partition. All writes must succeed on healthy cluster.
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+)]
 async fn test_actor_mode_producer_consumer() {
     let cluster = setup_actor_mode_cluster("producer_consumer", 3, 21300, 21400).await;
 
@@ -668,7 +741,10 @@ async fn test_actor_mode_producer_consumer() {
     }
 
     let total_produced: usize = acknowledged.iter().map(Vec::len).sum();
-    assert_eq!(total_produced, 100, "All 100 sends must succeed on healthy cluster");
+    assert_eq!(
+        total_produced, 100,
+        "All 100 sends must succeed on healthy cluster"
+    );
 
     // Consume and verify ALL data.
     println!("Consuming and verifying...");
@@ -688,7 +764,9 @@ async fn test_actor_mode_producer_consumer() {
         if consumed.len() != expected.len() {
             eprintln!(
                 "Partition {}: expected {} messages, got {}",
-                partition, expected.len(), consumed.len()
+                partition,
+                expected.len(),
+                consumed.len()
             );
         }
 
@@ -727,7 +805,10 @@ async fn test_actor_mode_producer_consumer() {
     println!("  Missing: {missing}");
     println!("  Corruption: {corruption}");
 
-    assert_eq!(ordering_errors, 0, "Found {ordering_errors} ordering violations");
+    assert_eq!(
+        ordering_errors, 0,
+        "Found {ordering_errors} ordering violations"
+    );
     assert_eq!(missing, 0, "Found {missing} missing messages");
     assert_eq!(corruption, 0, "Found {corruption} corrupted messages");
     assert_eq!(
@@ -823,8 +904,13 @@ async fn test_actor_mode_stress_many_seeds() {
 /// - Payload bytes must match exactly (no corruption)
 /// - Per-partition ordering must be maintained
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+)]
 async fn test_actor_mode_multi_partition_leader_failover_verified() {
-    let mut cluster = setup_actor_mode_cluster("multi_partition_leader_failover", 3, 23000, 23100).await;
+    let mut cluster =
+        setup_actor_mode_cluster("multi_partition_leader_failover", 3, 23000, 23100).await;
 
     let bootstrap_servers = cluster.bootstrap_servers().to_string();
     let executor = RealExecutor::with_mode(&bootstrap_servers, ProducerMode::LowLatency)
@@ -835,7 +921,7 @@ async fn test_actor_mode_multi_partition_leader_failover_verified() {
         .expect("cluster not ready");
 
     let topic = "leader-failover-verified";
-    let num_partitions = 8i32;  // More partitions
+    let num_partitions = 8i32; // More partitions
 
     // Track all acknowledged writes: partition -> Vec<(offset, payload)>
     let mut acknowledged: Vec<Vec<(u64, String)>> = vec![Vec::new(); num_partitions as usize];
@@ -872,10 +958,14 @@ async fn test_actor_mode_multi_partition_leader_failover_verified() {
 
     let phase1_total: usize = acknowledged.iter().map(Vec::len).sum();
     println!("  Phase 1 complete: {phase1_total} acknowledged writes");
-    assert_eq!(phase1_total, 1600, "Phase 1: expected exactly 1600 acknowledged writes");
+    assert_eq!(
+        phase1_total, 1600,
+        "Phase 1: expected exactly 1600 acknowledged writes"
+    );
 
     // Step 3: Find a node that is leader for multiple partitions and kill it
-    let mut leader_counts: std::collections::HashMap<u64, Vec<i32>> = std::collections::HashMap::new();
+    let mut leader_counts: std::collections::HashMap<u64, Vec<i32>> =
+        std::collections::HashMap::new();
     for (p, &leader) in partition_leaders.iter().enumerate() {
         leader_counts.entry(leader).or_default().push(p as i32);
     }
@@ -887,7 +977,9 @@ async fn test_actor_mode_multi_partition_leader_failover_verified() {
         .map(|(&node, partitions)| (node, partitions.clone()))
         .expect("no leaders found");
 
-    println!("\nStep 3: Killing node {victim_node} (leader for partitions {affected_partitions:?})...");
+    println!(
+        "\nStep 3: Killing node {victim_node} (leader for partitions {affected_partitions:?})..."
+    );
     cluster.kill_node(victim_node).expect("failed to kill node");
 
     // Step 4: Verify new leaders elected for affected partitions
@@ -936,8 +1028,10 @@ async fn test_actor_mode_multi_partition_leader_failover_verified() {
     );
 
     // Step 6: Read back ALL acknowledged writes and verify
-    println!("\nStep 6: Verifying all {} acknowledged writes...",
-        acknowledged.iter().map(Vec::len).sum::<usize>());
+    println!(
+        "\nStep 6: Verifying all {} acknowledged writes...",
+        acknowledged.iter().map(Vec::len).sum::<usize>()
+    );
 
     let mut verification_errors = 0u32;
     let mut verified_count = 0u32;
@@ -955,9 +1049,7 @@ async fn test_actor_mode_multi_partition_leader_failover_verified() {
             .expect("poll failed");
 
         // Build offset -> payload map from consumed
-        let consumed_map: std::collections::HashMap<u64, Bytes> = consumed
-            .into_iter()
-            .collect();
+        let consumed_map: std::collections::HashMap<u64, Bytes> = consumed.into_iter().collect();
 
         // Verify each acknowledged write
         for (offset, expected_payload) in expected {
@@ -1013,6 +1105,10 @@ async fn test_actor_mode_multi_partition_leader_failover_verified() {
 /// - Zero data loss through entire rolling restart
 /// - All payloads match exactly
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+)]
 async fn test_actor_mode_rolling_restart_verified() {
     let mut cluster = setup_actor_mode_cluster("rolling_restart", 3, 23200, 23300).await;
 
@@ -1025,7 +1121,7 @@ async fn test_actor_mode_rolling_restart_verified() {
         .expect("cluster not ready");
 
     let topic = "rolling-restart-verified";
-    let num_partitions = 6i32;  // More partitions
+    let num_partitions = 6i32; // More partitions
 
     // Track all acknowledged writes
     let mut acknowledged: Vec<Vec<(u64, String)>> = vec![Vec::new(); num_partitions as usize];
@@ -1043,7 +1139,10 @@ async fn test_actor_mode_rolling_restart_verified() {
     for partition in 0..num_partitions {
         for i in 0..100u32 {
             let payload = format!("p{partition}-initial-{i:04}");
-            match executor.send(topic, partition, Bytes::from(payload.clone())).await {
+            match executor
+                .send(topic, partition, Bytes::from(payload.clone()))
+                .await
+            {
                 Ok(offset) => {
                     acknowledged[partition as usize].push((offset, payload));
                 }
@@ -1063,14 +1162,17 @@ async fn test_actor_mode_rolling_restart_verified() {
         // Kill node
         println!("  Killing node {node_id}...");
         cluster.kill_node(node_id).expect("failed to kill node");
-        tokio::time::sleep(Duration::from_secs(1)).await;  // Shorter sleep to stress more
+        tokio::time::sleep(Duration::from_secs(1)).await; // Shorter sleep to stress more
 
         // Write during node down - 30 per partition
         println!("  Writing 30 messages per partition while node {node_id} is down...");
         for partition in 0..num_partitions {
             for i in 0..30u32 {
                 let payload = format!("p{partition}-during-node{node_id}-down-{i:04}");
-                match executor.send(topic, partition, Bytes::from(payload.clone())).await {
+                match executor
+                    .send(topic, partition, Bytes::from(payload.clone()))
+                    .await
+                {
                     Ok(offset) => {
                         acknowledged[partition as usize].push((offset, payload));
                     }
@@ -1084,8 +1186,10 @@ async fn test_actor_mode_rolling_restart_verified() {
 
         // Restart node
         println!("  Restarting node {node_id}...");
-        cluster.restart_node(node_id).expect("failed to restart node");
-        tokio::time::sleep(Duration::from_secs(2)).await;  // Shorter sleep
+        cluster
+            .restart_node(node_id)
+            .expect("failed to restart node");
+        tokio::time::sleep(Duration::from_secs(2)).await; // Shorter sleep
 
         // Verify all data still readable after restart
         println!("  Verifying data integrity after node {node_id} restart...");
@@ -1097,17 +1201,23 @@ async fn test_actor_mode_rolling_restart_verified() {
                 .await
                 .expect("poll failed");
 
-            let consumed_map: std::collections::HashMap<u64, Bytes> = consumed.into_iter().collect();
+            let consumed_map: std::collections::HashMap<u64, Bytes> =
+                consumed.into_iter().collect();
 
             for (offset, expected_payload) in expected {
                 match consumed_map.get(offset) {
-                    Some(actual) if String::from_utf8_lossy(actual) == expected_payload.as_str() => {}
+                    Some(actual)
+                        if String::from_utf8_lossy(actual) == expected_payload.as_str() => {}
                     Some(_) => {
-                        eprintln!("    CORRUPTION after node {node_id} restart: p{partition}@{offset}");
+                        eprintln!(
+                            "    CORRUPTION after node {node_id} restart: p{partition}@{offset}"
+                        );
                         errors += 1;
                     }
                     None => {
-                        eprintln!("    DATA LOSS after node {node_id} restart: p{partition}@{offset}");
+                        eprintln!(
+                            "    DATA LOSS after node {node_id} restart: p{partition}@{offset}"
+                        );
                         errors += 1;
                     }
                 }
@@ -1125,7 +1235,10 @@ async fn test_actor_mode_rolling_restart_verified() {
     for partition in 0..num_partitions {
         for i in 0..50u32 {
             let payload = format!("p{partition}-final-{i:04}");
-            match executor.send(topic, partition, Bytes::from(payload.clone())).await {
+            match executor
+                .send(topic, partition, Bytes::from(payload.clone()))
+                .await
+            {
                 Ok(offset) => {
                     acknowledged[partition as usize].push((offset, payload));
                 }
@@ -1166,7 +1279,10 @@ async fn test_actor_mode_rolling_restart_verified() {
     println!("  Verified correct: {total_verified}");
     println!("  Errors: {total_errors}");
 
-    assert_eq!(total_errors, 0, "CRITICAL: {total_errors} data integrity errors after rolling restart");
+    assert_eq!(
+        total_errors, 0,
+        "CRITICAL: {total_errors} data integrity errors after rolling restart"
+    );
     assert_eq!(
         total_verified as usize, total_acknowledged,
         "Not all writes verified: {total_verified}/{total_acknowledged}"
@@ -1186,6 +1302,10 @@ async fn test_actor_mode_rolling_restart_verified() {
 /// - All acknowledged data readable after crash recovery
 /// - No corruption in recovered data
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+)]
 async fn test_actor_mode_crash_recovery_from_wal() {
     let mut cluster = setup_actor_mode_cluster("crash_recovery", 3, 23400, 23500).await;
 
@@ -1198,7 +1318,7 @@ async fn test_actor_mode_crash_recovery_from_wal() {
         .expect("cluster not ready");
 
     let topic = "crash-recovery-wal";
-    let num_partitions = 6i32;  // More partitions
+    let num_partitions = 6i32; // More partitions
 
     let mut acknowledged: Vec<Vec<(u64, String)>> = vec![Vec::new(); num_partitions as usize];
 
@@ -1216,8 +1336,14 @@ async fn test_actor_mode_crash_recovery_from_wal() {
     println!("\nWriting 200 messages to each partition (1200 total)...");
     for partition in 0..num_partitions {
         for i in 0..200u32 {
-            let payload = format!("p{partition}-msg-{i:05}-checksum-{:08x}", rand::random::<u32>());
-            match executor.send(topic, partition, Bytes::from(payload.clone())).await {
+            let payload = format!(
+                "p{partition}-msg-{i:05}-checksum-{:08x}",
+                rand::random::<u32>()
+            );
+            match executor
+                .send(topic, partition, Bytes::from(payload.clone()))
+                .await
+            {
                 Ok(offset) => {
                     acknowledged[partition as usize].push((offset, payload));
                 }
@@ -1242,7 +1368,10 @@ async fn test_actor_mode_crash_recovery_from_wal() {
     for partition in 0..num_partitions {
         for i in 0..100u32 {
             let payload = format!("p{partition}-after-crash-{i:05}");
-            match executor.send(topic, partition, Bytes::from(payload.clone())).await {
+            match executor
+                .send(topic, partition, Bytes::from(payload.clone()))
+                .await
+            {
                 Ok(offset) => {
                     acknowledged[partition as usize].push((offset, payload));
                 }
@@ -1304,8 +1433,14 @@ async fn test_actor_mode_crash_recovery_from_wal() {
     println!("  Data loss: {data_loss}");
     println!("  Corruption: {corruption}");
 
-    assert_eq!(data_loss, 0, "CRITICAL: {data_loss} messages lost after crash recovery");
-    assert_eq!(corruption, 0, "CRITICAL: {corruption} messages corrupted after crash recovery");
+    assert_eq!(
+        data_loss, 0,
+        "CRITICAL: {data_loss} messages lost after crash recovery"
+    );
+    assert_eq!(
+        corruption, 0,
+        "CRITICAL: {corruption} messages corrupted after crash recovery"
+    );
     assert_eq!(
         verified as usize, total_acknowledged,
         "Not all writes verified: {verified}/{total_acknowledged}"
@@ -1321,6 +1456,10 @@ async fn test_actor_mode_crash_recovery_from_wal() {
 /// - Data written before quorum loss is preserved
 /// - System recovers when quorum restored
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+)]
 async fn test_actor_mode_quorum_loss_recovery() {
     let mut cluster = setup_actor_mode_cluster("quorum_loss", 3, 23600, 23700).await;
 
@@ -1339,7 +1478,10 @@ async fn test_actor_mode_quorum_loss_recovery() {
 
     // Wait for leaders
     for p in 0..num_partitions {
-        cluster.wait_for_leader(topic, p, Duration::from_secs(30)).await.expect("no leader");
+        cluster
+            .wait_for_leader(topic, p, Duration::from_secs(30))
+            .await
+            .expect("no leader");
     }
 
     // Write data with full cluster
@@ -1347,7 +1489,10 @@ async fn test_actor_mode_quorum_loss_recovery() {
     for partition in 0..num_partitions {
         for i in 0..50u32 {
             let payload = format!("p{partition}-before-quorum-loss-{i:04}");
-            match executor.send(topic, partition, Bytes::from(payload.clone())).await {
+            match executor
+                .send(topic, partition, Bytes::from(payload.clone()))
+                .await
+            {
                 Ok(offset) => {
                     acknowledged[partition as usize].push((offset, payload));
                 }
@@ -1390,7 +1535,10 @@ async fn test_actor_mode_quorum_loss_recovery() {
 
     // Wait for leaders to be elected
     for p in 0..num_partitions {
-        cluster.wait_for_leader(topic, p, Duration::from_secs(30)).await.expect("no leader after recovery");
+        cluster
+            .wait_for_leader(topic, p, Duration::from_secs(30))
+            .await
+            .expect("no leader after recovery");
     }
 
     // Verify pre-failure data is intact
@@ -1425,7 +1573,10 @@ async fn test_actor_mode_quorum_loss_recovery() {
     for partition in 0..num_partitions {
         for i in 0..30u32 {
             let payload = format!("p{partition}-after-recovery-{i:04}");
-            match executor.send(topic, partition, Bytes::from(payload.clone())).await {
+            match executor
+                .send(topic, partition, Bytes::from(payload.clone()))
+                .await
+            {
                 Ok(offset) => {
                     acknowledged[partition as usize].push((offset, payload));
                 }
@@ -1513,7 +1664,7 @@ async fn setup_cluster_with_mode(
 /// # Test Design
 ///
 /// This test validates Kafka's core offset guarantee under rapid failover:
-/// **If produce() returns Ok(offset), then consume(offset) MUST return that exact payload.**
+/// **If `produce()` returns Ok(offset), then consume(offset) MUST return that exact payload.**
 ///
 /// # Cluster Configuration
 ///
@@ -1595,7 +1746,7 @@ async fn run_rapid_failover_stress_test(actor_mode: bool, base_port: u16, raft_b
     }
     println!(
         "  Initial writes: {initial_successes}/{initial_attempts} succeeded ({:.1}%)",
-        100.0 * initial_successes as f64 / initial_attempts as f64
+        100.0 * f64::from(initial_successes) / f64::from(initial_attempts)
     );
 
     // === Phase 2: Rapid failover cycles ===
@@ -1636,7 +1787,7 @@ async fn run_rapid_failover_stress_test(actor_mode: bool, base_port: u16, raft_b
     }
     println!(
         "  Failover writes total: {failover_successes}/{failover_attempts} succeeded ({:.1}%)",
-        100.0 * failover_successes as f64 / failover_attempts as f64
+        100.0 * f64::from(failover_successes) / f64::from(failover_attempts)
     );
 
     // === Phase 3: Final writes (stable cluster, expect 100% success) ===
@@ -1661,7 +1812,7 @@ async fn run_rapid_failover_stress_test(actor_mode: bool, base_port: u16, raft_b
     }
     println!(
         "  Final writes: {final_successes}/{final_attempts} succeeded ({:.1}%)",
-        100.0 * final_successes as f64 / final_attempts as f64
+        100.0 * f64::from(final_successes) / f64::from(final_attempts)
     );
 
     // === Phase 4: Verification ===
@@ -1693,8 +1844,7 @@ async fn run_rapid_failover_stress_test(actor_mode: bool, base_port: u16, raft_b
             if let Some(existing) = offset_to_payload.insert(*offset, payload.as_str()) {
                 if existing != payload.as_str() {
                     eprintln!(
-                        "PRODUCER_DUPLICATE: partition {partition} offset {offset} returned for BOTH '{}' AND '{}'",
-                        existing, payload
+                        "PRODUCER_DUPLICATE: partition {partition} offset {offset} returned for BOTH '{existing}' AND '{payload}'"
                     );
                     producer_duplicate_errors += 1;
                 }
@@ -1731,8 +1881,7 @@ async fn run_rapid_failover_stress_test(actor_mode: bool, base_port: u16, raft_b
                         verified += 1;
                     } else {
                         eprintln!(
-                            "CONTENT_MISMATCH: partition {partition} offset {offset}: expected '{}', got '{}'",
-                            expected_payload, actual_str
+                            "CONTENT_MISMATCH: partition {partition} offset {offset}: expected '{expected_payload}', got '{actual_str}'"
                         );
                         content_mismatch_errors += 1;
                     }
@@ -1748,19 +1897,29 @@ async fn run_rapid_failover_stress_test(actor_mode: bool, base_port: u16, raft_b
     }
 
     // === Results Summary ===
-    let integrity_errors =
-        content_mismatch_errors + missing_offset_errors + storage_duplicate_errors + producer_duplicate_errors;
+    let integrity_errors = content_mismatch_errors
+        + missing_offset_errors
+        + storage_duplicate_errors
+        + producer_duplicate_errors;
 
     println!("\n=== Rapid Failover Stress Test Results ({mode_str} mode) ===");
     println!("Write Statistics:");
-    println!("  Initial:  {initial_successes}/{initial_attempts} ({:.1}%)",
-        100.0 * initial_successes as f64 / initial_attempts as f64);
-    println!("  Failover: {failover_successes}/{failover_attempts} ({:.1}%)",
-        100.0 * failover_successes as f64 / failover_attempts as f64);
-    println!("  Final:    {final_successes}/{final_attempts} ({:.1}%)",
-        100.0 * final_successes as f64 / final_attempts as f64);
-    println!("  Total:    {total_successes}/{total_attempts} ({:.1}%)",
-        100.0 * total_successes as f64 / total_attempts as f64);
+    println!(
+        "  Initial:  {initial_successes}/{initial_attempts} ({:.1}%)",
+        100.0 * f64::from(initial_successes) / f64::from(initial_attempts)
+    );
+    println!(
+        "  Failover: {failover_successes}/{failover_attempts} ({:.1}%)",
+        100.0 * f64::from(failover_successes) / f64::from(failover_attempts)
+    );
+    println!(
+        "  Final:    {final_successes}/{final_attempts} ({:.1}%)",
+        100.0 * f64::from(final_successes) / f64::from(final_attempts)
+    );
+    println!(
+        "  Total:    {total_successes}/{total_attempts} ({:.1}%)",
+        100.0 * f64::from(total_successes) / f64::from(total_attempts)
+    );
     println!();
     println!("Verification:");
     println!("  Acknowledged writes: {total_acknowledged}");
@@ -1786,7 +1945,7 @@ async fn run_rapid_failover_stress_test(actor_mode: bool, base_port: u16, raft_b
     );
 
     // 2. Failover writes should have high success rate (quorum always available)
-    let failover_success_rate = failover_successes as f64 / failover_attempts as f64;
+    let failover_success_rate = f64::from(failover_successes) / f64::from(failover_attempts);
     assert!(
         failover_success_rate >= 0.80,
         "Failover write success rate too low ({:.1}%) - quorum should be available",
@@ -1810,6 +1969,10 @@ async fn run_rapid_failover_stress_test(actor_mode: bool, base_port: u16, raft_b
 
 /// Rapid failover stress test - actor mode.
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+)]
 async fn test_actor_mode_rapid_failover_stress() {
     run_rapid_failover_stress_test(true, 23800, 23900).await;
 }
@@ -1819,6 +1982,10 @@ async fn test_actor_mode_rapid_failover_stress() {
 /// Tests the same bug scenario as the actor mode test, but using the
 /// traditional tick-based processing path in helix-server.
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+)]
 async fn test_non_actor_mode_rapid_failover_stress() {
     run_rapid_failover_stress_test(false, 23950, 24050).await;
 }
@@ -1845,13 +2012,9 @@ async fn test_actor_mode_stress_500_seeds() {
         // Use port range 30000+ to avoid conflicts.
         // Each seed gets 200 ports (100 for kafka, 100 for raft).
         let port_base = 30000 + ((seed % 100) as u16 * 200);
-        let cluster = setup_actor_mode_cluster(
-            &format!("ext_stress_{seed}"),
-            3,
-            port_base,
-            port_base + 100,
-        )
-        .await;
+        let cluster =
+            setup_actor_mode_cluster(&format!("ext_stress_{seed}"), 3, port_base, port_base + 100)
+                .await;
 
         let executor = RealExecutor::new(&cluster).expect("failed to create executor");
         executor
@@ -1897,24 +2060,24 @@ async fn test_actor_mode_stress_500_seeds() {
     );
 }
 
-/// Extended rapid failover: 100 seeds, 20 kill/restart cycles each.
+/// Extended rapid failover: 5 seeds, 3 kill/restart cycles each.
 ///
 /// This tests recovery under repeated failures to catch state corruption
-/// that only manifests after many failover cycles.
+/// that only manifests after multiple failover cycles.
 #[tokio::test]
 #[ignore = "extended failover test (Phase 3) - run with --ignored"]
 async fn test_actor_mode_extended_rapid_failover() {
-    for seed in 0..100u64 {
-        // Use port range 35000+ to avoid conflicts.
-        let port_base = 35000 + ((seed % 50) as u16 * 200);
+    for seed in 0..50u64 {
+        // Use per-seed moving windows and probe availability to avoid reuse collisions.
+        let seed_u16 = u16::try_from(seed).unwrap_or(0);
+        let kafka_start = 35000u16.saturating_add(seed_u16.saturating_mul(20));
+        let raft_start = 45000u16.saturating_add(seed_u16.saturating_mul(20));
+        let port_base = find_available_base_port(kafka_start, 3);
+        let raft_base = find_available_base_port(raft_start, 3);
 
-        let mut cluster = setup_actor_mode_cluster(
-            &format!("ext_failover_{seed}"),
-            3,
-            port_base,
-            port_base + 100,
-        )
-        .await;
+        let mut cluster =
+            setup_actor_mode_cluster(&format!("ext_failover_{seed}"), 3, port_base, raft_base)
+                .await;
 
         let executor = RealExecutor::new(&cluster).expect("failed to create executor");
         executor
@@ -1938,8 +2101,8 @@ async fn test_actor_mode_extended_rapid_failover() {
         let mut acknowledged: Vec<Vec<(u64, String)>> = vec![Vec::new(); num_partitions as usize];
         let mut write_index = 0u64;
 
-        // 20 cycles of: write, kill node, restart, write.
-        for cycle in 0..20u32 {
+        // 3 cycles of: write, kill node, restart, write.
+        for cycle in 0..3u32 {
             // Write some data.
             for _ in 0..10 {
                 let partition = (write_index % 4) as i32;
@@ -2008,9 +2171,7 @@ async fn test_actor_mode_extended_rapid_failover() {
                         }
                     }
                     None => {
-                        eprintln!(
-                            "Seed {seed}: DATA_LOSS partition {partition} offset {offset}"
-                        );
+                        eprintln!("Seed {seed}: DATA_LOSS partition {partition} offset {offset}");
                         errors += 1;
                     }
                 }

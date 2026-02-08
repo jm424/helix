@@ -331,7 +331,9 @@ impl Verification {
 
         for op in history.operations() {
             if let (
-                OperationKind::Poll { topic, partition, .. },
+                OperationKind::Poll {
+                    topic, partition, ..
+                },
                 Some(OperationResult::PollOk { messages }),
             ) = (&op.kind, &op.result)
             {
@@ -408,12 +410,7 @@ mod tests {
         history.record_complete(op_id, 1100, OperationResult::SendOk { offset });
     }
 
-    fn setup_poll(
-        history: &mut History,
-        topic: &str,
-        partition: i32,
-        messages: Vec<(u64, &[u8])>,
-    ) {
+    fn setup_poll(history: &mut History, topic: &str, partition: i32, messages: Vec<(u64, &[u8])>) {
         let op_id = history.record_invoke(
             OperationKind::Poll {
                 topic: topic.to_string(),
@@ -444,7 +441,10 @@ mod tests {
         setup_poll(&mut history, "test", 0, vec![(0, b"msg0"), (1, b"msg1")]);
 
         let violations = Verification::verify(&history);
-        assert!(violations.is_empty(), "Expected no violations: {violations:?}");
+        assert!(
+            violations.is_empty(),
+            "Expected no violations: {violations:?}"
+        );
     }
 
     #[test]

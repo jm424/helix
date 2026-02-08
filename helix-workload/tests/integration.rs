@@ -3,6 +3,14 @@
 //! These tests spawn real helix-server processes in Kafka mode and run
 //! workloads against them to verify correctness.
 
+// Integration tests prioritize scenario coverage over lint-perfect ergonomics.
+#![allow(clippy::items_after_statements)]
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::cast_sign_loss)]
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::redundant_locals)]
+
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -89,16 +97,18 @@ fn env_producer_mode(name: &str, default: ProducerMode) -> ProducerMode {
         .map(|mode| mode.trim().to_ascii_lowercase())
         .as_deref()
     {
-        Some("low") | Some("lowlatency") | Some("low-latency") => ProducerMode::LowLatency,
-        Some("high") | Some("highthroughput") | Some("high-throughput") => {
-            ProducerMode::HighThroughput
-        }
+        Some("low" | "lowlatency" | "low-latency") => ProducerMode::LowLatency,
+        Some("high" | "highthroughput" | "high-throughput") => ProducerMode::HighThroughput,
         _ => default,
     }
 }
 
 /// Single-node test: basic produce and consume correctness.
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload integration tests are slow in debug; run: cargo test --release -p helix-workload --test integration"
+)]
 async fn test_single_node_sequential() {
     let cluster = RealCluster::builder()
         .nodes(1)
@@ -154,6 +164,10 @@ async fn test_single_node_sequential() {
 
 /// Single-node test with more operations.
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload integration tests are slow in debug; run: cargo test --release -p helix-workload --test integration"
+)]
 async fn test_single_node_larger_workload() {
     let cluster = RealCluster::builder()
         .nodes(1)
@@ -206,6 +220,10 @@ async fn test_single_node_larger_workload() {
 
 /// Three-node cluster test: basic produce and consume.
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload integration tests are slow in debug; run: cargo test --release -p helix-workload --test integration"
+)]
 async fn test_three_node_sequential() {
     let cluster = RealCluster::builder()
         .nodes(3)
@@ -259,6 +277,10 @@ async fn test_three_node_sequential() {
 
 /// Three-node test with multiple partitions.
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload integration tests are slow in debug; run: cargo test --release -p helix-workload --test integration"
+)]
 async fn test_three_node_many_partitions() {
     let cluster = RealCluster::builder()
         .nodes(3)
@@ -315,6 +337,10 @@ async fn test_three_node_many_partitions() {
 
 /// Test that deterministic workloads produce consistent results.
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload integration tests are slow in debug; run: cargo test --release -p helix-workload --test integration"
+)]
 async fn test_deterministic_workload() {
     // Two workloads with same seed should generate same payloads.
     let workload1 = Workload::builder()
@@ -336,6 +362,10 @@ async fn test_deterministic_workload() {
 
 /// Test cluster health check.
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload integration tests are slow in debug; run: cargo test --release -p helix-workload --test integration"
+)]
 async fn test_cluster_health_check() {
     let mut cluster = RealCluster::builder()
         .nodes(1)
@@ -359,10 +389,14 @@ async fn test_cluster_health_check() {
 /// Uses `ProducerMode::HighThroughput` (linger.ms=100ms) and sends
 /// concurrent requests to measure actual throughput capacity.
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload integration tests are slow in debug; run: cargo test --release -p helix-workload --test integration"
+)]
 async fn test_three_node_concurrent_throughput() {
     use bytes::Bytes;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
 
     let cluster = RealCluster::builder()
         .nodes(3)
@@ -376,8 +410,9 @@ async fn test_three_node_concurrent_throughput() {
         .expect("failed to start cluster");
 
     // Create a temporary executor just for wait_ready check.
-    let wait_executor = RealExecutor::with_mode(cluster.bootstrap_servers(), ProducerMode::HighThroughput)
-        .expect("failed to create executor");
+    let wait_executor =
+        RealExecutor::with_mode(cluster.bootstrap_servers(), ProducerMode::HighThroughput)
+            .expect("failed to create executor");
 
     wait_executor
         .wait_ready(Duration::from_secs(60))
@@ -416,8 +451,9 @@ async fn test_three_node_concurrent_throughput() {
 
         let handle = tokio::spawn(async move {
             // Create a separate executor per producer for true connection concurrency.
-            let producer_executor = RealExecutor::with_mode(&bootstrap, ProducerMode::HighThroughput)
-                .expect("failed to create producer executor");
+            let producer_executor =
+                RealExecutor::with_mode(&bootstrap, ProducerMode::HighThroughput)
+                    .expect("failed to create producer executor");
 
             for i in 0..messages_per_producer {
                 let payload = Bytes::from(vec![0u8; MESSAGE_SIZE]);
@@ -451,7 +487,7 @@ async fn test_three_node_concurrent_throughput() {
     println!("Duration: {:.2}s", duration.as_secs_f64());
     println!("Successful: {success}");
     println!("Errors: {errors}");
-    println!("Throughput: {:.1} ops/sec", throughput);
+    println!("Throughput: {throughput:.1} ops/sec");
 
     // Allow up to 1% error rate for distributed system tolerance.
     // Occasional timeouts can occur during leader transitions or network hiccups.
@@ -475,6 +511,10 @@ async fn test_three_node_concurrent_throughput() {
 /// - Per-partition ordering (offsets monotonic within partition)
 /// - All data readable and matches what was written
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload integration tests are slow in debug; run: cargo test --release -p helix-workload --test integration"
+)]
 async fn test_concurrent_multi_partition_correctness() {
     let topic_name = "test-concurrent-mp";
     let partition_count = 8;
@@ -501,7 +541,11 @@ async fn test_concurrent_multi_partition_correctness() {
     // 4 producers writing to 8 partitions (2 partitions each).
     let mut workload = Workload::builder()
         .seed(42)
-        .topics(vec![TopicConfig::new(topic_name, partition_count as i32, 3)])
+        .topics(vec![TopicConfig::new(
+            topic_name,
+            partition_count as i32,
+            3,
+        )])
         .operations(500) // Total operations across all producers
         .pattern(WorkloadPattern::ConcurrentProducers {
             producers: 4,
@@ -542,6 +586,10 @@ async fn test_concurrent_multi_partition_correctness() {
 /// - No lost writes (all acknowledged writes are consumable)
 /// - Per-partition ordering maintained
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload integration tests are slow in debug; run: cargo test --release -p helix-workload --test integration"
+)]
 async fn test_producer_consumer_multi_partition() {
     let topic_name = "test-producer-consumer";
     let partition_count = 4;
@@ -568,7 +616,11 @@ async fn test_producer_consumer_multi_partition() {
     // Producer writes to 4 partitions, 2 consumers polling concurrently.
     let mut workload = Workload::builder()
         .seed(123)
-        .topics(vec![TopicConfig::new(topic_name, partition_count as i32, 3)])
+        .topics(vec![TopicConfig::new(
+            topic_name,
+            partition_count as i32,
+            3,
+        )])
         .operations(1000) // 1000 messages produced
         .pattern(WorkloadPattern::ProducerConsumer {
             producer_rate: 0, // Unlimited rate
@@ -610,6 +662,10 @@ async fn test_producer_consumer_multi_partition() {
 /// - Phase 3: restart node, produce 200 more
 /// - Verify all 600 acknowledged messages are readable
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload integration tests are slow in debug; run: cargo test --release -p helix-workload --test integration"
+)]
 async fn test_multi_partition_node_failure() {
     let topic = "test-node-failure";
     let partitions = 4;
@@ -648,7 +704,7 @@ async fn test_multi_partition_node_failure() {
 
     let stats1: WorkloadStats = workload1.run(&executor).await;
     let phase1_ok = stats1.sends_ok;
-    println!("Phase 1: {} successful sends", phase1_ok);
+    println!("Phase 1: {phase1_ok} successful sends");
 
     // Kill node 2.
     println!("=== Killing node 2 ===");
@@ -670,7 +726,7 @@ async fn test_multi_partition_node_failure() {
 
     let stats2: WorkloadStats = workload2.run(&executor).await;
     let phase2_ok = stats2.sends_ok;
-    println!("Phase 2: {} successful sends", phase2_ok);
+    println!("Phase 2: {phase2_ok} successful sends");
 
     // Restart node 2.
     println!("=== Restarting node 2 ===");
@@ -692,7 +748,7 @@ async fn test_multi_partition_node_failure() {
 
     let stats3: WorkloadStats = workload3.run(&executor).await;
     let phase3_ok = stats3.sends_ok;
-    println!("Phase 3: {} successful sends", phase3_ok);
+    println!("Phase 3: {phase3_ok} successful sends");
 
     // Summary.
     println!("=== Multi-Partition Node Failure Test Summary ===");
@@ -724,20 +780,17 @@ async fn test_multi_partition_node_failure() {
     // Phase 1 and 3 must be 100% - no faults active.
     assert_eq!(
         phase1_ok, 200,
-        "Phase 1: expected all 200 successful before failure, got {}",
-        phase1_ok
+        "Phase 1: expected all 200 successful before failure, got {phase1_ok}"
     );
     // Phase 2 may have brief unavailability during leader election after node death.
     // With RF=3 and 1 node down, majority quorum (2/3) is still available.
     assert!(
         phase2_ok >= 180,
-        "Phase 2: expected at least 180 successful during failure, got {}",
-        phase2_ok
+        "Phase 2: expected at least 180 successful during failure, got {phase2_ok}"
     );
     assert_eq!(
         phase3_ok, 200,
-        "Phase 3: expected all 200 successful after recovery, got {}",
-        phase3_ok
+        "Phase 3: expected all 200 successful after recovery, got {phase3_ok}"
     );
 }
 
@@ -748,6 +801,10 @@ async fn test_multi_partition_node_failure() {
 /// - 100 ops per partition (1600 total)
 /// - Verify no violations
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload integration tests are slow in debug; run: cargo test --release -p helix-workload --test integration"
+)]
 async fn test_multi_partition_scale() {
     let topic_name = "test-scale";
     let partition_count = 16;
@@ -774,7 +831,11 @@ async fn test_multi_partition_scale() {
     // 16 partitions, 100 ops each.
     let mut workload = Workload::builder()
         .seed(456)
-        .topics(vec![TopicConfig::new(topic_name, partition_count as i32, 3)])
+        .topics(vec![TopicConfig::new(
+            topic_name,
+            partition_count as i32,
+            3,
+        )])
         .operations(1600)
         .pattern(WorkloadPattern::ManyPartitions {
             partition_count: 16,
@@ -813,20 +874,21 @@ async fn test_multi_partition_scale() {
 /// This keeps a single partition but allows multiple in-flight produce
 /// requests per producer to measure server-side batching capacity.
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload integration tests are slow in debug; run: cargo test --release -p helix-workload --test integration"
+)]
 async fn test_single_partition_throughput_inflight() {
     use bytes::Bytes;
     use futures::stream::{FuturesUnordered, StreamExt};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
 
     let total_messages = env_u64("HELIX_THROUGHPUT_TOTAL_MESSAGES", 2_000);
     let inflight = env_usize("HELIX_THROUGHPUT_INFLIGHT", 64).max(1);
     let producer_count = env_usize("HELIX_THROUGHPUT_PRODUCERS", 1).max(1);
     let message_size = env_usize("HELIX_THROUGHPUT_MESSAGE_SIZE", 1024);
-    let producer_mode = env_producer_mode(
-        "HELIX_THROUGHPUT_MODE",
-        ProducerMode::HighThroughput,
-    );
+    let producer_mode = env_producer_mode("HELIX_THROUGHPUT_MODE", ProducerMode::HighThroughput);
     let node_count = 3u16;
     let base_port = std::env::var("HELIX_THROUGHPUT_BASE_PORT")
         .ok()
@@ -850,9 +912,8 @@ async fn test_single_partition_throughput_inflight() {
         .build()
         .expect("failed to start cluster");
 
-    let wait_executor =
-        RealExecutor::with_mode(cluster.bootstrap_servers(), producer_mode)
-            .expect("failed to create executor");
+    let wait_executor = RealExecutor::with_mode(cluster.bootstrap_servers(), producer_mode)
+        .expect("failed to create executor");
     wait_executor
         .wait_ready(Duration::from_secs(60))
         .await
@@ -882,8 +943,7 @@ async fn test_single_partition_throughput_inflight() {
         let errors = Arc::clone(&error_count);
         let payload = payload.clone();
         let producer_mode = producer_mode;
-        let producer_messages =
-            messages_per_producer + u64::from(producer_id == 0) * remainder;
+        let producer_messages = messages_per_producer + u64::from(producer_id == 0) * remainder;
 
         let handle = tokio::spawn(async move {
             let executor = Arc::new(
@@ -946,7 +1006,7 @@ async fn test_single_partition_throughput_inflight() {
     println!("Duration: {:.2}s", duration.as_secs_f64());
     println!("Successful: {success}");
     println!("Errors: {errors}");
-    println!("Throughput: {:.1} ops/sec", throughput);
+    println!("Throughput: {throughput:.1} ops/sec");
 
     assert!(errors == 0, "Expected no errors, got {errors}");
     assert!(
@@ -960,6 +1020,10 @@ async fn test_single_partition_throughput_inflight() {
 /// Actor mode uses lock-free partition actors instead of the global `RwLock`
 /// on `MultiRaft`, improving multi-partition concurrency.
 #[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload integration tests are slow in debug; run: cargo test --release -p helix-workload --test integration"
+)]
 async fn test_three_node_actor_mode() {
     let cluster = RealCluster::builder()
         .nodes(3)

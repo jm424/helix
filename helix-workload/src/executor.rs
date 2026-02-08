@@ -4,7 +4,8 @@
 //! The same workload can run against real Helix processes or in simulation.
 
 use std::collections::HashMap;
-use std::net::TcpListener;
+use std::fs::OpenOptions;
+use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -93,12 +94,8 @@ pub trait WorkloadExecutor {
     /// Sends a message to the specified topic/partition.
     ///
     /// Returns the assigned offset on success.
-    async fn send(
-        &self,
-        topic: &str,
-        partition: i32,
-        payload: Bytes,
-    ) -> Result<u64, ExecutorError>;
+    async fn send(&self, topic: &str, partition: i32, payload: Bytes)
+        -> Result<u64, ExecutorError>;
 
     /// Polls messages from the specified topic/partition.
     ///
@@ -188,13 +185,11 @@ impl S3TieringConfig {
 }
 
 /// Tiering behavior configuration for tests.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct TieringTestConfig {
     /// Minimum segment age before tiering (0 for immediate).
     pub min_age_secs: u64,
 }
-
 
 /// Tiering status for a partition.
 #[derive(Debug, Clone, Default)]
@@ -236,7 +231,6 @@ pub struct RealClusterConfig {
     pub topics: Vec<(String, u32)>,
 
     // === Tiering Configuration ===
-
     /// Filesystem object storage directory.
     /// Mutually exclusive with `s3_config`.
     pub object_storage_dir: Option<PathBuf>,
@@ -249,7 +243,6 @@ pub struct RealClusterConfig {
     pub log_level: String,
 
     // === Experimental ===
-
     /// Enable actor-based architecture for lock-free multi-partition.
     pub actor_mode: bool,
 }
@@ -271,6 +264,29 @@ impl Default for RealClusterConfig {
             tiering_config: TieringTestConfig::default(),
             log_level: String::from("info"),
             actor_mode: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TestLogMode {
+    Verbose,
+    Progress,
+    Quiet,
+}
+
+fn test_log_mode() -> TestLogMode {
+    match std::env::var("HELIX_TEST_LOG")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("verbose") => TestLogMode::Verbose,
+        Some("quiet") => TestLogMode::Quiet,
+        Some("progress") | None => TestLogMode::Progress,
+        Some(_) => {
+            eprintln!("[TEST_LOG_MODE] Unknown HELIX_TEST_LOG value, defaulting to progress");
+            TestLogMode::Progress
         }
     }
 }
@@ -440,6 +456,8 @@ impl RealCluster {
     /// Starts a cluster with the given configuration.
     #[allow(clippy::too_many_lines)] // Tiering config added; splitting would reduce clarity.
     fn start(config: RealClusterConfig) -> Result<Self, ExecutorError> {
+        let log_mode = test_log_mode();
+
         // Reserve all ports upfront by holding TcpListeners.
         // This prevents race conditions where another test could claim the same ports
         // between our availability check and actual server startup.
@@ -454,6 +472,21 @@ impl RealCluster {
         }
 
         let mut processes = Vec::with_capacity(config.node_count as usize);
+        let mut log_dir: Option<PathBuf> = None;
+
+        // Clean stale data from previous runs to prevent WAL recovery conflicts.
+        if config.data_dir.exists() {
+            let _ = std::fs::remove_dir_all(&config.data_dir);
+        }
+
+        if log_mode != TestLogMode::Verbose {
+            let dir = config.data_dir.join("logs");
+            std::fs::create_dir_all(&dir).map_err(ExecutorError::SpawnFailed)?;
+            log_dir = Some(dir.clone());
+            if log_mode == TestLogMode::Progress {
+                eprintln!("[TEST_LOG_MODE] mode=progress logs_dir={}", dir.display());
+            }
+        }
 
         // Build peer list for each node.
         // Format: node_id:host:kafka_port:raft_port
@@ -546,17 +579,39 @@ impl RealCluster {
                 cmd.arg("--actor-mode");
             }
 
-            // Inherit stderr for debugging, suppress stdout.
+            // Suppress stdout; configure stderr based on test log mode.
             // Explicitly inherit env so RUST_LOG propagates to child processes.
-            cmd.stdout(Stdio::null())
-                .stderr(Stdio::inherit())
-                .envs(std::env::vars());
+            cmd.stdout(Stdio::null()).envs(std::env::vars());
+
+            match log_mode {
+                TestLogMode::Verbose => {
+                    cmd.stderr(Stdio::inherit());
+                }
+                TestLogMode::Progress | TestLogMode::Quiet => {
+                    let dir = log_dir
+                        .as_ref()
+                        .expect("log_dir missing for non-verbose mode");
+                    let log_path = dir.join(format!("node-{node_id}.log"));
+                    let log_file = OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&log_path)
+                        .map_err(ExecutorError::SpawnFailed)?;
+                    cmd.stderr(Stdio::from(log_file));
+                    if log_mode == TestLogMode::Progress {
+                        eprintln!(
+                            "[CHILD_LOG] node_id={} path={}",
+                            node_id,
+                            log_path.display()
+                        );
+                    }
+                }
+            }
 
             // Drop the reserved listeners right before spawning to release the ports.
             // The server process will bind immediately after spawn.
             // This minimizes the window where another process could claim the port.
-            let (kafka_listener, raft_listener) =
-                reserved_listeners.remove(0);
+            let (kafka_listener, raft_listener) = reserved_listeners.remove(0);
             drop(kafka_listener);
             drop(raft_listener);
 
@@ -697,6 +752,11 @@ impl RealCluster {
         let kafka_port = self.config.base_port + u16::try_from(node_id).unwrap_or(0);
         let raft_port = self.config.raft_base_port + u16::try_from(node_id).unwrap_or(0);
         let node_dir = self.config.data_dir.join(format!("node-{node_id}"));
+        let log_mode = test_log_mode();
+
+        // Wait until old sockets are actually released before respawning.
+        let kafka_listener = reserve_port(kafka_port, Duration::from_secs(30))?;
+        let raft_listener = reserve_port(raft_port, Duration::from_secs(30))?;
 
         let mut cmd = Command::new(&self.config.binary_path);
         cmd.arg("--protocol")
@@ -708,12 +768,18 @@ impl RealCluster {
             .arg("--raft-addr")
             .arg(format!("127.0.0.1:{raft_port}"))
             .arg("--data-dir")
-            .arg(&node_dir);
+            .arg(&node_dir)
+            .arg("--log-level")
+            .arg(&self.config.log_level);
 
         if self.config.auto_create_topics {
             cmd.arg("--auto-create-topics");
             cmd.arg("--auto-create-partitions")
                 .arg(self.config.auto_create_partitions.to_string());
+        }
+
+        for (topic_name, partitions) in &self.config.topics {
+            cmd.arg("--topic").arg(format!("{topic_name}:{partitions}"));
         }
 
         // Add peers (format: node_id:host:kafka_port:raft_port).
@@ -759,10 +825,56 @@ impl RealCluster {
             cmd.arg("--actor-mode");
         }
 
-        // Suppress stdout/stderr to avoid I/O overload.
-        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        cmd.stdout(Stdio::null()).envs(std::env::vars());
+        match log_mode {
+            TestLogMode::Verbose => {
+                cmd.stderr(Stdio::inherit());
+            }
+            TestLogMode::Progress | TestLogMode::Quiet => {
+                let dir = self.config.data_dir.join("logs");
+                std::fs::create_dir_all(&dir).map_err(ExecutorError::SpawnFailed)?;
+                let log_path = dir.join(format!("node-{node_id}.log"));
+                let log_file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                    .map_err(ExecutorError::SpawnFailed)?;
+                cmd.stderr(Stdio::from(log_file));
+                if log_mode == TestLogMode::Progress {
+                    eprintln!(
+                        "[CHILD_LOG_RESTART] node_id={} path={}",
+                        node_id,
+                        log_path.display()
+                    );
+                }
+            }
+        }
 
-        let child = cmd.spawn().map_err(ExecutorError::SpawnFailed)?;
+        // Release reserved ports right before spawn to minimize race window.
+        drop(kafka_listener);
+        drop(raft_listener);
+
+        let mut child = cmd.spawn().map_err(ExecutorError::SpawnFailed)?;
+        eprintln!(
+            "[RESTART] node_id={} pid={} kafka_port={} raft_port={}",
+            node_id,
+            child.id(),
+            kafka_port,
+            raft_port
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Some(status) = child.try_wait().map_err(ExecutorError::SpawnFailed)? {
+            eprintln!(
+                "[RESTART_DIED] node_id={} pid={} exit_status={:?}",
+                node_id,
+                child.id(),
+                status
+            );
+            return Err(ExecutorError::ProcessExited { node_id });
+        }
+        eprintln!("[RESTART_ALIVE] node_id={} pid={}", node_id, child.id());
+
         self.processes[idx] = child;
         Ok(())
     }
@@ -940,9 +1052,10 @@ impl RealCluster {
     ///
     /// Returns an error if S3 is not configured or the CLI fails.
     pub fn list_s3_objects(&self) -> Result<Vec<String>, ExecutorError> {
-        let s3 = self.config.s3_config.as_ref().ok_or_else(|| {
-            ExecutorError::InvalidConfig("S3 tiering not configured".to_string())
-        })?;
+        let s3 =
+            self.config.s3_config.as_ref().ok_or_else(|| {
+                ExecutorError::InvalidConfig("S3 tiering not configured".to_string())
+            })?;
 
         let endpoint_args: Vec<&str> = s3
             .endpoint
@@ -981,7 +1094,17 @@ impl RealCluster {
 impl Drop for RealCluster {
     fn drop(&mut self) {
         self.stop();
-        // Clean up data directory.
+        // Keep artifacts when explicitly requested for failure diagnostics.
+        let keep_data_dir = std::env::var("HELIX_TEST_KEEP_DATA_DIR").ok().as_deref() == Some("1");
+        if keep_data_dir {
+            eprintln!(
+                "[TEST_KEEP_DATA_DIR] preserving {}",
+                self.config.data_dir.display()
+            );
+            return;
+        }
+
+        // Default behavior: clean up data directory.
         let _ = std::fs::remove_dir_all(&self.config.data_dir);
     }
 }
@@ -1044,6 +1167,13 @@ impl RealExecutor {
 
     /// Internal builder with configurable producer mode.
     fn build(bootstrap_servers: &str, mode: ProducerMode) -> Result<Self, ExecutorError> {
+        let log_mode = test_log_mode();
+        let rdkafka_log_level = match log_mode {
+            TestLogMode::Verbose => "6",
+            TestLogMode::Progress => "3",
+            TestLogMode::Quiet => "1",
+        };
+
         // Configure rdkafka with connection retry settings so it handles
         // broker availability internally. No explicit wait loops needed.
         // NOTE: Retries enabled for retriable errors (e.g., controller not available).
@@ -1056,6 +1186,7 @@ impl RealExecutor {
         let mut config = ClientConfig::new();
         config
             .set("bootstrap.servers", bootstrap_servers)
+            .set("log_level", rdkafka_log_level)
             .set("message.timeout.ms", "15000")
             .set("request.timeout.ms", "12500")
             .set("connections.max.idle.ms", "0")
@@ -1064,6 +1195,10 @@ impl RealExecutor {
             .set("acks", "all")
             .set("reconnect.backoff.ms", "100")
             .set("reconnect.backoff.max.ms", "1000"); // 1s max backoff for faster recovery
+
+        if log_mode == TestLogMode::Verbose {
+            config.set("debug", "fetch,broker,topic,msg,protocol");
+        }
 
         // Configure batching based on mode.
         // NOTE: queue.buffering.max.ms (librdkafka) = linger.ms (Kafka Java).
@@ -1115,8 +1250,10 @@ impl RealExecutor {
         let producer: FutureProducer = config.create()?;
 
         // Consumer config tuned for faster failover.
-        let consumer: BaseConsumer = ClientConfig::new()
+        let mut consumer_config = ClientConfig::new();
+        consumer_config
             .set("bootstrap.servers", bootstrap_servers)
+            .set("log_level", rdkafka_log_level)
             .set("group.id", "helix-workload-consumer")
             .set("enable.auto.commit", "false")
             .set("auto.offset.reset", "earliest")
@@ -1129,10 +1266,13 @@ impl RealExecutor {
             // Connection timeout settings for faster failover.
             .set("socket.timeout.ms", "12500")
             .set("connections.max.idle.ms", "0")
-            .set("fetch.wait.max.ms", "500")
-            // Debug logging for librdkafka internals.
-            .set("debug", "fetch,broker,topic,msg,protocol")
-            .create()?;
+            .set("fetch.wait.max.ms", "500");
+
+        if log_mode == TestLogMode::Verbose {
+            consumer_config.set("debug", "fetch,broker,topic,msg,protocol");
+        }
+
+        let consumer: BaseConsumer = consumer_config.create()?;
 
         Ok(Self {
             bootstrap_servers: bootstrap_servers.to_string(),
@@ -1166,11 +1306,9 @@ impl WorkloadExecutor for RealExecutor {
             .producer
             .send(record, Duration::from_secs(30))
             .await
-            .map_err(|(err, _record)| {
-                ExecutorError::Generic {
-                    code: -1,
-                    message: err.to_string(),
-                }
+            .map_err(|(err, _record)| ExecutorError::Generic {
+                code: -1,
+                message: err.to_string(),
             })?;
 
         // Extract the offset from the delivery result.
@@ -1207,10 +1345,12 @@ impl WorkloadExecutor for RealExecutor {
                 message: e.to_string(),
             })?;
 
-        self.consumer.assign(&tpl).map_err(|e| ExecutorError::Generic {
-            code: -1,
-            message: e.to_string(),
-        })?;
+        self.consumer
+            .assign(&tpl)
+            .map_err(|e| ExecutorError::Generic {
+                code: -1,
+                message: e.to_string(),
+            })?;
 
         eprintln!("[POLL_START] topic={topic} partition={partition} start_offset={start_offset} max_messages={max_messages}");
 
@@ -1236,7 +1376,10 @@ impl WorkloadExecutor for RealExecutor {
                         .payload()
                         .map(Bytes::copy_from_slice)
                         .unwrap_or_default();
-                    eprintln!("[POLL] topic={topic} partition={partition} offset={offset} payload_len={}", payload.len());
+                    eprintln!(
+                        "[POLL] topic={topic} partition={partition} offset={offset} payload_len={}",
+                        payload.len()
+                    );
                     messages.push((offset, payload));
                 }
                 Some(Err(KafkaError::PartitionEOF(p))) => {
@@ -1283,7 +1426,10 @@ impl WorkloadExecutor for RealExecutor {
             }
         }
 
-        eprintln!("[POLL_END] topic={topic} partition={partition} received={} messages", messages.len());
+        eprintln!(
+            "[POLL_END] topic={topic} partition={partition} received={} messages",
+            messages.len()
+        );
 
         Ok(messages)
     }
@@ -1359,7 +1505,10 @@ impl WorkloadExecutor for RealExecutor {
         while std::time::Instant::now() < deadline {
             attempt += 1;
             // Try to fetch cluster metadata. This will fail if the server isn't ready.
-            match self.consumer.fetch_metadata(None, std::time::Duration::from_secs(1)) {
+            match self
+                .consumer
+                .fetch_metadata(None, std::time::Duration::from_secs(1))
+            {
                 Ok(_metadata) => {
                     eprintln!(
                         "[WAIT_READY_OK] attempt={} elapsed={:?}",
@@ -1403,25 +1552,34 @@ impl WorkloadExecutor for RealExecutor {
 ///
 /// Returns `Ok(listener)` if the port is available, or an error after timeout.
 fn reserve_port(port: u16, timeout: Duration) -> Result<TcpListener, ExecutorError> {
-    let addr = format!("127.0.0.1:{port}");
+    let addr: SocketAddr = format!("127.0.0.1:{port}")
+        .parse::<SocketAddr>()
+        .map_err(|err: std::net::AddrParseError| ExecutorError::InvalidConfig(err.to_string()))?;
     let deadline = std::time::Instant::now() + timeout;
     let poll_interval = Duration::from_millis(100);
+    let mut last_error: Option<std::io::Error> = None;
 
     while std::time::Instant::now() < deadline {
-        match TcpListener::bind(&addr) {
+        match TcpListener::bind(addr) {
             Ok(listener) => {
                 // Port is available - return the listener to keep it reserved.
                 return Ok(listener);
             }
-            Err(_) => {
-                // Port is in use - wait and retry.
-                std::thread::sleep(poll_interval);
+            Err(err) => {
+                last_error = Some(err);
             }
         }
+
+        // Port is in use (or not ready) - wait and retry.
+        std::thread::sleep(poll_interval);
     }
 
     Err(ExecutorError::Timeout(format!(
-        "port {port} not available after {timeout:?}"
+        "port {port} not available after {timeout:?} (last_error={} raw_os_error={:?})",
+        last_error
+            .as_ref()
+            .map_or_else(|| "unknown".to_string(), std::string::ToString::to_string),
+        last_error.as_ref().and_then(std::io::Error::raw_os_error)
     )))
 }
 
