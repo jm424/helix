@@ -138,7 +138,10 @@ impl PartitionRouter {
     /// # Errors
     ///
     /// Returns `PartitionNotFound` if the partition doesn't exist.
-    pub async fn partition(&self, group_id: GroupId) -> Result<PartitionActorHandle, PartitionNotFound> {
+    pub async fn partition(
+        &self,
+        group_id: GroupId,
+    ) -> Result<PartitionActorHandle, PartitionNotFound> {
         let partitions = self.partitions.read().await;
         partitions
             .get(&group_id)
@@ -195,11 +198,9 @@ impl PartitionRouter {
         // Collect all send futures.
         let send_futures: Vec<_> = handles
             .into_iter()
-            .map(|(group_id, handle)| {
-                async move {
-                    if let Err(e) = handle.tick().await {
-                        tracing::warn!("failed to tick partition {group_id}: {e}");
-                    }
+            .map(|(group_id, handle)| async move {
+                if let Err(e) = handle.tick().await {
+                    tracing::warn!("failed to tick partition {group_id}: {e}");
                 }
             })
             .collect();
@@ -296,7 +297,7 @@ mod tests {
     use crate::service::wal_actor::{spawn_wal_actor, WalActorConfig};
     use helix_core::NodeId;
     use helix_raft::{RaftConfig, RaftNode};
-    use helix_wal::{PoolConfig, SimulatedStorage, SharedWalPool};
+    use helix_wal::{PoolConfig, SharedWalPool, SimulatedStorage};
     use tempfile::TempDir;
 
     fn create_test_raft_node(node_id: u64, cluster: Vec<u64>) -> RaftNode {
@@ -406,7 +407,7 @@ mod tests {
         }
 
         let mut collected: Vec<u64> = router.group_ids().await.iter().map(|g| g.get()).collect();
-        collected.sort();
+        collected.sort_unstable();
 
         assert_eq!(collected, ids);
 

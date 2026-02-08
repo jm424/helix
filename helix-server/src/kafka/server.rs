@@ -18,7 +18,9 @@ use tracing::{error, info};
 use super::codec;
 use super::error::{KafkaError, KafkaResult};
 use super::handler::KafkaHandler;
-use crate::HelixService;
+use crate::service::HelixService;
+use helix_runtime::TransportService;
+use helix_wal::Storage;
 
 /// Configuration for the Kafka server.
 #[derive(Debug, Clone)]
@@ -77,16 +79,16 @@ impl KafkaServerConfig {
 }
 
 /// Kafka-compatible TCP server backed by `HelixService`.
-pub struct KafkaServer {
-    handler: Arc<KafkaHandler>,
+pub struct KafkaServer<S: Storage + Clone + Send + Sync + 'static, T: TransportService> {
+    handler: Arc<KafkaHandler<S, T>>,
     config: KafkaServerConfig,
     shutdown: Arc<Notify>,
 }
 
-impl KafkaServer {
+impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaServer<S, T> {
     /// Create a new Kafka server.
     #[must_use]
-    pub fn new(service: Arc<HelixService>, config: KafkaServerConfig) -> Self {
+    pub fn new(service: Arc<HelixService<S, T>>, config: KafkaServerConfig) -> Self {
         let handler = Arc::new(KafkaHandler::new(
             service,
             config.advertised_host.clone(),
@@ -176,10 +178,6 @@ fn create_reusable_listener(addr: SocketAddr) -> KafkaResult<TcpListener> {
 
     let socket = Socket::new(domain, Type::STREAM, None)?;
     socket.set_reuse_address(true)?;
-    // On macOS/BSD, SO_REUSEPORT allows multiple processes to bind to the same port.
-    // This helps with rapid test restarts when previous sockets are still closing.
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    socket.set_reuse_port(true)?;
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     // Backlog of 128 pending connections.
@@ -200,10 +198,10 @@ fn create_reusable_listener(addr: SocketAddr) -> KafkaResult<TcpListener> {
 ///
 /// This allows multiple in-flight requests on a single connection,
 /// significantly improving throughput when requests have latency (e.g., Raft consensus).
-async fn handle_connection(
+async fn handle_connection<S: Storage + Clone + Send + Sync + 'static, T: TransportService>(
     stream: TcpStream,
     peer_addr: SocketAddr,
-    handler: Arc<KafkaHandler>,
+    handler: Arc<KafkaHandler<S, T>>,
 ) -> KafkaResult<()> {
     use tokio::sync::mpsc;
 

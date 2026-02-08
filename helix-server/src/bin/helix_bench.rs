@@ -226,10 +226,7 @@ async fn run_write_benchmark(
                 let duration = op_start.elapsed();
 
                 if response.get_ref().error_code != 0 {
-                    eprintln!(
-                        "Write error: {:?}",
-                        response.get_ref().error_message
-                    );
+                    eprintln!("Write error: {:?}", response.get_ref().error_message);
                 }
 
                 total_sent.fetch_add(u64::from(batch_size), Ordering::Relaxed);
@@ -496,8 +493,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             batch_size,
             clients,
         } => {
-            run_read_benchmark(args.addr, topic, partition, offset, records, batch_size, clients)
-                .await?;
+            run_read_benchmark(
+                args.addr, topic, partition, offset, records, batch_size, clients,
+            )
+            .await?;
         }
         Command::Latency {
             topic,

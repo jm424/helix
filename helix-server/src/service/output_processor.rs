@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use helix_core::{GroupId, LogIndex, Offset, ProducerEpoch, ProducerId, SequenceNum, TermId};
-use helix_runtime::TransportHandle;
+use helix_runtime::TransportService;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
@@ -54,8 +54,9 @@ use crate::vote_store::{LocalFileVoteStorage, VoteStore};
 use crate::error::ServerError;
 use crate::group_map::GroupMap;
 use crate::kafka::extract_producer_info;
-use crate::partition_storage::ServerPartitionStorage;
+use crate::partition_storage::PartitionStorage;
 use crate::storage::{BlobFormat, PartitionCommand};
+use helix_wal::Storage;
 
 use super::batcher::BackpressureState;
 use super::partition_actor::{BatchNotifyInfo, GroupedOutput, PartitionOutput};
@@ -107,12 +108,17 @@ pub fn create_output_channel(
 /// * `batcher_stats` - Stats for batch commit tracking (optional)
 /// * `batcher_backpressure` - Backpressure state for decrementing counters (optional)
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
-pub async fn output_processor_task(
+pub async fn output_processor_task<
+    S: Storage + Clone + Send + Sync + 'static,
+    T: TransportService,
+>(
     mut output_rx: mpsc::Receiver<GroupedOutput>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
     group_map: Arc<RwLock<GroupMap>>,
-    batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
-    transport_handle: Option<TransportHandle>,
+    batch_pending_proposals: Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
+    >,
+    transport_handle: Option<T>,
     batcher_stats: Option<Arc<BatcherStats>>,
     batcher_backpressure: Option<Arc<BackpressureState>>,
     vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
@@ -166,10 +172,10 @@ pub async fn output_processor_task(
 }
 
 /// Handles `SendMessages` output by sending via transport.
-async fn handle_send_messages(
+async fn handle_send_messages<T: TransportService>(
     to: helix_core::NodeId,
     messages: &[helix_raft::multi::GroupMessage],
-    transport_handle: Option<&TransportHandle>,
+    transport_handle: Option<&T>,
 ) {
     let Some(transport) = transport_handle else {
         debug!(
@@ -201,15 +207,21 @@ async fn handle_send_messages(
 /// The `batch_notify` parameter is provided by the partition actor when it owns
 /// the pending proposal (new actor model path). When `None`, falls back to the
 /// shared `batch_pending_proposals` map (backwards compatibility path).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::significant_drop_tightening)]
-async fn handle_entry_committed(
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::significant_drop_tightening
+)]
+async fn handle_entry_committed<S: Storage + Clone + Send + Sync + 'static>(
     group_id: GroupId,
     index: LogIndex,
     data: &bytes::Bytes,
     batch_notify: Option<BatchNotifyInfo>,
-    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
     group_map: &Arc<RwLock<GroupMap>>,
-    batch_pending_proposals: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
+    batch_pending_proposals: &Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
+    >,
     batcher_stats: Option<&Arc<BatcherStats>>,
     batcher_backpressure: Option<&Arc<BackpressureState>>,
 ) {
@@ -458,13 +470,7 @@ async fn handle_entry_committed(
             // Extract and record producer state from the entry data.
             // This ensures idempotent deduplication works correctly even for
             // entries committed by a new leader (PREVIOUS_TERM entries).
-            extract_and_record_producer_state(
-                data,
-                base_offset,
-                group_id,
-                partition_storage,
-            )
-            .await;
+            extract_and_record_producer_state(data, base_offset, group_id, partition_storage).await;
 
             debug!(
                 topic = topic_id.get(),
@@ -490,11 +496,11 @@ async fn handle_entry_committed(
 ///
 /// - `AppendBlob` with `KafkaRecordBatch`: Single blob with producer info in header
 /// - `AppendBlobBatch`: Multiple blobs, each with producer info in header
-pub async fn extract_and_record_producer_state(
+pub async fn extract_and_record_producer_state<S: Storage + Clone + Send + Sync + 'static>(
     data: &Bytes,
     base_offset: Offset,
     group_id: GroupId,
-    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
 ) {
     // Decode the partition command to access blob data.
     let Some(command) = PartitionCommand::decode(data) else {
@@ -569,7 +575,8 @@ pub async fn extract_and_record_producer_state(
                     }
                 }
                 // Advance offset for next blob in batch.
-                cumulative_offset = Offset::new(cumulative_offset.get() + u64::from(batched.record_count));
+                cumulative_offset =
+                    Offset::new(cumulative_offset.get() + u64::from(batched.record_count));
             }
         }
         // Other command types don't have producer state to record.
@@ -654,8 +661,11 @@ fn handle_vote_state_changed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::partition_storage::ServerPartitionStorage;
     use bytes::Bytes;
     use helix_core::{PartitionId, TopicId};
+    use helix_runtime::TransportHandle;
+    use helix_wal::TokioStorage;
     use tokio::sync::oneshot;
 
     #[tokio::test]
@@ -676,9 +686,12 @@ mod tests {
         let config = OutputProcessorConfig::default();
         let (tx, rx) = create_output_channel(config);
 
-        let partition_storage = Arc::new(RwLock::new(HashMap::new()));
+        let partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
         let group_map = Arc::new(RwLock::new(GroupMap::new()));
-        let batch_pending_proposals = Arc::new(RwLock::new(HashMap::new()));
+        let batch_pending_proposals: Arc<
+            RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
+        > = Arc::new(RwLock::new(HashMap::new()));
 
         // Add a mapping.
         {
@@ -687,7 +700,7 @@ mod tests {
         }
 
         // Spawn processor.
-        let processor = tokio::spawn(output_processor_task(
+        let processor = tokio::spawn(output_processor_task::<TokioStorage, TransportHandle>(
             rx,
             partition_storage,
             group_map,
@@ -718,8 +731,9 @@ mod tests {
         let partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let group_map = Arc::new(RwLock::new(GroupMap::new()));
-        let batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let batch_pending_proposals: Arc<
+            RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
+        > = Arc::new(RwLock::new(HashMap::new()));
 
         // Add a mapping.
         {
@@ -730,13 +744,12 @@ mod tests {
         // Add partition storage.
         {
             let mut storage = partition_storage.write().await;
-            let ps =
-                ServerPartitionStorage::new_in_memory(TopicId::new(1), PartitionId::new(0));
+            let ps = ServerPartitionStorage::new_in_memory(TopicId::new(1), PartitionId::new(0));
             storage.insert(GroupId::new(1), Arc::new(RwLock::new(ps)));
         }
 
         // Spawn processor.
-        let processor = tokio::spawn(output_processor_task(
+        let processor = tokio::spawn(output_processor_task::<TokioStorage, TransportHandle>(
             rx,
             partition_storage,
             group_map,
@@ -767,6 +780,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::items_after_statements)] // Local test-only imports keep scenario setup concise.
     async fn test_output_processor_batch_proposal_notification() {
         let config = OutputProcessorConfig::default();
         let (tx, rx) = create_output_channel(config);
@@ -774,8 +788,9 @@ mod tests {
         let partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let group_map = Arc::new(RwLock::new(GroupMap::new()));
-        let batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let batch_pending_proposals: Arc<
+            RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
+        > = Arc::new(RwLock::new(HashMap::new()));
         let batcher_stats = Arc::new(BatcherStats::default());
         let backpressure = Arc::new(BackpressureState::default());
 
@@ -791,8 +806,7 @@ mod tests {
         // Add partition storage.
         {
             let mut storage = partition_storage.write().await;
-            let ps =
-                ServerPartitionStorage::new_in_memory(TopicId::new(1), PartitionId::new(0));
+            let ps = ServerPartitionStorage::new_in_memory(TopicId::new(1), PartitionId::new(0));
             storage.insert(group_id, Arc::new(RwLock::new(ps)));
         }
 
@@ -831,7 +845,7 @@ mod tests {
         }
 
         // Spawn processor.
-        let processor = tokio::spawn(output_processor_task(
+        let processor = tokio::spawn(output_processor_task::<TokioStorage, TransportHandle>(
             rx,
             Arc::clone(&partition_storage),
             Arc::clone(&group_map),
@@ -867,11 +881,7 @@ mod tests {
         tx.send(output).await.unwrap();
 
         // Wait for notification.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            result_rx,
-        )
-        .await;
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), result_rx).await;
 
         assert!(result.is_ok(), "Should receive result");
         let inner_result = result.unwrap();

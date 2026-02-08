@@ -49,6 +49,15 @@ pub enum KafkaError {
         /// Error details.
         message: String,
     },
+
+    /// Protocol-level error returned by the Kafka handler.
+    #[error("protocol error: code={error_code} message={message}")]
+    Protocol {
+        /// Kafka error code.
+        error_code: i16,
+        /// Error message.
+        message: String,
+    },
 }
 
 impl KafkaError {

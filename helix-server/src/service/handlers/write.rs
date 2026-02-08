@@ -4,6 +4,8 @@ use bytes::Bytes;
 use helix_core::{NodeId, PartitionId, Record};
 use helix_raft::multi::MultiRaftOutput;
 use helix_raft::RaftState;
+use helix_runtime::TransportService;
+use helix_wal::Storage;
 use tokio::sync::oneshot;
 use tracing::debug;
 
@@ -13,15 +15,12 @@ use crate::storage::PartitionCommand;
 
 use super::super::{HelixService, PendingProposal, MAX_RECORDS_PER_WRITE};
 
-impl HelixService {
+impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixService<S, T> {
     /// Converts a proto Record to a core Record.
     #[allow(clippy::option_if_let_else)]
     pub(crate) fn proto_to_record(proto: &ProtoRecord) -> Record {
         let mut record = if let Some(key) = &proto.key {
-            Record::with_key(
-                Bytes::from(key.clone()),
-                Bytes::from(proto.value.clone()),
-            )
+            Record::with_key(Bytes::from(key.clone()), Bytes::from(proto.value.clone()))
         } else {
             Record::new(Bytes::from(proto.value.clone()))
         };
@@ -50,7 +49,10 @@ impl HelixService {
         clippy::too_many_lines,
         clippy::cast_possible_truncation // record_count is bounded by MAX_RECORDS_PER_WRITE
     )]
-    pub(crate) async fn write_internal(&self, request: WriteRequest) -> ServerResult<WriteResponse> {
+    pub(crate) async fn write_internal(
+        &self,
+        request: WriteRequest,
+    ) -> ServerResult<WriteResponse> {
         // Validate request.
         assert!(!request.topic.is_empty(), "topic cannot be empty");
         assert!(
@@ -60,11 +62,12 @@ impl HelixService {
             MAX_RECORDS_PER_WRITE
         );
 
-        let topic_meta = self.get_topic(&request.topic).await.ok_or_else(|| {
-            ServerError::TopicNotFound {
-                topic: request.topic.clone(),
-            }
-        })?;
+        let topic_meta =
+            self.get_topic(&request.topic)
+                .await
+                .ok_or_else(|| ServerError::TopicNotFound {
+                    topic: request.topic.clone(),
+                })?;
 
         let partition_idx = if request.partition < 0 {
             0 // Auto-partition: use round-robin or hash-based assignment.
@@ -125,13 +128,12 @@ impl HelixService {
         // Propose to Raft and get the log index.
         let (outputs, proposed_index) = {
             let mut mr = self.multi_raft.write().await;
-            mr.propose_with_index(group_id, data).ok_or_else(|| {
-                ServerError::NotLeader {
+            mr.propose_with_index(group_id, data)
+                .ok_or_else(|| ServerError::NotLeader {
                     topic: request.topic.clone(),
                     partition: partition_idx,
                     leader_hint: None,
-                }
-            })?
+                })?
         };
 
         // In single-node mode, the commit happens synchronously and the CommitEntry
@@ -168,9 +170,12 @@ impl HelixService {
             // Get the per-partition lock once outside the loop.
             let ps_lock = {
                 let storage = self.partition_storage.read().await;
-                storage.get(&group_id).cloned().ok_or_else(|| ServerError::Internal {
-                    message: "partition storage not found".to_string(),
-                })?
+                storage
+                    .get(&group_id)
+                    .cloned()
+                    .ok_or_else(|| ServerError::Internal {
+                        message: "partition storage not found".to_string(),
+                    })?
             };
 
             for retry in 0..MAX_CONCURRENT_APPLY_RETRIES {
@@ -198,18 +203,22 @@ impl HelixService {
                 if proposed_index == expected_next {
                     // It's our turn to apply.
                     match ps.apply_entry_async(proposed_index, &entry_data).await {
-                        Ok(Some(offset)) => return Ok(WriteResponse {
-                            base_offset: offset.get(),
-                            record_count: record_count as u32,
-                            error_code: ErrorCode::None.into(),
-                            error_message: None,
-                        }),
-                        Ok(None) => return Ok(WriteResponse {
-                            base_offset: ps.log_end_offset().get(),
-                            record_count: record_count as u32,
-                            error_code: ErrorCode::None.into(),
-                            error_message: None,
-                        }),
+                        Ok(Some(offset)) => {
+                            return Ok(WriteResponse {
+                                base_offset: offset.get(),
+                                record_count: record_count as u32,
+                                error_code: ErrorCode::None.into(),
+                                error_message: None,
+                            })
+                        }
+                        Ok(None) => {
+                            return Ok(WriteResponse {
+                                base_offset: ps.log_end_offset().get(),
+                                record_count: record_count as u32,
+                                error_code: ErrorCode::None.into(),
+                                error_message: None,
+                            })
+                        }
                         Err(e) => {
                             return Err(ServerError::Internal {
                                 message: format!("failed to apply: {e}"),
@@ -247,14 +256,21 @@ impl HelixService {
                     let mut proposals = self.pending_proposals.write().await;
                     proposals
                         .entry(group_id)
-                        .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())))
+                        .or_insert_with(|| {
+                            std::sync::Arc::new(tokio::sync::RwLock::new(
+                                std::collections::HashMap::new(),
+                            ))
+                        })
                         .clone()
                 };
                 let mut inner = inner_lock.write().await;
-                inner.insert(proposed_index, PendingProposal {
-                    log_index: proposed_index,
-                    result_tx,
-                });
+                inner.insert(
+                    proposed_index,
+                    PendingProposal {
+                        log_index: proposed_index,
+                        result_tx,
+                    },
+                );
             }
 
             // Wait for commit and apply with timeout.

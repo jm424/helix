@@ -102,9 +102,7 @@ impl WalActorHandle {
             .await
             .map_err(|_| helix_wal::WalError::Shutdown)?;
 
-        reply_rx
-            .await
-            .map_err(|_| helix_wal::WalError::Shutdown)?
+        reply_rx.await.map_err(|_| helix_wal::WalError::Shutdown)?
     }
 
     /// Requests the actor to shut down.
@@ -283,7 +281,8 @@ mod tests {
             let h = handle.clone();
             let partition = PartitionId::new(i);
             join_handles.push(tokio::spawn(async move {
-                h.append(partition, 1, 1, Bytes::from(format!("data {i}"))).await
+                h.append(partition, 1, 1, Bytes::from(format!("data {i}")))
+                    .await
             }));
         }
 

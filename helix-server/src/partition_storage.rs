@@ -6,7 +6,9 @@
 use std::path::PathBuf;
 
 use bytes::Bytes;
-use helix_core::{LogIndex, Offset, PartitionId, ProducerEpoch, ProducerId, Record, SequenceNum, TopicId};
+use helix_core::{
+    LogIndex, Offset, PartitionId, ProducerEpoch, ProducerId, Record, SequenceNum, TopicId,
+};
 use helix_wal::{SharedEntry, SharedWalHandle, Storage, TokioStorage};
 use tracing::{debug, info, warn};
 
@@ -45,12 +47,12 @@ fn extract_payload_preview(blob: &Bytes) -> String {
 use crate::error::{ServerError, ServerResult};
 use crate::producer_state::{PartitionProducerState, SequenceCheckResult};
 use crate::storage::{
-    BlobFormat, DurablePartition, DurablePartitionConfig, DurablePartitionError, Partition,
-    PartitionCommand, PartitionConfig, patch_kafka_base_offset,
+    patch_kafka_base_offset, BlobFormat, DurablePartition, DurablePartitionConfig,
+    DurablePartitionError, Partition, PartitionCommand, PartitionConfig,
 };
-use helix_tier::TieringConfig;
 #[cfg(feature = "s3")]
 use helix_tier::S3Config;
+use helix_tier::TieringConfig;
 
 /// Inner storage type for a partition.
 ///
@@ -91,7 +93,7 @@ pub type ServerPartitionStorage = PartitionStorage<TokioStorage>;
 
 impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     /// Creates new in-memory partition storage.
-    #[must_use] 
+    #[must_use]
     pub fn new_in_memory(topic_id: TopicId, partition_id: PartitionId) -> Self {
         let config = PartitionConfig::new(topic_id, partition_id);
         Self {
@@ -229,7 +231,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         if let Some(tier_cfg) = tiering_config {
             config = config.with_tiering(tier_cfg.clone());
         }
-        let durable = DurablePartition::open_with_shared_wal(config, wal_handle, recovered_entries).await?;
+        let durable =
+            DurablePartition::open_with_shared_wal(config, wal_handle, recovered_entries).await?;
         // Initialize last_applied from recovered WAL state for proper idempotency.
         let last_applied = LogIndex::new(durable.last_applied_index());
         Ok(Self {
@@ -265,7 +268,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         if let Some(tier_cfg) = tiering_config {
             config = config.with_tiering(tier_cfg.clone());
         }
-        let durable = DurablePartition::open_with_shared_wal(config, wal_handle, recovered_entries).await?;
+        let durable =
+            DurablePartition::open_with_shared_wal(config, wal_handle, recovered_entries).await?;
         // Initialize last_applied from recovered WAL state for proper idempotency.
         let last_applied = LogIndex::new(durable.last_applied_index());
         Ok(Self {
@@ -279,7 +283,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
 
     /// Returns the log start offset.
     #[allow(clippy::missing_const_for_fn)] // Const match not stable yet.
-    #[must_use] 
+    #[must_use]
     pub fn log_start_offset(&self) -> Offset {
         match &self.inner {
             PartitionStorageInner::InMemory(p) => p.log_start_offset(),
@@ -288,7 +292,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     }
 
     /// Returns the log end offset.
-    #[must_use] 
+    #[must_use]
     pub fn log_end_offset(&self) -> Offset {
         match &self.inner {
             PartitionStorageInner::InMemory(p) => p.log_end_offset(),
@@ -298,7 +302,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
 
     /// Returns the high watermark.
     #[allow(clippy::missing_const_for_fn)] // Const match not stable yet.
-    #[must_use] 
+    #[must_use]
     pub fn high_watermark(&self) -> Offset {
         match &self.inner {
             PartitionStorageInner::InMemory(p) => p.high_watermark(),
@@ -307,7 +311,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     }
 
     /// Returns the blob log end offset (for Kafka batch storage).
-    #[must_use] 
+    #[must_use]
     pub fn blob_log_end_offset(&self) -> Offset {
         match &self.inner {
             PartitionStorageInner::InMemory(p) => p.blob_log_end_offset(),
@@ -317,7 +321,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
 
     /// Returns the last applied Raft log index.
     #[allow(dead_code)]
-    #[must_use] 
+    #[must_use]
     pub const fn last_applied(&self) -> LogIndex {
         self.last_applied
     }
@@ -333,14 +337,15 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     /// - `OutOfSequence` if there's a gap in sequence numbers
     /// - `ProducerFenced` if the epoch is stale
     #[allow(dead_code)] // Will be used in append_blob integration.
-    #[must_use] 
+    #[must_use]
     pub fn check_producer_sequence(
         &self,
         producer_id: ProducerId,
         epoch: ProducerEpoch,
         sequence: SequenceNum,
     ) -> SequenceCheckResult {
-        self.producer_state.check_sequence(producer_id, epoch, sequence)
+        self.producer_state
+            .check_sequence(producer_id, epoch, sequence)
     }
 
     /// Records a successful produce after Raft commit.
@@ -361,13 +366,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         // Use current timestamp (microseconds since start would be better,
         // but for simplicity we use a monotonic counter based on offset).
         let timestamp_us = base_offset.get();
-        self.producer_state.record_produce(
-            producer_id,
-            epoch,
-            sequence,
-            base_offset,
-            timestamp_us,
-        );
+        self.producer_state
+            .record_produce(producer_id, epoch, sequence, base_offset, timestamp_us);
     }
 
     /// Reads records from the partition.
@@ -377,16 +377,18 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     /// Returns an error if the read operation fails (e.g., internal storage error).
     pub fn read(&self, start_offset: Offset, max_records: u32) -> ServerResult<Vec<Record>> {
         match &self.inner {
-            PartitionStorageInner::InMemory(p) => p.read(start_offset, max_records).map_err(|e| {
-                ServerError::Internal {
-                    message: format!("failed to read: {e}"),
-                }
-            }),
-            PartitionStorageInner::Durable(p) => p.read(start_offset, max_records).map_err(|e| {
-                ServerError::Internal {
-                    message: format!("failed to read: {e}"),
-                }
-            }),
+            PartitionStorageInner::InMemory(p) => {
+                p.read(start_offset, max_records)
+                    .map_err(|e| ServerError::Internal {
+                        message: format!("failed to read: {e}"),
+                    })
+            }
+            PartitionStorageInner::Durable(p) => {
+                p.read(start_offset, max_records)
+                    .map_err(|e| ServerError::Internal {
+                        message: format!("failed to read: {e}"),
+                    })
+            }
         }
     }
 
@@ -397,7 +399,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     /// Returns an error if the entry cannot be decoded or applied.
     #[allow(dead_code)] // Kept for potential future use; async version used everywhere.
     #[allow(clippy::too_many_lines)]
-    pub fn apply_entry_sync(&mut self, index: LogIndex, data: &Bytes) -> ServerResult<Option<Offset>> {
+    pub fn apply_entry_sync(
+        &mut self,
+        index: LogIndex,
+        data: &Bytes,
+    ) -> ServerResult<Option<Offset>> {
         // Skip if already applied.
         if index <= self.last_applied {
             debug!(
@@ -430,9 +436,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
             PartitionStorageInner::InMemory(partition) => match command {
                 PartitionCommand::Append { records, .. } => {
                     let _record_count = records.len();
-                    let offset = partition.append(records).map_err(|e| ServerError::Internal {
-                        message: format!("failed to append: {e}"),
-                    })?;
+                    let offset = partition
+                        .append(records)
+                        .map_err(|e| ServerError::Internal {
+                            message: format!("failed to append: {e}"),
+                        })?;
 
                     // Update high watermark since entry is committed.
                     let new_hwm = partition.log_end_offset();
@@ -440,7 +448,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
 
                     Some(offset)
                 }
-                PartitionCommand::AppendBlob { blob, record_count, format, base_offset } => {
+                PartitionCommand::AppendBlob {
+                    blob,
+                    record_count,
+                    format,
+                    base_offset,
+                } => {
                     // Use base_offset from command - assigned by leader at propose time.
                     // This ensures all replicas use the same offset for consistency.
 
@@ -450,11 +463,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                         BlobFormat::KafkaRecordBatch => patch_kafka_base_offset(blob, base_offset),
                     };
 
-                    partition.append_blob(blob_to_store, record_count).map_err(|e| {
-                        ServerError::Internal {
+                    partition
+                        .append_blob(blob_to_store, record_count)
+                        .map_err(|e| ServerError::Internal {
                             message: format!("failed to append blob: {e}"),
-                        }
-                    })?;
+                        })?;
 
                     let new_hwm = partition.blob_log_end_offset();
                     partition.set_high_watermark(new_hwm);
@@ -479,9 +492,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                         from_offset = %from_offset,
                         "applied truncate"
                     );
-                    partition.truncate(from_offset).map_err(|e| ServerError::Internal {
-                        message: format!("failed to truncate: {e}"),
-                    })?;
+                    partition
+                        .truncate(from_offset)
+                        .map_err(|e| ServerError::Internal {
+                            message: format!("failed to truncate: {e}"),
+                        })?;
                     None
                 }
                 PartitionCommand::UpdateHighWatermark { high_watermark } => {
@@ -508,13 +523,14 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                                 patch_kafka_base_offset(batched.blob, current_offset)
                             }
                         };
-                        partition.append_blob(blob_to_store, batched.record_count).map_err(|e| {
-                            ServerError::Internal {
+                        partition
+                            .append_blob(blob_to_store, batched.record_count)
+                            .map_err(|e| ServerError::Internal {
                                 message: format!("failed to append blob in batch: {e}"),
-                            }
-                        })?;
+                            })?;
                         // Advance offset for next blob in batch.
-                        current_offset = Offset::new(current_offset.get() + u64::from(batched.record_count));
+                        current_offset =
+                            Offset::new(current_offset.get() + u64::from(batched.record_count));
                     }
 
                     let new_hwm = partition.blob_log_end_offset();
@@ -586,16 +602,23 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         let base_offset = match &mut self.inner {
             PartitionStorageInner::InMemory(partition) => match command {
                 PartitionCommand::Append { records, .. } => {
-                    let offset = partition.append(records).map_err(|e| ServerError::Internal {
-                        message: format!("failed to append: {e}"),
-                    })?;
+                    let offset = partition
+                        .append(records)
+                        .map_err(|e| ServerError::Internal {
+                            message: format!("failed to append: {e}"),
+                        })?;
 
                     let new_hwm = partition.log_end_offset();
                     partition.set_high_watermark(new_hwm);
 
                     Some(offset)
                 }
-                PartitionCommand::AppendBlob { blob, record_count, format, base_offset } => {
+                PartitionCommand::AppendBlob {
+                    blob,
+                    record_count,
+                    format,
+                    base_offset,
+                } => {
                     // Use base_offset from command - assigned by leader at propose time.
 
                     // Extract payload preview for debugging offset bugs.
@@ -610,11 +633,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                     // Use append_blob_at_offset to store at the leader-assigned offset.
                     // This ensures all replicas use the same offset, even with concurrent
                     // PREVIOUS_TERM entry processing.
-                    partition.append_blob_at_offset(blob_to_store, record_count, base_offset).map_err(|e| {
-                        ServerError::Internal {
+                    partition
+                        .append_blob_at_offset(blob_to_store, record_count, base_offset)
+                        .map_err(|e| ServerError::Internal {
                             message: format!("failed to append blob: {e}"),
-                        }
-                    })?;
+                        })?;
 
                     let new_hwm = partition.blob_log_end_offset();
                     partition.set_high_watermark(new_hwm);
@@ -639,9 +662,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                         from_offset = %from_offset,
                         "applied truncate"
                     );
-                    partition.truncate(from_offset).map_err(|e| ServerError::Internal {
-                        message: format!("failed to truncate: {e}"),
-                    })?;
+                    partition
+                        .truncate(from_offset)
+                        .map_err(|e| ServerError::Internal {
+                            message: format!("failed to truncate: {e}"),
+                        })?;
                     None
                 }
                 PartitionCommand::UpdateHighWatermark { high_watermark } => {
@@ -678,12 +703,17 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                             }
                         };
                         // Use append_blob_at_offset to store at the leader-assigned offset.
-                        partition.append_blob_at_offset(blob_to_store, batched.record_count, current_offset).map_err(|e| {
-                            ServerError::Internal {
+                        partition
+                            .append_blob_at_offset(
+                                blob_to_store,
+                                batched.record_count,
+                                current_offset,
+                            )
+                            .map_err(|e| ServerError::Internal {
                                 message: format!("failed to append blob in batch: {e}"),
-                            }
-                        })?;
-                        current_offset = Offset::new(current_offset.get() + u64::from(batched.record_count));
+                            })?;
+                        current_offset =
+                            Offset::new(current_offset.get() + u64::from(batched.record_count));
                     }
 
                     let new_hwm = partition.blob_log_end_offset();
@@ -704,14 +734,20 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                 PartitionCommand::Append { records, .. } => {
                     // Use append_at_index with the Raft index to ensure proper
                     // idempotency tracking after crash recovery.
-                    let offset = partition.append_at_index(index.get(), records).await.map_err(|e| {
-                        ServerError::Internal {
+                    let offset = partition
+                        .append_at_index(index.get(), records)
+                        .await
+                        .map_err(|e| ServerError::Internal {
                             message: format!("failed to append: {e}"),
-                        }
-                    })?;
+                        })?;
                     Some(offset)
                 }
-                PartitionCommand::AppendBlob { blob, record_count, format, base_offset } => {
+                PartitionCommand::AppendBlob {
+                    blob,
+                    record_count,
+                    format,
+                    base_offset,
+                } => {
                     // Use base_offset from command - assigned by leader at propose time.
 
                     // Apply protocol-specific patching if needed.
@@ -721,11 +757,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                     };
 
                     // Use append_blob_at_index with the Raft index AND leader-assigned offset.
-                    partition.append_blob_at_index(index.get(), blob_to_store, record_count, base_offset).await.map_err(|e| {
-                        ServerError::Internal {
+                    partition
+                        .append_blob_at_index(index.get(), blob_to_store, record_count, base_offset)
+                        .await
+                        .map_err(|e| ServerError::Internal {
                             message: format!("failed to append blob: {e}"),
-                        }
-                    })?;
+                        })?;
                     Some(base_offset)
                 }
                 PartitionCommand::Truncate { from_offset: _ } => {
@@ -757,12 +794,19 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                                 patch_kafka_base_offset(batched.blob.clone(), current_offset)
                             }
                         };
-                        partition.append_blob_at_index(index.get(), blob_to_store, batched.record_count, current_offset).await.map_err(|e| {
-                            ServerError::Internal {
+                        partition
+                            .append_blob_at_index(
+                                index.get(),
+                                blob_to_store,
+                                batched.record_count,
+                                current_offset,
+                            )
+                            .await
+                            .map_err(|e| ServerError::Internal {
                                 message: format!("failed to append blob in batch: {e}"),
-                            }
-                        })?;
-                        current_offset = Offset::new(current_offset.get() + u64::from(batched.record_count));
+                            })?;
+                        current_offset =
+                            Offset::new(current_offset.get() + u64::from(batched.record_count));
                     }
 
                     debug!(
@@ -806,13 +850,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     pub async fn check_and_register_sealed_segments(&mut self) -> Result<u32, ServerError> {
         match &mut self.inner {
             PartitionStorageInner::InMemory(_) => Ok(0),
-            PartitionStorageInner::Durable(p) => {
-                p.check_and_register_sealed_segments()
-                    .await
-                    .map_err(|e| ServerError::Internal {
-                        message: format!("tiering registration failed: {e}"),
-                    })
-            }
+            PartitionStorageInner::Durable(p) => p
+                .check_and_register_sealed_segments()
+                .await
+                .map_err(|e| ServerError::Internal {
+                    message: format!("tiering registration failed: {e}"),
+                }),
         }
     }
 
@@ -830,13 +873,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     pub async fn on_entries_committed(&self, committed_index: u64) -> Result<u32, ServerError> {
         match &self.inner {
             PartitionStorageInner::InMemory(_) => Ok(0),
-            PartitionStorageInner::Durable(p) => {
-                p.on_entries_committed(committed_index)
-                    .await
-                    .map_err(|e| ServerError::Internal {
-                        message: format!("tiering commit notification failed: {e}"),
-                    })
-            }
+            PartitionStorageInner::Durable(p) => p
+                .on_entries_committed(committed_index)
+                .await
+                .map_err(|e| ServerError::Internal {
+                    message: format!("tiering commit notification failed: {e}"),
+                }),
         }
     }
 

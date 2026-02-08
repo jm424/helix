@@ -1,11 +1,13 @@
 //! Utility methods for the Helix service.
 
 use helix_core::{NodeId, PartitionId};
+use helix_runtime::TransportService;
+use helix_wal::Storage;
 
 use super::super::HelixService;
 use crate::controller::CONTROLLER_GROUP_ID;
 
-impl HelixService {
+impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixService<S, T> {
     /// Hashes a string to produce a deterministic u64 ID.
     pub(crate) fn hash_string(s: &str) -> u64 {
         use std::hash::{Hash, Hasher};

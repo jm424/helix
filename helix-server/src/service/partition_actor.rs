@@ -246,7 +246,10 @@ impl PartitionActorHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
 
         self.tx
-            .send(PartitionCommand::Propose { data, reply: reply_tx })
+            .send(PartitionCommand::Propose {
+                data,
+                reply: reply_tx,
+            })
             .await
             .map_err(|_| PartitionError::ActorShutdown)?;
 
@@ -680,18 +683,17 @@ impl PartitionActorShared {
                     // Extract batch info if this was a batched proposal from this leader.
                     // Convert to BatchNotifyInfo to pass to output processor.
                     let has_batch = self.batch_pending_proposals.contains_key(&index);
-                    let batch_notify =
-                        self.batch_pending_proposals
-                            .remove(&index)
-                            .map(|pending| BatchNotifyInfo {
-                                first_request_at: pending.first_request_at,
-                                proposed_at: pending.proposed_at,
-                                batch_size: pending.batch_size,
-                                batch_bytes: pending.batch_bytes,
-                                total_records: pending.total_records,
-                                record_counts: pending.record_counts,
-                                result_txs: pending.result_txs,
-                            });
+                    let batch_notify = self.batch_pending_proposals.remove(&index).map(|pending| {
+                        BatchNotifyInfo {
+                            first_request_at: pending.first_request_at,
+                            proposed_at: pending.proposed_at,
+                            batch_size: pending.batch_size,
+                            batch_bytes: pending.batch_bytes,
+                            total_records: pending.total_records,
+                            record_counts: pending.record_counts,
+                            result_txs: pending.result_txs,
+                        }
+                    });
 
                     info!(
                         group_id = self.group_id.get(),
@@ -764,7 +766,6 @@ impl PartitionActorShared {
             }
         }
     }
-
 }
 
 /// The partition actor state.
@@ -890,10 +891,13 @@ impl PartitionActor {
                         group_id: self.group_id,
                         message,
                     };
-                    let _ = self.output_tx.send(PartitionOutput::SendMessages {
-                        to,
-                        messages: vec![group_message],
-                    }).await;
+                    let _ = self
+                        .output_tx
+                        .send(PartitionOutput::SendMessages {
+                            to,
+                            messages: vec![group_message],
+                        })
+                        .await;
                 }
                 RaftOutput::CommitEntry { index, data } => {
                     // Notify pending proposal if any.
@@ -929,10 +933,13 @@ impl PartitionActor {
                     let _ = self.output_tx.send(PartitionOutput::SteppedDown).await;
                 }
                 RaftOutput::VoteStateChanged { term, voted_for } => {
-                    let _ = self.output_tx.send(PartitionOutput::VoteStateChanged {
-                        term: term.get(),
-                        voted_for,
-                    }).await;
+                    let _ = self
+                        .output_tx
+                        .send(PartitionOutput::VoteStateChanged {
+                            term: term.get(),
+                            voted_for,
+                        })
+                        .await;
                 }
             }
         }
@@ -956,11 +963,8 @@ mod tests {
     #[tokio::test]
     async fn test_partition_actor_startup_shutdown() {
         let raft_node = create_test_raft_node(1, vec![1, 2, 3]);
-        let (handle, _output_rx) = spawn_partition_actor(
-            GroupId::new(1),
-            raft_node,
-            PartitionActorConfig::default(),
-        );
+        let (handle, _output_rx) =
+            spawn_partition_actor(GroupId::new(1), raft_node, PartitionActorConfig::default());
 
         // Actor should be running.
         assert!(handle.is_leader().await.is_ok());
@@ -979,11 +983,8 @@ mod tests {
     #[tokio::test]
     async fn test_partition_actor_not_leader() {
         let raft_node = create_test_raft_node(1, vec![1, 2, 3]);
-        let (handle, _output_rx) = spawn_partition_actor(
-            GroupId::new(1),
-            raft_node,
-            PartitionActorConfig::default(),
-        );
+        let (handle, _output_rx) =
+            spawn_partition_actor(GroupId::new(1), raft_node, PartitionActorConfig::default());
 
         // Initially not leader (haven't won election).
         let is_leader = handle.is_leader().await.unwrap();
@@ -999,11 +1000,8 @@ mod tests {
     #[tokio::test]
     async fn test_partition_actor_tick() {
         let raft_node = create_test_raft_node(1, vec![1, 2, 3]);
-        let (handle, mut output_rx) = spawn_partition_actor(
-            GroupId::new(1),
-            raft_node,
-            PartitionActorConfig::default(),
-        );
+        let (handle, mut output_rx) =
+            spawn_partition_actor(GroupId::new(1), raft_node, PartitionActorConfig::default());
 
         // Send ticks to trigger election.
         for _ in 0..20 {
@@ -1011,10 +1009,8 @@ mod tests {
         }
 
         // Should receive some outputs (pre-vote messages, etc.).
-        let output = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            output_rx.recv()
-        ).await;
+        let output =
+            tokio::time::timeout(std::time::Duration::from_millis(100), output_rx.recv()).await;
 
         // Expect either a message or timeout (both are valid depending on timing).
         // The important thing is the actor processed the ticks without panicking.
@@ -1026,11 +1022,8 @@ mod tests {
     #[tokio::test]
     async fn test_partition_actor_handle_clone() {
         let raft_node = create_test_raft_node(1, vec![1, 2, 3]);
-        let (handle, _output_rx) = spawn_partition_actor(
-            GroupId::new(1),
-            raft_node,
-            PartitionActorConfig::default(),
-        );
+        let (handle, _output_rx) =
+            spawn_partition_actor(GroupId::new(1), raft_node, PartitionActorConfig::default());
 
         // Clone the handle.
         let handle2 = handle.clone();

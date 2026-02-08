@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use helix_core::{GroupId, LogIndex, NodeId, Offset, TermId};
 use helix_raft::multi::{MultiRaft, MultiRaftOutput};
 use helix_raft::RaftState;
-use helix_runtime::{BrokerHeartbeat, IncomingMessage, TransportHandle};
-use helix_wal::TokioStorage;
+use helix_runtime::{BrokerHeartbeat, IncomingMessage, TransportService};
+use helix_wal::Storage;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
@@ -22,11 +22,11 @@ use crate::vote_store::{LocalFileVoteStorage, VoteStore};
 use crate::controller::{ControllerCommand, ControllerState, CONTROLLER_GROUP_ID};
 use crate::error::ServerError;
 use crate::group_map::GroupMap;
-use crate::partition_storage::ServerPartitionStorage;
+use crate::partition_storage::PartitionStorage;
 use crate::storage::PartitionCommand;
-use helix_tier::TieringConfig;
 #[cfg(feature = "s3")]
 use helix_tier::S3Config;
+use helix_tier::TieringConfig;
 
 use super::{
     output_processor::extract_and_record_producer_state, BatchPendingProposal, BatcherStats,
@@ -89,12 +89,14 @@ fn extract_commit_payload_preview(data: &bytes::Bytes) -> String {
 }
 
 /// Background task to handle Raft ticks for all groups (single-node).
-#[allow(clippy::significant_drop_tightening)]
-pub async fn tick_task(
+#[allow(clippy::significant_drop_tightening, clippy::implicit_hasher)]
+pub async fn tick_task<S: Storage + Clone + Send + Sync + 'static>(
     multi_raft: Arc<RwLock<MultiRaft>>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
     group_map: Arc<RwLock<GroupMap>>,
-    pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>>,
+    pending_proposals: Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>,
+    >,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
     let mut tick_interval =
@@ -128,24 +130,32 @@ pub async fn tick_task(
 }
 
 /// Background task for multi-node operation.
-#[allow(clippy::significant_drop_tightening)]
+#[allow(clippy::significant_drop_tightening, clippy::implicit_hasher)]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub async fn tick_task_multi_node(
+pub async fn tick_task_multi_node<
+    S: Storage + Clone + Send + Sync + 'static,
+    T: TransportService,
+>(
     multi_raft: Arc<RwLock<MultiRaft>>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
     group_map: Arc<RwLock<GroupMap>>,
     controller_state: Arc<RwLock<ControllerState>>,
-    pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>>,
+    pending_proposals: Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>,
+    >,
     pending_controller_proposals: Arc<RwLock<Vec<PendingControllerProposal>>>,
-    batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
+    batch_pending_proposals: Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
+    >,
     local_broker_heartbeats: Arc<RwLock<HashMap<NodeId, u64>>>,
     cluster_nodes: Vec<NodeId>,
-    transport_handle: TransportHandle,
+    transport_handle: T,
+    storage: S,
     data_dir: Option<PathBuf>,
     object_storage_dir: Option<PathBuf>,
     #[cfg(feature = "s3")] s3_config: Option<S3Config>,
     tiering_config: Option<TieringConfig>,
-    shared_wal_pool: Option<Arc<helix_wal::SharedWalPool<helix_wal::TokioStorage>>>,
+    shared_wal_pool: Option<Arc<helix_wal::SharedWalPool<S>>>,
     recovered_entries: Arc<RwLock<HashMap<helix_core::PartitionId, Vec<helix_wal::SharedEntry>>>>,
     batcher_stats: Option<Arc<BatcherStats>>,
     batcher_backpressure: Option<Arc<crate::service::batcher::BackpressureState>>,
@@ -192,6 +202,7 @@ pub async fn tick_task_multi_node(
                     &batcher_backpressure,
                     &cluster_nodes,
                     &transport_handle,
+                    &storage,
                     &data_dir,
                     &object_storage_dir,
                     &s3_config,
@@ -215,6 +226,7 @@ pub async fn tick_task_multi_node(
                     &batcher_backpressure,
                     &cluster_nodes,
                     &transport_handle,
+                    &storage,
                     &data_dir,
                     &object_storage_dir,
                     &tiering_config,
@@ -288,6 +300,7 @@ pub async fn tick_task_multi_node(
                     &batcher_backpressure,
                     &cluster_nodes,
                     &transport_handle,
+                    &storage,
                     &data_dir,
                     &object_storage_dir,
                     &s3_config,
@@ -311,6 +324,217 @@ pub async fn tick_task_multi_node(
                     &batcher_backpressure,
                     &cluster_nodes,
                     &transport_handle,
+                    &storage,
+                    &data_dir,
+                    &object_storage_dir,
+                    &tiering_config,
+                    &shared_wal_pool,
+                    &recovered_entries,
+                    vote_store.as_ref(),
+                ).await;
+            }
+        }
+    }
+}
+
+/// Background tick task for multi-node DST (Deterministic Simulation Testing).
+///
+/// This is a simplified version of `tick_task_multi_node` for DST use:
+/// - No S3/tiering configuration (uses None for tiering params)
+/// - Works with any `TransportService` (e.g., `MadSimTransport`)
+/// - Same core logic as production for high-fidelity testing
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::implicit_hasher,
+    clippy::significant_drop_tightening
+)]
+pub async fn tick_task_multi_node_dst<
+    S: Storage + Clone + Send + Sync + 'static,
+    T: TransportService,
+>(
+    multi_raft: Arc<RwLock<MultiRaft>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
+    group_map: Arc<RwLock<GroupMap>>,
+    controller_state: Arc<RwLock<ControllerState>>,
+    pending_proposals: Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>,
+    >,
+    pending_controller_proposals: Arc<RwLock<Vec<PendingControllerProposal>>>,
+    batch_pending_proposals: Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
+    >,
+    local_broker_heartbeats: Arc<RwLock<HashMap<NodeId, u64>>>,
+    cluster_nodes: Vec<NodeId>,
+    transport_handle: T,
+    storage: S,
+    data_dir: Option<PathBuf>,
+    shared_wal_pool: Option<Arc<helix_wal::SharedWalPool<S>>>,
+    recovered_entries: Arc<RwLock<HashMap<helix_core::PartitionId, Vec<helix_wal::SharedEntry>>>>,
+    batcher_stats: Option<Arc<BatcherStats>>,
+    batcher_backpressure: Option<Arc<crate::service::batcher::BackpressureState>>,
+    vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
+    mut incoming_rx: mpsc::Receiver<IncomingMessage>,
+    mut shutdown_rx: mpsc::Receiver<()>,
+) {
+    let mut tick_interval =
+        tokio::time::interval(tokio::time::Duration::from_millis(TICK_INTERVAL_MS));
+    let mut heartbeat_interval =
+        tokio::time::interval(tokio::time::Duration::from_millis(HEARTBEAT_INTERVAL_MS));
+    let mut tiering_interval =
+        tokio::time::interval(tokio::time::Duration::from_millis(TIERING_INTERVAL_MS));
+
+    let node_id = {
+        let mr = multi_raft.read().await;
+        mr.node_id()
+    };
+
+    // DST uses None for tiering-related params.
+    let object_storage_dir: Option<PathBuf> = None;
+    let tiering_config: Option<TieringConfig> = None;
+    #[cfg(feature = "s3")]
+    let s3_config: Option<S3Config> = None;
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                debug!("DST multi-node tick task shutting down");
+                break;
+            }
+            _ = tick_interval.tick() => {
+                let outputs = {
+                    let mut mr = multi_raft.write().await;
+                    mr.tick()
+                };
+                #[cfg(feature = "s3")]
+                process_outputs_multi_node(
+                    &outputs,
+                    node_id,
+                    &multi_raft,
+                    &partition_storage,
+                    &group_map,
+                    &controller_state,
+                    &pending_proposals,
+                    &pending_controller_proposals,
+                    &batch_pending_proposals,
+                    &batcher_stats,
+                    &batcher_backpressure,
+                    &cluster_nodes,
+                    &transport_handle,
+                    &storage,
+                    &data_dir,
+                    &object_storage_dir,
+                    &s3_config,
+                    &tiering_config,
+                    &shared_wal_pool,
+                    &recovered_entries,
+                    vote_store.as_ref(),
+                ).await;
+                #[cfg(not(feature = "s3"))]
+                process_outputs_multi_node(
+                    &outputs,
+                    node_id,
+                    &multi_raft,
+                    &partition_storage,
+                    &group_map,
+                    &controller_state,
+                    &pending_proposals,
+                    &pending_controller_proposals,
+                    &batch_pending_proposals,
+                    &batcher_stats,
+                    &batcher_backpressure,
+                    &cluster_nodes,
+                    &transport_handle,
+                    &storage,
+                    &data_dir,
+                    &object_storage_dir,
+                    &tiering_config,
+                    &shared_wal_pool,
+                    &recovered_entries,
+                    vote_store.as_ref(),
+                ).await;
+            }
+            _ = heartbeat_interval.tick() => {
+                send_broker_heartbeats_to_peers(
+                    &local_broker_heartbeats,
+                    node_id,
+                    &cluster_nodes,
+                    &transport_handle,
+                ).await;
+            }
+            _ = tiering_interval.tick() => {
+                process_tiering(&partition_storage).await;
+            }
+            Some(incoming) = incoming_rx.recv() => {
+                let outputs = match incoming {
+                    IncomingMessage::Single(_message) => {
+                        warn!("Received single message in DST multi-node mode, expected batch");
+                        vec![]
+                    }
+                    IncomingMessage::Batch(group_messages) => {
+                        let mut mr = multi_raft.write().await;
+                        let mut all_outputs = Vec::new();
+                        for group_msg in group_messages {
+                            let outputs = mr.handle_message(
+                                group_msg.group_id,
+                                group_msg.message,
+                            );
+                            all_outputs.extend(outputs);
+                        }
+                        all_outputs.extend(mr.flush());
+                        all_outputs
+                    }
+                    IncomingMessage::Heartbeat(heartbeat) => {
+                        let mut heartbeats = local_broker_heartbeats.write().await;
+                        heartbeats.insert(heartbeat.node_id, heartbeat.timestamp_ms);
+                        debug!(
+                            from = heartbeat.node_id.get(),
+                            timestamp_ms = heartbeat.timestamp_ms,
+                            "DST: Recorded heartbeat from peer"
+                        );
+                        vec![]
+                    }
+                };
+                #[cfg(feature = "s3")]
+                process_outputs_multi_node(
+                    &outputs,
+                    node_id,
+                    &multi_raft,
+                    &partition_storage,
+                    &group_map,
+                    &controller_state,
+                    &pending_proposals,
+                    &pending_controller_proposals,
+                    &batch_pending_proposals,
+                    &batcher_stats,
+                    &batcher_backpressure,
+                    &cluster_nodes,
+                    &transport_handle,
+                    &storage,
+                    &data_dir,
+                    &object_storage_dir,
+                    &s3_config,
+                    &tiering_config,
+                    &shared_wal_pool,
+                    &recovered_entries,
+                    vote_store.as_ref(),
+                ).await;
+                #[cfg(not(feature = "s3"))]
+                process_outputs_multi_node(
+                    &outputs,
+                    node_id,
+                    &multi_raft,
+                    &partition_storage,
+                    &group_map,
+                    &controller_state,
+                    &pending_proposals,
+                    &pending_controller_proposals,
+                    &batch_pending_proposals,
+                    &batcher_stats,
+                    &batcher_backpressure,
+                    &cluster_nodes,
+                    &transport_handle,
+                    &storage,
                     &data_dir,
                     &object_storage_dir,
                     &tiering_config,
@@ -345,18 +569,20 @@ pub async fn tick_task_multi_node(
 ///   channel and are processed by the `OutputProcessor`
 /// - Simpler control flow since output processing is decoupled
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
-pub async fn tick_task_actor(
+pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: TransportService>(
     router: Arc<super::router::PartitionRouter>,
     multi_raft: Arc<RwLock<MultiRaft>>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
     group_map: Arc<RwLock<GroupMap>>,
     controller_state: Arc<RwLock<ControllerState>>,
-    pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>>,
+    pending_proposals: Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>,
+    >,
     pending_controller_proposals: Arc<RwLock<Vec<PendingControllerProposal>>>,
     local_broker_heartbeats: Arc<RwLock<HashMap<NodeId, u64>>>,
     node_id: NodeId,
     cluster_nodes: Vec<NodeId>,
-    transport_handle: TransportHandle,
+    transport_handle: T,
     output_tx: mpsc::Sender<super::partition_actor::GroupedOutput>,
     vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
     mut incoming_rx: mpsc::Receiver<IncomingMessage>,
@@ -490,15 +716,20 @@ pub async fn tick_task_actor(
 ///
 /// Data partition operations are handled by `tick_task_actor` via the router.
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
-pub async fn tick_task_controller(
+pub async fn tick_task_controller<
+    S: Storage + Clone + Send + Sync + 'static,
+    T: TransportService,
+>(
     multi_raft: Arc<RwLock<MultiRaft>>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
     group_map: Arc<RwLock<GroupMap>>,
     controller_state: Arc<RwLock<ControllerState>>,
-    pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>>,
+    pending_proposals: Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>,
+    >,
     pending_controller_proposals: Arc<RwLock<Vec<PendingControllerProposal>>>,
     cluster_nodes: Vec<NodeId>,
-    transport_handle: TransportHandle,
+    transport_handle: T,
     router: Arc<super::router::PartitionRouter>,
     output_tx: mpsc::Sender<super::partition_actor::GroupedOutput>,
     vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
@@ -530,40 +761,6 @@ pub async fn tick_task_controller(
                     mr.tick()
                 };
 
-                if !outputs.is_empty() {
-                    for output in &outputs {
-                        match output {
-                            MultiRaftOutput::CommitEntry { group_id, index, .. } => {
-                                info!(group = group_id.get(), index = index.get(), "Tick: CommitEntry");
-                            }
-                            MultiRaftOutput::BecameLeader { group_id } => {
-                                info!(group = group_id.get(), "Tick: BecameLeader");
-                            }
-                            MultiRaftOutput::SendMessages { to, messages } => {
-                                info!(to = to.get(), count = messages.len(), "Tick: SendMessages");
-                            }
-                            MultiRaftOutput::SteppedDown { group_id } => {
-                                info!(group = group_id.get(), "Tick: SteppedDown");
-                            }
-                            MultiRaftOutput::VoteStateChanged { group_id, term, voted_for } => {
-                                info!(group = group_id.get(), term = term.get(), "Tick: VoteStateChanged");
-                                // Persist vote state change.
-                                if let Some(ref vs) = vote_store {
-                                    if let Ok(mut store) = vs.lock() {
-                                        if let Err(e) = store.save(*group_id, *term, *voted_for) {
-                                            error!(
-                                                group = group_id.get(),
-                                                error = %e,
-                                                "Failed to persist vote state"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
                 // Process controller-related outputs only.
                 process_controller_outputs(
                     &outputs,
@@ -591,21 +788,36 @@ pub async fn tick_task_controller(
 /// This is a simplified version of `process_outputs_multi_node` that only
 /// handles controller partition (group 0) outputs. Data partition outputs
 /// are handled by the `OutputProcessor`.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::significant_drop_tightening)]
-async fn process_controller_outputs(
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::significant_drop_tightening,
+    clippy::implicit_hasher
+)]
+pub async fn process_controller_outputs<
+    S: Storage + Clone + Send + Sync + 'static,
+    T: TransportService,
+>(
     outputs: &[MultiRaftOutput],
     multi_raft: &Arc<RwLock<MultiRaft>>,
-    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
     group_map: &Arc<RwLock<GroupMap>>,
     controller_state: &Arc<RwLock<ControllerState>>,
-    _pending_proposals: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>>,
+    _pending_proposals: &Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>,
+    >,
     pending_controller_proposals: &Arc<RwLock<Vec<PendingControllerProposal>>>,
     cluster_nodes: &[NodeId],
-    transport_handle: &TransportHandle,
+    transport_handle: &T,
     router: &Arc<super::router::PartitionRouter>,
     output_tx: &mpsc::Sender<super::partition_actor::GroupedOutput>,
     vote_store: Option<&Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
 ) {
+    // Collect follow-up outputs for single-node processing.
+    // For single-node clusters, propose() returns CommitEntry immediately,
+    // so we need to process those after the main loop.
+    let mut all_follow_up_outputs: Vec<MultiRaftOutput> = Vec::new();
+
     for output in outputs {
         match output {
             MultiRaftOutput::CommitEntry {
@@ -620,10 +832,7 @@ async fn process_controller_outputs(
                 }
 
                 let Some(cmd) = ControllerCommand::decode(data) else {
-                    warn!(
-                        index = index.get(),
-                        "Failed to decode controller command"
-                    );
+                    warn!(index = index.get(), "Failed to decode controller command");
                     continue;
                 };
 
@@ -638,7 +847,8 @@ async fn process_controller_outputs(
                 // Notify any pending controller proposals for this index.
                 {
                     let mut proposals = pending_controller_proposals.write().await;
-                    let pending_indexes: Vec<u64> = proposals.iter().map(|p| p.log_index.get()).collect();
+                    let pending_indexes: Vec<u64> =
+                        proposals.iter().map(|p| p.log_index.get()).collect();
                     info!(
                         commit_index = index.get(),
                         pending_count = proposals.len(),
@@ -662,6 +872,8 @@ async fn process_controller_outputs(
                 }
 
                 // Propose follow-up commands if we're the leader.
+                // For single-node clusters, these commits happen immediately during propose,
+                // so we collect the outputs and process them after the loop.
                 if !follow_ups.is_empty() {
                     let is_leader = {
                         let mr = multi_raft.read().await;
@@ -671,13 +883,19 @@ async fn process_controller_outputs(
 
                     if is_leader {
                         let mut mr = multi_raft.write().await;
-                        for follow_up in follow_ups {
+                        for follow_up in &follow_ups {
                             let encoded = follow_up.encode();
-                            if mr.propose(CONTROLLER_GROUP_ID, encoded).is_none() {
-                                warn!(
-                                    command = ?follow_up,
-                                    "Failed to propose follow-up controller command (actor mode)"
-                                );
+                            match mr.propose(CONTROLLER_GROUP_ID, encoded) {
+                                None => {
+                                    warn!(
+                                        command = ?follow_up,
+                                        "Failed to propose follow-up controller command (actor mode)"
+                                    );
+                                }
+                                Some(outputs) => {
+                                    // Collect outputs for single-node processing.
+                                    all_follow_up_outputs.extend(outputs);
+                                }
                             }
                         }
                     }
@@ -701,7 +919,10 @@ async fn process_controller_outputs(
                         let (term, voted_for, observation_mode) = vote_store
                             .and_then(|vs| vs.lock().ok())
                             .and_then(|store| {
-                                store.state().get_group(data_group_id).map(|v| (v.term, v.voted_for, false))
+                                store
+                                    .state()
+                                    .get_group(data_group_id)
+                                    .map(|v| (v.term, v.voted_for, false))
                             })
                             .unwrap_or((TermId::new(0), None, false));
 
@@ -723,26 +944,33 @@ async fn process_controller_outputs(
 
                         // Create partition storage (in-memory for now).
                         {
-                            let mut storage = partition_storage.write().await;
-                            if let std::collections::hash_map::Entry::Vacant(e) = storage.entry(data_group_id) {
-                                let ps = ServerPartitionStorage::new_in_memory(topic_id, partition_id);
+                            let mut ps_map = partition_storage.write().await;
+                            if let std::collections::hash_map::Entry::Vacant(e) =
+                                ps_map.entry(data_group_id)
+                            {
+                                let ps =
+                                    PartitionStorage::<S>::new_in_memory(topic_id, partition_id);
                                 e.insert(Arc::new(RwLock::new(ps)));
                             }
                         }
 
                         // Create the partition actor with restored vote state and add it to the router.
-                        let partition_handle = super::actor_setup::create_partition_actor_with_state(
-                            data_group_id,
-                            node_id,
-                            replicas.clone(),
-                            term,
-                            voted_for,
-                            observation_mode,
-                            output_tx.clone(),
-                            super::partition_actor::PartitionActorConfig::default(),
-                        );
+                        let partition_handle =
+                            super::actor_setup::create_partition_actor_with_state(
+                                data_group_id,
+                                node_id,
+                                replicas.clone(),
+                                term,
+                                voted_for,
+                                observation_mode,
+                                output_tx.clone(),
+                                super::partition_actor::PartitionActorConfig::default(),
+                            );
 
-                        if router.add_partition_dynamic(data_group_id, partition_handle).await {
+                        if router
+                            .add_partition_dynamic(data_group_id, partition_handle)
+                            .await
+                        {
                             info!(
                                 topic = topic_id.get(),
                                 partition = partition_id.get(),
@@ -782,7 +1010,10 @@ async fn process_controller_outputs(
                     .collect();
 
                 if !controller_messages.is_empty() {
-                    if let Err(e) = transport_handle.send_batch(*to, controller_messages.clone()).await {
+                    if let Err(e) = transport_handle
+                        .send_batch(*to, controller_messages.clone())
+                        .await
+                    {
                         error!(
                             to = to.get(),
                             count = controller_messages.len(),
@@ -798,7 +1029,11 @@ async fn process_controller_outputs(
                     }
                 }
             }
-            MultiRaftOutput::VoteStateChanged { group_id, term, voted_for } => {
+            MultiRaftOutput::VoteStateChanged {
+                group_id,
+                term,
+                voted_for,
+            } => {
                 if *group_id == CONTROLLER_GROUP_ID {
                     debug!(
                         group = group_id.get(),
@@ -823,6 +1058,101 @@ async fn process_controller_outputs(
             }
         }
     }
+
+    // Process follow-up outputs (for single-node clusters).
+    // These are commits that happened during propose of follow-up commands.
+    if !all_follow_up_outputs.is_empty() {
+        for output in &all_follow_up_outputs {
+            if let MultiRaftOutput::CommitEntry {
+                group_id,
+                index,
+                data,
+            } = output
+            {
+                if *group_id != CONTROLLER_GROUP_ID {
+                    continue;
+                }
+
+                let Some(cmd) = ControllerCommand::decode(data) else {
+                    warn!(
+                        index = index.get(),
+                        "Failed to decode follow-up controller command"
+                    );
+                    continue;
+                };
+
+                // Apply to controller state (for AssignPartition, this is a no-op since already applied).
+                {
+                    let mut state = controller_state.write().await;
+                    let _ = state.apply(&cmd, cluster_nodes);
+                }
+
+                // Handle AssignPartition by creating partition actor.
+                if let ControllerCommand::AssignPartition {
+                    topic_id,
+                    partition_id,
+                    group_id: data_group_id,
+                    ref replicas,
+                } = cmd
+                {
+                    let node_id = {
+                        let mr = multi_raft.read().await;
+                        mr.node_id()
+                    };
+
+                    if replicas.contains(&node_id) {
+                        // Update group map.
+                        {
+                            let mut gm = group_map.write().await;
+                            gm.insert(topic_id, partition_id, data_group_id);
+                        }
+
+                        // Create partition storage.
+                        {
+                            let mut ps_map = partition_storage.write().await;
+                            if let std::collections::hash_map::Entry::Vacant(e) =
+                                ps_map.entry(data_group_id)
+                            {
+                                let ps =
+                                    PartitionStorage::<S>::new_in_memory(topic_id, partition_id);
+                                e.insert(Arc::new(RwLock::new(ps)));
+                            }
+                        }
+
+                        // Create the partition actor and add to router.
+                        let partition_handle =
+                            super::actor_setup::create_partition_actor_with_state(
+                                data_group_id,
+                                node_id,
+                                replicas.clone(),
+                                TermId::new(0),
+                                None,
+                                false,
+                                output_tx.clone(),
+                                super::partition_actor::PartitionActorConfig::default(),
+                            );
+
+                        if router
+                            .add_partition_dynamic(data_group_id, partition_handle)
+                            .await
+                        {
+                            info!(
+                                topic = topic_id.get(),
+                                partition = partition_id.get(),
+                                group = data_group_id.get(),
+                                "Created partition actor from follow-up (single-node)"
+                            );
+                        } else {
+                            warn!(
+                                group = data_group_id.get(),
+                                "Follow-up partition actor already exists"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Sends broker heartbeats to all peers via transport (Kafka `KRaft` pattern).
@@ -833,11 +1163,11 @@ async fn process_controller_outputs(
 ///
 /// This ensures all nodes have a local view of broker liveness without requiring
 /// Raft consensus, which would only work for the leader node.
-async fn send_broker_heartbeats_to_peers(
+async fn send_broker_heartbeats_to_peers<T: TransportService>(
     local_broker_heartbeats: &Arc<RwLock<HashMap<NodeId, u64>>>,
     node_id: NodeId,
     cluster_nodes: &[NodeId],
-    transport_handle: &TransportHandle,
+    transport_handle: &T,
 ) {
     // Get current time in milliseconds.
     // Safe truncation: milliseconds won't overflow u64 for ~584 million years.
@@ -881,11 +1211,13 @@ async fn send_broker_heartbeats_to_peers(
 
 /// Processes Multi-Raft outputs (single-node).
 #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
-async fn process_outputs(
+async fn process_outputs<S: Storage + Clone + Send + Sync + 'static>(
     outputs: &[MultiRaftOutput],
-    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
     group_map: &Arc<RwLock<GroupMap>>,
-    pending_proposals: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>>,
+    pending_proposals: &Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>,
+    >,
 ) {
     for output in outputs {
         match output {
@@ -1023,7 +1355,11 @@ async fn process_outputs(
                     "Would send messages (single-node, ignoring)"
                 );
             }
-            MultiRaftOutput::VoteStateChanged { group_id, term, voted_for } => {
+            MultiRaftOutput::VoteStateChanged {
+                group_id,
+                term,
+                voted_for,
+            } => {
                 debug!(
                     group = group_id.get(),
                     term = term.get(),
@@ -1045,25 +1381,33 @@ async fn process_outputs(
     clippy::significant_drop_tightening
 )]
 #[tracing::instrument(skip_all, name = "process_outputs", fields(output_count = outputs.len(), node_id = node_id.get()))]
-async fn process_outputs_multi_node(
+async fn process_outputs_multi_node<
+    S: Storage + Clone + Send + Sync + 'static,
+    T: TransportService,
+>(
     outputs: &[MultiRaftOutput],
     node_id: NodeId,
     multi_raft: &Arc<RwLock<MultiRaft>>,
-    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
     group_map: &Arc<RwLock<GroupMap>>,
     controller_state: &Arc<RwLock<ControllerState>>,
-    pending_proposals: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>>,
+    pending_proposals: &Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>,
+    >,
     pending_controller_proposals: &Arc<RwLock<Vec<PendingControllerProposal>>>,
-    batch_pending_proposals: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
+    batch_pending_proposals: &Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
+    >,
     batcher_stats: &Option<Arc<BatcherStats>>,
     batcher_backpressure: &Option<Arc<crate::service::batcher::BackpressureState>>,
     cluster_nodes: &[NodeId],
-    transport_handle: &TransportHandle,
+    transport_handle: &T,
+    storage: &S,
     data_dir: &Option<PathBuf>,
     object_storage_dir: &Option<PathBuf>,
     #[cfg(feature = "s3")] s3_config: &Option<S3Config>,
     tiering_config: &Option<TieringConfig>,
-    shared_wal_pool: &Option<Arc<helix_wal::SharedWalPool<helix_wal::TokioStorage>>>,
+    shared_wal_pool: &Option<Arc<helix_wal::SharedWalPool<S>>>,
     recovered_entries: &Arc<RwLock<HashMap<helix_core::PartitionId, Vec<helix_wal::SharedEntry>>>>,
     vote_store: Option<&Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
 ) {
@@ -1111,7 +1455,8 @@ async fn process_outputs_multi_node(
                     // Notify any pending controller proposals for this index.
                     {
                         let proposals = pending_controller_proposals.read().await;
-                        let pending_indexes: Vec<u64> = proposals.iter().map(|p| p.log_index.get()).collect();
+                        let pending_indexes: Vec<u64> =
+                            proposals.iter().map(|p| p.log_index.get()).collect();
                         info!(
                             index = index.get(),
                             pending_count = proposals.len(),
@@ -1124,10 +1469,7 @@ async fn process_outputs_multi_node(
                         if let Some(pos) = proposals.iter().position(|p| p.log_index == *index) {
                             let proposal = proposals.swap_remove(pos);
                             let _ = proposal.result_tx.send(Ok(()));
-                            info!(
-                                index = index.get(),
-                                "Notified pending controller proposal"
-                            );
+                            info!(index = index.get(), "Notified pending controller proposal");
                         } else {
                             info!(
                                 index = index.get(),
@@ -1176,7 +1518,10 @@ async fn process_outputs_multi_node(
                             let (term, voted_for, observation_mode) = vote_store
                                 .and_then(|vs| vs.lock().ok())
                                 .and_then(|store| {
-                                    store.state().get_group(data_group_id).map(|v| (v.term, v.voted_for, false))
+                                    store
+                                        .state()
+                                        .get_group(data_group_id)
+                                        .map(|v| (v.term, v.voted_for, false))
                                 })
                                 .unwrap_or((TermId::new(0), None, false));
 
@@ -1219,11 +1564,15 @@ async fn process_outputs_multi_node(
 
                             // Create partition storage (durable if data_dir is set).
                             {
-                                let mut storage = partition_storage.write().await;
-                                if let std::collections::hash_map::Entry::Vacant(e) = storage.entry(data_group_id) {
+                                let mut ps_map = partition_storage.write().await;
+                                if let std::collections::hash_map::Entry::Vacant(e) =
+                                    ps_map.entry(data_group_id)
+                                {
                                     let ps = if let Some(ref pool) = shared_wal_pool {
                                         // Shared WAL mode: get handle from pool and recovered entries.
-                                        let dir = data_dir.as_ref().expect("data_dir must be set with shared_wal_pool");
+                                        let dir = data_dir
+                                            .as_ref()
+                                            .expect("data_dir must be set with shared_wal_pool");
                                         let wal_handle = pool.handle(partition_id);
                                         let recovered = recovered_entries
                                             .write()
@@ -1232,26 +1581,30 @@ async fn process_outputs_multi_node(
                                             .unwrap_or_default();
 
                                         #[cfg(feature = "s3")]
-                                        let ps_result = ServerPartitionStorage::new_durable_with_shared_wal(
-                                            dir,
-                                            topic_id,
-                                            partition_id,
-                                            wal_handle,
-                                            recovered,
-                                            object_storage_dir.as_ref(),
-                                            s3_config.as_ref(),
-                                            tiering_config.as_ref(),
-                                        ).await;
+                                        let ps_result =
+                                            PartitionStorage::<S>::new_durable_with_shared_wal(
+                                                dir,
+                                                topic_id,
+                                                partition_id,
+                                                wal_handle,
+                                                recovered,
+                                                object_storage_dir.as_ref(),
+                                                s3_config.as_ref(),
+                                                tiering_config.as_ref(),
+                                            )
+                                            .await;
                                         #[cfg(not(feature = "s3"))]
-                                        let ps_result = ServerPartitionStorage::new_durable_with_shared_wal(
-                                            dir,
-                                            topic_id,
-                                            partition_id,
-                                            wal_handle,
-                                            recovered,
-                                            object_storage_dir.as_ref(),
-                                            tiering_config.as_ref(),
-                                        ).await;
+                                        let ps_result =
+                                            PartitionStorage::<S>::new_durable_with_shared_wal(
+                                                dir,
+                                                topic_id,
+                                                partition_id,
+                                                wal_handle,
+                                                recovered,
+                                                object_storage_dir.as_ref(),
+                                                tiering_config.as_ref(),
+                                            )
+                                            .await;
 
                                         match ps_result {
                                             Ok(durable) => durable,
@@ -1262,22 +1615,27 @@ async fn process_outputs_multi_node(
                                                     error = %e,
                                                     "Failed to create partition with shared WAL, falling back to in-memory"
                                                 );
-                                                ServerPartitionStorage::new_in_memory(topic_id, partition_id)
+                                                PartitionStorage::<S>::new_in_memory(
+                                                    topic_id,
+                                                    partition_id,
+                                                )
                                             }
                                         }
                                     } else {
                                         // Dedicated WAL mode (used when shared WAL is not available).
                                         #[cfg(feature = "s3")]
                                         let ps_inner = if let Some(dir) = data_dir {
-                                            match ServerPartitionStorage::new_durable(
-                                                TokioStorage::new(),
+                                            match PartitionStorage::<S>::new_durable(
+                                                storage.clone(),
                                                 dir,
                                                 object_storage_dir.as_ref(),
                                                 s3_config.as_ref(),
                                                 tiering_config.as_ref(),
                                                 topic_id,
                                                 partition_id,
-                                            ).await {
+                                            )
+                                            .await
+                                            {
                                                 Ok(durable) => durable,
                                                 Err(e) => {
                                                     error!(
@@ -1286,22 +1644,30 @@ async fn process_outputs_multi_node(
                                                         error = %e,
                                                         "Failed to create durable partition, falling back to in-memory"
                                                     );
-                                                    ServerPartitionStorage::new_in_memory(topic_id, partition_id)
+                                                    PartitionStorage::<S>::new_in_memory(
+                                                        topic_id,
+                                                        partition_id,
+                                                    )
                                                 }
                                             }
                                         } else {
-                                            ServerPartitionStorage::new_in_memory(topic_id, partition_id)
+                                            PartitionStorage::<S>::new_in_memory(
+                                                topic_id,
+                                                partition_id,
+                                            )
                                         };
                                         #[cfg(not(feature = "s3"))]
                                         let ps_inner = if let Some(dir) = data_dir {
-                                            match ServerPartitionStorage::new_durable(
-                                                TokioStorage::new(),
+                                            match PartitionStorage::<S>::new_durable(
+                                                storage.clone(),
                                                 dir,
                                                 object_storage_dir.as_ref(),
                                                 tiering_config.as_ref(),
                                                 topic_id,
                                                 partition_id,
-                                            ).await {
+                                            )
+                                            .await
+                                            {
                                                 Ok(durable) => durable,
                                                 Err(e) => {
                                                     error!(
@@ -1310,11 +1676,17 @@ async fn process_outputs_multi_node(
                                                         error = %e,
                                                         "Failed to create durable partition, falling back to in-memory"
                                                     );
-                                                    ServerPartitionStorage::new_in_memory(topic_id, partition_id)
+                                                    PartitionStorage::<S>::new_in_memory(
+                                                        topic_id,
+                                                        partition_id,
+                                                    )
                                                 }
                                             }
                                         } else {
-                                            ServerPartitionStorage::new_in_memory(topic_id, partition_id)
+                                            PartitionStorage::<S>::new_in_memory(
+                                                topic_id,
+                                                partition_id,
+                                            )
                                         };
                                         ps_inner
                                     };
@@ -1381,7 +1753,7 @@ async fn process_outputs_multi_node(
                     } else if has_single_proposal {
                         "SINGLE_CLIENT"
                     } else {
-                        "PREVIOUS_TERM"  // No pending proposal = replicated from old leader
+                        "PREVIOUS_TERM" // No pending proposal = replicated from old leader
                     };
 
                     info!(
@@ -1567,7 +1939,9 @@ async fn process_outputs_multi_node(
                                     );
                                 }
                                 let err = ServerError::Internal {
-                                    message: "batch apply returned no offset (already applied or empty)".to_string(),
+                                    message:
+                                        "batch apply returned no offset (already applied or empty)"
+                                            .to_string(),
                                 };
                                 for result_tx in batch_proposal.result_txs {
                                     let _ = result_tx.send(Err(err.clone()));
@@ -1692,7 +2066,8 @@ async fn process_outputs_multi_node(
                                             "BUG: apply returned None for entry with pending proposal"
                                         );
                                         Err(ServerError::Internal {
-                                            message: "apply returned None for client entry".to_string(),
+                                            message: "apply returned None for client entry"
+                                                .to_string(),
                                         })
                                     }
                                     Err(e) => Err(ServerError::Internal {
@@ -1790,7 +2165,11 @@ async fn process_outputs_multi_node(
                     );
                 }
             }
-            MultiRaftOutput::VoteStateChanged { group_id, term, voted_for } => {
+            MultiRaftOutput::VoteStateChanged {
+                group_id,
+                term,
+                voted_for,
+            } => {
                 debug!(
                     group = group_id.get(),
                     term = term.get(),
@@ -1825,13 +2204,13 @@ async fn process_outputs_multi_node(
 ///
 /// * `partition_storage` - Map of group ID to partition storage
 #[allow(clippy::significant_drop_tightening)]
-async fn process_tiering(
-    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
+async fn process_tiering<S: Storage + Clone + Send + Sync + 'static>(
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
 ) {
     // Collect group IDs of partitions with tiering enabled.
     // Note: We hold the outer read lock while checking has_tiering() on each partition.
     // This is intentional to get a consistent snapshot of which partitions have tiering.
-    let tiering_groups: Vec<(GroupId, Arc<RwLock<ServerPartitionStorage>>)> = {
+    let tiering_groups: Vec<(GroupId, Arc<RwLock<PartitionStorage<S>>>)> = {
         let storage = partition_storage.read().await;
         let mut groups = Vec::new();
         for (group_id, ps_lock) in storage.iter() {

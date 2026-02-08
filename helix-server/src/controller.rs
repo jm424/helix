@@ -400,11 +400,8 @@ impl ControllerState {
                     self.next_group_id += 1;
 
                     // Round-robin replica assignment.
-                    let replicas = Self::assign_replicas(
-                        cluster_nodes,
-                        partition,
-                        *replication_factor,
-                    );
+                    let replicas =
+                        Self::assign_replicas(cluster_nodes, partition, *replication_factor);
 
                     follow_up_commands.push(ControllerCommand::AssignPartition {
                         topic_id,
@@ -419,7 +416,8 @@ impl ControllerState {
                 if let Some(topic_info) = self.topics.remove(name) {
                     self.topics_by_id.remove(&topic_info.topic_id);
                     // Remove all partition assignments for this topic.
-                    self.assignments.retain(|(tid, _), _| *tid != topic_info.topic_id);
+                    self.assignments
+                        .retain(|(tid, _), _| *tid != topic_info.topic_id);
                 }
             }
 
@@ -541,11 +539,7 @@ impl ControllerState {
 
     /// Returns the group ID for a partition, if assigned.
     #[must_use]
-    pub fn get_group_id(
-        &self,
-        topic_id: TopicId,
-        partition_id: PartitionId,
-    ) -> Option<GroupId> {
+    pub fn get_group_id(&self, topic_id: TopicId, partition_id: PartitionId) -> Option<GroupId> {
         self.assignments
             .get(&(topic_id, partition_id))
             .map(|a| a.group_id)
@@ -729,7 +723,9 @@ mod tests {
 
         // Check assignment exists.
         let topic = state.get_topic("test-topic").unwrap();
-        let assignment = state.get_assignment(topic.topic_id, PartitionId::new(0)).unwrap();
+        let assignment = state
+            .get_assignment(topic.topic_id, PartitionId::new(0))
+            .unwrap();
         assert_eq!(assignment.replicas.len(), 2);
         assert_eq!(assignment.group_id.get(), 1); // First data group.
     }

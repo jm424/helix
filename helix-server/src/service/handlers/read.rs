@@ -2,14 +2,18 @@
 
 use bytes::Bytes;
 use helix_core::{Offset, PartitionId, Record};
+use helix_runtime::TransportService;
+use helix_wal::Storage;
 use tracing::debug;
 
 use crate::error::{ServerError, ServerResult};
-use crate::generated::{ErrorCode, ReadRequest, ReadResponse, Record as ProtoRecord, RecordWithOffset};
+use crate::generated::{
+    ErrorCode, ReadRequest, ReadResponse, Record as ProtoRecord, RecordWithOffset,
+};
 
 use super::super::{HelixService, MAX_BYTES_PER_READ};
 
-impl HelixService {
+impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixService<S, T> {
     /// Converts a core Record to a proto Record.
     pub(crate) fn record_to_proto(record: &Record) -> ProtoRecord {
         ProtoRecord {
@@ -19,7 +23,12 @@ impl HelixService {
             headers: record
                 .headers
                 .iter()
-                .map(|h| (String::from_utf8_lossy(&h.key).to_string(), h.value.to_vec()))
+                .map(|h| {
+                    (
+                        String::from_utf8_lossy(&h.key).to_string(),
+                        h.value.to_vec(),
+                    )
+                })
                 .collect(),
         }
     }
@@ -31,11 +40,12 @@ impl HelixService {
         assert!(!request.topic.is_empty(), "topic cannot be empty");
         assert!(request.partition >= 0, "partition must be non-negative");
 
-        let topic_meta = self.get_topic(&request.topic).await.ok_or_else(|| {
-            ServerError::TopicNotFound {
-                topic: request.topic.clone(),
-            }
-        })?;
+        let topic_meta =
+            self.get_topic(&request.topic)
+                .await
+                .ok_or_else(|| ServerError::TopicNotFound {
+                    topic: request.topic.clone(),
+                })?;
 
         if request.partition >= topic_meta.partition_count {
             return Err(ServerError::PartitionNotFound {
@@ -61,10 +71,13 @@ impl HelixService {
 
         let ps_lock = {
             let storage = self.partition_storage.read().await;
-            storage.get(&group_id).cloned().ok_or_else(|| ServerError::PartitionNotFound {
-                topic: request.topic.clone(),
-                partition: request.partition,
-            })?
+            storage
+                .get(&group_id)
+                .cloned()
+                .ok_or_else(|| ServerError::PartitionNotFound {
+                    topic: request.topic.clone(),
+                    partition: request.partition,
+                })?
         };
         let ps = ps_lock.read().await;
 

@@ -6,39 +6,42 @@
 //! The service is backed by Multi-Raft for consensus across multiple
 //! partition groups, with configurable partition storage.
 
-/// Handler implementations for the Helix service.
-pub mod handlers;
-/// Request batching for improved throughput.
-pub mod batcher;
-/// Partition actor for lock-free multi-partition scalability.
-pub mod partition_actor;
-/// WAL actor for command-channel based WAL access.
-pub mod wal_actor;
-/// Partition router for lock-free request dispatch.
-pub mod router;
-/// Output processor for actor-based multi-partition coordination.
-pub mod output_processor;
 /// Actor-based service setup for lock-free multi-partition coordination.
 pub mod actor_setup;
-mod tick;
+/// Request batching for improved throughput.
+pub mod batcher;
+/// Handler implementations for the Helix service.
+pub mod handlers;
+/// Output processor for actor-based multi-partition coordination.
+pub mod output_processor;
+/// Partition actor for lock-free multi-partition scalability.
+pub mod partition_actor;
+/// Partition router for lock-free request dispatch.
+pub mod router;
+/// Tick task for Raft consensus.
+pub mod tick;
+/// WAL actor for command-channel based WAL access.
+pub mod wal_actor;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use helix_core::{GroupId, LogIndex, NodeId, Offset, PartitionId, TermId, TopicId, WriteDurability};
+use helix_core::{
+    GroupId, LogIndex, NodeId, Offset, PartitionId, TermId, TopicId, WriteDurability,
+};
 use helix_progress::{ProgressConfig, ProgressManager, SimulatedProgressStore};
 use helix_raft::multi::MultiRaft;
-use helix_runtime::{PeerInfo, TransportConfig, TransportError, TransportHandle};
+use helix_runtime::{PeerInfo, TransportConfig, TransportError, TransportHandle, TransportService};
 use helix_tier::SimulatedObjectStorage;
-use helix_wal::{PoolConfig, SharedEntry, SharedWalPool, TokioStorage};
+use helix_wal::{PoolConfig, SharedEntry, SharedWalPool, Storage, TokioStorage};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{error, info, warn};
 
 use crate::controller::{ControllerState, BROKER_HEARTBEAT_TIMEOUT_MS, CONTROLLER_GROUP_ID};
 use crate::group_map::GroupMap;
-use crate::partition_storage::ServerPartitionStorage;
+use crate::partition_storage::PartitionStorage;
 use crate::vote_store::{LocalFileVoteStorage, VoteState, VoteStore};
 
 use self::router::PartitionRouter;
@@ -50,17 +53,28 @@ use self::router::PartitionRouter;
 /// Shared map of pending proposals, keyed by group ID, then by log index.
 /// Uses per-partition locks to enable parallel processing of different partitions.
 #[allow(clippy::type_complexity)]
-pub type PendingProposalMap = Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>>;
+pub type PendingProposalMap =
+    Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>>;
 
 /// Shared map of batch pending proposals, keyed by group ID, then by log index.
 /// Uses per-partition locks to enable parallel processing of different partitions.
 #[allow(clippy::type_complexity)]
-pub type BatchPendingProposalMap = Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>;
+pub type BatchPendingProposalMap =
+    Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>;
 
-/// Shared map of partition storage, keyed by group ID.
+/// Generic shared map of partition storage, keyed by group ID.
 /// Uses per-partition locks to enable parallel access to different partitions.
+///
+/// # Type Parameters
+///
+/// * `S` - Storage backend (e.g., `TokioStorage` for production, `SimulatedStorage` for DST)
 #[allow(clippy::type_complexity)]
-pub type PartitionStorageMap = Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>;
+pub type GenericPartitionStorageMap<S> =
+    Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>;
+
+/// Shared map of partition storage using production `TokioStorage`.
+#[allow(clippy::type_complexity)]
+pub type PartitionStorageMap = GenericPartitionStorageMap<TokioStorage>;
 
 /// Maximum records per write request.
 pub const MAX_RECORDS_PER_WRITE: usize = 1000;
@@ -167,7 +181,8 @@ impl BatcherStats {
         batch_records: u64,
         batch_age_us: u64,
     ) {
-        self.flush_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.flush_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match reason {
             "linger" => {
                 self.flush_linger_count
@@ -310,7 +325,7 @@ pub struct BatcherStatsSnapshot {
 
 impl BatcherStatsSnapshot {
     /// Formats the snapshot as a JSON string for reporting.
-    #[must_use] 
+    #[must_use]
     pub fn to_json(&self, node_id: u64, timestamp_ms: u64) -> String {
         format!(
             "{{\"node_id\":{node_id},\"timestamp_ms\":{timestamp_ms},\"flush_count\":{flush_count},\"flush_linger_count\":{flush_linger_count},\"flush_size_count\":{flush_size_count},\"flush_shutdown_count\":{flush_shutdown_count},\"commit_count\":{commit_count},\"total_batch_requests\":{total_batch_requests},\"total_batch_bytes\":{total_batch_bytes},\"total_batch_records\":{total_batch_records},\"total_batch_age_us\":{total_batch_age_us},\"total_batch_wait_us\":{total_batch_wait_us},\"total_commit_latency_us\":{total_commit_latency_us},\"total_total_age_us\":{total_total_age_us},\"not_leader_count\":{not_leader_count},\"apply_error_count\":{apply_error_count}}}",
@@ -347,7 +362,15 @@ pub struct TopicMetadata {
 ///
 /// This provides a Raft-replicated implementation using the Multi-Raft
 /// engine for efficient management of many partition groups.
-pub struct HelixService {
+///
+/// # Type Parameters
+///
+/// * `S` - Storage backend (e.g., `TokioStorage` for production, `SimulatedStorage` for DST)
+/// * `T` - Transport backend (e.g., `TransportHandle` for production, `MadSimTransport` for DST)
+pub struct HelixService<
+    S: Storage + Clone + Send + Sync + 'static,
+    T: TransportService = TransportHandle,
+> {
     /// Cluster ID.
     pub(crate) cluster_id: String,
     /// This node's ID.
@@ -356,7 +379,9 @@ pub struct HelixService {
     pub(crate) multi_raft: Arc<RwLock<MultiRaft>>,
     /// Partition storage indexed by `GroupId`.
     /// Uses per-partition locks to enable parallel processing of different partitions.
-    pub(crate) partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
+    pub(crate) partition_storage: GenericPartitionStorageMap<S>,
+    /// Storage backend instance for creating new partitions.
+    pub(crate) storage: S,
     /// Group ID mapping.
     pub(crate) group_map: Arc<RwLock<GroupMap>>,
     /// Topic name to metadata mapping.
@@ -380,7 +405,7 @@ pub struct HelixService {
     pub(crate) tiering_config: Option<helix_tier::TieringConfig>,
     /// Transport handle for sending Raft messages (multi-node only).
     #[allow(dead_code)]
-    pub(crate) transport_handle: Option<TransportHandle>,
+    pub(crate) transport_handle: Option<T>,
     /// Progress manager for consumer group tracking.
     pub(crate) progress_manager: Arc<ProgressManager<SimulatedProgressStore>>,
     /// Controller state machine (cluster metadata).
@@ -398,7 +423,7 @@ pub struct HelixService {
     /// and each node maintains its own view of broker liveness.
     pub(crate) local_broker_heartbeats: Arc<RwLock<HashMap<NodeId, u64>>>,
     /// Shared WAL pool for fsync amortization. Present when `data_dir` is set.
-    pub(crate) shared_wal_pool: Option<Arc<SharedWalPool<TokioStorage>>>,
+    pub(crate) shared_wal_pool: Option<Arc<SharedWalPool<S>>>,
     /// Recovered entries from shared WAL, indexed by `PartitionId`.
     /// Used during partition creation to restore state (Phase 3).
     #[allow(dead_code)] // Used in Phase 3 of SharedWAL integration.
@@ -419,6 +444,10 @@ pub struct HelixService {
     /// Partition router for actor mode (lock-free request dispatch).
     #[allow(dead_code)] // Used by handlers in follow-up integration.
     pub(crate) actor_router: Option<Arc<PartitionRouter>>,
+    /// Output channel for partition actors (actor mode only).
+    /// Used to process propose outputs for single-node clusters.
+    #[allow(dead_code)] // Used by handlers for single-node actor mode.
+    pub(crate) actor_output_tx: Option<mpsc::Sender<partition_actor::GroupedOutput>>,
     /// Shutdown sender for actor tick task (data partitions).
     #[allow(dead_code)] // Used for graceful shutdown in follow-up.
     pub(crate) actor_shutdown_tx: Option<mpsc::Sender<()>>,
@@ -434,19 +463,43 @@ pub struct HelixService {
     pub(crate) vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
 }
 
-impl HelixService {
-    /// Creates a new Helix service with in-memory storage (for testing).
+/// Type alias for production Helix service using `TokioStorage` and `TransportHandle`.
+///
+/// This is the default type used in production and most tests. For DST
+/// (Deterministic Simulation Testing), use `HelixService<SimulatedStorage, MadSimTransport>`.
+pub type ProductionHelixService = HelixService<TokioStorage, TransportHandle>;
+
+impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
+    /// Creates a new Helix service with in-memory storage (for testing/DST).
     ///
-    /// This starts a background task to handle Raft ticks for all groups.
-    pub async fn new(cluster_id: String, node_id: u64) -> Self {
+    /// **Note**: This constructor does NOT start a background tick task.
+    /// For DST, the test harness handles ticking manually.
+    /// For production use, use `ProductionHelixService::new()` instead.
+    ///
+    /// # Arguments
+    /// * `cluster_id` - Unique cluster identifier
+    /// * `node_id` - This node's ID
+    /// * `storage` - Storage backend for WAL operations
+    pub async fn with_storage(cluster_id: String, node_id: u64, storage: S) -> Self {
         // In-memory mode doesn't use WAL, but pass Fsync for safety if WAL is added later.
-        Self::new_internal(cluster_id, node_id, None, None, None, WriteDurability::Fsync).await
+        let (service, _shutdown_rx) = Self::new_internal(
+            cluster_id,
+            node_id,
+            None,
+            None,
+            None,
+            WriteDurability::Fsync,
+            storage,
+        )
+        .await;
+        service
     }
 
-    /// Creates a new Helix service with durable WAL-backed storage.
+    /// Creates a new Helix service with durable WAL-backed storage (for testing/DST).
     ///
-    /// This starts a background task to handle Raft ticks for all groups.
-    /// Partition data is persisted to the specified directory.
+    /// **Note**: This constructor does NOT start a background tick task.
+    /// For DST, the test harness handles ticking manually.
+    /// For production use, use `ProductionHelixService::with_data_dir()` instead.
     ///
     /// # Arguments
     /// * `cluster_id` - Unique cluster identifier
@@ -454,45 +507,64 @@ impl HelixService {
     /// * `data_dir` - Directory for durable storage
     /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
     /// * `write_durability` - Durability mode for writes
-    pub async fn with_data_dir(
+    /// * `storage` - Storage backend for WAL operations
+    pub async fn with_data_dir_and_storage(
         cluster_id: String,
         node_id: u64,
         data_dir: PathBuf,
         shared_wal_count: Option<u32>,
         write_durability: WriteDurability,
+        storage: S,
     ) -> Self {
-        Self::new_internal(cluster_id, node_id, Some(data_dir), None, shared_wal_count, write_durability).await
+        let (service, _shutdown_rx) = Self::new_internal(
+            cluster_id,
+            node_id,
+            Some(data_dir),
+            None,
+            shared_wal_count,
+            write_durability,
+            storage,
+        )
+        .await;
+        service
     }
 
-    /// Creates a new Helix service with durable storage and object storage for tiering.
+    /// Creates a new Helix service with durable storage and object storage for tiering (for testing/DST).
     ///
-    /// This starts a background task to handle Raft ticks for all groups.
-    /// Partition data is persisted to `data_dir`, and tiered segments are stored
-    /// in `object_storage_dir`.
+    /// **Note**: This constructor does NOT start a background tick task.
+    /// For DST, the test harness handles ticking manually.
+    /// For production use, use `ProductionHelixService::with_data_and_object_storage()` instead.
     ///
     /// # Arguments
     /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
     /// * `write_durability` - Durability mode for writes
-    pub async fn with_data_and_object_storage(
+    /// * `storage` - Storage backend for WAL operations
+    pub async fn with_data_and_object_storage_and_storage(
         cluster_id: String,
         node_id: u64,
         data_dir: PathBuf,
         object_storage_dir: PathBuf,
         shared_wal_count: Option<u32>,
         write_durability: WriteDurability,
+        storage: S,
     ) -> Self {
-        Self::new_internal(
+        let (service, _shutdown_rx) = Self::new_internal(
             cluster_id,
             node_id,
             Some(data_dir),
             Some(object_storage_dir),
             shared_wal_count,
             write_durability,
+            storage,
         )
-        .await
+        .await;
+        service
     }
 
-    /// Internal constructor.
+    /// Internal constructor that returns the service and shutdown receiver.
+    ///
+    /// The caller is responsible for spawning the tick task if needed.
+    /// Production constructors spawn the tick task; DST constructors don't.
     async fn new_internal(
         cluster_id: String,
         node_id: u64,
@@ -500,12 +572,14 @@ impl HelixService {
         object_storage_dir: Option<PathBuf>,
         shared_wal_count: Option<u32>,
         write_durability: WriteDurability,
-    ) -> Self {
+        storage: S,
+    ) -> (Self, mpsc::Receiver<()>) {
         let node_id = NodeId::new(node_id);
         let cluster_nodes = vec![node_id]; // Single node for now.
 
         let multi_raft = Arc::new(RwLock::new(MultiRaft::new(node_id)));
-        let partition_storage: PartitionStorageMap = Arc::new(RwLock::new(HashMap::new()));
+        let partition_storage: GenericPartitionStorageMap<S> =
+            Arc::new(RwLock::new(HashMap::new()));
         let group_map = Arc::new(RwLock::new(GroupMap::new()));
         let pending_proposals: PendingProposalMap = Arc::new(RwLock::new(HashMap::new()));
 
@@ -541,13 +615,16 @@ impl HelixService {
                 "SharedWalPool durability mode"
             );
 
-            // Open pool.
-            let pool = SharedWalPool::open(TokioStorage::new(), pool_config)
+            // Open pool with the provided storage backend.
+            let pool = SharedWalPool::open(storage.clone(), pool_config)
                 .await
                 .expect("Failed to open SharedWalPool");
 
             // Recover all partitions.
-            let recovered = pool.recover().await.expect("Failed to recover from SharedWalPool");
+            let recovered = pool
+                .recover()
+                .await
+                .expect("Failed to recover from SharedWalPool");
 
             info!(
                 partitions = recovered.len(),
@@ -562,20 +639,17 @@ impl HelixService {
 
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
-        // Start background tick task.
-        tokio::spawn(tick::tick_task(
-            Arc::clone(&multi_raft),
-            Arc::clone(&partition_storage),
-            Arc::clone(&group_map),
-            Arc::clone(&pending_proposals),
-            shutdown_rx,
-        ));
+        // Note: Tick task is NOT spawned here. Caller must decide whether to
+        // spawn the tick task based on the use case:
+        // - Production: spawn tick task using the returned shutdown_rx
+        // - DST: don't spawn, test harness handles ticking manually
 
-        Self {
+        let service = Self {
             cluster_id,
             node_id,
             multi_raft,
             partition_storage,
+            storage,
             group_map,
             topics: Arc::new(RwLock::new(HashMap::new())),
             next_topic_id: Arc::new(RwLock::new(1)),
@@ -600,14 +674,17 @@ impl HelixService {
             batcher_stats: None,
             actor_mode: false, // Single-node uses lock-based approach.
             actor_router: None,
+            actor_output_tx: None,
             actor_shutdown_tx: None,
             controller_shutdown_tx: None,
             actor_backpressure: None,
             vote_store: None, // Single-node mode doesn't persist vote state.
-        }
+        };
+
+        (service, shutdown_rx)
     }
 
-    /// Creates a new Helix service with multi-node networking.
+    /// Creates a new Helix service with multi-node networking and custom storage.
     ///
     /// This starts both the Raft tick task and the transport for peer
     /// communication. Partition data is persisted to the specified directory.
@@ -616,6 +693,7 @@ impl HelixService {
     /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
     /// * `write_durability` - Durability mode for writes
     /// * `enable_actor_mode` - If true, uses lock-free actor-based architecture
+    /// * `storage` - Storage backend for WAL operations
     ///
     /// # Errors
     /// Returns an error if the transport cannot be started.
@@ -626,7 +704,7 @@ impl HelixService {
     #[allow(clippy::too_many_arguments)] // Constructor naturally needs many parameters.
     #[allow(clippy::too_many_lines)] // Constructor with initialization logic.
     #[cfg(feature = "s3")]
-    pub async fn new_multi_node(
+    pub async fn new_multi_node_with_storage(
         cluster_id: String,
         node_id: u64,
         listen_addr: SocketAddr,
@@ -640,6 +718,7 @@ impl HelixService {
         shared_wal_count: Option<u32>,
         write_durability: WriteDurability,
         enable_actor_mode: bool,
+        storage: S,
     ) -> Result<Self, TransportError> {
         Self::new_multi_node_internal(
             cluster_id,
@@ -655,11 +734,12 @@ impl HelixService {
             shared_wal_count,
             write_durability,
             enable_actor_mode,
+            storage,
         )
         .await
     }
 
-    /// Creates a new Helix service with multi-node networking.
+    /// Creates a new Helix service with multi-node networking and custom storage.
     ///
     /// This starts both the Raft tick task and the transport for peer
     /// communication. Partition data is persisted to the specified directory.
@@ -668,6 +748,7 @@ impl HelixService {
     /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
     /// * `write_durability` - Durability mode for writes
     /// * `enable_actor_mode` - If true, uses lock-free actor-based architecture
+    /// * `storage` - Storage backend for WAL operations
     ///
     /// # Errors
     /// Returns an error if the transport cannot be started.
@@ -677,7 +758,7 @@ impl HelixService {
     /// fails to open or recover (indicates filesystem or corruption issues).
     #[allow(clippy::too_many_arguments)]
     #[cfg(not(feature = "s3"))]
-    pub async fn new_multi_node(
+    pub async fn new_multi_node_with_storage(
         cluster_id: String,
         node_id: u64,
         listen_addr: SocketAddr,
@@ -690,6 +771,7 @@ impl HelixService {
         shared_wal_count: Option<u32>,
         write_durability: WriteDurability,
         enable_actor_mode: bool,
+        storage: S,
     ) -> Result<Self, TransportError> {
         Self::new_multi_node_internal(
             cluster_id,
@@ -704,6 +786,7 @@ impl HelixService {
             shared_wal_count,
             write_durability,
             enable_actor_mode,
+            storage,
         )
         .await
     }
@@ -723,6 +806,7 @@ impl HelixService {
         shared_wal_count: Option<u32>,
         write_durability: WriteDurability,
         enable_actor_mode: bool,
+        storage: S,
     ) -> Result<Self, TransportError> {
         let node_id = NodeId::new(node_id);
 
@@ -740,7 +824,8 @@ impl HelixService {
         let transport_handle = transport.start().await?;
 
         let multi_raft = Arc::new(RwLock::new(MultiRaft::new(node_id)));
-        let partition_storage: PartitionStorageMap = Arc::new(RwLock::new(HashMap::new()));
+        let partition_storage: GenericPartitionStorageMap<S> =
+            Arc::new(RwLock::new(HashMap::new()));
         let group_map = Arc::new(RwLock::new(GroupMap::new()));
         let controller_state = Arc::new(RwLock::new(ControllerState::new()));
         let pending_proposals: PendingProposalMap = Arc::new(RwLock::new(HashMap::new()));
@@ -756,75 +841,77 @@ impl HelixService {
         // Initialize VoteStore for Raft vote state persistence.
         // Uses local file for fast recovery + S3 backup for disk loss scenarios.
         // Must be done before creating Raft groups so we can restore vote state.
-        let (vote_store, initial_vote_state, recovered_from_remote) = if let Some(ref dir) = data_dir {
-            let vote_file_path = dir.join("vote-state.bin");
-            let local_storage = Arc::new(LocalFileVoteStorage::new(vote_file_path));
+        let (vote_store, initial_vote_state, recovered_from_remote) =
+            if let Some(ref dir) = data_dir {
+                let vote_file_path = dir.join("vote-state.bin");
+                let local_storage = Arc::new(LocalFileVoteStorage::new(vote_file_path));
 
-            // Use simulated object storage for S3 backup (can be upgraded to real S3 later).
-            let remote_storage = Arc::new(SimulatedObjectStorage::new(node_id.get()));
+                // Use simulated object storage for S3 backup (can be upgraded to real S3 later).
+                let remote_storage = Arc::new(SimulatedObjectStorage::new(node_id.get()));
 
-            // Load existing vote state or start fresh.
-            let load_result = VoteStore::<LocalFileVoteStorage>::load(
-                node_id,
-                local_storage.as_ref(),
-                remote_storage.as_ref(),
-            )
-            .await;
+                // Load existing vote state or start fresh.
+                let load_result = VoteStore::<LocalFileVoteStorage>::load(
+                    node_id,
+                    local_storage.as_ref(),
+                    remote_storage.as_ref(),
+                )
+                .await;
 
-            let (initial_state, recovered_from_remote) = match load_result {
-                Ok(result) => {
-                    info!(
-                        node_id = node_id.get(),
-                        sequence = result.state.sequence,
-                        groups = result.state.group_count(),
-                        recovered_from_remote = result.recovered_from_remote,
-                        "Loaded vote state"
-                    );
-                    (result.state, result.recovered_from_remote)
-                }
-                Err(e) => {
-                    warn!(
-                        node_id = node_id.get(),
-                        error = %e,
-                        "Failed to load vote state, starting fresh"
-                    );
-                    (VoteState::new(), false)
-                }
+                let (initial_state, recovered_from_remote) = match load_result {
+                    Ok(result) => {
+                        info!(
+                            node_id = node_id.get(),
+                            sequence = result.state.sequence,
+                            groups = result.state.group_count(),
+                            recovered_from_remote = result.recovered_from_remote,
+                            "Loaded vote state"
+                        );
+                        (result.state, result.recovered_from_remote)
+                    }
+                    Err(e) => {
+                        warn!(
+                            node_id = node_id.get(),
+                            error = %e,
+                            "Failed to load vote state, starting fresh"
+                        );
+                        (VoteState::new(), false)
+                    }
+                };
+
+                // Create VoteStore and spawn background S3 worker.
+                let (store, handle) = VoteStore::new(
+                    node_id,
+                    local_storage,
+                    remote_storage,
+                    initial_state.clone(),
+                );
+
+                // Spawn background S3 upload worker.
+                tokio::spawn(handle.run());
+
+                (
+                    Some(Arc::new(Mutex::new(store))),
+                    initial_state,
+                    recovered_from_remote,
+                )
+            } else {
+                // In-memory mode - no vote persistence.
+                (None, VoteState::new(), false)
             };
-
-            // Create VoteStore and spawn background S3 worker.
-            let (store, handle) = VoteStore::new(
-                node_id,
-                local_storage,
-                remote_storage,
-                initial_state.clone(),
-            );
-
-            // Spawn background S3 upload worker.
-            tokio::spawn(handle.run());
-
-            (Some(Arc::new(Mutex::new(store))), initial_state, recovered_from_remote)
-        } else {
-            // In-memory mode - no vote persistence.
-            (None, VoteState::new(), false)
-        };
 
         // Create controller partition (group 0) with all cluster nodes.
         // Use persisted vote state if available to restore term/voted_for.
         let controller_vote = initial_vote_state.get_group(CONTROLLER_GROUP_ID);
-        let (term, voted_for) = controller_vote
-            .map_or((TermId::new(0), None), |v| (v.term, v.voted_for));
+        let (term, voted_for) =
+            controller_vote.map_or((TermId::new(0), None), |v| (v.term, v.voted_for));
 
-        let create_result = multi_raft
-            .write()
-            .await
-            .create_group_with_state(
-                CONTROLLER_GROUP_ID,
-                cluster_nodes.clone(),
-                term,
-                voted_for,
-                recovered_from_remote, // observation mode if recovered from S3
-            );
+        let create_result = multi_raft.write().await.create_group_with_state(
+            CONTROLLER_GROUP_ID,
+            cluster_nodes.clone(),
+            term,
+            voted_for,
+            recovered_from_remote, // observation mode if recovered from S3
+        );
 
         match create_result {
             Ok(()) => {
@@ -874,13 +961,16 @@ impl HelixService {
                 "SharedWalPool durability mode (multi-node)"
             );
 
-            // Open pool.
-            let pool = SharedWalPool::open(TokioStorage::new(), pool_config)
+            // Open pool with the provided storage backend.
+            let pool = SharedWalPool::open(storage.clone(), pool_config)
                 .await
                 .expect("Failed to open SharedWalPool");
 
             // Recover all partitions.
-            let recovered = pool.recover().await.expect("Failed to recover from SharedWalPool");
+            let recovered = pool
+                .recover()
+                .await
+                .expect("Failed to recover from SharedWalPool");
 
             info!(
                 partitions = recovered.len(),
@@ -896,158 +986,170 @@ impl HelixService {
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
         // Create batch pending proposals map.
-        let batch_pending_proposals: BatchPendingProposalMap = Arc::new(RwLock::new(HashMap::new()));
+        let batch_pending_proposals: BatchPendingProposalMap =
+            Arc::new(RwLock::new(HashMap::new()));
 
         // Branch based on actor mode.
-        let (batcher_handle, batcher_stats, actor_router, actor_shutdown_tx, controller_shutdown_tx, actor_backpressure) =
-            if enable_actor_mode {
-                // Actor mode: use lock-free actor-based architecture.
-                info!("Initializing actor mode for multi-node service");
+        let (
+            batcher_handle,
+            batcher_stats,
+            actor_router,
+            actor_output_tx,
+            actor_shutdown_tx,
+            controller_shutdown_tx,
+            actor_backpressure,
+        ) = if enable_actor_mode {
+            // Actor mode: use lock-free actor-based architecture.
+            info!("Initializing actor mode for multi-node service");
 
-                // Create actor-based setup with empty initial groups.
-                // Data partitions will be created dynamically via AssignPartition.
-                let actor_handles = actor_setup::setup_multi_partition(
-                    node_id,
-                    cluster_nodes.clone(),
-                    HashMap::new(), // Empty initial groups - created via controller.
-                    Arc::clone(&partition_storage),
-                    Arc::clone(&group_map),
-                    Arc::clone(&controller_state),
-                    Arc::clone(&pending_proposals),
-                    Arc::clone(&pending_controller_proposals),
-                    Arc::clone(&batch_pending_proposals),
-                    Arc::clone(&local_broker_heartbeats),
-                    Arc::clone(&multi_raft),
-                    transport_handle.clone(),
-                    incoming_rx,
-                    actor_setup::ActorSetupConfig::default(),
-                    vote_store.clone(),
-                )
-                .await;
+            // Create actor-based setup with empty initial groups.
+            // Data partitions will be created dynamically via AssignPartition.
+            let actor_handles = actor_setup::setup_multi_partition(
+                node_id,
+                cluster_nodes.clone(),
+                HashMap::new(), // Empty initial groups - created via controller.
+                Arc::clone(&partition_storage),
+                Arc::clone(&group_map),
+                Arc::clone(&controller_state),
+                Arc::clone(&pending_proposals),
+                Arc::clone(&pending_controller_proposals),
+                Arc::clone(&batch_pending_proposals),
+                Arc::clone(&local_broker_heartbeats),
+                Arc::clone(&multi_raft),
+                transport_handle.clone(),
+                incoming_rx,
+                actor_setup::ActorSetupConfig::default(),
+                vote_store.clone(),
+            )
+            .await;
 
-                // Spawn controller tick task (handles controller partition via MultiRaft).
-                let controller_shutdown_rx = {
-                    let (tx, rx) = mpsc::channel(1);
-                    // Store tx in actor_shutdown_tx to signal shutdown.
-                    // For now, we'll use the actor_handles.shutdown_tx for the actor tick,
-                    // and spawn a separate controller tick.
-                    tokio::spawn(tick::tick_task_controller(
-                        Arc::clone(&multi_raft),
-                        Arc::clone(&partition_storage),
-                        Arc::clone(&group_map),
-                        Arc::clone(&controller_state),
-                        Arc::clone(&pending_proposals),
-                        Arc::clone(&pending_controller_proposals),
-                        cluster_nodes.clone(),
-                        transport_handle.clone(),
-                        Arc::clone(&actor_handles.router),
-                        actor_handles.output_tx.clone(),
-                        vote_store.clone(),
-                        rx,
-                    ));
-                    tx
-                };
-
-                info!(
-                    node_id = node_id.get(),
-                    listen_addr = %listen_addr,
-                    peer_count = peers.len(),
-                    "Started multi-node Helix service (actor mode)"
-                );
-
-                // Return actor handles - keep both shutdown channels alive.
-                (
-                    Some(actor_handles.batcher_handle),
-                    Some(actor_handles.batcher_stats),
-                    Some(actor_handles.router),
-                    Some(actor_handles.shutdown_tx), // Actor tick task (data partitions)
-                    Some(controller_shutdown_rx),    // Controller tick task
-                    Some(actor_handles.backpressure),
-                )
-            } else {
-                // Lock-based mode: use existing MultiRaft-based architecture.
-
-                // Create and spawn the batcher task.
-                let batcher_stats = Arc::new(BatcherStats::default());
-                let (batcher_handle, batcher_rx, backpressure_state) = batcher::create_batcher();
-                tokio::spawn(batcher::batcher_task(
-                    batcher_rx,
-                    Arc::clone(&multi_raft),
-                    Arc::clone(&batch_pending_proposals),
-                    Some(transport_handle.clone()),
-                    Arc::clone(&batcher_stats),
-                    batcher::BatcherConfig::default(),
-                    Arc::clone(&backpressure_state),
-                    Arc::clone(&partition_storage),
-                ));
-
-                info!("Started request batcher for multi-node");
-
-                // Start background tick task with transport.
-                #[cfg(feature = "s3")]
-                tokio::spawn(tick::tick_task_multi_node(
+            // Spawn controller tick task (handles controller partition via MultiRaft).
+            let controller_shutdown_rx = {
+                let (tx, rx) = mpsc::channel(1);
+                // Store tx in actor_shutdown_tx to signal shutdown.
+                // For now, we'll use the actor_handles.shutdown_tx for the actor tick,
+                // and spawn a separate controller tick.
+                tokio::spawn(tick::tick_task_controller(
                     Arc::clone(&multi_raft),
                     Arc::clone(&partition_storage),
                     Arc::clone(&group_map),
                     Arc::clone(&controller_state),
                     Arc::clone(&pending_proposals),
                     Arc::clone(&pending_controller_proposals),
-                    Arc::clone(&batch_pending_proposals),
-                    Arc::clone(&local_broker_heartbeats),
                     cluster_nodes.clone(),
                     transport_handle.clone(),
-                    data_dir.clone(),
-                    object_storage_dir.clone(),
-                    s3_config.clone(),
-                    tiering_config.clone(),
-                    shared_wal_pool.clone(),
-                    Arc::clone(&recovered_entries),
-                    Some(Arc::clone(&batcher_stats)),
-                    Some(backpressure_state.clone()),
+                    Arc::clone(&actor_handles.router),
+                    actor_handles.output_tx.clone(),
                     vote_store.clone(),
-                    incoming_rx,
-                    shutdown_rx,
+                    rx,
                 ));
-                #[cfg(not(feature = "s3"))]
-                tokio::spawn(tick::tick_task_multi_node(
-                    Arc::clone(&multi_raft),
-                    Arc::clone(&partition_storage),
-                    Arc::clone(&group_map),
-                    Arc::clone(&controller_state),
-                    Arc::clone(&pending_proposals),
-                    Arc::clone(&pending_controller_proposals),
-                    Arc::clone(&batch_pending_proposals),
-                    Arc::clone(&local_broker_heartbeats),
-                    cluster_nodes.clone(),
-                    transport_handle.clone(),
-                    data_dir.clone(),
-                    object_storage_dir.clone(),
-                    tiering_config.clone(),
-                    shared_wal_pool.clone(),
-                    Arc::clone(&recovered_entries),
-                    Some(Arc::clone(&batcher_stats)),
-                    Some(backpressure_state.clone()),
-                    vote_store.clone(),
-                    incoming_rx,
-                    shutdown_rx,
-                ));
-
-                info!(
-                    node_id = node_id.get(),
-                    listen_addr = %listen_addr,
-                    peer_count = peers.len(),
-                    "Started multi-node Helix service"
-                );
-
-                (
-                    Some(batcher_handle),
-                    Some(batcher_stats),
-                    None,  // No actor router in lock-based mode
-                    None,  // No actor shutdown in lock-based mode
-                    None,  // No controller shutdown in lock-based mode
-                    Some(backpressure_state),
-                )
+                tx
             };
+
+            info!(
+                node_id = node_id.get(),
+                listen_addr = %listen_addr,
+                peer_count = peers.len(),
+                "Started multi-node Helix service (actor mode)"
+            );
+
+            // Return actor handles - keep both shutdown channels alive.
+            (
+                Some(actor_handles.batcher_handle),
+                Some(actor_handles.batcher_stats),
+                Some(actor_handles.router),
+                Some(actor_handles.output_tx.clone()),
+                Some(actor_handles.shutdown_tx), // Actor tick task (data partitions)
+                Some(controller_shutdown_rx),    // Controller tick task
+                Some(actor_handles.backpressure),
+            )
+        } else {
+            // Lock-based mode: use existing MultiRaft-based architecture.
+
+            // Create and spawn the batcher task.
+            let batcher_stats = Arc::new(BatcherStats::default());
+            let (batcher_handle, batcher_rx, backpressure_state) = batcher::create_batcher();
+            tokio::spawn(batcher::batcher_task(
+                batcher_rx,
+                Arc::clone(&multi_raft),
+                Arc::clone(&batch_pending_proposals),
+                Some(transport_handle.clone()),
+                Arc::clone(&batcher_stats),
+                batcher::BatcherConfig::default(),
+                Arc::clone(&backpressure_state),
+                Arc::clone(&partition_storage),
+            ));
+
+            info!("Started request batcher for multi-node");
+
+            // Start background tick task with transport.
+            #[cfg(feature = "s3")]
+            tokio::spawn(tick::tick_task_multi_node(
+                Arc::clone(&multi_raft),
+                Arc::clone(&partition_storage),
+                Arc::clone(&group_map),
+                Arc::clone(&controller_state),
+                Arc::clone(&pending_proposals),
+                Arc::clone(&pending_controller_proposals),
+                Arc::clone(&batch_pending_proposals),
+                Arc::clone(&local_broker_heartbeats),
+                cluster_nodes.clone(),
+                transport_handle.clone(),
+                storage.clone(),
+                data_dir.clone(),
+                object_storage_dir.clone(),
+                s3_config.clone(),
+                tiering_config.clone(),
+                shared_wal_pool.clone(),
+                Arc::clone(&recovered_entries),
+                Some(Arc::clone(&batcher_stats)),
+                Some(backpressure_state.clone()),
+                vote_store.clone(),
+                incoming_rx,
+                shutdown_rx,
+            ));
+            #[cfg(not(feature = "s3"))]
+            tokio::spawn(tick::tick_task_multi_node(
+                Arc::clone(&multi_raft),
+                Arc::clone(&partition_storage),
+                Arc::clone(&group_map),
+                Arc::clone(&controller_state),
+                Arc::clone(&pending_proposals),
+                Arc::clone(&pending_controller_proposals),
+                Arc::clone(&batch_pending_proposals),
+                Arc::clone(&local_broker_heartbeats),
+                cluster_nodes.clone(),
+                transport_handle.clone(),
+                storage.clone(),
+                data_dir.clone(),
+                object_storage_dir.clone(),
+                tiering_config.clone(),
+                shared_wal_pool.clone(),
+                Arc::clone(&recovered_entries),
+                Some(Arc::clone(&batcher_stats)),
+                Some(backpressure_state.clone()),
+                vote_store.clone(),
+                incoming_rx,
+                shutdown_rx,
+            ));
+
+            info!(
+                node_id = node_id.get(),
+                listen_addr = %listen_addr,
+                peer_count = peers.len(),
+                "Started multi-node Helix service"
+            );
+
+            (
+                Some(batcher_handle),
+                Some(batcher_stats),
+                None, // No actor router in lock-based mode
+                None, // No actor output channel in lock-based mode
+                None, // No actor shutdown in lock-based mode
+                None, // No controller shutdown in lock-based mode
+                Some(backpressure_state),
+            )
+        };
 
         // Build Kafka peer addresses map (includes self).
         let mut peer_addrs = kafka_peer_addrs;
@@ -1058,6 +1160,7 @@ impl HelixService {
             node_id,
             multi_raft,
             partition_storage,
+            storage,
             group_map,
             topics: Arc::new(RwLock::new(HashMap::new())),
             next_topic_id: Arc::new(RwLock::new(1)),
@@ -1082,6 +1185,7 @@ impl HelixService {
             batcher_stats,
             actor_mode: enable_actor_mode,
             actor_router,
+            actor_output_tx,
             actor_shutdown_tx,
             controller_shutdown_tx,
             actor_backpressure,
@@ -1109,104 +1213,6 @@ impl HelixService {
             pool.shutdown().await?;
         }
         Ok(())
-    }
-
-    /// Returns the cluster nodes.
-    #[must_use]
-    pub fn cluster_nodes(&self) -> &[NodeId] {
-        &self.cluster_nodes
-    }
-
-    /// Returns live brokers (those with recent heartbeats).
-    ///
-    /// In multi-node mode, filters out brokers that have missed heartbeats.
-    /// In single-node mode, returns all cluster nodes (no heartbeat filtering).
-    ///
-    /// # Kafka `KRaft` Pattern
-    ///
-    /// Unlike other controller state, heartbeats are **soft state** (not Raft-replicated).
-    /// Each broker sends heartbeats via transport to all peers, and each node maintains
-    /// its own local view of broker liveness based on received heartbeats.
-    #[allow(clippy::significant_drop_tightening)]
-    pub async fn live_brokers(&self) -> Vec<NodeId> {
-        // In single-node mode, all brokers are "live".
-        if !self.is_multi_node() {
-            return self.cluster_nodes.clone();
-        }
-
-        // Get current time in milliseconds.
-        // Safe truncation: milliseconds won't overflow u64 for ~584 million years.
-        #[allow(clippy::cast_possible_truncation)]
-        let current_time_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as u64);
-
-        // Use local heartbeat soft state (not Raft-replicated controller state).
-        let heartbeats = self.local_broker_heartbeats.read().await;
-
-        // If no heartbeats have been recorded yet, assume all brokers are live.
-        // This handles initial startup before heartbeats are established.
-        if heartbeats.is_empty() {
-            return self.cluster_nodes.clone();
-        }
-
-        self.cluster_nodes
-            .iter()
-            .filter(|&node_id| {
-                heartbeats
-                    .get(node_id)
-                    .is_some_and(|&last_heartbeat| {
-                        current_time_ms.saturating_sub(last_heartbeat) < BROKER_HEARTBEAT_TIMEOUT_MS
-                    })
-            })
-            .copied()
-            .collect()
-    }
-
-    /// Returns the cluster ID.
-    #[must_use] 
-    pub fn cluster_id(&self) -> &str {
-        &self.cluster_id
-    }
-
-    /// Returns whether this is a multi-node cluster.
-    #[must_use]
-    pub fn is_multi_node(&self) -> bool {
-        self.cluster_nodes.len() > 1
-    }
-
-    /// Returns the Kafka address for a node.
-    pub fn get_node_address(&self, node_id: NodeId) -> Option<&str> {
-        self.peer_addrs.get(&node_id).map(String::as_str)
-    }
-
-    /// Sends Raft messages via the transport handle.
-    ///
-    /// This is used to immediately send messages after proposing entries,
-    /// rather than waiting for the next tick. This significantly reduces
-    /// latency for acks=all workloads.
-    ///
-    /// Messages are sent in parallel to all destination nodes.
-    pub(crate) async fn send_raft_messages(
-        &self,
-        outputs: &[helix_raft::multi::MultiRaftOutput],
-    ) {
-        let Some(ref transport) = self.transport_handle else {
-            return;
-        };
-
-        for output in outputs {
-            if let helix_raft::multi::MultiRaftOutput::SendMessages { to, messages } = output {
-                if let Err(e) = transport.send_batch(*to, messages.clone()).await {
-                    tracing::debug!(
-                        to = to.get(),
-                        count = messages.len(),
-                        error = %e,
-                        "Failed to send Raft messages (will retry on tick)"
-                    );
-                }
-            }
-        }
     }
 
     /// Waits for the controller partition to have a leader.
@@ -1261,8 +1267,7 @@ impl HelixService {
 
         let node_id = self.node_id.get();
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
             loop {
                 interval.tick().await;
                 // Safety: duration since UNIX_EPOCH will never exceed u64::MAX milliseconds
@@ -1282,5 +1287,1098 @@ impl HelixService {
                 }
             }
         });
+    }
+}
+
+// =============================================================================
+// DST Helper Methods (Generic over Transport)
+// =============================================================================
+
+/// DST methods for `HelixService<S, T>` with any transport type.
+///
+/// These methods enable Deterministic Simulation Testing (DST) by allowing
+/// the test harness to drive the service manually:
+/// - Inject transport and configure cluster nodes
+/// - Drive ticks and process incoming messages
+/// - Access internal state for property checking
+impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixService<S, T> {
+    /// Creates a new Helix service for DST with explicit transport type.
+    ///
+    /// This constructor allows creating a service with any transport type T,
+    /// not just the default `TransportHandle`. The service is created without
+    /// a background tick task - the test harness drives ticking manually.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let service: HelixService<SimulatedStorage, MadSimTransport> =
+    ///     HelixService::new_for_test(cluster_id, node_id, storage);
+    /// ```
+    #[allow(clippy::unused_async)]
+    pub async fn new_for_test(cluster_id: String, node_id: u64, storage: S) -> Self {
+        let node_id = NodeId::new(node_id);
+        let cluster_nodes = vec![node_id];
+
+        let multi_raft = Arc::new(RwLock::new(MultiRaft::new(node_id)));
+        let partition_storage: GenericPartitionStorageMap<S> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let group_map = Arc::new(RwLock::new(GroupMap::new()));
+        let pending_proposals: PendingProposalMap = Arc::new(RwLock::new(HashMap::new()));
+
+        let progress_store = SimulatedProgressStore::new(node_id.get());
+        let progress_config = ProgressConfig::for_testing();
+        let progress_manager = Arc::new(ProgressManager::new(progress_store, progress_config));
+
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+
+        Self {
+            cluster_id,
+            node_id,
+            multi_raft,
+            partition_storage,
+            storage,
+            group_map,
+            topics: Arc::new(RwLock::new(HashMap::new())),
+            next_topic_id: Arc::new(RwLock::new(1)),
+            cluster_nodes,
+            peer_addrs: HashMap::new(),
+            _shutdown_tx: shutdown_tx,
+            data_dir: None,
+            object_storage_dir: None,
+            #[cfg(feature = "s3")]
+            s3_config: None,
+            tiering_config: None,
+            transport_handle: None,
+            progress_manager,
+            controller_state: Arc::new(RwLock::new(ControllerState::new())),
+            pending_proposals,
+            pending_controller_proposals: Arc::new(RwLock::new(Vec::new())),
+            local_broker_heartbeats: Arc::new(RwLock::new(HashMap::new())),
+            shared_wal_pool: None,
+            recovered_entries: Arc::new(RwLock::new(HashMap::new())),
+            batch_pending_proposals: Arc::new(RwLock::new(HashMap::new())),
+            batcher_handle: None,
+            batcher_stats: None,
+            actor_mode: false,
+            actor_router: None,
+            actor_output_tx: None,
+            actor_shutdown_tx: None,
+            controller_shutdown_tx: None,
+            actor_backpressure: None,
+            vote_store: None,
+        }
+    }
+
+    /// Creates a new Helix service for E2E testing with full multi-node capabilities.
+    ///
+    /// Unlike `new_for_test()`, this constructor sets up the batcher for proper
+    /// concurrent produce handling. Use this for E2E tests that exercise the
+    /// full service stack with concurrent producers.
+    ///
+    /// Returns the service and the batcher components needed for spawning background tasks.
+    ///
+    /// # Arguments
+    /// * `cluster_id` - Unique cluster identifier
+    /// * `node_id` - This node's ID
+    /// * `storage` - Storage backend (e.g., `SimulatedStorage` for DST)
+    ///
+    /// # Returns
+    /// A tuple of (service, `batcher_rx`, `batcher_stats`, `backpressure_state`)
+    #[allow(clippy::type_complexity)]
+    pub fn new_for_e2e(
+        cluster_id: String,
+        node_id: u64,
+        storage: S,
+    ) -> (
+        Self,
+        batcher::BatcherHandle,
+        tokio::sync::mpsc::Receiver<batcher::BatcherMessage>,
+        Arc<BatcherStats>,
+        Arc<batcher::BackpressureState>,
+    ) {
+        let node_id_typed = NodeId::new(node_id);
+        let cluster_nodes = vec![node_id_typed];
+
+        let multi_raft = Arc::new(RwLock::new(MultiRaft::new(node_id_typed)));
+        let partition_storage: GenericPartitionStorageMap<S> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let group_map = Arc::new(RwLock::new(GroupMap::new()));
+        let pending_proposals: PendingProposalMap = Arc::new(RwLock::new(HashMap::new()));
+
+        let progress_store = SimulatedProgressStore::new(node_id);
+        let progress_config = ProgressConfig::for_testing();
+        let progress_manager = Arc::new(ProgressManager::new(progress_store, progress_config));
+
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+
+        // Create batcher for concurrent produce handling.
+        let batcher_stats = Arc::new(BatcherStats::default());
+        let (batcher_handle, batcher_rx, backpressure_state) = batcher::create_batcher();
+
+        let service = Self {
+            cluster_id,
+            node_id: node_id_typed,
+            multi_raft,
+            partition_storage,
+            storage,
+            group_map,
+            topics: Arc::new(RwLock::new(HashMap::new())),
+            next_topic_id: Arc::new(RwLock::new(1)),
+            cluster_nodes,
+            peer_addrs: HashMap::new(),
+            _shutdown_tx: shutdown_tx,
+            data_dir: None,
+            object_storage_dir: None,
+            #[cfg(feature = "s3")]
+            s3_config: None,
+            tiering_config: None,
+            transport_handle: None,
+            progress_manager,
+            controller_state: Arc::new(RwLock::new(ControllerState::new())),
+            pending_proposals,
+            pending_controller_proposals: Arc::new(RwLock::new(Vec::new())),
+            local_broker_heartbeats: Arc::new(RwLock::new(HashMap::new())),
+            shared_wal_pool: None,
+            recovered_entries: Arc::new(RwLock::new(HashMap::new())),
+            batch_pending_proposals: Arc::new(RwLock::new(HashMap::new())),
+            batcher_handle: Some(batcher_handle.clone()),
+            batcher_stats: Some(Arc::clone(&batcher_stats)),
+            actor_mode: false,
+            actor_router: None,
+            actor_output_tx: None,
+            actor_shutdown_tx: None,
+            controller_shutdown_tx: None,
+            actor_backpressure: None,
+            vote_store: None,
+        };
+
+        (
+            service,
+            batcher_handle,
+            batcher_rx,
+            batcher_stats,
+            backpressure_state,
+        )
+    }
+
+    /// Creates a new Helix service for E2E testing with durable storage (`SharedWalPool`).
+    ///
+    /// This is the **production-like** E2E constructor that exercises the full
+    /// durable storage path:
+    /// - `SharedWalPool` for fsync amortization
+    /// - `BufferedWal` for durable partition storage
+    /// - Background flush tasks
+    ///
+    /// Use this for E2E DST tests that need to verify the complete storage stack.
+    ///
+    /// # Arguments
+    /// * `cluster_id` - Unique cluster identifier
+    /// * `node_id` - This node's ID
+    /// * `data_dir` - Directory for durable storage (`SharedWalPool` files)
+    /// * `storage` - Storage backend (e.g., `SimulatedStorage` for DST)
+    ///
+    /// # Returns
+    /// A tuple of (service, `batcher_handle`, `batcher_rx`, `batcher_stats`, `backpressure_state`)
+    ///
+    /// # Panics
+    /// Panics if the `SharedWalPool` fails to open (indicates storage issues).
+    #[allow(clippy::type_complexity)]
+    pub async fn new_for_e2e_durable(
+        cluster_id: String,
+        node_id: u64,
+        data_dir: PathBuf,
+        storage: S,
+    ) -> (
+        Self,
+        batcher::BatcherHandle,
+        tokio::sync::mpsc::Receiver<batcher::BatcherMessage>,
+        Arc<BatcherStats>,
+        Arc<batcher::BackpressureState>,
+    ) {
+        let node_id_typed = NodeId::new(node_id);
+        let cluster_nodes = vec![node_id_typed];
+
+        let multi_raft = Arc::new(RwLock::new(MultiRaft::new(node_id_typed)));
+        let partition_storage: GenericPartitionStorageMap<S> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let group_map = Arc::new(RwLock::new(GroupMap::new()));
+        let pending_proposals: PendingProposalMap = Arc::new(RwLock::new(HashMap::new()));
+
+        let progress_store = SimulatedProgressStore::new(node_id);
+        let progress_config = ProgressConfig::for_testing();
+        let progress_manager = Arc::new(ProgressManager::new(progress_store, progress_config));
+
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+
+        // Create batcher for concurrent produce handling.
+        let batcher_stats = Arc::new(BatcherStats::default());
+        let (batcher_handle, batcher_rx, backpressure_state) = batcher::create_batcher();
+
+        // Initialize SharedWalPool for durable storage.
+        let wal_count = 4; // Default for E2E testing
+        let pool_config = PoolConfig::new(data_dir.join("shared-wal"), wal_count)
+            .with_flush_interval(std::time::Duration::from_millis(1))
+            .with_durability(WriteDurability::Fsync);
+
+        let pool = SharedWalPool::open(storage.clone(), pool_config)
+            .await
+            .expect("Failed to open SharedWalPool for E2E testing");
+
+        // Recover any existing partitions (empty for fresh test).
+        let recovered = pool
+            .recover()
+            .await
+            .expect("Failed to recover from SharedWalPool");
+
+        let shared_wal_pool = Some(Arc::new(pool));
+        let recovered_entries = Arc::new(RwLock::new(recovered));
+
+        let service = Self {
+            cluster_id,
+            node_id: node_id_typed,
+            multi_raft,
+            partition_storage,
+            storage,
+            group_map,
+            topics: Arc::new(RwLock::new(HashMap::new())),
+            next_topic_id: Arc::new(RwLock::new(1)),
+            cluster_nodes,
+            peer_addrs: HashMap::new(),
+            _shutdown_tx: shutdown_tx,
+            data_dir: Some(data_dir),
+            object_storage_dir: None,
+            #[cfg(feature = "s3")]
+            s3_config: None,
+            tiering_config: None,
+            transport_handle: None,
+            progress_manager,
+            controller_state: Arc::new(RwLock::new(ControllerState::new())),
+            pending_proposals,
+            pending_controller_proposals: Arc::new(RwLock::new(Vec::new())),
+            local_broker_heartbeats: Arc::new(RwLock::new(HashMap::new())),
+            shared_wal_pool,
+            recovered_entries,
+            batch_pending_proposals: Arc::new(RwLock::new(HashMap::new())),
+            batcher_handle: Some(batcher_handle.clone()),
+            batcher_stats: Some(Arc::clone(&batcher_stats)),
+            actor_mode: false,
+            actor_router: None,
+            actor_output_tx: None,
+            actor_shutdown_tx: None,
+            controller_shutdown_tx: None,
+            actor_backpressure: None,
+            vote_store: None,
+        };
+
+        (
+            service,
+            batcher_handle,
+            batcher_rx,
+            batcher_stats,
+            backpressure_state,
+        )
+    }
+
+    /// Returns the shared WAL pool (if durable storage is enabled).
+    #[must_use]
+    pub fn shared_wal_pool(&self) -> Option<Arc<SharedWalPool<S>>> {
+        self.shared_wal_pool.clone()
+    }
+
+    /// Returns the data directory (if durable storage is enabled).
+    #[must_use]
+    pub const fn data_dir(&self) -> Option<&PathBuf> {
+        self.data_dir.as_ref()
+    }
+
+    /// Sets the transport for DST.
+    ///
+    /// This allows injecting a simulated transport (e.g., `MadSimTransport`)
+    /// after creating the service.
+    pub fn set_transport(&mut self, transport: T) {
+        self.transport_handle = Some(transport);
+    }
+
+    /// Sets the cluster nodes for multi-node DST.
+    ///
+    /// This configures the service for multi-node operation without starting
+    /// a background tick task. The test harness drives ticking manually.
+    pub fn set_cluster_nodes(&mut self, nodes: Vec<NodeId>) {
+        self.cluster_nodes = nodes;
+    }
+
+    /// Sets the batcher handle for multi-node DST.
+    ///
+    /// This enables the batcher for concurrent produce requests, which
+    /// serializes offset assignment to prevent race conditions.
+    pub fn set_batcher_handle(&mut self, handle: batcher::BatcherHandle) {
+        self.batcher_handle = Some(handle);
+    }
+
+    /// Sets the actor router for actor mode DST.
+    ///
+    /// This enables actor mode request routing for multi-node DST, allowing
+    /// the service to query partition actors for leadership and routing.
+    pub fn set_actor_router(&mut self, router: Arc<router::PartitionRouter>) {
+        self.actor_router = Some(router);
+        self.actor_mode = true;
+    }
+
+    /// Returns a reference to the actor router, if set.
+    ///
+    /// This is used for debugging and testing to verify the router is properly configured.
+    #[must_use]
+    pub const fn actor_router(&self) -> Option<&Arc<router::PartitionRouter>> {
+        self.actor_router.as_ref()
+    }
+
+    /// Ticks all Raft groups and returns outputs.
+    ///
+    /// This is the DST equivalent of the periodic tick in `tick_task_multi_node`.
+    /// The test harness should call this periodically to advance Raft state.
+    ///
+    /// Returns a list of `MultiRaftOutput` that need processing.
+    pub async fn tick(&self) -> Vec<helix_raft::multi::MultiRaftOutput> {
+        let mut multi_raft = self.multi_raft.write().await;
+        multi_raft.tick()
+    }
+
+    /// Processes incoming Raft messages from other nodes.
+    ///
+    /// This is the DST equivalent of handling `IncomingMessage::Batch` in
+    /// `tick_task_multi_node`. The test harness calls this when messages
+    /// arrive from the simulated transport.
+    ///
+    /// Returns a list of `MultiRaftOutput` that need processing.
+    pub async fn process_incoming_raft_batch(
+        &self,
+        messages: Vec<helix_raft::multi::GroupMessage>,
+    ) -> Vec<helix_raft::multi::MultiRaftOutput> {
+        let mut multi_raft = self.multi_raft.write().await;
+        let mut all_outputs = Vec::new();
+        for group_msg in messages {
+            let outputs = multi_raft.handle_message(group_msg.group_id, group_msg.message);
+            all_outputs.extend(outputs);
+        }
+        // Flush any pending outbound messages immediately.
+        all_outputs.extend(multi_raft.flush());
+        all_outputs
+    }
+
+    /// Processes an incoming broker heartbeat.
+    ///
+    /// This is the DST equivalent of handling `IncomingMessage::Heartbeat` in
+    /// `tick_task_multi_node`. Updates local heartbeat soft state.
+    pub async fn process_broker_heartbeat(&self, heartbeat: helix_runtime::BrokerHeartbeat) {
+        let mut heartbeats = self.local_broker_heartbeats.write().await;
+        heartbeats.insert(heartbeat.node_id, heartbeat.timestamp_ms);
+    }
+
+    /// Returns access to the `MultiRaft` engine for advanced DST scenarios.
+    ///
+    /// This provides direct access to the consensus engine for property checking
+    /// and state inspection during DST.
+    #[must_use]
+    pub const fn multi_raft(&self) -> &Arc<RwLock<MultiRaft>> {
+        &self.multi_raft
+    }
+
+    /// Returns access to the partition storage map for DST.
+    #[must_use]
+    pub const fn partition_storage_map(&self) -> &GenericPartitionStorageMap<S> {
+        &self.partition_storage
+    }
+
+    /// Returns access to the group map for DST.
+    #[must_use]
+    pub const fn group_map(&self) -> &Arc<RwLock<GroupMap>> {
+        &self.group_map
+    }
+
+    /// Returns access to pending proposals for DST.
+    #[must_use]
+    pub const fn pending_proposals(&self) -> &PendingProposalMap {
+        &self.pending_proposals
+    }
+
+    /// Returns access to pending controller proposals for DST.
+    #[must_use]
+    pub const fn pending_controller_proposals(
+        &self,
+    ) -> &Arc<RwLock<Vec<PendingControllerProposal>>> {
+        &self.pending_controller_proposals
+    }
+
+    /// Returns access to batch pending proposals for DST.
+    #[must_use]
+    pub const fn batch_pending_proposals(&self) -> &BatchPendingProposalMap {
+        &self.batch_pending_proposals
+    }
+
+    /// Returns access to local broker heartbeats for DST.
+    #[must_use]
+    pub const fn local_broker_heartbeats(&self) -> &Arc<RwLock<HashMap<NodeId, u64>>> {
+        &self.local_broker_heartbeats
+    }
+
+    /// Returns access to controller state for DST.
+    #[must_use]
+    pub const fn controller_state(&self) -> &Arc<RwLock<ControllerState>> {
+        &self.controller_state
+    }
+
+    /// Returns access to recovered entries for DST.
+    #[must_use]
+    pub const fn recovered_entries(&self) -> &Arc<RwLock<HashMap<PartitionId, Vec<SharedEntry>>>> {
+        &self.recovered_entries
+    }
+
+    /// Returns access to the storage backend.
+    #[must_use]
+    pub const fn storage(&self) -> &S {
+        &self.storage
+    }
+
+    /// Returns the cluster nodes (for generic transport types).
+    #[must_use]
+    pub fn cluster_nodes_generic(&self) -> &[NodeId] {
+        &self.cluster_nodes
+    }
+
+    /// Returns topic metadata by name (for E2E testing).
+    pub async fn get_topic_generic(&self, name: &str) -> Option<TopicMetadata> {
+        let topics = self.topics.read().await;
+        topics.get(name).cloned()
+    }
+
+    /// Returns whether this is a multi-node cluster.
+    #[must_use]
+    pub fn is_multi_node(&self) -> bool {
+        self.cluster_nodes.len() > 1
+    }
+
+    /// Alias for backwards compatibility.
+    #[must_use]
+    pub fn is_multi_node_generic(&self) -> bool {
+        self.is_multi_node()
+    }
+
+    /// Returns whether actor mode is enabled.
+    ///
+    /// In actor mode, data partitions are managed by dedicated partition actors
+    /// instead of a shared `MultiRaft` instance. This requires using the controller
+    /// path for topic creation even in single-node clusters.
+    #[must_use]
+    pub const fn is_actor_mode(&self) -> bool {
+        self.actor_mode
+    }
+
+    /// Returns the cluster ID.
+    #[must_use]
+    pub fn cluster_id(&self) -> &str {
+        &self.cluster_id
+    }
+
+    /// Returns the cluster nodes.
+    #[must_use]
+    pub fn cluster_nodes(&self) -> &[NodeId] {
+        &self.cluster_nodes
+    }
+
+    /// Returns the Kafka address for a node.
+    #[must_use]
+    pub fn get_node_address(&self, node_id: NodeId) -> Option<&str> {
+        self.peer_addrs.get(&node_id).map(String::as_str)
+    }
+
+    /// Returns live brokers based on heartbeat status.
+    ///
+    /// In single-node mode, returns all nodes.
+    /// In multi-node mode, returns only nodes with recent heartbeats.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn live_brokers(&self) -> Vec<NodeId> {
+        // In single-node mode, all brokers are "live".
+        if !self.is_multi_node() {
+            return self.cluster_nodes.clone();
+        }
+
+        // Get current time in milliseconds.
+        // Safe truncation: milliseconds won't overflow u64 for ~584 million years.
+        #[allow(clippy::cast_possible_truncation)]
+        let current_time_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+
+        // Use local heartbeat soft state (not Raft-replicated controller state).
+        let heartbeats = self.local_broker_heartbeats.read().await;
+
+        // If no heartbeats have been recorded yet, assume all brokers are live.
+        // This handles initial startup before heartbeats are established.
+        if heartbeats.is_empty() {
+            return self.cluster_nodes.clone();
+        }
+
+        self.cluster_nodes
+            .iter()
+            .filter(|&node_id| {
+                heartbeats.get(node_id).is_some_and(|&last_heartbeat| {
+                    current_time_ms.saturating_sub(last_heartbeat) < BROKER_HEARTBEAT_TIMEOUT_MS
+                })
+            })
+            .copied()
+            .collect()
+    }
+
+    /// Sends Raft messages via the transport handle (generic version).
+    ///
+    /// This is used to immediately send messages after proposing entries,
+    /// rather than waiting for the next tick. This significantly reduces
+    /// latency for acks=all workloads.
+    ///
+    /// Messages are sent in parallel to all destination nodes.
+    pub(crate) async fn send_raft_messages(&self, outputs: &[helix_raft::multi::MultiRaftOutput]) {
+        let Some(ref transport) = self.transport_handle else {
+            return;
+        };
+
+        for output in outputs {
+            if let helix_raft::multi::MultiRaftOutput::SendMessages { to, messages } = output {
+                if let Err(e) = transport.send_batch(*to, messages.clone()).await {
+                    tracing::debug!(
+                        to = to.get(),
+                        count = messages.len(),
+                        error = %e,
+                        "Failed to send Raft messages (will retry on tick)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Creates a new Helix service for multi-node DST with an injected transport.
+    ///
+    /// This constructor uses the full production wiring (actor mode or tick-based)
+    /// but accepts an injected transport instead of creating a TCP transport.
+    /// This enables Deterministic Simulation Testing with `MadSimTransport` while
+    /// exercising the exact same code paths as production.
+    ///
+    /// # Arguments
+    ///
+    /// * `cluster_id` - Unique cluster identifier
+    /// * `node_id` - This node's ID (as u64)
+    /// * `cluster_nodes` - All node IDs in the cluster (including self)
+    /// * `transport` - Injected transport implementing `TransportService`
+    /// * `incoming_rx` - Receiver for incoming Raft messages from the transport
+    /// * `data_dir` - Optional directory for durable storage (`SharedWalPool`)
+    /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
+    /// * `write_durability` - Durability mode for writes
+    /// * `enable_actor_mode` - If true, uses lock-free actor-based architecture
+    /// * `storage` - Storage backend (e.g., `SimulatedStorage` for DST)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let transport = MadSimTransport::new(node_id, network_state, mailboxes);
+    /// let service: HelixService<SimulatedStorage, MadSimTransport> =
+    ///     HelixService::new_multi_node_with_transport(
+    ///         "cluster".to_string(),
+    ///         1,
+    ///         vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)],
+    ///         transport,
+    ///         incoming_rx,
+    ///         Some(data_dir),
+    ///         None,
+    ///         WriteDurability::Fsync,
+    ///         true, // actor mode
+    ///         storage,
+    ///     ).await;
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `shared_wal_count` is outside `[1, 16]` or if shared WAL
+    /// open/recovery fails while `data_dir` is enabled.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub async fn new_multi_node_with_transport(
+        cluster_id: String,
+        node_id: u64,
+        cluster_nodes: Vec<NodeId>,
+        transport: T,
+        incoming_rx: mpsc::Receiver<helix_runtime::IncomingMessage>,
+        data_dir: Option<PathBuf>,
+        shared_wal_count: Option<u32>,
+        write_durability: WriteDurability,
+        enable_actor_mode: bool,
+        storage: S,
+    ) -> Self {
+        let node_id = NodeId::new(node_id);
+
+        let multi_raft = Arc::new(RwLock::new(MultiRaft::new(node_id)));
+        let partition_storage: GenericPartitionStorageMap<S> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let group_map = Arc::new(RwLock::new(GroupMap::new()));
+        let controller_state = Arc::new(RwLock::new(ControllerState::new()));
+        let pending_proposals: PendingProposalMap = Arc::new(RwLock::new(HashMap::new()));
+        let pending_controller_proposals = Arc::new(RwLock::new(Vec::new()));
+        let local_broker_heartbeats = Arc::new(RwLock::new(HashMap::new()));
+
+        // For DST, we skip vote persistence (simpler, deterministic).
+        // Production multi-node uses VoteStore for crash recovery.
+        let vote_store = None;
+
+        // Create controller partition (group 0) with all cluster nodes.
+        let create_result = multi_raft
+            .write()
+            .await
+            .create_group(CONTROLLER_GROUP_ID, cluster_nodes.clone());
+
+        match create_result {
+            Ok(()) => {
+                info!(
+                    group_id = CONTROLLER_GROUP_ID.get(),
+                    nodes = ?cluster_nodes.iter().map(|n| n.get()).collect::<Vec<_>>(),
+                    "Created controller partition for DST"
+                );
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to create controller partition");
+            }
+        }
+
+        // Create progress manager.
+        let progress_store = SimulatedProgressStore::new(node_id.get());
+        let progress_config = ProgressConfig::for_testing();
+        let progress_manager = Arc::new(ProgressManager::new(progress_store, progress_config));
+
+        // Initialize SharedWalPool if data_dir is set.
+        let (shared_wal_pool, recovered_entries) = if let Some(ref dir) = data_dir {
+            let wal_count = shared_wal_count.unwrap_or(4);
+            assert!(
+                (1..=16).contains(&wal_count),
+                "shared_wal_count must be in range [1, 16]"
+            );
+
+            info!(
+                wal_count,
+                data_dir = ?dir,
+                "Initializing SharedWalPool for DST multi-node"
+            );
+
+            let pool_config = PoolConfig::new(dir.join("shared-wal"), wal_count)
+                .with_flush_interval(std::time::Duration::from_millis(1))
+                .with_max_buffer_entries(1000)
+                .with_durability(write_durability);
+
+            let pool = SharedWalPool::open(storage.clone(), pool_config)
+                .await
+                .expect("Failed to open SharedWalPool");
+
+            let recovered = pool
+                .recover()
+                .await
+                .expect("Failed to recover from SharedWalPool");
+
+            info!(
+                partitions = recovered.len(),
+                "SharedWalPool recovery complete for DST multi-node"
+            );
+
+            (Some(Arc::new(pool)), Arc::new(RwLock::new(recovered)))
+        } else {
+            (None, Arc::new(RwLock::new(HashMap::new())))
+        };
+
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let batch_pending_proposals: BatchPendingProposalMap =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        // Branch based on actor mode - same logic as production.
+        let (
+            batcher_handle,
+            batcher_stats,
+            actor_router,
+            actor_output_tx,
+            actor_shutdown_tx,
+            controller_shutdown_tx,
+            actor_backpressure,
+        ) = if enable_actor_mode {
+            info!("Initializing actor mode for DST multi-node service");
+
+            // Use the production actor setup.
+            let actor_handles = actor_setup::setup_multi_partition(
+                node_id,
+                cluster_nodes.clone(),
+                HashMap::new(), // Empty initial groups - created via controller.
+                Arc::clone(&partition_storage),
+                Arc::clone(&group_map),
+                Arc::clone(&controller_state),
+                Arc::clone(&pending_proposals),
+                Arc::clone(&pending_controller_proposals),
+                Arc::clone(&batch_pending_proposals),
+                Arc::clone(&local_broker_heartbeats),
+                Arc::clone(&multi_raft),
+                transport.clone(),
+                incoming_rx,
+                actor_setup::ActorSetupConfig::default(),
+                vote_store.clone(),
+            )
+            .await;
+
+            // Spawn controller tick task.
+            let controller_shutdown_rx = {
+                let (tx, rx) = mpsc::channel(1);
+                tokio::spawn(tick::tick_task_controller(
+                    Arc::clone(&multi_raft),
+                    Arc::clone(&partition_storage),
+                    Arc::clone(&group_map),
+                    Arc::clone(&controller_state),
+                    Arc::clone(&pending_proposals),
+                    Arc::clone(&pending_controller_proposals),
+                    cluster_nodes.clone(),
+                    transport.clone(),
+                    Arc::clone(&actor_handles.router),
+                    actor_handles.output_tx.clone(),
+                    vote_store.clone(),
+                    rx,
+                ));
+                tx
+            };
+
+            info!(
+                node_id = node_id.get(),
+                cluster_size = cluster_nodes.len(),
+                "Started DST multi-node Helix service (actor mode)"
+            );
+
+            (
+                Some(actor_handles.batcher_handle),
+                Some(actor_handles.batcher_stats),
+                Some(actor_handles.router),
+                Some(actor_handles.output_tx.clone()),
+                Some(actor_handles.shutdown_tx),
+                Some(controller_shutdown_rx),
+                Some(actor_handles.backpressure),
+            )
+        } else {
+            // Tick-based mode.
+            let batcher_stats = Arc::new(BatcherStats::default());
+            let (batcher_handle, batcher_rx, backpressure_state) = batcher::create_batcher();
+            tokio::spawn(batcher::batcher_task(
+                batcher_rx,
+                Arc::clone(&multi_raft),
+                Arc::clone(&batch_pending_proposals),
+                Some(transport.clone()),
+                Arc::clone(&batcher_stats),
+                batcher::BatcherConfig::default(),
+                Arc::clone(&backpressure_state),
+                Arc::clone(&partition_storage),
+            ));
+
+            info!("Started request batcher for DST multi-node");
+
+            // Spawn tick task - note: tick_task_multi_node requires specific storage/tiering params.
+            // For DST, we use a simplified version without S3/tiering.
+            tokio::spawn(tick::tick_task_multi_node_dst(
+                Arc::clone(&multi_raft),
+                Arc::clone(&partition_storage),
+                Arc::clone(&group_map),
+                Arc::clone(&controller_state),
+                Arc::clone(&pending_proposals),
+                Arc::clone(&pending_controller_proposals),
+                Arc::clone(&batch_pending_proposals),
+                Arc::clone(&local_broker_heartbeats),
+                cluster_nodes.clone(),
+                transport.clone(),
+                storage.clone(),
+                data_dir.clone(),
+                shared_wal_pool.clone(),
+                Arc::clone(&recovered_entries),
+                Some(Arc::clone(&batcher_stats)),
+                Some(backpressure_state.clone()),
+                vote_store.clone(),
+                incoming_rx,
+                shutdown_rx,
+            ));
+
+            info!(
+                node_id = node_id.get(),
+                cluster_size = cluster_nodes.len(),
+                "Started DST multi-node Helix service (tick-based)"
+            );
+
+            (
+                Some(batcher_handle),
+                Some(batcher_stats),
+                None, // No actor router in tick-based mode
+                None, // No actor output channel in tick-based mode
+                None, // No actor shutdown in tick-based mode
+                None, // No controller shutdown in tick-based mode
+                Some(backpressure_state),
+            )
+        };
+
+        // Build peer addresses map - use placeholder addresses for DST.
+        let peer_addrs: HashMap<NodeId, String> = cluster_nodes
+            .iter()
+            .map(|&n| (n, format!("127.0.0.1:{}", 9092 + n.get())))
+            .collect();
+
+        Self {
+            cluster_id,
+            node_id,
+            multi_raft,
+            partition_storage,
+            storage,
+            group_map,
+            topics: Arc::new(RwLock::new(HashMap::new())),
+            next_topic_id: Arc::new(RwLock::new(1)),
+            cluster_nodes,
+            peer_addrs,
+            _shutdown_tx: shutdown_tx,
+            data_dir,
+            object_storage_dir: None,
+            #[cfg(feature = "s3")]
+            s3_config: None,
+            tiering_config: None,
+            transport_handle: Some(transport),
+            progress_manager,
+            controller_state,
+            pending_proposals,
+            pending_controller_proposals,
+            local_broker_heartbeats,
+            shared_wal_pool,
+            recovered_entries,
+            batch_pending_proposals,
+            batcher_handle,
+            batcher_stats,
+            actor_mode: enable_actor_mode,
+            actor_router,
+            actor_output_tx,
+            actor_shutdown_tx,
+            controller_shutdown_tx,
+            actor_backpressure,
+            vote_store,
+        }
+    }
+}
+
+// =============================================================================
+// Backwards-Compatible Constructors for ProductionHelixService
+// =============================================================================
+
+/// Backwards-compatible constructors using `TokioStorage`.
+///
+/// These constructors automatically use `TokioStorage::new()` as the storage backend
+/// and spawn background tick tasks for automatic Raft tick processing.
+/// For DST or custom storage, use the generic constructors that accept a storage parameter.
+impl ProductionHelixService {
+    /// Creates a new Helix service with in-memory storage (for testing).
+    ///
+    /// This starts a background task to handle Raft ticks for all groups.
+    pub async fn new(cluster_id: String, node_id: u64) -> Self {
+        let (service, shutdown_rx) = Self::new_internal(
+            cluster_id,
+            node_id,
+            None,
+            None,
+            None,
+            WriteDurability::Fsync,
+            TokioStorage::new(),
+        )
+        .await;
+
+        // Spawn tick task for production use.
+        tokio::spawn(tick::tick_task(
+            Arc::clone(&service.multi_raft),
+            Arc::clone(&service.partition_storage),
+            Arc::clone(&service.group_map),
+            Arc::clone(&service.pending_proposals),
+            shutdown_rx,
+        ));
+
+        service
+    }
+
+    /// Creates a new Helix service with durable WAL-backed storage.
+    ///
+    /// This starts a background task to handle Raft ticks for all groups.
+    /// Partition data is persisted to the specified directory.
+    ///
+    /// # Arguments
+    /// * `cluster_id` - Unique cluster identifier
+    /// * `node_id` - This node's ID
+    /// * `data_dir` - Directory for durable storage
+    /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
+    /// * `write_durability` - Durability mode for writes
+    pub async fn with_data_dir(
+        cluster_id: String,
+        node_id: u64,
+        data_dir: PathBuf,
+        shared_wal_count: Option<u32>,
+        write_durability: WriteDurability,
+    ) -> Self {
+        let (service, shutdown_rx) = Self::new_internal(
+            cluster_id,
+            node_id,
+            Some(data_dir),
+            None,
+            shared_wal_count,
+            write_durability,
+            TokioStorage::new(),
+        )
+        .await;
+
+        // Spawn tick task for production use.
+        tokio::spawn(tick::tick_task(
+            Arc::clone(&service.multi_raft),
+            Arc::clone(&service.partition_storage),
+            Arc::clone(&service.group_map),
+            Arc::clone(&service.pending_proposals),
+            shutdown_rx,
+        ));
+
+        service
+    }
+
+    /// Creates a new Helix service with durable storage and object storage for tiering.
+    ///
+    /// This starts a background task to handle Raft ticks for all groups.
+    /// Partition data is persisted to `data_dir`, and tiered segments are stored
+    /// in `object_storage_dir`.
+    ///
+    /// # Arguments
+    /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
+    /// * `write_durability` - Durability mode for writes
+    pub async fn with_data_and_object_storage(
+        cluster_id: String,
+        node_id: u64,
+        data_dir: PathBuf,
+        object_storage_dir: PathBuf,
+        shared_wal_count: Option<u32>,
+        write_durability: WriteDurability,
+    ) -> Self {
+        let (service, shutdown_rx) = Self::new_internal(
+            cluster_id,
+            node_id,
+            Some(data_dir),
+            Some(object_storage_dir),
+            shared_wal_count,
+            write_durability,
+            TokioStorage::new(),
+        )
+        .await;
+
+        // Spawn tick task for production use.
+        tokio::spawn(tick::tick_task(
+            Arc::clone(&service.multi_raft),
+            Arc::clone(&service.partition_storage),
+            Arc::clone(&service.group_map),
+            Arc::clone(&service.pending_proposals),
+            shutdown_rx,
+        ));
+
+        service
+    }
+
+    /// Creates a new Helix service with multi-node networking.
+    ///
+    /// This starts both the Raft tick task and the transport for peer
+    /// communication. Partition data is persisted to the specified directory.
+    ///
+    /// # Arguments
+    /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
+    /// * `write_durability` - Durability mode for writes
+    /// * `enable_actor_mode` - If true, uses lock-free actor-based architecture
+    ///
+    /// # Errors
+    /// Returns an error if the transport cannot be started.
+    ///
+    /// # Panics
+    /// Panics if `shared_wal_count` is not in range [1, 16], or if the `SharedWalPool`
+    /// fails to open or recover (indicates filesystem or corruption issues).
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(feature = "s3")]
+    pub async fn new_multi_node(
+        cluster_id: String,
+        node_id: u64,
+        listen_addr: SocketAddr,
+        peers: Vec<PeerInfo>,
+        data_dir: Option<PathBuf>,
+        object_storage_dir: Option<PathBuf>,
+        s3_config: Option<helix_tier::S3Config>,
+        tiering_config: Option<helix_tier::TieringConfig>,
+        kafka_addr: String,
+        kafka_peer_addrs: HashMap<NodeId, String>,
+        shared_wal_count: Option<u32>,
+        write_durability: WriteDurability,
+        enable_actor_mode: bool,
+    ) -> Result<Self, TransportError> {
+        Self::new_multi_node_with_storage(
+            cluster_id,
+            node_id,
+            listen_addr,
+            peers,
+            data_dir,
+            object_storage_dir,
+            s3_config,
+            tiering_config,
+            kafka_addr,
+            kafka_peer_addrs,
+            shared_wal_count,
+            write_durability,
+            enable_actor_mode,
+            TokioStorage::new(),
+        )
+        .await
+    }
+
+    /// Creates a new Helix service with multi-node networking.
+    ///
+    /// This starts both the Raft tick task and the transport for peer
+    /// communication. Partition data is persisted to the specified directory.
+    ///
+    /// # Arguments
+    /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
+    /// * `write_durability` - Durability mode for writes
+    /// * `enable_actor_mode` - If true, uses lock-free actor-based architecture
+    ///
+    /// # Errors
+    /// Returns an error if the transport cannot be started.
+    ///
+    /// # Panics
+    /// Panics if `shared_wal_count` is not in range [1, 16], or if the `SharedWalPool`
+    /// fails to open or recover (indicates filesystem or corruption issues).
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(not(feature = "s3"))]
+    pub async fn new_multi_node(
+        cluster_id: String,
+        node_id: u64,
+        listen_addr: SocketAddr,
+        peers: Vec<PeerInfo>,
+        data_dir: Option<PathBuf>,
+        object_storage_dir: Option<PathBuf>,
+        tiering_config: Option<helix_tier::TieringConfig>,
+        kafka_addr: String,
+        kafka_peer_addrs: HashMap<NodeId, String>,
+        shared_wal_count: Option<u32>,
+        write_durability: WriteDurability,
+        enable_actor_mode: bool,
+    ) -> Result<Self, TransportError> {
+        Self::new_multi_node_with_storage(
+            cluster_id,
+            node_id,
+            listen_addr,
+            peers,
+            data_dir,
+            object_storage_dir,
+            tiering_config,
+            kafka_addr,
+            kafka_peer_addrs,
+            shared_wal_count,
+            write_durability,
+            enable_actor_mode,
+            TokioStorage::new(),
+        )
+        .await
     }
 }

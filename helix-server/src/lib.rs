@@ -15,6 +15,7 @@ pub mod controller;
 mod error;
 /// Group ID mapping for topic/partition to Raft group.
 pub mod group_map;
+mod grpc;
 /// Kafka wire protocol support.
 pub mod kafka;
 /// Partition storage (in-memory and durable).
@@ -23,7 +24,6 @@ pub mod partition_storage;
 pub mod producer_state;
 /// Helix service implementation.
 pub mod service;
-mod grpc;
 /// Partition storage implementations.
 pub mod storage;
 /// Vote state persistence for Raft consensus.
@@ -41,4 +41,4 @@ pub mod generated {
 }
 
 pub use error::{ServerError, ServerResult};
-pub use service::HelixService;
+pub use service::{HelixService, ProductionHelixService};

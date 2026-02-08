@@ -81,7 +81,10 @@ use helix_tier::{
 };
 #[cfg(feature = "s3")]
 use helix_tier::{S3Config, S3ObjectStorage};
-use helix_wal::{BufferedWal, BufferedWalConfig, Entry, SegmentId, SharedEntry, SharedWalHandle, Storage, TokioStorage, WalConfig};
+use helix_wal::{
+    BufferedWal, BufferedWalConfig, Entry, SegmentId, SharedEntry, SharedWalHandle, Storage,
+    TokioStorage, WalConfig,
+};
 use tracing::{debug, info, warn};
 
 // -----------------------------------------------------------------------------
@@ -152,13 +155,15 @@ impl<S: Storage + Clone + Send + Sync + 'static> SegmentReader for WalSegmentRea
                         message: e.to_string(),
                     })
             }
-            WalBackend::Shared(handle) => handle
-                .read_segment_bytes(segment_id)
-                .await
-                .map_err(|e| TierError::Io {
-                    operation: "read_segment_bytes",
-                    message: e.to_string(),
-                }),
+            WalBackend::Shared(handle) => {
+                handle
+                    .read_segment_bytes(segment_id)
+                    .await
+                    .map_err(|e| TierError::Io {
+                        operation: "read_segment_bytes",
+                        message: e.to_string(),
+                    })
+            }
         }
     }
 
@@ -412,7 +417,12 @@ impl PartitionCommand {
                     record.encode(&mut buf);
                 }
             }
-            Self::AppendBlob { blob, record_count, format, base_offset } => {
+            Self::AppendBlob {
+                blob,
+                record_count,
+                format,
+                base_offset,
+            } => {
                 buf.put_u8(3);
                 buf.put_u64_le(base_offset.get()); // Encode base_offset first for consistency.
                 buf.put_u32_le(*record_count);
@@ -439,7 +449,7 @@ impl PartitionCommand {
             Self::AppendBlobBatch { blobs, base_offset } => {
                 buf.put_u8(4); // Command type for batch.
                 buf.put_u64_le(base_offset.get()); // Encode base_offset for all replicas.
-                // Safe cast: blob count bounded by MAX_BATCH_REQUESTS (1000).
+                                                   // Safe cast: blob count bounded by MAX_BATCH_REQUESTS (1000).
                 #[allow(clippy::cast_possible_truncation)]
                 let blob_count = blobs.len() as u32;
                 buf.put_u32_le(blob_count);
@@ -522,7 +532,12 @@ impl PartitionCommand {
                     return None;
                 }
                 let blob = buf.copy_to_bytes(blob_len);
-                Some(Self::AppendBlob { blob, record_count, format, base_offset })
+                Some(Self::AppendBlob {
+                    blob,
+                    record_count,
+                    format,
+                    base_offset,
+                })
             }
             4 => {
                 // AppendBlobBatch: base_offset (u64) + blob_count (u32) + [record_count (u32) + format (u8) + blob_len (u32) + blob bytes]...
@@ -553,7 +568,11 @@ impl PartitionCommand {
                         return None;
                     }
                     let blob = buf.copy_to_bytes(blob_len);
-                    blobs.push(BatchedBlob { blob, record_count, format });
+                    blobs.push(BatchedBlob {
+                        blob,
+                        record_count,
+                        format,
+                    });
                 }
                 Some(Self::AppendBlobBatch { blobs, base_offset })
             }
@@ -580,10 +599,7 @@ pub fn patch_kafka_base_offset(blob: Bytes, base_offset: Offset) -> Bytes {
 
     if blob.len() < KAFKA_BASE_OFFSET_SIZE {
         // Blob too small to be a valid RecordBatch, return as-is.
-        tracing::warn!(
-            blob_len = blob.len(),
-            "Blob too small for Kafka patching"
-        );
+        tracing::warn!(blob_len = blob.len(), "Blob too small for Kafka patching");
         return blob;
     }
 
@@ -837,9 +853,7 @@ impl Partition {
     /// Returns the log start offset for blob storage (earliest available offset).
     #[must_use]
     pub fn blob_log_start_offset(&self) -> Offset {
-        self.blobs
-            .first()
-            .map_or(Offset::new(0), |b| b.base_offset)
+        self.blobs.first().map_or(Offset::new(0), |b| b.base_offset)
     }
 
     /// Appends a blob to the partition.
@@ -872,7 +886,8 @@ impl Partition {
 
         // Store the blob as-is with its metadata.
         // Protocol-specific transformations (like Kafka baseOffset patching) happen at read time.
-        self.blobs.push(StoredBlob::new(base_offset, record_count, blob));
+        self.blobs
+            .push(StoredBlob::new(base_offset, record_count, blob));
 
         // Advance the log end offset.
         self.blob_log_end_offset = Offset::new(base_offset.get() + u64::from(record_count));
@@ -979,7 +994,8 @@ impl Partition {
         }
 
         // Store the blob at the leader-assigned offset.
-        self.blobs.push(StoredBlob::new(base_offset, record_count, blob));
+        self.blobs
+            .push(StoredBlob::new(base_offset, record_count, blob));
 
         // Update the log end offset to be after this blob.
         // This ensures consistency even if entries arrive out of order due to
@@ -1224,7 +1240,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
     /// Panics if filesystem object storage creation fails when `object_storage_dir`
     /// is configured (e.g., if the directory cannot be created).
     #[allow(clippy::too_many_lines)]
-    pub async fn open(storage: S, config: DurablePartitionConfig) -> Result<Self, DurablePartitionError> {
+    pub async fn open(
+        storage: S,
+        config: DurablePartitionConfig,
+    ) -> Result<Self, DurablePartitionError> {
         let wal_dir = config.wal_dir();
 
         // Build BufferedWalConfig with flush_interval for background sync.
@@ -1236,8 +1255,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         };
 
         let wal_config = WalConfig::new(&wal_dir);
-        let buffered_config = BufferedWalConfig::new(wal_config)
-            .with_flush_interval(effective_flush_interval);
+        let buffered_config =
+            BufferedWalConfig::new(wal_config).with_flush_interval(effective_flush_interval);
 
         info!(
             topic = config.topic_id.get(),
@@ -1262,11 +1281,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         // Recover entries from WAL.
         if let Some(last_index) = wal.last_index().await {
             let first_index = wal.first_index().await;
-            info!(
-                first_index,
-                last_index,
-                "Recovering entries from WAL"
-            );
+            info!(first_index, last_index, "Recovering entries from WAL");
 
             for index in first_index..=last_index {
                 match wal.read(index).await {
@@ -1282,8 +1297,14 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                 }
             }
 
+            // Recovered entries were previously committed, so set HWM to
+            // match the recovered log end offset.
+            let recovered_hwm = cache.blob_log_end_offset();
+            cache.set_high_watermark(recovered_hwm);
+
             info!(
                 entries = last_index - first_index + 1,
+                recovered_hwm = %recovered_hwm,
                 "Recovery complete"
             );
         }
@@ -1475,6 +1496,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             last_applied_index = entry.index();
         }
 
+        // Recovered entries were previously committed through Raft, so the
+        // high watermark should reflect the recovered state. Without this,
+        // Kafka reads return empty results after restart because HWM stays 0.
+        let recovered_hwm = cache.blob_log_end_offset();
+        cache.set_high_watermark(recovered_hwm);
+
         // Query the SharedWal for any pending/durable entries we might have missed.
         // This handles the case where the DurablePartition is recreated but the
         // SharedWal has entries that weren't included in recovered_entries.
@@ -1492,6 +1519,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         info!(
             entries = recovered_entries.len(),
             last_index = last_applied_index,
+            recovered_hwm = %recovered_hwm,
             "Recovery complete"
         );
 
@@ -1631,21 +1659,20 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                 // Use auto-index assignment to eliminate TOCTOU races.
                 // Don't wait for fsync - durability is provided by Raft replication.
                 // The entry is buffered and will be fsynced within flush_interval.
-                handle
-                    .append_nowait(term, data)
-                    .await
-                    .map_err(|e| DurablePartitionError::WalWrite {
+                handle.append_nowait(term, data).await.map_err(|e| {
+                    DurablePartitionError::WalWrite {
                         message: e.to_string(),
-                    })?
+                    }
+                })?
             }
         };
 
         // Update in-memory cache.
-        self.cache.append(records).map_err(|e| {
-            DurablePartitionError::CacheUpdate {
+        self.cache
+            .append(records)
+            .map_err(|e| DurablePartitionError::CacheUpdate {
                 message: e.to_string(),
-            }
-        })?;
+            })?;
 
         self.last_applied_index = assigned_index;
 
@@ -1688,7 +1715,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
     ///
     /// # Errors
     /// Returns an error if the offset is out of range.
-    pub fn read(&self, start_offset: Offset, max_records: u32) -> Result<Vec<Record>, PartitionError> {
+    pub fn read(
+        &self,
+        start_offset: Offset,
+        max_records: u32,
+    ) -> Result<Vec<Record>, PartitionError> {
         self.cache.read(start_offset, max_records)
     }
 
@@ -1769,23 +1800,22 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                 // Use auto-index assignment to eliminate TOCTOU races.
                 // Don't wait for fsync - durability is provided by Raft replication.
                 // The entry is buffered and will be fsynced within flush_interval.
-                handle
-                    .append_nowait(term, data)
-                    .await
-                    .map_err(|e| DurablePartitionError::WalWrite {
+                handle.append_nowait(term, data).await.map_err(|e| {
+                    DurablePartitionError::WalWrite {
                         message: e.to_string(),
-                    })?
+                    }
+                })?
             }
         };
 
         // Update in-memory cache at the leader-assigned offset.
         // This uses append_blob_at_offset which has idempotency checking to skip
         // duplicates that might occur during failover.
-        self.cache.append_blob_at_offset(blob, record_count, base_offset).map_err(|e| {
-            DurablePartitionError::CacheUpdate {
+        self.cache
+            .append_blob_at_offset(blob, record_count, base_offset)
+            .map_err(|e| DurablePartitionError::CacheUpdate {
                 message: e.to_string(),
-            }
-        })?;
+            })?;
 
         self.last_applied_index = assigned_index;
 
@@ -1829,7 +1859,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         // Auto-assign the next index and offset (for non-replicated use cases).
         let next_index = self.last_applied_index + 1;
         let base_offset = self.cache.blob_log_end_offset();
-        self.append_blob_at_index(next_index, blob, record_count, base_offset).await
+        self.append_blob_at_index(next_index, blob, record_count, base_offset)
+            .await
     }
 
     /// Reads blobs starting at the given offset.
@@ -1866,9 +1897,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
     pub async fn sync(&self) -> Result<(), DurablePartitionError> {
         match &self.wal {
             WalBackend::Dedicated(wal) => {
-                wal.sync().await.map_err(|e| DurablePartitionError::WalSync {
-                    message: e.to_string(),
-                })
+                wal.sync()
+                    .await
+                    .map_err(|e| DurablePartitionError::WalSync {
+                        message: e.to_string(),
+                    })
             }
             WalBackend::Shared(_) => {
                 // Shared WAL auto-syncs via background flush.
@@ -1885,11 +1918,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             return Ok(());
         }
 
-        let command = PartitionCommand::decode(&data).ok_or_else(|| PartitionError::OffsetOutOfRange {
-            offset: Offset::new(0),
-            first: Offset::new(0),
-            last: Offset::new(0),
-        })?;
+        let command =
+            PartitionCommand::decode(&data).ok_or_else(|| PartitionError::OffsetOutOfRange {
+                offset: Offset::new(0),
+                first: Offset::new(0),
+                last: Offset::new(0),
+            })?;
 
         // Debug: log WAL recovery entries.
         tracing::info!(
@@ -1902,7 +1936,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             PartitionCommand::Append { records, .. } => {
                 cache.append(records)?;
             }
-            PartitionCommand::AppendBlob { blob, record_count, base_offset, .. } => {
+            PartitionCommand::AppendBlob {
+                blob,
+                record_count,
+                base_offset,
+                ..
+            } => {
                 // During WAL recovery, blobs are already in the correct format
                 // (patching happened at original apply time). Store at the leader-assigned offset.
                 // Use append_blob_at_offset for idempotency - this prevents duplicates if the
@@ -1915,7 +1954,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                 );
                 cache.append_blob_at_offset(blob, record_count, base_offset)?;
             }
-            PartitionCommand::AppendBlobBatch { blobs, base_offset, .. } => {
+            PartitionCommand::AppendBlobBatch {
+                blobs, base_offset, ..
+            } => {
                 // During WAL recovery, batch blobs are already patched. Apply each at its offset.
                 // Use append_blob_at_offset for idempotency - prevents duplicates from failover.
                 tracing::info!(
@@ -1926,8 +1967,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                 );
                 let mut current_offset = base_offset;
                 for batched in blobs {
-                    cache.append_blob_at_offset(batched.blob, batched.record_count, current_offset)?;
-                    current_offset = Offset::new(current_offset.get() + u64::from(batched.record_count));
+                    cache.append_blob_at_offset(
+                        batched.blob,
+                        batched.record_count,
+                        current_offset,
+                    )?;
+                    current_offset =
+                        Offset::new(current_offset.get() + u64::from(batched.record_count));
                 }
             }
             PartitionCommand::Truncate { from_offset } => {
@@ -1954,11 +2000,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             return Ok(());
         }
 
-        let command = PartitionCommand::decode(&data).ok_or_else(|| PartitionError::OffsetOutOfRange {
-            offset: Offset::new(0),
-            first: Offset::new(0),
-            last: Offset::new(0),
-        })?;
+        let command =
+            PartitionCommand::decode(&data).ok_or_else(|| PartitionError::OffsetOutOfRange {
+                offset: Offset::new(0),
+                first: Offset::new(0),
+                last: Offset::new(0),
+            })?;
 
         match command {
             PartitionCommand::Append { records, .. } => {
@@ -1974,13 +2021,20 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                 // Use append_blob_at_offset for idempotency - prevents duplicates from failover.
                 cache.append_blob_at_offset(blob, record_count, base_offset)?;
             }
-            PartitionCommand::AppendBlobBatch { blobs, base_offset, .. } => {
+            PartitionCommand::AppendBlobBatch {
+                blobs, base_offset, ..
+            } => {
                 // During WAL recovery, batch blobs are already patched. Apply each at its offset.
                 // Use append_blob_at_offset for idempotency - prevents duplicates from failover.
                 let mut current_offset = base_offset;
                 for batched in blobs {
-                    cache.append_blob_at_offset(batched.blob, batched.record_count, current_offset)?;
-                    current_offset = Offset::new(current_offset.get() + u64::from(batched.record_count));
+                    cache.append_blob_at_offset(
+                        batched.blob,
+                        batched.record_count,
+                        current_offset,
+                    )?;
+                    current_offset =
+                        Offset::new(current_offset.get() + u64::from(batched.record_count));
                 }
             }
             PartitionCommand::Truncate { from_offset } => {
@@ -2010,7 +2064,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
     /// # Panics
     ///
     /// Panics if more than 100 segments are registered in a single call (`TigerStyle` bound).
-    pub async fn check_and_register_sealed_segments(&mut self) -> Result<u32, DurablePartitionError> {
+    pub async fn check_and_register_sealed_segments(
+        &mut self,
+    ) -> Result<u32, DurablePartitionError> {
         let Some(tiering) = &self.tiering else {
             return Ok(0);
         };
@@ -2090,8 +2146,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
 
             debug!(
                 segment_id = segment_id_raw,
-                first_index,
-                "Registered sealed segment with tiering"
+                first_index, "Registered sealed segment with tiering"
             );
         }
 
@@ -2110,7 +2165,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
     /// # Errors
     ///
     /// Returns an error if marking segments as committed fails.
-    pub async fn on_entries_committed(&self, committed_index: u64) -> Result<u32, DurablePartitionError> {
+    pub async fn on_entries_committed(
+        &self,
+        committed_index: u64,
+    ) -> Result<u32, DurablePartitionError> {
         let Some(tiering) = &self.tiering else {
             return Ok(0);
         };
@@ -2155,9 +2213,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
 
             debug!(
                 segment_id = segment_id.get(),
-                segment_last_index,
-                committed_index,
-                "Segment marked as committed for tiering"
+                segment_last_index, committed_index, "Segment marked as committed for tiering"
             );
         }
 
@@ -2177,12 +2233,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             return Ok(0);
         };
 
-        let eligible = tiering
-            .find_eligible_segments()
-            .await
-            .map_err(|e| DurablePartitionError::WalWrite {
+        let eligible = tiering.find_eligible_segments().await.map_err(|e| {
+            DurablePartitionError::WalWrite {
                 message: format!("failed to find eligible segments: {e}"),
-            })?;
+            }
+        })?;
 
         let mut tiered_count = 0u32;
 
@@ -2254,7 +2309,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         duration_us: u64,
         current_time_us: u64,
     ) -> Result<Option<Lease>, DurablePartitionError> {
-        let progress = self.progress.as_ref().ok_or(DurablePartitionError::ProgressNotEnabled)?;
+        let progress = self
+            .progress
+            .as_ref()
+            .ok_or(DurablePartitionError::ProgressNotEnabled)?;
 
         // Start leasing from the current log start offset.
         let from_offset = self.cache.log_start_offset();
@@ -2291,7 +2349,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         offset: Offset,
         current_time_us: u64,
     ) -> Result<(), DurablePartitionError> {
-        let progress = self.progress.as_ref().ok_or(DurablePartitionError::ProgressNotEnabled)?;
+        let progress = self
+            .progress
+            .as_ref()
+            .ok_or(DurablePartitionError::ProgressNotEnabled)?;
 
         progress
             .commit_offset(
@@ -2319,7 +2380,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         consumer_id: ConsumerId,
         current_time_us: u64,
     ) -> Result<(), DurablePartitionError> {
-        let progress = self.progress.as_ref().ok_or(DurablePartitionError::ProgressNotEnabled)?;
+        let progress = self
+            .progress
+            .as_ref()
+            .ok_or(DurablePartitionError::ProgressNotEnabled)?;
 
         progress
             .register_consumer(group_id, consumer_id, current_time_us)
@@ -2500,13 +2564,12 @@ mod tests {
     #[tokio::test]
     async fn test_durable_partition_append_and_read() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let config = DurablePartitionConfig::new(
-            temp_dir.path(),
-            TopicId::new(1),
-            PartitionId::new(0),
-        );
+        let config =
+            DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0));
 
-        let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
+        let mut partition = DurablePartition::open(TokioStorage::new(), config)
+            .await
+            .unwrap();
 
         let records = vec![
             Record::new(Bytes::from("value1")),
@@ -2528,13 +2591,12 @@ mod tests {
 
         // Write some records.
         {
-            let config = DurablePartitionConfig::new(
-                temp_dir.path(),
-                TopicId::new(1),
-                PartitionId::new(0),
-            );
+            let config =
+                DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0));
 
-            let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
+            let mut partition = DurablePartition::open(TokioStorage::new(), config)
+                .await
+                .unwrap();
 
             for i in 0..5 {
                 let records = vec![Record::new(Bytes::from(format!("value-{i}")))];
@@ -2546,13 +2608,12 @@ mod tests {
 
         // Reopen and verify recovery.
         {
-            let config = DurablePartitionConfig::new(
-                temp_dir.path(),
-                TopicId::new(1),
-                PartitionId::new(0),
-            );
+            let config =
+                DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0));
 
-            let partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
+            let partition = DurablePartition::open(TokioStorage::new(), config)
+                .await
+                .unwrap();
 
             assert_eq!(partition.log_end_offset(), Offset::new(5));
 
@@ -2566,14 +2627,13 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
 
         // Create partition with tiering enabled.
-        let config = DurablePartitionConfig::new(
-            temp_dir.path(),
-            TopicId::new(1),
-            PartitionId::new(0),
-        )
-        .with_tiering(TieringConfig::for_testing());
+        let config =
+            DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
+                .with_tiering(TieringConfig::for_testing());
 
-        let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
+        let mut partition = DurablePartition::open(TokioStorage::new(), config)
+            .await
+            .unwrap();
 
         // Verify tiering is enabled.
         assert!(partition.tiering_backend().is_some());
@@ -2586,7 +2646,10 @@ mod tests {
         partition.append(records).await.unwrap();
 
         // Call tiering hooks (no sealed segments yet, so should return 0).
-        let registered = partition.check_and_register_sealed_segments().await.unwrap();
+        let registered = partition
+            .check_and_register_sealed_segments()
+            .await
+            .unwrap();
         assert_eq!(registered, 0);
 
         let committed = partition.on_entries_committed(10).await.unwrap();
@@ -2601,14 +2664,13 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
 
         // Create partition with progress tracking enabled.
-        let config = DurablePartitionConfig::new(
-            temp_dir.path(),
-            TopicId::new(1),
-            PartitionId::new(0),
-        )
-        .with_progress(ProgressConfig::for_testing());
+        let config =
+            DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
+                .with_progress(ProgressConfig::for_testing());
 
-        let partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
+        let partition = DurablePartition::open(TokioStorage::new(), config)
+            .await
+            .unwrap();
 
         // Verify progress is enabled.
         assert!(partition.has_progress());
@@ -2619,14 +2681,13 @@ mod tests {
     async fn test_durable_partition_consumer_registration() {
         let temp_dir = tempfile::tempdir().unwrap();
 
-        let config = DurablePartitionConfig::new(
-            temp_dir.path(),
-            TopicId::new(1),
-            PartitionId::new(0),
-        )
-        .with_progress(ProgressConfig::for_testing());
+        let config =
+            DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
+                .with_progress(ProgressConfig::for_testing());
 
-        let partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
+        let partition = DurablePartition::open(TokioStorage::new(), config)
+            .await
+            .unwrap();
 
         let group_id = ConsumerGroupId::new(1);
         let consumer_id = ConsumerId::new(100);
@@ -2649,14 +2710,13 @@ mod tests {
     async fn test_durable_partition_lease_and_commit() {
         let temp_dir = tempfile::tempdir().unwrap();
 
-        let config = DurablePartitionConfig::new(
-            temp_dir.path(),
-            TopicId::new(1),
-            PartitionId::new(0),
-        )
-        .with_progress(ProgressConfig::for_testing());
+        let config =
+            DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
+                .with_progress(ProgressConfig::for_testing());
 
-        let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
+        let mut partition = DurablePartition::open(TokioStorage::new(), config)
+            .await
+            .unwrap();
 
         // Write some records first.
         let records = vec![
@@ -2710,14 +2770,13 @@ mod tests {
     async fn test_durable_partition_safe_eviction_offset() {
         let temp_dir = tempfile::tempdir().unwrap();
 
-        let config = DurablePartitionConfig::new(
-            temp_dir.path(),
-            TopicId::new(1),
-            PartitionId::new(0),
-        )
-        .with_progress(ProgressConfig::for_testing());
+        let config =
+            DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
+                .with_progress(ProgressConfig::for_testing());
 
-        let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
+        let mut partition = DurablePartition::open(TokioStorage::new(), config)
+            .await
+            .unwrap();
 
         // Write records.
         let records = vec![
@@ -2780,13 +2839,12 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
 
         // Create partition WITHOUT progress tracking.
-        let config = DurablePartitionConfig::new(
-            temp_dir.path(),
-            TopicId::new(1),
-            PartitionId::new(0),
-        );
+        let config =
+            DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0));
 
-        let partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
+        let partition = DurablePartition::open(TokioStorage::new(), config)
+            .await
+            .unwrap();
 
         // Attempting to use progress methods should fail.
         let group_id = ConsumerGroupId::new(1);
@@ -2910,13 +2968,12 @@ mod tests {
     #[tokio::test]
     async fn test_durable_partition_blob_append_and_read() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let config = DurablePartitionConfig::new(
-            temp_dir.path(),
-            TopicId::new(1),
-            PartitionId::new(0),
-        );
+        let config =
+            DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0));
 
-        let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
+        let mut partition = DurablePartition::open(TokioStorage::new(), config)
+            .await
+            .unwrap();
 
         // Append blobs.
         let blob1 = Bytes::from("kafka-batch-1");
@@ -2943,13 +3000,12 @@ mod tests {
 
         // Write some blobs.
         {
-            let config = DurablePartitionConfig::new(
-                temp_dir.path(),
-                TopicId::new(1),
-                PartitionId::new(0),
-            );
+            let config =
+                DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0));
 
-            let mut partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
+            let mut partition = DurablePartition::open(TokioStorage::new(), config)
+                .await
+                .unwrap();
 
             for i in 0..5 {
                 let blob = Bytes::from(format!("kafka-batch-{i}"));
@@ -2961,13 +3017,12 @@ mod tests {
 
         // Reopen and verify recovery.
         {
-            let config = DurablePartitionConfig::new(
-                temp_dir.path(),
-                TopicId::new(1),
-                PartitionId::new(0),
-            );
+            let config =
+                DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0));
 
-            let partition = DurablePartition::open(TokioStorage::new(), config).await.unwrap();
+            let partition = DurablePartition::open(TokioStorage::new(), config)
+                .await
+                .unwrap();
 
             // 5 blobs * 2 records each = 10 total offset advancement.
             assert_eq!(partition.blob_log_end_offset(), Offset::new(10));

@@ -6,6 +6,13 @@ use helix_progress::ProgressError;
 /// Server error type.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ServerError {
+    /// Topic already exists.
+    #[error("topic already exists: {topic}")]
+    TopicAlreadyExists {
+        /// The topic name.
+        topic: String,
+    },
+
     /// Topic not found.
     #[error("topic not found: {topic}")]
     TopicNotFound {
@@ -157,7 +164,9 @@ pub enum ServerError {
     },
 
     /// Server overloaded (backpressure).
-    #[error("server overloaded: {pending_requests} pending requests, {pending_bytes} pending bytes")]
+    #[error(
+        "server overloaded: {pending_requests} pending requests, {pending_bytes} pending bytes"
+    )]
     Overloaded {
         /// Number of pending requests.
         pending_requests: u64,
@@ -178,7 +187,7 @@ impl ServerError {
     #[must_use]
     pub const fn to_error_code(&self) -> ErrorCode {
         match self {
-            Self::TopicNotFound { .. } => ErrorCode::InvalidTopic,
+            Self::TopicAlreadyExists { .. } | Self::TopicNotFound { .. } => ErrorCode::InvalidTopic,
             Self::PartitionNotFound { .. } => ErrorCode::InvalidPartition,
             Self::OffsetOutOfRange { .. } => ErrorCode::OffsetOutOfRange,
             Self::NotLeader { .. } => ErrorCode::NotLeader,
@@ -219,7 +228,9 @@ const fn progress_error_to_code(e: &ProgressError) -> ErrorCode {
         ProgressError::OffsetNotLeased { .. } => ErrorCode::OffsetNotLeased,
         ProgressError::TooManyGroups { .. } => ErrorCode::TooManyGroups,
         ProgressError::TooManyConsumers { .. } => ErrorCode::TooManyConsumers,
-        ProgressError::LeaseDurationExceeded { .. } | ProgressError::Io { .. } => ErrorCode::Unknown,
+        ProgressError::LeaseDurationExceeded { .. } | ProgressError::Io { .. } => {
+            ErrorCode::Unknown
+        }
     }
 }
 

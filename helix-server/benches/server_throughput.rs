@@ -6,15 +6,13 @@
 #![allow(missing_docs)]
 #![allow(clippy::significant_drop_tightening)]
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use hdrhistogram::Histogram;
 use tokio::runtime::Builder;
 use tokio::task::JoinSet;
@@ -39,7 +37,7 @@ async fn start_server() -> SocketAddr {
     let port = get_unique_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
-    let service = HelixService::new("bench-cluster".to_string(), 1);
+    let service = HelixService::new("bench-cluster".to_string(), 1).await;
 
     // Create the default topic.
     service
@@ -391,8 +389,7 @@ fn bench_read_after_write(c: &mut Criterion) {
                                     max_bytes: 1024 * 1024,
                                 };
 
-                                let read_resp =
-                                    client.read(read_req).await.expect("read failed");
+                                let read_resp = client.read(read_req).await.expect("read failed");
                                 black_box(read_resp);
 
                                 let duration = op_start.elapsed();

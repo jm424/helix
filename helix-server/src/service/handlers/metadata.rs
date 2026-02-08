@@ -2,6 +2,8 @@
 
 use helix_core::{NodeId, PartitionId};
 use helix_raft::multi::MultiRaft;
+use helix_runtime::TransportService;
+use helix_wal::Storage;
 
 use crate::error::{ServerError, ServerResult};
 use crate::generated::{
@@ -12,7 +14,7 @@ use crate::group_map::GroupMap;
 
 use super::super::{HelixService, TopicMetadata};
 
-impl HelixService {
+impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixService<S, T> {
     /// Internal metadata implementation.
     pub(crate) async fn get_metadata_internal(
         &self,
@@ -96,11 +98,12 @@ impl HelixService {
         &self,
         request: GetPartitionInfoRequest,
     ) -> ServerResult<GetPartitionInfoResponse> {
-        let topic_meta = self.get_topic(&request.topic).await.ok_or_else(|| {
-            ServerError::TopicNotFound {
-                topic: request.topic.clone(),
-            }
-        })?;
+        let topic_meta =
+            self.get_topic(&request.topic)
+                .await
+                .ok_or_else(|| ServerError::TopicNotFound {
+                    topic: request.topic.clone(),
+                })?;
 
         if request.partition < 0 || request.partition >= topic_meta.partition_count {
             return Err(ServerError::PartitionNotFound {
@@ -127,10 +130,13 @@ impl HelixService {
         let multi_raft = self.multi_raft.read().await;
         let ps_lock = {
             let storage = self.partition_storage.read().await;
-            storage.get(&group_id).cloned().ok_or_else(|| ServerError::PartitionNotFound {
-                topic: request.topic.clone(),
-                partition: request.partition,
-            })?
+            storage
+                .get(&group_id)
+                .cloned()
+                .ok_or_else(|| ServerError::PartitionNotFound {
+                    topic: request.topic.clone(),
+                    partition: request.partition,
+                })?
         };
         let ps = ps_lock.read().await;
 

@@ -3,6 +3,8 @@
 use bytes::Bytes;
 use helix_core::{ConsumerGroupId, ConsumerId, LeaseId, Offset, PartitionId};
 use helix_progress::{AckMode, PartitionKey};
+use helix_runtime::TransportService;
+use helix_wal::Storage;
 use tracing::{debug, warn};
 
 use crate::error::{ServerError, ServerResult};
@@ -14,7 +16,7 @@ use crate::generated::{
 
 use super::super::{HelixService, MAX_BYTES_PER_READ};
 
-impl HelixService {
+impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixService<S, T> {
     /// Creates a consumer group.
     pub(crate) async fn create_consumer_group_internal(
         &self,
@@ -23,10 +25,11 @@ impl HelixService {
         let group_id = ConsumerGroupId::new(Self::hash_string(&request.consumer_group_id));
 
         // Convert proto ack mode to internal ack mode.
-        let ack_mode = match ProtoAckMode::try_from(request.ack_mode).unwrap_or(ProtoAckMode::Cumulative) {
-            ProtoAckMode::Cumulative => AckMode::Cumulative,
-            ProtoAckMode::Individual => AckMode::Individual,
-        };
+        let ack_mode =
+            match ProtoAckMode::try_from(request.ack_mode).unwrap_or(ProtoAckMode::Cumulative) {
+                ProtoAckMode::Cumulative => AckMode::Cumulative,
+                ProtoAckMode::Individual => AckMode::Individual,
+            };
 
         let current_time_us = Self::current_time_us();
 
@@ -61,11 +64,12 @@ impl HelixService {
             "consumer_id cannot be empty"
         );
 
-        let topic_meta = self.get_topic(&request.topic).await.ok_or_else(|| {
-            ServerError::TopicNotFound {
-                topic: request.topic.clone(),
-            }
-        })?;
+        let topic_meta =
+            self.get_topic(&request.topic)
+                .await
+                .ok_or_else(|| ServerError::TopicNotFound {
+                    topic: request.topic.clone(),
+                })?;
 
         if request.partition >= topic_meta.partition_count {
             return Err(ServerError::PartitionNotFound {
@@ -189,12 +193,13 @@ impl HelixService {
         // Read the actual records from storage.
         let ps_lock = {
             let storage = self.partition_storage.read().await;
-            storage.get(&raft_group_id).cloned().ok_or_else(|| {
-                ServerError::PartitionNotFound {
+            storage
+                .get(&raft_group_id)
+                .cloned()
+                .ok_or_else(|| ServerError::PartitionNotFound {
                     topic: request.topic.clone(),
                     partition: request.partition,
-                }
-            })?
+                })?
         };
         let ps = ps_lock.read().await;
 
@@ -279,11 +284,12 @@ impl HelixService {
             "consumer_id cannot be empty"
         );
 
-        let topic_meta = self.get_topic(&request.topic).await.ok_or_else(|| {
-            ServerError::TopicNotFound {
-                topic: request.topic.clone(),
-            }
-        })?;
+        let topic_meta =
+            self.get_topic(&request.topic)
+                .await
+                .ok_or_else(|| ServerError::TopicNotFound {
+                    topic: request.topic.clone(),
+                })?;
 
         if request.partition >= topic_meta.partition_count {
             return Err(ServerError::PartitionNotFound {
@@ -405,11 +411,12 @@ impl HelixService {
         &self,
         request: GetCommittedOffsetRequest,
     ) -> ServerResult<GetCommittedOffsetResponse> {
-        let topic_meta = self.get_topic(&request.topic).await.ok_or_else(|| {
-            ServerError::TopicNotFound {
-                topic: request.topic.clone(),
-            }
-        })?;
+        let topic_meta =
+            self.get_topic(&request.topic)
+                .await
+                .ok_or_else(|| ServerError::TopicNotFound {
+                    topic: request.topic.clone(),
+                })?;
 
         if request.partition < 0 || request.partition >= topic_meta.partition_count {
             return Err(ServerError::PartitionNotFound {

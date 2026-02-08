@@ -160,10 +160,8 @@ impl VoteState {
 
     /// Updates vote state for a group.
     pub fn update_group(&mut self, group_id: GroupId, term: TermId, voted_for: Option<NodeId>) {
-        self.groups.insert(
-            group_id,
-            GroupVoteState::new(group_id, term, voted_for),
-        );
+        self.groups
+            .insert(group_id, GroupVoteState::new(group_id, term, voted_for));
     }
 
     /// Removes a group from the vote state.
@@ -427,7 +425,9 @@ impl SimulatedVoteStorage {
     ///
     /// Panics if the mutex is poisoned.
     pub fn fault_config(&self) -> std::sync::MutexGuard<'_, VoteStorageFaultConfig> {
-        self.fault_config.lock().expect("fault config lock poisoned")
+        self.fault_config
+            .lock()
+            .expect("fault config lock poisoned")
     }
 
     /// Deterministic check for fault injection.
@@ -439,7 +439,10 @@ impl SimulatedVoteStorage {
             return true;
         }
         let counter = self.counter.fetch_add(1, Ordering::Relaxed);
-        let hash = self.seed.wrapping_add(counter).wrapping_mul(0x5851_f42d_4c95_7f2d);
+        let hash = self
+            .seed
+            .wrapping_add(counter)
+            .wrapping_mul(0x5851_f42d_4c95_7f2d);
         #[allow(clippy::cast_precision_loss)]
         let normalized = (hash as f64) / (u64::MAX as f64);
         normalized < rate
@@ -459,7 +462,10 @@ impl Clone for SimulatedVoteStorage {
 
 impl VoteStorage for SimulatedVoteStorage {
     fn read(&self) -> VoteStoreResult<Option<Bytes>> {
-        let mut config = self.fault_config.lock().expect("fault config lock poisoned");
+        let mut config = self
+            .fault_config
+            .lock()
+            .expect("fault config lock poisoned");
         if config.force_read_fail {
             config.force_read_fail = false;
             return Err(VoteStoreError::Io(std::io::Error::other(
@@ -480,7 +486,10 @@ impl VoteStorage for SimulatedVoteStorage {
     }
 
     fn write(&self, data: &[u8]) -> VoteStoreResult<()> {
-        let mut config = self.fault_config.lock().expect("fault config lock poisoned");
+        let mut config = self
+            .fault_config
+            .lock()
+            .expect("fault config lock poisoned");
         if config.force_write_fail {
             config.force_write_fail = false;
             return Err(VoteStoreError::Io(std::io::Error::other(
@@ -723,7 +732,10 @@ impl VoteStoreHandle {
                 s
             } else {
                 let Some(s) = self.upload_rx.recv().await else {
-                    info!(node_id = self.node_id.get(), "Vote store S3 worker shutting down");
+                    info!(
+                        node_id = self.node_id.get(),
+                        "Vote store S3 worker shutting down"
+                    );
                     break;
                 };
                 s
@@ -736,10 +748,7 @@ impl VoteStoreHandle {
             let state = pending.take().unwrap_or(state);
 
             // Upload to S3
-            let key = ObjectKey::new(format!(
-                "helix/vote-state/node-{}.bin",
-                self.node_id.get()
-            ));
+            let key = ObjectKey::new(format!("helix/vote-state/node-{}.bin", self.node_id.get()));
             let data = state.serialize();
 
             match self.remote.put(&key, data).await {
@@ -817,14 +826,22 @@ mod tests {
         bytes[10] ^= 0xFF;
 
         let result = VoteState::deserialize(&bytes);
-        assert!(matches!(result, Err(VoteStoreError::ChecksumMismatch { .. })));
+        assert!(matches!(
+            result,
+            Err(VoteStoreError::ChecksumMismatch { .. })
+        ));
     }
 
     #[test]
     fn test_vote_state_invalid_magic() {
-        let bytes = vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let bytes = vec![
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         let result = VoteState::deserialize(&bytes);
-        assert!(matches!(result, Err(VoteStoreError::ChecksumMismatch { .. })));
+        assert!(matches!(
+            result,
+            Err(VoteStoreError::ChecksumMismatch { .. })
+        ));
     }
 
     #[test]

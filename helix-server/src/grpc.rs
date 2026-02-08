@@ -12,10 +12,10 @@ use crate::generated::{
     GetMetadataRequest, GetMetadataResponse, GetPartitionInfoRequest, GetPartitionInfoResponse,
     PullRequest, PullResponse, ReadRequest, ReadResponse, WriteRequest, WriteResponse,
 };
-use crate::service::HelixService;
+use crate::service::ProductionHelixService;
 
 #[tonic::async_trait]
-impl Helix for HelixService {
+impl Helix for ProductionHelixService {
     async fn write(
         &self,
         request: Request<WriteRequest>,
@@ -37,10 +37,7 @@ impl Helix for HelixService {
         }
     }
 
-    async fn read(
-        &self,
-        request: Request<ReadRequest>,
-    ) -> Result<Response<ReadResponse>, Status> {
+    async fn read(&self, request: Request<ReadRequest>) -> Result<Response<ReadResponse>, Status> {
         let inner = request.into_inner();
         debug!(
             topic = %inner.topic,

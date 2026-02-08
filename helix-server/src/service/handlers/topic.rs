@@ -6,15 +6,16 @@ use helix_raft::RaftState;
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
-use helix_wal::TokioStorage;
+use helix_runtime::TransportService;
+use helix_wal::Storage;
 
 use crate::controller::{ControllerCommand, CONTROLLER_GROUP_ID};
 use crate::error::{ServerError, ServerResult};
-use crate::partition_storage::ServerPartitionStorage;
+use crate::partition_storage::PartitionStorage;
 
 use super::super::{HelixService, PendingControllerProposal, TopicMetadata};
 
-impl HelixService {
+impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixService<S, T> {
     /// Creates a topic with the specified number of partitions.
     ///
     /// # Errors
@@ -29,9 +30,7 @@ impl HelixService {
 
         let mut topics = self.topics.write().await;
         if topics.contains_key(&name) {
-            return Err(ServerError::Internal {
-                message: format!("topic already exists: {name}"),
-            });
+            return Err(ServerError::TopicAlreadyExists { topic: name });
         }
 
         let mut next_id = self.next_topic_id.write().await;
@@ -61,7 +60,10 @@ impl HelixService {
             // Create partition storage (durable or in-memory based on config).
             let ps = if let Some(ref pool) = self.shared_wal_pool {
                 // Shared WAL mode: get handle from pool and recovered entries.
-                let data_dir = self.data_dir.as_ref().expect("data_dir must be set with shared_wal_pool");
+                let data_dir = self
+                    .data_dir
+                    .as_ref()
+                    .expect("data_dir must be set with shared_wal_pool");
                 let wal_handle = pool.handle(partition_id);
                 let recovered = self
                     .recovered_entries
@@ -71,7 +73,7 @@ impl HelixService {
                     .unwrap_or_default();
 
                 #[cfg(feature = "s3")]
-                let ps_result = ServerPartitionStorage::new_durable_with_shared_wal(
+                let ps_result = PartitionStorage::new_durable_with_shared_wal(
                     data_dir,
                     topic_id,
                     partition_id,
@@ -83,7 +85,7 @@ impl HelixService {
                 )
                 .await;
                 #[cfg(not(feature = "s3"))]
-                let ps_result = ServerPartitionStorage::new_durable_with_shared_wal(
+                let ps_result = PartitionStorage::new_durable_with_shared_wal(
                     data_dir,
                     topic_id,
                     partition_id,
@@ -100,8 +102,8 @@ impl HelixService {
                 // Dedicated WAL mode (used when shared WAL is not available).
                 #[cfg(feature = "s3")]
                 let ps_inner = if let Some(data_dir) = &self.data_dir {
-                    ServerPartitionStorage::new_durable(
-                        TokioStorage::new(),
+                    PartitionStorage::new_durable(
+                        self.storage.clone(),
                         data_dir,
                         self.object_storage_dir.as_ref(),
                         self.s3_config.as_ref(),
@@ -114,12 +116,12 @@ impl HelixService {
                         message: format!("failed to create durable partition: {e}"),
                     })?
                 } else {
-                    ServerPartitionStorage::new_in_memory(topic_id, partition_id)
+                    PartitionStorage::new_in_memory(topic_id, partition_id)
                 };
                 #[cfg(not(feature = "s3"))]
                 let ps_inner = if let Some(data_dir) = &self.data_dir {
-                    ServerPartitionStorage::new_durable(
-                        TokioStorage::new(),
+                    PartitionStorage::new_durable(
+                        self.storage.clone(),
                         data_dir,
                         self.object_storage_dir.as_ref(),
                         self.tiering_config.as_ref(),
@@ -131,7 +133,7 @@ impl HelixService {
                         message: format!("failed to create durable partition: {e}"),
                     })?
                 } else {
-                    ServerPartitionStorage::new_in_memory(topic_id, partition_id)
+                    PartitionStorage::new_in_memory(topic_id, partition_id)
                 };
                 ps_inner
             };
@@ -197,6 +199,11 @@ impl HelixService {
     ///
     /// Returns an error if this node is not the controller leader, if the
     /// proposal fails, or if the topic creation times out.
+    ///
+    /// # Panics
+    ///
+    /// Panics in single-node actor mode if internal actor output channels are
+    /// unexpectedly unavailable during immediate output processing.
     #[allow(clippy::too_many_lines)] // Synchronous topic creation is a single logical unit.
     pub async fn create_topic_via_controller(
         &self,
@@ -211,9 +218,7 @@ impl HelixService {
         {
             let state = self.controller_state.read().await;
             if state.topic_exists(&name) {
-                return Err(ServerError::Internal {
-                    message: format!("topic already exists: {name}"),
-                });
+                return Err(ServerError::TopicAlreadyExists { topic: name });
             }
         }
 
@@ -227,9 +232,13 @@ impl HelixService {
 
         let (result_tx, result_rx) = oneshot::channel();
 
-        let proposed_index = {
+        // For single-node actor mode, we need to process propose outputs immediately
+        // because commits happen during propose, not during tick.
+        let is_single_node_actor = self.cluster_nodes.len() == 1 && self.actor_mode;
+
+        let (proposed_index, propose_outputs) = {
             let mut mr = self.multi_raft.write().await;
-            let Some((_, index)) = mr.propose_with_index(CONTROLLER_GROUP_ID, encoded) else {
+            let Some((outputs, index)) = mr.propose_with_index(CONTROLLER_GROUP_ID, encoded) else {
                 // Get controller leader hint if available.
                 let controller_hint = mr
                     .group_state(CONTROLLER_GROUP_ID)
@@ -239,7 +248,7 @@ impl HelixService {
                 return Err(ServerError::NotController { controller_hint });
             };
             drop(mr); // Release lock early before awaiting result.
-            index
+            (index, outputs)
         };
 
         // Register the pending controller proposal.
@@ -251,6 +260,35 @@ impl HelixService {
             });
             proposals.len()
         };
+
+        // For single-node actor mode, process propose outputs immediately.
+        // This handles commits that happen during propose rather than tick.
+        if is_single_node_actor && !propose_outputs.is_empty() {
+            if let (Some(router), Some(output_tx)) = (&self.actor_router, &self.actor_output_tx) {
+                debug!(
+                    topic = %name,
+                    outputs = propose_outputs.len(),
+                    "Single-node actor: processing propose outputs"
+                );
+                crate::service::tick::process_controller_outputs(
+                    &propose_outputs,
+                    &self.multi_raft,
+                    &self.partition_storage,
+                    &self.group_map,
+                    &self.controller_state,
+                    &self.pending_proposals,
+                    &self.pending_controller_proposals,
+                    &self.cluster_nodes,
+                    self.transport_handle
+                        .as_ref()
+                        .expect("transport must be set"),
+                    router,
+                    output_tx,
+                    None, // vote_store not available here
+                )
+                .await;
+            }
+        }
 
         info!(
             topic = %name,
@@ -310,9 +348,7 @@ impl HelixService {
 
             if tokio::time::Instant::now() >= deadline {
                 return Err(ServerError::Internal {
-                    message: format!(
-                        "timeout waiting for partition assignments for {name}"
-                    ),
+                    message: format!("timeout waiting for partition assignments for {name}"),
                 });
             }
 
@@ -334,10 +370,12 @@ impl HelixService {
 
                     (0..partition_count).all(|p| {
                         let partition_id = PartitionId::new(u64::from(p));
-                        state.get_assignment(topic_id, partition_id).is_some_and(|assignment| {
-                            mr.group_state(assignment.group_id)
-                                .is_some_and(|gs| gs.leader_id.is_some())
-                        })
+                        state
+                            .get_assignment(topic_id, partition_id)
+                            .is_some_and(|assignment| {
+                                mr.group_state(assignment.group_id)
+                                    .is_some_and(|gs| gs.leader_id.is_some())
+                            })
                     })
                 };
 
@@ -372,20 +410,21 @@ impl HelixService {
 
     /// Gets topic metadata by name.
     pub(crate) async fn get_topic(&self, name: &str) -> Option<TopicMetadata> {
-        // In multi-node mode, read from controller state.
-        if self.is_multi_node() {
+        // In multi-node mode, first check controller state.
+        if self.is_multi_node_generic() {
             let state = self.controller_state.read().await;
-            return state.get_topic(name).map(|info| {
+            if let Some(info) = state.get_topic(name) {
                 // Safe cast: partition_count is bounded by 256.
                 #[allow(clippy::cast_possible_wrap)]
-                TopicMetadata {
+                return Some(TopicMetadata {
                     topic_id: info.topic_id,
                     partition_count: info.partition_count as i32,
-                }
-            });
+                });
+            }
+            // Fall through to check local topics map.
         }
 
-        // Single-node mode uses local topics map.
+        // Check local topics map (single-node mode, or fallback for multi-node).
         let topics = self.topics.read().await;
         topics.get(name).cloned()
     }
@@ -395,7 +434,7 @@ impl HelixService {
     /// Returns a list of (`topic_name`, `partition_count`) pairs.
     pub async fn get_all_topics(&self) -> Vec<(String, i32)> {
         // In multi-node mode, read from controller state.
-        if self.is_multi_node() {
+        if self.is_multi_node_generic() {
             let state = self.controller_state.read().await;
             return state
                 .topics()
@@ -418,7 +457,7 @@ impl HelixService {
     /// Checks if a topic exists.
     pub async fn topic_exists(&self, topic: &str) -> bool {
         // In multi-node mode, check controller state.
-        if self.is_multi_node() {
+        if self.is_multi_node_generic() {
             let state = self.controller_state.read().await;
             return state.topic_exists(topic);
         }

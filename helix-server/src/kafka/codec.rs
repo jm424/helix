@@ -57,18 +57,19 @@ pub const fn request_header_version(api_key: i16, api_version: i16) -> i16 {
 #[allow(clippy::match_same_arms)] // Explicit for documentation clarity.
 const fn flexible_version_threshold(api_key: i16) -> Option<i16> {
     match api_key {
-        0 => Some(9),   // Produce
-        1 => Some(12),  // Fetch
-        2 => Some(6),   // ListOffsets
-        3 => Some(9),   // Metadata
-        8 => Some(8),   // OffsetCommit
-        9 => Some(6),   // OffsetFetch
-        10 => Some(3),  // FindCoordinator
-        18 => None,     // ApiVersions: always v0
+        0 => Some(9),  // Produce
+        1 => Some(12), // Fetch
+        2 => Some(6),  // ListOffsets
+        3 => Some(9),  // Metadata
+        8 => Some(8),  // OffsetCommit
+        9 => Some(6),  // OffsetFetch
+        10 => Some(3), // FindCoordinator
+        18 => None,    // ApiVersions: always v0
         _ => None,
     }
 }
 
+/// Get response header version for a given API key and version.
 #[must_use]
 pub const fn response_header_version(api_key: i16, api_version: i16) -> i16 {
     match flexible_version_threshold(api_key) {
@@ -166,8 +167,7 @@ pub fn decode_request_header(mut payload: Bytes) -> KafkaResult<DecodedRequest> 
     let header_version = request_header_version(api_key, api_version);
 
     // Decode the full header.
-    let header = RequestHeader::decode(&mut payload, header_version)
-        .map_err(KafkaError::decode)?;
+    let header = RequestHeader::decode(&mut payload, header_version).map_err(KafkaError::decode)?;
 
     let correlation_id = header.correlation_id;
 

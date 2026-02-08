@@ -35,14 +35,16 @@ use std::sync::{Arc, Mutex};
 
 use helix_core::{GroupId, LogIndex, NodeId};
 use helix_raft::{RaftConfig, RaftNode};
-use helix_runtime::{IncomingMessage, TransportHandle};
+use helix_runtime::{IncomingMessage, TransportService};
 use tokio::sync::{mpsc, RwLock};
 use tracing::info;
+
+use helix_wal::Storage;
 
 use crate::vote_store::{LocalFileVoteStorage, VoteStore};
 
 use crate::group_map::GroupMap;
-use crate::partition_storage::ServerPartitionStorage;
+use crate::partition_storage::PartitionStorage;
 
 use super::batcher::{self, BackpressureState, BatcherConfig, BatcherHandle};
 use super::output_processor::{self, OutputProcessorConfig};
@@ -98,15 +100,24 @@ pub struct ActorSetupHandles {
 /// # Returns
 ///
 /// Handles for interacting with the actor system.
-#[allow(clippy::too_many_arguments, clippy::implicit_hasher, clippy::unused_async)]
-pub async fn setup_single_partition(
+#[allow(
+    clippy::too_many_arguments,
+    clippy::implicit_hasher,
+    clippy::unused_async
+)]
+pub async fn setup_single_partition<
+    S: Storage + Clone + Send + Sync + 'static,
+    T: TransportService,
+>(
     group_id: GroupId,
     node_id: NodeId,
     cluster_nodes: Vec<NodeId>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
     group_map: Arc<RwLock<GroupMap>>,
-    batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
-    transport_handle: Option<TransportHandle>,
+    batch_pending_proposals: Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
+    >,
+    transport_handle: Option<T>,
     config: ActorSetupConfig,
     vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
 ) -> ActorSetupHandles {
@@ -199,20 +210,31 @@ pub async fn setup_single_partition(
 /// # Returns
 ///
 /// Handles for interacting with the actor system.
-#[allow(clippy::too_many_arguments, clippy::implicit_hasher, clippy::unused_async)]
-pub async fn setup_multi_partition(
+#[allow(
+    clippy::too_many_arguments,
+    clippy::implicit_hasher,
+    clippy::unused_async
+)]
+pub async fn setup_multi_partition<
+    S: Storage + Clone + Send + Sync + 'static,
+    T: TransportService,
+>(
     node_id: NodeId,
     cluster_nodes: Vec<NodeId>,
     initial_groups: HashMap<GroupId, Vec<NodeId>>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
     group_map: Arc<RwLock<GroupMap>>,
     controller_state: Arc<RwLock<crate::controller::ControllerState>>,
-    pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, super::PendingProposal>>>>>>,
+    pending_proposals: Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, super::PendingProposal>>>>>,
+    >,
     pending_controller_proposals: Arc<RwLock<Vec<super::PendingControllerProposal>>>,
-    batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
+    batch_pending_proposals: Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
+    >,
     local_broker_heartbeats: Arc<RwLock<HashMap<NodeId, u64>>>,
     multi_raft: Arc<RwLock<helix_raft::multi::MultiRaft>>,
-    transport_handle: TransportHandle,
+    transport_handle: T,
     incoming_rx: mpsc::Receiver<IncomingMessage>,
     config: ActorSetupConfig,
     vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
@@ -373,8 +395,11 @@ pub fn create_partition_actor_with_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::partition_storage::ServerPartitionStorage;
     use bytes::Bytes;
     use helix_core::{PartitionId, TopicId};
+    use helix_runtime::TransportHandle;
+    use helix_wal::TokioStorage;
     use tokio::time::{timeout, Duration};
 
     #[tokio::test]
@@ -386,8 +411,9 @@ mod tests {
         let partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let group_map = Arc::new(RwLock::new(GroupMap::new()));
-        let batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let batch_pending_proposals: Arc<
+            RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
+        > = Arc::new(RwLock::new(HashMap::new()));
 
         // Add group mapping.
         {
@@ -402,7 +428,7 @@ mod tests {
             storage.insert(group_id, Arc::new(RwLock::new(ps)));
         }
 
-        let handles = setup_single_partition(
+        let handles = setup_single_partition::<TokioStorage, TransportHandle>(
             group_id,
             node_id,
             cluster_nodes,
@@ -435,8 +461,9 @@ mod tests {
         let partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let group_map = Arc::new(RwLock::new(GroupMap::new()));
-        let batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let batch_pending_proposals: Arc<
+            RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
+        > = Arc::new(RwLock::new(HashMap::new()));
 
         // Add group mapping.
         {
@@ -451,7 +478,7 @@ mod tests {
             storage.insert(group_id, Arc::new(RwLock::new(ps)));
         }
 
-        let handles = setup_single_partition(
+        let handles = setup_single_partition::<TokioStorage, TransportHandle>(
             group_id,
             node_id,
             cluster_nodes,
@@ -497,7 +524,7 @@ mod tests {
                 .await
                 .expect("propose timed out");
 
-            assert!(result.is_ok(), "Propose should succeed: {:?}", result);
+            assert!(result.is_ok(), "Propose should succeed: {result:?}");
         }
 
         // Shutdown.

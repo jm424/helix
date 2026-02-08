@@ -55,9 +55,9 @@ use tracing_subscriber::{fmt::format::FmtSpan, FmtSubscriber};
 use helix_server::generated::helix_server::HelixServer;
 use helix_server::kafka::{KafkaServer, KafkaServerConfig};
 use helix_server::HelixService;
-use helix_tier::TieringConfig;
 #[cfg(feature = "s3")]
 use helix_tier::S3Config;
+use helix_tier::TieringConfig;
 
 /// Protocol to use for client connections.
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -229,7 +229,9 @@ fn parse_topic(s: &str) -> Result<TopicSpec, String> {
         .map_err(|_| format!("invalid partition count '{}' in topic '{s}'", parts[1]))?;
 
     if partitions <= 0 {
-        return Err(format!("partition count must be positive, got {partitions}"));
+        return Err(format!(
+            "partition count must be positive, got {partitions}"
+        ));
     }
 
     Ok(TopicSpec { name, partitions })
@@ -355,7 +357,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         // Convert ExtendedPeerInfo to PeerInfo for the transport (uses Raft addresses).
-        let raft_peers: Vec<PeerInfo> = args.peers.iter().map(ExtendedPeerInfo::to_peer_info).collect();
+        let raft_peers: Vec<PeerInfo> = args
+            .peers
+            .iter()
+            .map(ExtendedPeerInfo::to_peer_info)
+            .collect();
 
         // Build Kafka peer addresses map for metadata responses.
         let kafka_peer_addrs: HashMap<NodeId, String> = args
@@ -507,7 +513,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await
         } else {
             // Single-node: create directly.
-            service.create_topic(topic.name.clone(), topic.partitions).await
+            service
+                .create_topic(topic.name.clone(), topic.partitions)
+                .await
         };
 
         match result {

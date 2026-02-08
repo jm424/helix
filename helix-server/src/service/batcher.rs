@@ -32,12 +32,14 @@ use bytes::Bytes;
 use helix_core::{GroupId, LogIndex, Offset};
 use helix_raft::multi::MultiRaft;
 use helix_raft::RaftState;
-use helix_runtime::TransportHandle;
+use helix_runtime::TransportService;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{debug, info, warn, Instrument};
 
 use crate::error::{ServerError, ServerResult};
+use crate::partition_storage::PartitionStorage;
 use crate::storage::{BatchedBlob, BlobFormat, PartitionCommand};
+use helix_wal::Storage;
 
 use super::{BatchPendingProposal, BatcherStats};
 
@@ -317,15 +319,17 @@ impl AccumulatedBatch {
 /// 5. Registers `BatchPendingProposal` for commit notification
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::implicit_hasher)]
-pub async fn batcher_task(
+pub async fn batcher_task<S: Storage + Clone + Send + Sync + 'static, T: TransportService>(
     mut rx: mpsc::Receiver<BatcherMessage>,
     multi_raft: Arc<RwLock<MultiRaft>>,
-    batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
-    transport_handle: Option<TransportHandle>,
+    batch_pending_proposals: Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
+    >,
+    transport_handle: Option<T>,
     batcher_stats: Arc<BatcherStats>,
     config: BatcherConfig,
     backpressure: Arc<BackpressureState>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<crate::partition_storage::ServerPartitionStorage>>>>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
 ) {
     let mut batches: HashMap<GroupId, AccumulatedBatch> = HashMap::new();
     let linger_duration = Duration::from_millis(config.linger_ms);
@@ -434,22 +438,26 @@ pub async fn batcher_task(
 #[tracing::instrument(skip_all, name = "batcher_handle_submit", fields(group_id = request.group_id.get()))]
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::ref_option)]
-async fn handle_submit(
+async fn handle_submit<S: Storage + Clone + Send + Sync + 'static, T: TransportService>(
     request: PendingBatchRequest,
     batches: &mut HashMap<GroupId, AccumulatedBatch>,
     multi_raft: &Arc<RwLock<MultiRaft>>,
-    batch_pending_proposals: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
-    transport_handle: &Option<TransportHandle>,
+    batch_pending_proposals: &Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
+    >,
+    transport_handle: &Option<T>,
     batcher_stats: &Arc<BatcherStats>,
     config: &BatcherConfig,
     backpressure: &Arc<BackpressureState>,
-    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<crate::partition_storage::ServerPartitionStorage>>>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
 ) {
     let group_id = request.group_id;
     #[allow(clippy::cast_possible_truncation)]
     let blob_size = request.blob.len() as u32;
 
-    let batch = batches.entry(group_id).or_insert_with(AccumulatedBatch::new);
+    let batch = batches
+        .entry(group_id)
+        .or_insert_with(AccumulatedBatch::new);
 
     // Check if adding this request would exceed limits.
     let would_exceed_bytes = batch.total_bytes + blob_size > config.max_batch_bytes;
@@ -495,16 +503,18 @@ async fn handle_submit(
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::ref_option)]
 #[allow(clippy::significant_drop_tightening)]
-async fn flush_batch(
+async fn flush_batch<S: Storage + Clone + Send + Sync + 'static, T: TransportService>(
     group_id: GroupId,
     batch: AccumulatedBatch,
     multi_raft: &Arc<RwLock<MultiRaft>>,
-    batch_pending_proposals: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
-    transport_handle: &Option<TransportHandle>,
+    batch_pending_proposals: &Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
+    >,
+    transport_handle: &Option<T>,
     batcher_stats: &Arc<BatcherStats>,
     reason: FlushReason,
     backpressure: &Arc<BackpressureState>,
-    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<crate::partition_storage::ServerPartitionStorage>>>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
 ) {
     let batch_size = batch.request_count();
     let batch_bytes = batch.total_bytes;
@@ -779,7 +789,10 @@ async fn flush_batch(
         );
 
         // Encode command with captured base_offset.
-        let command = PartitionCommand::AppendBlobBatch { blobs: batch_blobs, base_offset };
+        let command = PartitionCommand::AppendBlobBatch {
+            blobs: batch_blobs,
+            base_offset,
+        };
         let command_data = command.encode();
 
         // Propose to Raft.
@@ -817,7 +830,11 @@ async fn flush_batch(
                 let mut proposals = batch_pending_proposals.write().await;
                 proposals
                     .entry(group_id)
-                    .or_insert_with(|| std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())))
+                    .or_insert_with(|| {
+                        std::sync::Arc::new(tokio::sync::RwLock::new(
+                            std::collections::HashMap::new(),
+                        ))
+                    })
                     .clone()
             };
             let mut inner = inner_lock.write().await;
@@ -899,14 +916,16 @@ use crate::service::router::PartitionRouter;
 /// - Proposals are sent via `PartitionActorHandle::propose()`
 /// - No write lock contention - each partition processes independently
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
-pub async fn batcher_task_actor(
+pub async fn batcher_task_actor<S: Storage + Clone + Send + Sync + 'static>(
     mut rx: mpsc::Receiver<BatcherMessage>,
     router: Arc<PartitionRouter>,
-    batch_pending_proposals: Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
+    batch_pending_proposals: Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
+    >,
     batcher_stats: Arc<BatcherStats>,
     config: BatcherConfig,
     backpressure: Arc<BackpressureState>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<crate::partition_storage::ServerPartitionStorage>>>>>,
+    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
 ) {
     let mut batches: HashMap<GroupId, AccumulatedBatch> = HashMap::new();
     let linger_duration = Duration::from_millis(config.linger_ms);
@@ -1011,21 +1030,25 @@ pub async fn batcher_task_actor(
 /// Handles a submit request (actor mode).
 #[tracing::instrument(skip_all, name = "batcher_handle_submit_actor", fields(group_id = request.group_id.get()))]
 #[allow(clippy::too_many_arguments)]
-async fn handle_submit_actor(
+async fn handle_submit_actor<S: Storage + Clone + Send + Sync + 'static>(
     request: PendingBatchRequest,
     batches: &mut HashMap<GroupId, AccumulatedBatch>,
     router: &Arc<PartitionRouter>,
-    batch_pending_proposals: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
+    batch_pending_proposals: &Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
+    >,
     batcher_stats: &Arc<BatcherStats>,
     config: &BatcherConfig,
     backpressure: &Arc<BackpressureState>,
-    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<crate::partition_storage::ServerPartitionStorage>>>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
 ) {
     let group_id = request.group_id;
     #[allow(clippy::cast_possible_truncation)]
     let blob_size = request.blob.len() as u32;
 
-    let batch = batches.entry(group_id).or_insert_with(AccumulatedBatch::new);
+    let batch = batches
+        .entry(group_id)
+        .or_insert_with(AccumulatedBatch::new);
 
     // Check if adding this request would exceed limits.
     let would_exceed_bytes = batch.total_bytes + blob_size > config.max_batch_bytes;
@@ -1071,15 +1094,17 @@ async fn handle_submit_actor(
 /// partition actor via the router.
 #[tracing::instrument(skip_all, name = "batcher_flush_actor", fields(group_id = group_id.get(), batch_size = batch.request_count()))]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn flush_batch_actor(
+async fn flush_batch_actor<S: Storage + Clone + Send + Sync + 'static>(
     group_id: GroupId,
     batch: AccumulatedBatch,
     router: &Arc<PartitionRouter>,
-    batch_pending_proposals: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>>,
+    batch_pending_proposals: &Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
+    >,
     batcher_stats: &Arc<BatcherStats>,
     reason: FlushReason,
     backpressure: &Arc<BackpressureState>,
-    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<crate::partition_storage::ServerPartitionStorage>>>>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
 ) {
     let batch_size = batch.request_count();
     let batch_bytes = batch.total_bytes;
@@ -1192,7 +1217,10 @@ async fn flush_batch_actor(
     };
 
     // Encode the batch command with the leader-assigned base_offset.
-    let command = PartitionCommand::AppendBlobBatch { blobs: batch.blobs, base_offset };
+    let command = PartitionCommand::AppendBlobBatch {
+        blobs: batch.blobs,
+        base_offset,
+    };
     let command_data = command.encode();
 
     // Build batch proposal info for the partition actor.
@@ -1214,7 +1242,9 @@ async fn flush_batch_actor(
 
     // Propose batch to the partition actor (lock-free!).
     // The partition actor stores the batch info internally, so no race condition.
-    let propose_result = partition_handle.propose_batch(command_data, batch_info).await;
+    let propose_result = partition_handle
+        .propose_batch(command_data, batch_info)
+        .await;
 
     if let Err(e) = propose_result {
         // Propose failed (channel closed).
@@ -1241,8 +1271,7 @@ async fn flush_batch_actor(
 
     debug!(
         group_id = group_id.get(),
-        batch_size,
-        "Batch sent to partition actor"
+        batch_size, "Batch sent to partition actor"
     );
 
     // Note: batch_pending_proposals is no longer used in actor mode.
@@ -1254,9 +1283,11 @@ async fn flush_batch_actor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::partition_storage::ServerPartitionStorage;
     use crate::service::partition_actor::{spawn_partition_actor, PartitionActorConfig};
     use helix_core::NodeId;
     use helix_raft::{RaftConfig, RaftNode};
+    use helix_wal::TokioStorage;
 
     fn create_test_raft_node(node_id: u64, cluster: Vec<u64>) -> RaftNode {
         let config = RaftConfig::new(
@@ -1283,7 +1314,8 @@ mod tests {
         let (batcher_handle, batcher_rx, backpressure) = create_batcher();
         let batch_pending_proposals = Arc::new(RwLock::new(HashMap::new()));
         let batcher_stats = Arc::new(BatcherStats::default());
-        let partition_storage = Arc::new(RwLock::new(HashMap::new()));
+        let partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
         let config = BatcherConfig {
             linger_ms: 1,
             max_batch_bytes: 64 * 1024,
@@ -1291,7 +1323,7 @@ mod tests {
         };
 
         // Spawn batcher task.
-        let batcher_task = tokio::spawn(batcher_task_actor(
+        let batcher_task = tokio::spawn(batcher_task_actor::<TokioStorage>(
             batcher_rx,
             Arc::clone(&router),
             Arc::clone(&batch_pending_proposals),
@@ -1331,7 +1363,8 @@ mod tests {
         let (batcher_handle, batcher_rx, backpressure) = create_batcher();
         let batch_pending_proposals = Arc::new(RwLock::new(HashMap::new()));
         let batcher_stats = Arc::new(BatcherStats::default());
-        let partition_storage = Arc::new(RwLock::new(HashMap::new()));
+        let partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
         let config = BatcherConfig {
             linger_ms: 1,
             max_batch_bytes: 64 * 1024,
@@ -1339,7 +1372,7 @@ mod tests {
         };
 
         // Spawn batcher task.
-        let batcher_task = tokio::spawn(batcher_task_actor(
+        let batcher_task = tokio::spawn(batcher_task_actor::<TokioStorage>(
             batcher_rx,
             Arc::clone(&router),
             Arc::clone(&batch_pending_proposals),
@@ -1384,14 +1417,15 @@ mod tests {
         let (batcher_handle, batcher_rx, backpressure) = create_batcher();
         let batch_pending_proposals = Arc::new(RwLock::new(HashMap::new()));
         let batcher_stats = Arc::new(BatcherStats::default());
-        let partition_storage = Arc::new(RwLock::new(HashMap::new()));
+        let partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
         let config = BatcherConfig {
             linger_ms: 1,
             max_batch_bytes: 64 * 1024,
             max_batch_requests: 100,
         };
 
-        let batcher_task = tokio::spawn(batcher_task_actor(
+        let batcher_task = tokio::spawn(batcher_task_actor::<TokioStorage>(
             batcher_rx,
             Arc::clone(&router),
             Arc::clone(&batch_pending_proposals),
