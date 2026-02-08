@@ -155,7 +155,9 @@ impl<S: Storage> SharedWal<S> {
     /// even if they haven't been synced yet.
     #[must_use]
     pub fn partition_last_index(&self, partition_id: PartitionId) -> Option<u64> {
-        self.partition_state.get(&partition_id).map(|s| s.last_index)
+        self.partition_state
+            .get(&partition_id)
+            .map(|s| s.last_index)
     }
 
     /// Appends an entry for a partition.
@@ -296,7 +298,8 @@ impl<S: Storage> SharedWal<S> {
     /// the durable indices.
     pub fn update_partition_durable_indices(&mut self) {
         for (partition_id, state) in &self.partition_state {
-            self.partition_durable.insert(*partition_id, state.last_index);
+            self.partition_durable
+                .insert(*partition_id, state.last_index);
         }
     }
 
@@ -346,7 +349,8 @@ impl<S: Storage> SharedWal<S> {
         // else: no entries for this partition yet, truncation is a no-op
 
         // Record truncation point for filtering during reads.
-        self.partition_truncated_after.insert(partition_id, after_index);
+        self.partition_truncated_after
+            .insert(partition_id, after_index);
 
         // Update partition state so next append expects after_index + 1.
         // We preserve the term from the entry at after_index (or allow any term for new entries).
@@ -433,7 +437,8 @@ impl<S: Storage> SharedWal<S> {
 
         // Recovered entries are durable - update per-partition durable indices.
         for (partition_id, state) in &self.partition_state {
-            self.partition_durable.insert(*partition_id, state.last_index);
+            self.partition_durable
+                .insert(*partition_id, state.last_index);
         }
 
         // Clear truncation tracking since we've recovered to a consistent state.
@@ -585,7 +590,7 @@ impl CoordinatorConfig {
             wal_config: SharedWalConfig::new(dir),
             flush_interval: Duration::from_millis(1),
             max_buffer_entries: 1000,
-            max_buffer_bytes: 16 * 1024 * 1024, // 16 MB
+            max_buffer_bytes: 16 * 1024 * 1024,     // 16 MB
             durability: WriteDurability::default(), // ReplicationOnly for throughput
         }
     }
@@ -864,7 +869,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
     /// Returns information about a sealed segment.
     ///
     /// Returns `None` if the segment doesn't exist or is the active segment.
-    pub async fn segment_info(&self, segment_id: crate::SegmentId) -> Option<crate::wal::SegmentInfo> {
+    pub async fn segment_info(
+        &self,
+        segment_id: crate::SegmentId,
+    ) -> Option<crate::wal::SegmentInfo> {
         let wal = self.inner.wal.lock().await;
         wal.segment_info(segment_id)
     }
@@ -1173,7 +1181,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
     /// Returns information about a sealed segment.
     ///
     /// Returns `None` if the segment doesn't exist or is the active segment.
-    pub async fn segment_info(&self, segment_id: crate::SegmentId) -> Option<crate::wal::SegmentInfo> {
+    pub async fn segment_info(
+        &self,
+        segment_id: crate::SegmentId,
+    ) -> Option<crate::wal::SegmentInfo> {
         let wal = self.inner.wal.lock().await;
         wal.segment_info(segment_id)
     }
@@ -1612,9 +1623,7 @@ mod tests {
 
         // Reopen and recover.
         {
-            let mut wal = SharedWal::open(TokioStorage::new(), config)
-                .await
-                .unwrap();
+            let mut wal = SharedWal::open(TokioStorage::new(), config).await.unwrap();
 
             let by_partition = wal.recover().unwrap();
 
@@ -1782,12 +1791,8 @@ mod tests {
         assert!(wal.read(p1, 5).is_none());
 
         // Can append new entries starting from 4.
-        wal.append(p1, 2, 4, Bytes::from("p1-4-new"))
-            .await
-            .unwrap();
-        wal.append(p1, 2, 5, Bytes::from("p1-5-new"))
-            .await
-            .unwrap();
+        wal.append(p1, 2, 4, Bytes::from("p1-4-new")).await.unwrap();
+        wal.append(p1, 2, 5, Bytes::from("p1-5-new")).await.unwrap();
         wal.sync().await.unwrap();
 
         // Now we should have 5 entries: 1, 2, 3, 4-new, 5-new.
@@ -1834,9 +1839,7 @@ mod tests {
 
         // Phase 2: Recover and verify last-write-wins.
         {
-            let mut wal = SharedWal::open(TokioStorage::new(), config)
-                .await
-                .unwrap();
+            let mut wal = SharedWal::open(TokioStorage::new(), config).await.unwrap();
 
             let by_partition = wal.recover().unwrap();
             let entries = by_partition.get(&p1).unwrap();
@@ -1910,9 +1913,7 @@ mod tests {
         assert_eq!(wal.entries_for_partition(p2).len(), 5);
 
         // Append new entries to p1.
-        wal.append(p1, 2, 3, Bytes::from("p1-3-new"))
-            .await
-            .unwrap();
+        wal.append(p1, 2, 3, Bytes::from("p1-3-new")).await.unwrap();
         wal.sync().await.unwrap();
 
         assert_eq!(wal.entries_for_partition(p1).len(), 3);
@@ -1938,8 +1939,8 @@ mod coordinator_tests {
     #[tokio::test]
     async fn test_coordinator_basic() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let config = CoordinatorConfig::new(temp_dir.path())
-            .with_flush_interval(Duration::from_millis(10));
+        let config =
+            CoordinatorConfig::new(temp_dir.path()).with_flush_interval(Duration::from_millis(10));
 
         let coordinator = SharedWalCoordinator::open(TokioStorage::new(), config)
             .await
@@ -1974,8 +1975,8 @@ mod coordinator_tests {
     #[tokio::test]
     async fn test_coordinator_sequential_writes() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let config = CoordinatorConfig::new(temp_dir.path())
-            .with_flush_interval(Duration::from_millis(5));
+        let config =
+            CoordinatorConfig::new(temp_dir.path()).with_flush_interval(Duration::from_millis(5));
 
         let coordinator = SharedWalCoordinator::open(TokioStorage::new(), config)
             .await
@@ -1986,7 +1987,10 @@ mod coordinator_tests {
 
         // Sequential writes.
         for i in 1..=10u64 {
-            let ack = h1.append(1, i, Bytes::from(format!("entry-{i}"))).await.unwrap();
+            let ack = h1
+                .append(1, i, Bytes::from(format!("entry-{i}")))
+                .await
+                .unwrap();
             assert_eq!(ack.index, i);
         }
 
@@ -1998,8 +2002,8 @@ mod coordinator_tests {
     #[tokio::test]
     async fn test_coordinator_multi_partition_concurrent() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let config = CoordinatorConfig::new(temp_dir.path())
-            .with_flush_interval(Duration::from_millis(5));
+        let config =
+            CoordinatorConfig::new(temp_dir.path()).with_flush_interval(Duration::from_millis(5));
 
         let coordinator = SharedWalCoordinator::open(TokioStorage::new(), config)
             .await
@@ -2042,8 +2046,8 @@ mod coordinator_tests {
     #[tokio::test]
     async fn test_coordinator_recovery() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let config = CoordinatorConfig::new(temp_dir.path())
-            .with_flush_interval(Duration::from_millis(5));
+        let config =
+            CoordinatorConfig::new(temp_dir.path()).with_flush_interval(Duration::from_millis(5));
 
         let p1 = PartitionId::new(1);
         let p2 = PartitionId::new(2);
@@ -2058,8 +2062,12 @@ mod coordinator_tests {
             let h2 = coordinator.handle(p2);
 
             for i in 1..=5u64 {
-                h1.append(1, i, Bytes::from(format!("p1-{i}"))).await.unwrap();
-                h2.append(1, i, Bytes::from(format!("p2-{i}"))).await.unwrap();
+                h1.append(1, i, Bytes::from(format!("p1-{i}")))
+                    .await
+                    .unwrap();
+                h2.append(1, i, Bytes::from(format!("p2-{i}")))
+                    .await
+                    .unwrap();
             }
 
             coordinator.shutdown().await.unwrap();
@@ -2090,8 +2098,8 @@ mod coordinator_tests {
     #[tokio::test]
     async fn test_coordinator_handle_clone() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let config = CoordinatorConfig::new(temp_dir.path())
-            .with_flush_interval(Duration::from_millis(5));
+        let config =
+            CoordinatorConfig::new(temp_dir.path()).with_flush_interval(Duration::from_millis(5));
 
         let coordinator = SharedWalCoordinator::open(TokioStorage::new(), config)
             .await
@@ -2103,7 +2111,10 @@ mod coordinator_tests {
 
         // Both handles can write.
         h1.append(1, 1, Bytes::from("from-original")).await.unwrap();
-        h1_clone.append(1, 2, Bytes::from("from-clone")).await.unwrap();
+        h1_clone
+            .append(1, 2, Bytes::from("from-clone"))
+            .await
+            .unwrap();
 
         assert_eq!(coordinator.entry_count().await, 2);
 
@@ -2113,8 +2124,8 @@ mod coordinator_tests {
     #[tokio::test]
     async fn test_coordinator_flush() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let config = CoordinatorConfig::new(temp_dir.path())
-            .with_flush_interval(Duration::from_secs(60)); // Long interval
+        let config =
+            CoordinatorConfig::new(temp_dir.path()).with_flush_interval(Duration::from_secs(60)); // Long interval
 
         let coordinator = SharedWalCoordinator::open(TokioStorage::new(), config)
             .await
@@ -2139,8 +2150,8 @@ mod coordinator_tests {
     #[tokio::test]
     async fn test_coordinator_shutdown_flushes() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let config = CoordinatorConfig::new(temp_dir.path())
-            .with_flush_interval(Duration::from_secs(60)); // Long interval
+        let config =
+            CoordinatorConfig::new(temp_dir.path()).with_flush_interval(Duration::from_secs(60)); // Long interval
 
         let p1 = PartitionId::new(1);
 
@@ -2174,8 +2185,8 @@ mod coordinator_tests {
     #[tokio::test]
     async fn test_coordinator_durable_index() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let config = CoordinatorConfig::new(temp_dir.path())
-            .with_flush_interval(Duration::from_millis(5));
+        let config =
+            CoordinatorConfig::new(temp_dir.path()).with_flush_interval(Duration::from_millis(5));
 
         let coordinator = SharedWalCoordinator::open(TokioStorage::new(), config)
             .await
@@ -2210,8 +2221,8 @@ mod pool_tests {
     #[tokio::test]
     async fn test_pool_basic() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let config = PoolConfig::new(temp_dir.path(), 2)
-            .with_flush_interval(Duration::from_millis(10));
+        let config =
+            PoolConfig::new(temp_dir.path(), 2).with_flush_interval(Duration::from_millis(10));
 
         let pool = SharedWalPool::open(TokioStorage::new(), config)
             .await
@@ -2254,8 +2265,8 @@ mod pool_tests {
 
         // Write entries.
         {
-            let config = PoolConfig::new(&base_path, 4)
-                .with_flush_interval(Duration::from_millis(5));
+            let config =
+                PoolConfig::new(&base_path, 4).with_flush_interval(Duration::from_millis(5));
 
             let pool = SharedWalPool::open(TokioStorage::new(), config)
                 .await
@@ -2273,8 +2284,8 @@ mod pool_tests {
 
         // Recover entries.
         {
-            let config = PoolConfig::new(&base_path, 4)
-                .with_flush_interval(Duration::from_millis(5));
+            let config =
+                PoolConfig::new(&base_path, 4).with_flush_interval(Duration::from_millis(5));
 
             let pool = SharedWalPool::open(TokioStorage::new(), config)
                 .await

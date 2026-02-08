@@ -21,9 +21,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use bytes::Bytes;
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use tempfile::TempDir;
 use tokio::runtime::Builder;
 use tokio::time::Instant;
@@ -61,16 +59,17 @@ struct BenchConfig {
 
 impl BenchConfig {
     fn name(&self) -> String {
-        let sync = if self.sync_each { "_sync_each" } else { "_sync_end" };
+        let sync = if self.sync_each {
+            "_sync_each"
+        } else {
+            "_sync_end"
+        };
         format!("{}B_x{}{}", self.data_size, self.entry_count, sync)
     }
 }
 
 /// Generic benchmark runner for any storage backend.
-async fn run_write_benchmark<S: Storage + 'static>(
-    storage: S,
-    config: &BenchConfig,
-) -> Duration {
+async fn run_write_benchmark<S: Storage + 'static>(storage: S, config: &BenchConfig) -> Duration {
     let temp_dir = create_temp_dir();
     let wal_config = WalConfig::new(temp_dir.path()).with_sync_on_write(config.sync_each);
     let mut wal = Wal::open(storage, wal_config)
@@ -102,11 +101,27 @@ fn bench_tokio_storage(c: &mut Criterion) {
 
     let configs = vec![
         // Sync at end (batched) - typical use case
-        BenchConfig { data_size: 1024, entry_count: 1000, sync_each: false },
-        BenchConfig { data_size: 1024, entry_count: 10000, sync_each: false },
+        BenchConfig {
+            data_size: 1024,
+            entry_count: 1000,
+            sync_each: false,
+        },
+        BenchConfig {
+            data_size: 1024,
+            entry_count: 10000,
+            sync_each: false,
+        },
         // Sync each write (worst case for fsync overhead)
-        BenchConfig { data_size: 1024, entry_count: 100, sync_each: true },
-        BenchConfig { data_size: 1024, entry_count: 1000, sync_each: true },
+        BenchConfig {
+            data_size: 1024,
+            entry_count: 100,
+            sync_each: true,
+        },
+        BenchConfig {
+            data_size: 1024,
+            entry_count: 1000,
+            sync_each: true,
+        },
     ];
 
     let mut group = c.benchmark_group("storage_tokio");
@@ -147,11 +162,27 @@ fn bench_io_uring_storage(c: &mut Criterion) {
 
     let configs = vec![
         // Sync at end (batched) - typical use case
-        BenchConfig { data_size: 1024, entry_count: 1000, sync_each: false },
-        BenchConfig { data_size: 1024, entry_count: 10000, sync_each: false },
+        BenchConfig {
+            data_size: 1024,
+            entry_count: 1000,
+            sync_each: false,
+        },
+        BenchConfig {
+            data_size: 1024,
+            entry_count: 10000,
+            sync_each: false,
+        },
         // Sync each write (worst case for fsync overhead)
-        BenchConfig { data_size: 1024, entry_count: 100, sync_each: true },
-        BenchConfig { data_size: 1024, entry_count: 1000, sync_each: true },
+        BenchConfig {
+            data_size: 1024,
+            entry_count: 100,
+            sync_each: true,
+        },
+        BenchConfig {
+            data_size: 1024,
+            entry_count: 1000,
+            sync_each: true,
+        },
     ];
 
     // Create storage once and reuse across iterations (it's cloneable).
@@ -197,9 +228,30 @@ fn bench_comparison(c: &mut Criterion) {
 
     // Focus on the most meaningful comparisons
     let configs = vec![
-        ("1KB_x1000_sync_end", BenchConfig { data_size: 1024, entry_count: 1000, sync_each: false }),
-        ("1KB_x1000_sync_each", BenchConfig { data_size: 1024, entry_count: 1000, sync_each: true }),
-        ("4KB_x1000_sync_end", BenchConfig { data_size: 4096, entry_count: 1000, sync_each: false }),
+        (
+            "1KB_x1000_sync_end",
+            BenchConfig {
+                data_size: 1024,
+                entry_count: 1000,
+                sync_each: false,
+            },
+        ),
+        (
+            "1KB_x1000_sync_each",
+            BenchConfig {
+                data_size: 1024,
+                entry_count: 1000,
+                sync_each: true,
+            },
+        ),
+        (
+            "4KB_x1000_sync_end",
+            BenchConfig {
+                data_size: 4096,
+                entry_count: 1000,
+                sync_each: false,
+            },
+        ),
     ];
 
     // Create io_uring storage once and reuse across iterations.
@@ -214,40 +266,32 @@ fn bench_comparison(c: &mut Criterion) {
         group.throughput(Throughput::Elements(config.entry_count as u64));
 
         // TokioStorage
-        group.bench_with_input(
-            BenchmarkId::new("tokio", *name),
-            config,
-            |b, cfg| {
-                b.iter_custom(|iters| {
-                    rt.block_on(async {
-                        let mut total = Duration::ZERO;
-                        for _ in 0..iters {
-                            total += run_write_benchmark(TokioStorage::new(), cfg).await;
-                        }
-                        total
-                    })
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("tokio", *name), config, |b, cfg| {
+            b.iter_custom(|iters| {
+                rt.block_on(async {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        total += run_write_benchmark(TokioStorage::new(), cfg).await;
+                    }
+                    total
+                })
+            });
+        });
 
         // IoUringWorkerStorage
         let io_uring_storage = io_uring_storage.clone();
-        group.bench_with_input(
-            BenchmarkId::new("io_uring", *name),
-            config,
-            |b, cfg| {
-                b.iter_custom(|iters| {
-                    let storage = io_uring_storage.clone();
-                    rt.block_on(async {
-                        let mut total = Duration::ZERO;
-                        for _ in 0..iters {
-                            total += run_write_benchmark(storage.clone(), cfg).await;
-                        }
-                        total
-                    })
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("io_uring", *name), config, |b, cfg| {
+            b.iter_custom(|iters| {
+                let storage = io_uring_storage.clone();
+                rt.block_on(async {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        total += run_write_benchmark(storage.clone(), cfg).await;
+                    }
+                    total
+                })
+            });
+        });
     }
 
     group.finish();

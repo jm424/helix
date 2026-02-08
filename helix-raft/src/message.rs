@@ -310,7 +310,13 @@ pub struct AppendEntriesResponse {
 impl AppendEntriesResponse {
     /// Creates a new `AppendEntries` response.
     #[must_use]
-    pub const fn new(term: TermId, from: NodeId, to: NodeId, success: bool, match_index: LogIndex) -> Self {
+    pub const fn new(
+        term: TermId,
+        from: NodeId,
+        to: NodeId,
+        success: bool,
+        match_index: LogIndex,
+    ) -> Self {
         Self {
             term,
             from,
@@ -447,7 +453,13 @@ pub struct InstallSnapshotResponse {
 impl InstallSnapshotResponse {
     /// Creates a new `InstallSnapshot` response.
     #[must_use]
-    pub const fn new(term: TermId, from: NodeId, to: NodeId, success: bool, next_offset: u64) -> Self {
+    pub const fn new(
+        term: TermId,
+        from: NodeId,
+        to: NodeId,
+        success: bool,
+        next_offset: u64,
+    ) -> Self {
         Self {
             term,
             from,
@@ -507,11 +519,7 @@ mod tests {
 
     #[test]
     fn test_append_entries_with_entries() {
-        let entry = LogEntry::new(
-            TermId::new(1),
-            LogIndex::new(1),
-            Bytes::from("test"),
-        );
+        let entry = LogEntry::new(TermId::new(1), LogIndex::new(1), Bytes::from("test"));
         let req = AppendEntriesRequest::new(
             TermId::new(1),
             NodeId::new(1),

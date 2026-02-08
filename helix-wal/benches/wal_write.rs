@@ -16,9 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use hdrhistogram::Histogram;
 use tempfile::TempDir;
 use tokio::runtime::Builder;
@@ -54,7 +52,9 @@ fn bench_base_dir() -> Option<PathBuf> {
 /// Uses HELIX_BENCH_DIR env var if set, otherwise system temp directory.
 async fn setup_wal(sync_on_write: bool) -> (Wal<TokioStorage>, TempDir) {
     let tempdir = match bench_base_dir() {
-        Some(base) => tempfile::tempdir_in(base).expect("failed to create temp dir in HELIX_BENCH_DIR"),
+        Some(base) => {
+            tempfile::tempdir_in(base).expect("failed to create temp dir in HELIX_BENCH_DIR")
+        }
         None => tempfile::tempdir().expect("failed to create temp dir"),
     };
     let config = WalConfig::new(tempdir.path()).with_sync_on_write(sync_on_write);

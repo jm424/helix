@@ -94,9 +94,7 @@ impl RaftLog {
     /// Returns the term of the last entry, or 0 if empty.
     #[must_use]
     pub fn last_term(&self) -> TermId {
-        self.entries
-            .last()
-            .map_or(TermId::new(0), |e| e.term)
+        self.entries.last().map_or(TermId::new(0), |e| e.term)
     }
 
     /// Gets an entry by index.

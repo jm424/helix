@@ -461,7 +461,10 @@ mod tests {
         }
 
         transfer.start_catchup(50);
-        assert!(matches!(transfer.state, TransferState::CatchingUp { lag: 50 }));
+        assert!(matches!(
+            transfer.state,
+            TransferState::CatchingUp { lag: 50 }
+        ));
 
         transfer.update_lag(0);
         transfer.start_switching();

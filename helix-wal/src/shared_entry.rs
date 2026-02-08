@@ -73,7 +73,8 @@ impl SharedEntryHeader {
 
         // TigerStyle: Check limits explicitly.
         if length > ENTRY_LENGTH_MAX as usize {
-            #[allow(clippy::cast_possible_truncation)] // Truncated value is fine for error reporting.
+            #[allow(clippy::cast_possible_truncation)]
+            // Truncated value is fine for error reporting.
             return Err(WalError::EntryTooLarge {
                 size: length as u32,
                 max: ENTRY_LENGTH_MAX,
@@ -117,8 +118,13 @@ impl SharedEntryHeader {
     /// # Errors
     /// Returns `ChecksumMismatch` if the CRC doesn't match.
     pub fn verify(&self, payload: &[u8], offset: u64) -> WalResult<()> {
-        let expected =
-            Self::compute_crc(self.length, self.partition_id, self.term, self.index, payload);
+        let expected = Self::compute_crc(
+            self.length,
+            self.partition_id,
+            self.term,
+            self.index,
+            payload,
+        );
         if expected != self.crc {
             return Err(WalError::ChecksumMismatch {
                 offset,
@@ -346,8 +352,7 @@ mod tests {
 
     #[test]
     fn test_shared_entry_checksum_detects_corruption() {
-        let entry =
-            SharedEntry::new(PartitionId::new(1), 1, 1, Bytes::from("test")).unwrap();
+        let entry = SharedEntry::new(PartitionId::new(1), 1, 1, Bytes::from("test")).unwrap();
 
         let mut buf = BytesMut::new();
         entry.encode(&mut buf);
@@ -371,8 +376,7 @@ mod tests {
     #[test]
     fn test_shared_entry_header_size() {
         // Verify our constant matches actual encoded size.
-        let header =
-            SharedEntryHeader::new(PartitionId::new(1), 1, 1, &[]).unwrap();
+        let header = SharedEntryHeader::new(PartitionId::new(1), 1, 1, &[]).unwrap();
         let mut buf = BytesMut::new();
         header.encode(&mut buf);
         assert_eq!(buf.len(), SHARED_ENTRY_HEADER_SIZE);
@@ -380,8 +384,7 @@ mod tests {
 
     #[test]
     fn test_truncated_shared_entry() {
-        let entry =
-            SharedEntry::new(PartitionId::new(1), 1, 1, Bytes::from("hello")).unwrap();
+        let entry = SharedEntry::new(PartitionId::new(1), 1, 1, Bytes::from("hello")).unwrap();
         let mut buf = BytesMut::new();
         entry.encode(&mut buf);
 
@@ -395,8 +398,7 @@ mod tests {
     #[test]
     fn test_shared_entry_walentry_trait() {
         // Verify SharedEntry implements WalEntry correctly.
-        let entry =
-            SharedEntry::new(PartitionId::new(99), 5, 42, Bytes::from("data")).unwrap();
+        let entry = SharedEntry::new(PartitionId::new(99), 5, 42, Bytes::from("data")).unwrap();
 
         // Check trait constants and methods.
         assert_eq!(SharedEntry::HEADER_SIZE, SHARED_ENTRY_HEADER_SIZE);
@@ -419,12 +421,9 @@ mod tests {
     #[test]
     fn test_shared_entry_multiple_partitions() {
         // Test entries from different partitions can be distinguished.
-        let entry1 =
-            SharedEntry::new(PartitionId::new(1), 1, 1, Bytes::from("p1")).unwrap();
-        let entry2 =
-            SharedEntry::new(PartitionId::new(2), 1, 1, Bytes::from("p2")).unwrap();
-        let entry3 =
-            SharedEntry::new(PartitionId::new(1), 1, 2, Bytes::from("p1-2")).unwrap();
+        let entry1 = SharedEntry::new(PartitionId::new(1), 1, 1, Bytes::from("p1")).unwrap();
+        let entry2 = SharedEntry::new(PartitionId::new(2), 1, 1, Bytes::from("p2")).unwrap();
+        let entry3 = SharedEntry::new(PartitionId::new(1), 1, 2, Bytes::from("p1-2")).unwrap();
 
         assert_ne!(entry1.partition_id(), entry2.partition_id());
         assert_eq!(entry1.partition_id(), entry3.partition_id());

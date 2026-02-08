@@ -105,7 +105,10 @@ impl ShardRouter {
         let hash = Self::hash_key(key);
 
         // Find the responsible group.
-        let group_id = self.shard_map.lookup(hash).ok_or(RoutingError::NoShardForKey { hash })?;
+        let group_id = self
+            .shard_map
+            .lookup(hash)
+            .ok_or(RoutingError::NoShardForKey { hash })?;
 
         // Check the leader cache.
         if let Some(node_id) = self.leader_cache.get(group_id, current_time_us) {
@@ -125,12 +128,11 @@ impl ShardRouter {
     ///
     /// Returns `RoutingError::NoShardForKey` if no shard covers the hash.
     /// Returns `RoutingError::LeaderUnknown` if the leader is not cached.
-    pub fn route_hash(
-        &self,
-        hash: u32,
-        current_time_us: u64,
-    ) -> Result<RouteResult, RoutingError> {
-        let group_id = self.shard_map.lookup(hash).ok_or(RoutingError::NoShardForKey { hash })?;
+    pub fn route_hash(&self, hash: u32, current_time_us: u64) -> Result<RouteResult, RoutingError> {
+        let group_id = self
+            .shard_map
+            .lookup(hash)
+            .ok_or(RoutingError::NoShardForKey { hash })?;
 
         if let Some(node_id) = self.leader_cache.get(group_id, current_time_us) {
             return Ok(RouteResult {

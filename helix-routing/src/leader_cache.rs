@@ -86,9 +86,7 @@ impl LeaderCache {
     /// If the cache is full, the oldest entry is evicted.
     pub fn put(&mut self, group_id: GroupId, leader: NodeId, current_time_us: u64) {
         // Check if we need to evict.
-        if self.entries.len() >= self.config.max_entries
-            && !self.entries.contains_key(&group_id)
-        {
+        if self.entries.len() >= self.config.max_entries && !self.entries.contains_key(&group_id) {
             self.evict_oldest();
         }
 

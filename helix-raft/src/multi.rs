@@ -484,11 +484,7 @@ impl MultiRaft {
     ///
     /// Returns outputs if this node is the leader of the group.
     /// Returns `None` if not leader or group doesn't exist.
-    pub fn propose(
-        &mut self,
-        group_id: GroupId,
-        data: Bytes,
-    ) -> Option<Vec<MultiRaftOutput>> {
+    pub fn propose(&mut self, group_id: GroupId, data: Bytes) -> Option<Vec<MultiRaftOutput>> {
         let info = self.groups.get_mut(&group_id)?;
 
         let request = ClientRequest::new(data);
@@ -522,11 +518,7 @@ impl MultiRaft {
     /// If the group doesn't exist and `default_peers` is set, the group
     /// is auto-created before processing the message. This enables nodes
     /// to rejoin groups after recovery without explicit group creation.
-    pub fn handle_message(
-        &mut self,
-        group_id: GroupId,
-        message: Message,
-    ) -> Vec<MultiRaftOutput> {
+    pub fn handle_message(&mut self, group_id: GroupId, message: Message) -> Vec<MultiRaftOutput> {
         // Auto-create group if it doesn't exist and we have default peers.
         if !self.groups.contains_key(&group_id) {
             if let Some(ref peers) = self.default_peers {

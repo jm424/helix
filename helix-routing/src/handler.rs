@@ -132,7 +132,10 @@ impl std::fmt::Display for HandlerError {
         match self {
             Self::GroupNotFound(id) => write!(f, "group {} not found", id.get()),
             Self::SnapshotNotFound(id) => write!(f, "snapshot {id} not found"),
-            Self::NotLeader { group_id, leader_hint } => {
+            Self::NotLeader {
+                group_id,
+                leader_hint,
+            } => {
                 write!(f, "not leader of group {}", group_id.get())?;
                 if let Some(leader) = leader_hint {
                     write!(f, " (leader hint: {leader})")?;
@@ -140,17 +143,38 @@ impl std::fmt::Display for HandlerError {
                 Ok(())
             }
             Self::SnapshotCreationFailed { group_id, reason } => {
-                write!(f, "snapshot creation failed for group {}: {}", group_id.get(), reason)
+                write!(
+                    f,
+                    "snapshot creation failed for group {}: {}",
+                    group_id.get(),
+                    reason
+                )
             }
             Self::SnapshotInstallFailed { group_id, reason } => {
-                write!(f, "snapshot install failed for group {}: {}", group_id.get(), reason)
+                write!(
+                    f,
+                    "snapshot install failed for group {}: {}",
+                    group_id.get(),
+                    reason
+                )
             }
-            Self::InvalidChunkOffset { offset, snapshot_size } => {
-                write!(f, "invalid chunk offset {offset} (snapshot size: {snapshot_size})")
+            Self::InvalidChunkOffset {
+                offset,
+                snapshot_size,
+            } => {
+                write!(
+                    f,
+                    "invalid chunk offset {offset} (snapshot size: {snapshot_size})"
+                )
             }
             Self::ShardRangeNotFound { group_id, range } => {
-                write!(f, "shard range {}-{} not found in group {}",
-                       range.start, range.end, group_id.get())
+                write!(
+                    f,
+                    "shard range {}-{} not found in group {}",
+                    range.start,
+                    range.end,
+                    group_id.get()
+                )
             }
             Self::IoError(msg) => write!(f, "I/O error: {msg}"),
         }
@@ -333,7 +357,10 @@ mod tests {
             offset: 5000,
             snapshot_size: 1000,
         };
-        assert_eq!(err.to_string(), "invalid chunk offset 5000 (snapshot size: 1000)");
+        assert_eq!(
+            err.to_string(),
+            "invalid chunk offset 5000 (snapshot size: 1000)"
+        );
     }
 
     #[test]

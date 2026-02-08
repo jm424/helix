@@ -14,9 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use tempfile::TempDir;
 use tokio::runtime::Builder;
 use tokio::task::JoinSet;
@@ -57,7 +55,9 @@ fn bench_base_dir() -> Option<PathBuf> {
 /// Uses HELIX_BENCH_DIR env var if set, otherwise system temp directory.
 async fn setup_buffered_wal(flush_interval_ms: u64) -> (BufferedWal<TokioStorage>, TempDir) {
     let tempdir = match bench_base_dir() {
-        Some(base) => tempfile::tempdir_in(base).expect("failed to create temp dir in HELIX_BENCH_DIR"),
+        Some(base) => {
+            tempfile::tempdir_in(base).expect("failed to create temp dir in HELIX_BENCH_DIR")
+        }
         None => tempfile::tempdir().expect("failed to create temp dir"),
     };
     let wal_config = WalConfig::new(tempdir.path());
@@ -111,12 +111,9 @@ fn bench_buffered_wal_concurrent(c: &mut Criterion) {
                             let total_start = Instant::now();
 
                             for _ in 0..iters {
-                                let (wal, _tmp) =
-                                    setup_buffered_wal(cfg.flush_interval_ms).await;
+                                let (wal, _tmp) = setup_buffered_wal(cfg.flush_interval_ms).await;
                                 let wal = Arc::new(wal);
-                                let index_counter = Arc::new(
-                                    std::sync::atomic::AtomicU64::new(1),
-                                );
+                                let index_counter = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
                                 let mut join_set = JoinSet::new();
 
@@ -128,10 +125,8 @@ fn bench_buffered_wal_concurrent(c: &mut Criterion) {
 
                                     join_set.spawn(async move {
                                         for _ in 0..entries_count {
-                                            let idx = counter.fetch_add(
-                                                1,
-                                                std::sync::atomic::Ordering::Relaxed,
-                                            );
+                                            let idx = counter
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                             let entry = Entry::new(1, idx, data_clone.clone())
                                                 .expect("entry");
                                             black_box(
@@ -180,28 +175,32 @@ fn bench_buffered_wal_batch(c: &mut Criterion) {
         let id = format!("batch_{}", batch_size);
 
         // Buffered mode (10ms).
-        group.bench_with_input(BenchmarkId::new("buffered_10ms", &id), &batch_size, |b, &size| {
-            let data = Bytes::from(vec![0u8; data_size]);
+        group.bench_with_input(
+            BenchmarkId::new("buffered_10ms", &id),
+            &batch_size,
+            |b, &size| {
+                let data = Bytes::from(vec![0u8; data_size]);
 
-            b.iter_custom(|iters| {
-                rt.block_on(async {
-                    let total_start = Instant::now();
+                b.iter_custom(|iters| {
+                    rt.block_on(async {
+                        let total_start = Instant::now();
 
-                    for _ in 0..iters {
-                        let (wal, _tmp) = setup_buffered_wal(10).await;
+                        for _ in 0..iters {
+                            let (wal, _tmp) = setup_buffered_wal(10).await;
 
-                        let entries: Vec<Entry> = (1..=size as u64)
-                            .map(|i| Entry::new(1, i, data.clone()).unwrap())
-                            .collect();
+                            let entries: Vec<Entry> = (1..=size as u64)
+                                .map(|i| Entry::new(1, i, data.clone()).unwrap())
+                                .collect();
 
-                        black_box(wal.append_batch(entries).await.expect("batch"));
-                        wal.flush().await.expect("flush");
-                    }
+                            black_box(wal.append_batch(entries).await.expect("batch"));
+                            wal.flush().await.expect("flush");
+                        }
 
-                    total_start.elapsed()
-                })
-            });
-        });
+                        total_start.elapsed()
+                    })
+                });
+            },
+        );
 
         // Sync mode.
         group.bench_with_input(BenchmarkId::new("sync", &id), &batch_size, |b, &size| {
@@ -230,5 +229,9 @@ fn bench_buffered_wal_batch(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_buffered_wal_concurrent, bench_buffered_wal_batch);
+criterion_group!(
+    benches,
+    bench_buffered_wal_concurrent,
+    bench_buffered_wal_batch
+);
 criterion_main!(benches);

@@ -245,9 +245,9 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
         let mut gap_detected = false;
         let mut segments_to_remove: Vec<SegmentId> = Vec::new(); // Segments after gap
         let mut overlaps_to_fix: Vec<(SegmentId, u64)> = Vec::new(); // (segment_id, truncate_to)
-        // Track the max segment ID that contributed to valid_last_index.
-        // This prevents older segments (lower ID) from overriding newer segments
-        // (higher ID) that were processed earlier due to lower first_index.
+                                                                     // Track the max segment ID that contributed to valid_last_index.
+                                                                     // This prevents older segments (lower ID) from overriding newer segments
+                                                                     // (higher ID) that were processed earlier due to lower first_index.
         let mut max_contributing_id: Option<SegmentId> = None;
 
         // Skip gap/overlap detection for non-global-index entry types (e.g., SharedEntry).
@@ -325,8 +325,7 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
                 // any segment that already contributed. Lower id = older = stale data.
                 // A segment with lower first_index but higher id was already processed
                 // and its data should take precedence.
-                let dominated_by_newer = max_contributing_id
-                    .is_some_and(|max_id| *id < max_id);
+                let dominated_by_newer = max_contributing_id.is_some_and(|max_id| *id < max_id);
 
                 if dominated_by_newer {
                     // This segment is older (lower id) than one we've already used.
@@ -408,8 +407,7 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
 
                 info!(
                     segment_id = seg_id.get(),
-                    truncate_to,
-                    "Truncated overlapping segment"
+                    truncate_to, "Truncated overlapping segment"
                 );
             }
         }
@@ -562,7 +560,10 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
     ///
     /// Panics if entries is empty.
     pub async fn append_batch(&mut self, entries: &[E]) -> WalResult<u64> {
-        assert!(!entries.is_empty(), "append_batch requires at least one entry");
+        assert!(
+            !entries.is_empty(),
+            "append_batch requires at least one entry"
+        );
 
         // Calculate total size needed.
         let total_payload: u32 = entries.iter().map(E::payload_len).sum();
@@ -655,9 +656,8 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
                     // in-memory last_index is durable, because on crash we might recover
                     // extra entries from this segment's synced state.
                     if let Some(seg_last) = sealed.segment.last_index() {
-                        max_pending_synced_index = Some(
-                            max_pending_synced_index.map_or(seg_last, |m| m.max(seg_last)),
-                        );
+                        max_pending_synced_index =
+                            Some(max_pending_synced_index.map_or(seg_last, |m| m.max(seg_last)));
                     }
                 }
             }
@@ -755,11 +755,7 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
         self.sealed_segments
             .values()
             .flat_map(|s| s.segment.entries())
-            .chain(
-                self.active_segment
-                    .iter()
-                    .flat_map(|a| a.segment.entries()),
-            )
+            .chain(self.active_segment.iter().flat_map(|a| a.segment.entries()))
     }
 
     /// Returns the number of entries in the WAL.
@@ -870,8 +866,7 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
                 let _ = sealed.segment.truncate_entries_after(last_index_to_keep);
                 debug!(
                     segment_id = segment_id.get(),
-                    last_index_to_keep,
-                    "Truncated sealed segment (in-memory)"
+                    last_index_to_keep, "Truncated sealed segment (in-memory)"
                 );
 
                 // If segment is now empty, mark for deletion.
@@ -959,7 +954,10 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
             write_offset: SEGMENT_HEADER_SIZE as u64,
         });
 
-        info!(segment_id = segment_id.get(), first_index, "Created new segment");
+        info!(
+            segment_id = segment_id.get(),
+            first_index, "Created new segment"
+        );
         Ok(())
     }
 
@@ -1054,11 +1052,12 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
     ///
     /// Panics if the segment exists but is not sealed (invariant violation).
     pub fn read_segment_bytes(&self, segment_id: SegmentId) -> WalResult<bytes::Bytes> {
-        let sealed = self.sealed_segments.get(&segment_id).ok_or_else(|| {
-            WalError::SegmentNotFound {
-                segment_id: segment_id.get(),
-            }
-        })?;
+        let sealed =
+            self.sealed_segments
+                .get(&segment_id)
+                .ok_or_else(|| WalError::SegmentNotFound {
+                    segment_id: segment_id.get(),
+                })?;
 
         // TigerStyle: Assert preconditions.
         assert!(
@@ -1073,8 +1072,8 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::storage::TokioStorage;
+    use bytes::Bytes;
 
     #[tokio::test]
     async fn test_wal_append_and_read() {
@@ -1112,7 +1111,9 @@ mod tests {
 
         // Write some entries.
         {
-            let mut wal: Wal<TokioStorage> = Wal::open(TokioStorage::new(), config.clone()).await.unwrap();
+            let mut wal: Wal<TokioStorage> = Wal::open(TokioStorage::new(), config.clone())
+                .await
+                .unwrap();
             for i in 1..=10 {
                 let entry = Entry::new(1, i, Bytes::from(format!("data-{i}"))).unwrap();
                 wal.append(entry).await.unwrap();
@@ -1160,7 +1161,9 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let config = WalConfig::new(temp_dir.path());
 
-        let mut wal: Wal<TokioStorage> = Wal::open(TokioStorage::new(), config.clone()).await.unwrap();
+        let mut wal: Wal<TokioStorage> = Wal::open(TokioStorage::new(), config.clone())
+            .await
+            .unwrap();
 
         // Initially empty - both indices are None
         assert_eq!(wal.last_index(), None);
@@ -1209,7 +1212,9 @@ mod tests {
 
         // Create a WAL with SharedEntry type.
         let mut wal: Wal<TokioStorage, SharedEntry> =
-            Wal::open(TokioStorage::new(), config.clone()).await.unwrap();
+            Wal::open(TokioStorage::new(), config.clone())
+                .await
+                .unwrap();
         assert!(wal.is_empty());
 
         // Append entries from multiple partitions with partition-local indices.

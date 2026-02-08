@@ -122,7 +122,10 @@ impl SimpleRng {
     /// Generates the next random u32.
     const fn next_u32(&mut self) -> u32 {
         // LCG constants from Numerical Recipes.
-        self.state = self.state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        self.state = self
+            .state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
         (self.state >> 32) as u32
     }
 
@@ -673,12 +676,8 @@ impl RaftNode {
         // In observation mode, we're recovering from S3 and don't know the
         // current cluster state yet.
         if self.observation_mode {
-            let response = PreVoteResponse::new(
-                req.term,
-                self.config.node_id,
-                req.candidate_id,
-                false,
-            );
+            let response =
+                PreVoteResponse::new(req.term, self.config.node_id, req.candidate_id, false);
             outputs.push(RaftOutput::SendMessage(Message::PreVoteResponse(response)));
             return outputs;
         }
@@ -689,7 +688,9 @@ impl RaftNode {
         // 3. The candidate's log is at least as up-to-date as ours
         let vote_granted = req.term >= self.current_term
             && (self.leader_id.is_none() || req.term > self.current_term)
-            && self.log.is_up_to_date(req.last_log_term, req.last_log_index);
+            && self
+                .log
+                .is_up_to_date(req.last_log_term, req.last_log_index);
 
         let response = PreVoteResponse::new(
             req.term, // Echo back the proposed term.
@@ -824,7 +825,8 @@ impl RaftNode {
         }
 
         // Check if candidate's log is at least as up-to-date as ours.
-        self.log.is_up_to_date(req.last_log_term, req.last_log_index)
+        self.log
+            .is_up_to_date(req.last_log_term, req.last_log_index)
     }
 
     /// Handles a `RequestVote` response.
@@ -865,7 +867,8 @@ impl RaftNode {
         // inflight_count starts at 0 (no in-flight requests).
         let next_idx = LogIndex::new(self.log.last_index().get() + 1);
         for peer in self.config.peers() {
-            self.replication_state.insert(peer, ReplicationState::new(next_idx));
+            self.replication_state
+                .insert(peer, ReplicationState::new(next_idx));
         }
 
         // Postcondition: leader state initialized for all peers.
@@ -994,10 +997,7 @@ impl RaftNode {
     /// With pipelining, we may have multiple in-flight requests. On success,
     /// we update `match_index` and try to send more. On failure, we reset the
     /// pipeline and backtrack using the follower's `match_index` for fast backup.
-    fn handle_append_entries_response(
-        &mut self,
-        resp: AppendEntriesResponse,
-    ) -> Vec<RaftOutput> {
+    fn handle_append_entries_response(&mut self, resp: AppendEntriesResponse) -> Vec<RaftOutput> {
         let mut outputs = Vec::new();
 
         // Ignore if not leader or term doesn't match.
@@ -1127,10 +1127,7 @@ impl RaftNode {
     ///
     /// Note: Full implementation requires snapshot storage integration.
     /// This is a placeholder that acknowledges the snapshot.
-    fn handle_install_snapshot(
-        &mut self,
-        req: &InstallSnapshotRequest,
-    ) -> Vec<RaftOutput> {
+    fn handle_install_snapshot(&mut self, req: &InstallSnapshotRequest) -> Vec<RaftOutput> {
         let mut outputs = Vec::new();
 
         // Check term.
@@ -1189,10 +1186,7 @@ impl RaftNode {
     /// Note: Full implementation requires snapshot chunking and sending logic.
     /// This is a placeholder.
     #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
-    fn handle_install_snapshot_response(
-        &self,
-        _resp: InstallSnapshotResponse,
-    ) -> Vec<RaftOutput> {
+    fn handle_install_snapshot_response(&self, _resp: InstallSnapshotResponse) -> Vec<RaftOutput> {
         // Full implementation would:
         // 1. Track progress per follower
         // 2. Send next chunk if not complete
@@ -1238,7 +1232,8 @@ impl RaftNode {
             .map_or(LogIndex::new(0), |s| s.match_index);
         if target_match >= self.log.last_index() {
             // Target is already caught up, send TimeoutNow immediately.
-            let timeout_now = TimeoutNowRequest::new(self.current_term, self.config.node_id, target);
+            let timeout_now =
+                TimeoutNowRequest::new(self.current_term, self.config.node_id, target);
             outputs.push(RaftOutput::SendMessage(Message::TimeoutNow(timeout_now)));
         } else {
             // Send AppendEntries to catch up the target.
@@ -1431,7 +1426,11 @@ impl RaftNode {
 
         // Check each index from commit_index+1 to last_index.
         // Bounded loop: at most (last_index - commit_index) iterations.
-        let _loop_bound = self.log.last_index().get().saturating_sub(self.commit_index.get());
+        let _loop_bound = self
+            .log
+            .last_index()
+            .get()
+            .saturating_sub(self.commit_index.get());
         // Loop is bounded by the log length which is finite.
 
         for n in (self.commit_index.get() + 1)..=self.log.last_index().get() {
@@ -1618,7 +1617,10 @@ mod tests {
         let mut heartbeat_sent = false;
         for _ in 0..5 {
             let outputs = node.tick();
-            if outputs.iter().any(|o| matches!(o, RaftOutput::SendMessage(Message::AppendEntries(_)))) {
+            if outputs
+                .iter()
+                .any(|o| matches!(o, RaftOutput::SendMessage(Message::AppendEntries(_))))
+            {
                 heartbeat_sent = true;
                 break;
             }
@@ -1711,17 +1713,14 @@ mod tests {
         assert_eq!(vote_requests.len(), 2);
 
         // Phase 3: Receive vote from node 2.
-        let vote = RequestVoteResponse::new(
-            TermId::new(1),
-            NodeId::new(2),
-            NodeId::new(1),
-            true,
-        );
+        let vote = RequestVoteResponse::new(TermId::new(1), NodeId::new(2), NodeId::new(1), true);
         let outputs = node.handle_message(Message::RequestVoteResponse(vote));
 
         // Should be leader now (have 2 votes: self + node 2, quorum is 2).
         assert_eq!(node.state(), RaftState::Leader);
-        assert!(outputs.iter().any(|o| matches!(o, RaftOutput::BecameLeader)));
+        assert!(outputs
+            .iter()
+            .any(|o| matches!(o, RaftOutput::BecameLeader)));
     }
 
     #[test]
@@ -1792,21 +1791,24 @@ mod tests {
 
     #[test]
     fn test_single_node_cluster_commits_immediately() {
-        let config = RaftConfig::new(NodeId::new(1), vec![NodeId::new(1)])
-            .with_tick_config(5, 1);
+        let config = RaftConfig::new(NodeId::new(1), vec![NodeId::new(1)]).with_tick_config(5, 1);
         let mut node = RaftNode::new(config);
 
         // Tick until election triggers - should become leader immediately.
         let outputs = tick_until_election(&mut node);
         assert!(node.is_leader());
-        assert!(outputs.iter().any(|o| matches!(o, RaftOutput::BecameLeader)));
+        assert!(outputs
+            .iter()
+            .any(|o| matches!(o, RaftOutput::BecameLeader)));
 
         // Client request should commit immediately.
         // Note: no-op at index 1 is already committed, client request at index 2.
         let request = ClientRequest::new(Bytes::from("test"));
         let outputs = node.handle_client_request(request).unwrap();
 
-        assert!(outputs.iter().any(|o| matches!(o, RaftOutput::CommitEntry { .. })));
+        assert!(outputs
+            .iter()
+            .any(|o| matches!(o, RaftOutput::CommitEntry { .. })));
         assert_eq!(node.commit_index().get(), 2); // no-op + client request both committed
     }
 
@@ -1830,7 +1832,10 @@ mod tests {
 
         // At least two should be different (with high probability).
         let unique: std::collections::HashSet<_> = timeouts.iter().collect();
-        assert!(unique.len() >= 2, "Expected different timeouts, got {timeouts:?}");
+        assert!(
+            unique.len() >= 2,
+            "Expected different timeouts, got {timeouts:?}"
+        );
     }
 
     // ========================================================================
@@ -1908,7 +1913,10 @@ mod tests {
             .iter()
             .filter(|o| matches!(o, RaftOutput::SendMessage(Message::AppendEntries(_))))
             .count();
-        assert_eq!(sent_count, 1, "Should send new AppendEntries after freeing slot");
+        assert_eq!(
+            sent_count, 1,
+            "Should send new AppendEntries after freeing slot"
+        );
     }
 
     #[test]
@@ -2011,7 +2019,10 @@ mod tests {
         );
         node.handle_message(Message::AppendEntriesResponse(response));
 
-        assert_eq!(node.replication_state.get(&peer).unwrap().match_index.get(), 3);
+        assert_eq!(
+            node.replication_state.get(&peer).unwrap().match_index.get(),
+            3
+        );
 
         // Receive response for match_index 2 (earlier batch, out of order).
         // match_index should NOT go backwards.
@@ -2025,6 +2036,9 @@ mod tests {
         node.handle_message(Message::AppendEntriesResponse(response));
 
         // match_index should still be 3 (not 2).
-        assert_eq!(node.replication_state.get(&peer).unwrap().match_index.get(), 3);
+        assert_eq!(
+            node.replication_state.get(&peer).unwrap().match_index.get(),
+            3
+        );
     }
 }

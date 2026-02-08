@@ -235,11 +235,10 @@ impl IoUringFile {
     pub fn truncate(&self, len: u64) -> WalResult<()> {
         // tokio_uring doesn't have set_len directly, but we can use std::fs.
         // This requires reopening the file briefly.
-        let std_file =
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&self.path)
-                .map_err(|e| WalError::io("open_for_truncate", e))?;
+        let std_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .map_err(|e| WalError::io("open_for_truncate", e))?;
         std_file
             .set_len(len)
             .map_err(|e| WalError::io("truncate", e))

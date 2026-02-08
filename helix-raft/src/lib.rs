@@ -37,8 +37,8 @@ pub use message::{
     InstallSnapshotResponse, Message, PreVoteRequest, PreVoteResponse, RequestVoteRequest,
     RequestVoteResponse, TimeoutNowRequest,
 };
-pub use state::{RaftNode, RaftOutput, RaftState};
 pub use snapshot::{Snapshot, SnapshotBuildError, SnapshotBuilder, SnapshotChunk, SnapshotMeta};
+pub use state::{RaftNode, RaftOutput, RaftState};
 pub use storage::{MemoryStorage, PersistentState, RaftStorage, StorageError, StorageResult};
 pub use wal_storage::WalStorage;
 
@@ -53,7 +53,6 @@ pub mod limits {
     /// Pipelining improves throughput by allowing the leader to send
     /// multiple `AppendEntries` without waiting for each response.
     pub const MAX_INFLIGHT_APPEND_ENTRIES: u32 = 5;
-
 
     /// Maximum number of nodes in a cluster.
     pub const CLUSTER_SIZE_MAX: usize = 7;

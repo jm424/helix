@@ -86,6 +86,19 @@ impl FaultConfig {
         }
     }
 
+    /// Creates a flaky profile focused on runtime I/O faults.
+    ///
+    /// Startup metadata operations (`exists`, `list_files`, `open`) are not
+    /// faulted so bootstrap/recovery can complete before runtime faults are
+    /// exercised.
+    #[must_use]
+    pub fn flaky_runtime() -> Self {
+        Self::flaky()
+            .with_exists_fail_rate(0.0)
+            .with_list_files_fail_rate(0.0)
+            .with_open_fail_rate(0.0)
+    }
+
     /// Sets the read fail rate.
     #[must_use]
     pub const fn with_read_fail_rate(mut self, rate: f64) -> Self {
@@ -199,8 +212,14 @@ pub struct FaultStats {
     pub open_failures: u64,
     /// Number of remove failures injected.
     pub remove_failures: u64,
-    /// Total storage operations attempted.
+    /// Total storage operations attempted (file-level: open, exists, list, remove).
     pub total_ops: u64,
+    /// Total write operations (bytes written to files).
+    pub write_ops: u64,
+    /// Total read operations (bytes read from files).
+    pub read_ops: u64,
+    /// Total sync/fsync operations.
+    pub sync_ops: u64,
 }
 
 impl FaultStats {
@@ -276,7 +295,10 @@ impl SimulatedStorage {
     /// Simulates a crash by reverting all files to their last synced state.
     /// Un-synced data is lost.
     pub fn simulate_crash(&self) {
-        let synced = self.synced_files.lock().expect("synced_files lock poisoned");
+        let synced = self
+            .synced_files
+            .lock()
+            .expect("synced_files lock poisoned");
         let mut files = self.files.lock().expect("files lock poisoned");
         files.clone_from(&synced);
     }
@@ -301,13 +323,25 @@ impl SimulatedStorage {
 
     /// Returns a reference to the fault configuration for modification.
     pub fn fault_config(&self) -> MutexGuard<'_, FaultConfig> {
-        self.fault_config.lock().expect("fault config lock poisoned")
+        self.fault_config
+            .lock()
+            .expect("fault config lock poisoned")
+    }
+
+    /// Returns the raw pointer to the fault config Arc for debugging.
+    /// Two storages sharing the same config will have the same pointer.
+    #[must_use]
+    pub fn fault_config_ptr(&self) -> usize {
+        Arc::as_ptr(&self.fault_config) as usize
     }
 
     /// Returns a copy of the current fault statistics.
     #[must_use]
     pub fn fault_stats(&self) -> FaultStats {
-        self.fault_stats.lock().expect("fault stats lock poisoned").clone()
+        self.fault_stats
+            .lock()
+            .expect("fault stats lock poisoned")
+            .clone()
     }
 
     /// Increments a fault counter.
@@ -342,21 +376,30 @@ impl SimulatedStorage {
     /// Gets the synced (durable) file content for inspection in tests.
     #[must_use]
     pub fn get_synced_content(&self, path: &Path) -> Option<Vec<u8>> {
-        let synced = self.synced_files.lock().expect("synced_files lock poisoned");
+        let synced = self
+            .synced_files
+            .lock()
+            .expect("synced_files lock poisoned");
         synced.get(path).cloned()
     }
 
     /// Returns all synced file paths for inspection in tests.
     #[must_use]
     pub fn synced_file_paths(&self) -> Vec<PathBuf> {
-        let synced = self.synced_files.lock().expect("synced_files lock poisoned");
+        let synced = self
+            .synced_files
+            .lock()
+            .expect("synced_files lock poisoned");
         synced.keys().cloned().collect()
     }
 
     /// Returns a snapshot of all synced files with their contents for debugging.
     #[must_use]
     pub fn synced_snapshot(&self) -> HashMap<PathBuf, Vec<u8>> {
-        let synced = self.synced_files.lock().expect("synced_files lock poisoned");
+        let synced = self
+            .synced_files
+            .lock()
+            .expect("synced_files lock poisoned");
         synced.clone()
     }
 
@@ -400,7 +443,10 @@ impl SimulatedStorage {
         self.record_op();
         // Check for open failure.
         {
-            let config = self.fault_config.lock().expect("fault config lock poisoned");
+            let config = self
+                .fault_config
+                .lock()
+                .expect("fault config lock poisoned");
             if self.should_inject_fault(config.open_fail_rate) {
                 self.record_fault(FaultType::OpenFail);
                 return Err(WalError::Io {
@@ -434,7 +480,10 @@ impl SimulatedStorage {
     pub fn exists_sync(&self, path: &Path) -> WalResult<bool> {
         self.record_op();
         {
-            let config = self.fault_config.lock().expect("fault config lock poisoned");
+            let config = self
+                .fault_config
+                .lock()
+                .expect("fault config lock poisoned");
             if self.should_inject_fault(config.exists_fail_rate) {
                 self.record_fault(FaultType::ExistsFail);
                 return Err(WalError::Io {
@@ -455,7 +504,10 @@ impl SimulatedStorage {
     pub fn list_files_sync(&self, dir: &Path, extension: &str) -> WalResult<Vec<PathBuf>> {
         self.record_op();
         {
-            let config = self.fault_config.lock().expect("fault config lock poisoned");
+            let config = self
+                .fault_config
+                .lock()
+                .expect("fault config lock poisoned");
             if self.should_inject_fault(config.list_files_fail_rate) {
                 self.record_fault(FaultType::ListFilesFail);
                 return Err(WalError::Io {
@@ -486,7 +538,10 @@ impl SimulatedStorage {
     pub fn remove_sync(&self, path: &Path) -> WalResult<()> {
         self.record_op();
         {
-            let config = self.fault_config.lock().expect("fault config lock poisoned");
+            let config = self
+                .fault_config
+                .lock()
+                .expect("fault config lock poisoned");
             if self.should_inject_fault(config.remove_fail_rate) {
                 self.record_fault(FaultType::RemoveFail);
                 return Err(WalError::Io {
@@ -498,7 +553,10 @@ impl SimulatedStorage {
 
         let mut files = self.files.lock().expect("files lock poisoned");
         files.remove(path);
-        let mut synced = self.synced_files.lock().expect("synced_files lock poisoned");
+        let mut synced = self
+            .synced_files
+            .lock()
+            .expect("synced_files lock poisoned");
         synced.remove(path);
         Ok(())
     }
@@ -534,7 +592,10 @@ impl Storage for SimulatedStorage {
         self.record_op();
         // Check for open failure.
         {
-            let config = self.fault_config.lock().expect("fault config lock poisoned");
+            let config = self
+                .fault_config
+                .lock()
+                .expect("fault config lock poisoned");
             if self.should_inject_fault(config.open_fail_rate) {
                 self.record_fault(FaultType::OpenFail);
                 return Err(WalError::Io {
@@ -565,7 +626,10 @@ impl Storage for SimulatedStorage {
         self.record_op();
         // Check for exists failure.
         {
-            let config = self.fault_config.lock().expect("fault config lock poisoned");
+            let config = self
+                .fault_config
+                .lock()
+                .expect("fault config lock poisoned");
             if self.should_inject_fault(config.exists_fail_rate) {
                 self.record_fault(FaultType::ExistsFail);
                 return Err(WalError::Io {
@@ -583,7 +647,10 @@ impl Storage for SimulatedStorage {
         self.record_op();
         // Check for list_files failure.
         {
-            let config = self.fault_config.lock().expect("fault config lock poisoned");
+            let config = self
+                .fault_config
+                .lock()
+                .expect("fault config lock poisoned");
             if self.should_inject_fault(config.list_files_fail_rate) {
                 self.record_fault(FaultType::ListFilesFail);
                 return Err(WalError::Io {
@@ -609,7 +676,10 @@ impl Storage for SimulatedStorage {
         self.record_op();
         // Check for remove failure.
         {
-            let config = self.fault_config.lock().expect("fault config lock poisoned");
+            let config = self
+                .fault_config
+                .lock()
+                .expect("fault config lock poisoned");
             if self.should_inject_fault(config.remove_fail_rate) {
                 self.record_fault(FaultType::RemoveFail);
                 return Err(WalError::Io {
@@ -624,7 +694,10 @@ impl Storage for SimulatedStorage {
         files.remove(path);
         drop(files);
 
-        let mut synced = self.synced_files.lock().expect("synced_files lock poisoned");
+        let mut synced = self
+            .synced_files
+            .lock()
+            .expect("synced_files lock poisoned");
         synced.remove(path);
 
         Ok(())
@@ -710,6 +783,24 @@ impl SimulatedFile {
         }
     }
 
+    /// Records a write operation.
+    fn record_write_op(&self) {
+        let mut stats = self.fault_stats.lock().expect("fault stats lock poisoned");
+        stats.write_ops += 1;
+    }
+
+    /// Records a read operation.
+    fn record_read_op(&self) {
+        let mut stats = self.fault_stats.lock().expect("fault stats lock poisoned");
+        stats.read_ops += 1;
+    }
+
+    /// Records a sync operation.
+    fn record_sync_op(&self) {
+        let mut stats = self.fault_stats.lock().expect("fault stats lock poisoned");
+        stats.sync_ops += 1;
+    }
+
     // ========================================================================
     // Synchronous API for DST (Deterministic Simulation Testing)
     // ========================================================================
@@ -722,7 +813,10 @@ impl SimulatedFile {
     pub fn write_at_sync(&self, offset: u64, data: &[u8]) -> WalResult<()> {
         let counter = self.write_counter.fetch_add(1, Ordering::Relaxed);
 
-        let config = self.fault_config.lock().expect("fault config lock poisoned");
+        let config = self
+            .fault_config
+            .lock()
+            .expect("fault config lock poisoned");
 
         // Check for write failure.
         if self.should_inject_fault(config.write_fail_rate, counter) {
@@ -736,7 +830,10 @@ impl SimulatedFile {
         // Check for disk full.
         if config.force_disk_full {
             drop(config);
-            let mut config = self.fault_config.lock().expect("fault config lock poisoned");
+            let mut config = self
+                .fault_config
+                .lock()
+                .expect("fault config lock poisoned");
             config.force_disk_full = false;
             return Err(WalError::Io {
                 operation: "write",
@@ -747,7 +844,10 @@ impl SimulatedFile {
         // Determine if this write should be torn.
         let torn_at = if let Some(torn_offset) = config.force_torn_write_at {
             drop(config);
-            let mut config = self.fault_config.lock().expect("fault config lock poisoned");
+            let mut config = self
+                .fault_config
+                .lock()
+                .expect("fault config lock poisoned");
             config.force_torn_write_at = None;
             Some(torn_offset)
         } else if self.should_inject_fault(config.torn_write_rate, counter) {
@@ -787,6 +887,7 @@ impl SimulatedFile {
 
         // Normal write.
         content[offset as usize..offset as usize + data.len()].copy_from_slice(data);
+        self.record_write_op();
         Ok(())
     }
 
@@ -798,7 +899,10 @@ impl SimulatedFile {
     pub fn read_at_sync(&self, offset: u64, len: usize) -> WalResult<Bytes> {
         // Check for read failure.
         {
-            let config = self.fault_config.lock().expect("fault config lock poisoned");
+            let config = self
+                .fault_config
+                .lock()
+                .expect("fault config lock poisoned");
             let counter = self.read_counter.fetch_add(1, Ordering::Relaxed);
             if Self::should_inject_fault_with_salt(self.seed, config.read_fail_rate, counter, 2) {
                 self.record_fault(FaultType::ReadFail);
@@ -824,7 +928,10 @@ impl SimulatedFile {
         let mut data = content[start..end].to_vec();
 
         // Check for read corruption.
-        let config = self.fault_config.lock().expect("fault config lock poisoned");
+        let config = self
+            .fault_config
+            .lock()
+            .expect("fault config lock poisoned");
         let counter = self.read_counter.fetch_add(1, Ordering::Relaxed);
         if Self::should_inject_fault_with_salt(self.seed, config.read_corruption_rate, counter, 2)
             && !data.is_empty()
@@ -838,6 +945,7 @@ impl SimulatedFile {
             self.record_fault(FaultType::ReadCorruption);
         }
 
+        self.record_read_op();
         Ok(Bytes::from(data))
     }
 
@@ -851,6 +959,7 @@ impl SimulatedFile {
             operation: "read",
             message: "file not found".to_string(),
         })?;
+        self.record_read_op();
         Ok(Bytes::from(content.clone()))
     }
 
@@ -859,14 +968,20 @@ impl SimulatedFile {
     /// # Errors
     /// Returns an error if the sync fails.
     pub fn sync_data(&self) -> WalResult<()> {
-        let config = self.fault_config.lock().expect("fault config lock poisoned");
+        let config = self
+            .fault_config
+            .lock()
+            .expect("fault config lock poisoned");
         let counter = self.sync_counter.fetch_add(1, Ordering::Relaxed);
         let should_fail = config.force_fsync_fail
             || Self::should_inject_fault_with_salt(self.seed, config.fsync_fail_rate, counter, 1);
 
         if should_fail {
             drop(config);
-            let mut config = self.fault_config.lock().expect("fault config lock poisoned");
+            let mut config = self
+                .fault_config
+                .lock()
+                .expect("fault config lock poisoned");
             config.force_fsync_fail = false;
             self.record_fault(FaultType::FsyncFail);
             return Err(WalError::Io {
@@ -879,10 +994,14 @@ impl SimulatedFile {
         // Copy current file content to synced state (makes it durable).
         let files = self.files.lock().expect("files lock poisoned");
         if let Some(content) = files.get(&self.path) {
-            let mut synced = self.synced_files.lock().expect("synced_files lock poisoned");
+            let mut synced = self
+                .synced_files
+                .lock()
+                .expect("synced_files lock poisoned");
             synced.insert(self.path.clone(), content.clone());
         }
 
+        self.record_sync_op();
         Ok(())
     }
 
@@ -923,7 +1042,10 @@ impl StorageFile for SimulatedFile {
     async fn write_at(&self, offset: u64, data: &[u8]) -> WalResult<()> {
         let counter = self.write_counter.fetch_add(1, Ordering::Relaxed);
 
-        let config = self.fault_config.lock().expect("fault config lock poisoned");
+        let config = self
+            .fault_config
+            .lock()
+            .expect("fault config lock poisoned");
 
         // Check for write failure.
         if self.should_inject_fault(config.write_fail_rate, counter) {
@@ -937,7 +1059,10 @@ impl StorageFile for SimulatedFile {
         // Check for disk full.
         if config.force_disk_full {
             drop(config);
-            let mut config = self.fault_config.lock().expect("fault config lock poisoned");
+            let mut config = self
+                .fault_config
+                .lock()
+                .expect("fault config lock poisoned");
             config.force_disk_full = false;
             return Err(WalError::Io {
                 operation: "write",
@@ -948,7 +1073,10 @@ impl StorageFile for SimulatedFile {
         // Determine if this write should be torn.
         let torn_at = if let Some(torn_offset) = config.force_torn_write_at {
             drop(config);
-            let mut config = self.fault_config.lock().expect("fault config lock poisoned");
+            let mut config = self
+                .fault_config
+                .lock()
+                .expect("fault config lock poisoned");
             config.force_torn_write_at = None;
             Some(torn_offset)
         } else if self.should_inject_fault(config.torn_write_rate, counter) {
@@ -994,13 +1122,17 @@ impl StorageFile for SimulatedFile {
         // Normal write.
         content[offset as usize..offset as usize + data.len()].copy_from_slice(data);
 
+        self.record_write_op();
         Ok(())
     }
 
     async fn read_at(&self, offset: u64, len: usize) -> WalResult<Bytes> {
         // Check for read failure first (use separate read_counter AND salt=2).
         {
-            let config = self.fault_config.lock().expect("fault config lock poisoned");
+            let config = self
+                .fault_config
+                .lock()
+                .expect("fault config lock poisoned");
             let counter = self.read_counter.fetch_add(1, Ordering::Relaxed);
             if Self::should_inject_fault_with_salt(self.seed, config.read_fail_rate, counter, 2) {
                 self.record_fault(FaultType::ReadFail);
@@ -1026,7 +1158,10 @@ impl StorageFile for SimulatedFile {
         let mut data = content[start..end].to_vec();
 
         // Check for read corruption (use separate read_counter AND salt=2).
-        let config = self.fault_config.lock().expect("fault config lock poisoned");
+        let config = self
+            .fault_config
+            .lock()
+            .expect("fault config lock poisoned");
         let counter = self.read_counter.fetch_add(1, Ordering::Relaxed);
         if Self::should_inject_fault_with_salt(self.seed, config.read_corruption_rate, counter, 2)
             && !data.is_empty()
@@ -1041,6 +1176,7 @@ impl StorageFile for SimulatedFile {
             self.record_fault(FaultType::ReadCorruption);
         }
 
+        self.record_read_op();
         Ok(Bytes::from(data))
     }
 
@@ -1052,11 +1188,15 @@ impl StorageFile for SimulatedFile {
         })?;
 
         // Note: read_all doesn't inject corruption to allow clean recovery testing.
+        self.record_read_op();
         Ok(Bytes::from(content.clone()))
     }
 
     async fn sync(&self) -> WalResult<()> {
-        let config = self.fault_config.lock().expect("fault config lock poisoned");
+        let config = self
+            .fault_config
+            .lock()
+            .expect("fault config lock poisoned");
         // Use separate sync_counter AND salt=1 for independence from write faults.
         let counter = self.sync_counter.fetch_add(1, Ordering::Relaxed);
         let should_fail = config.force_fsync_fail
@@ -1064,7 +1204,10 @@ impl StorageFile for SimulatedFile {
 
         if should_fail {
             drop(config);
-            let mut config = self.fault_config.lock().expect("fault config lock poisoned");
+            let mut config = self
+                .fault_config
+                .lock()
+                .expect("fault config lock poisoned");
             config.force_fsync_fail = false;
             self.record_fault(FaultType::FsyncFail);
             return Err(WalError::Io {
@@ -1077,10 +1220,14 @@ impl StorageFile for SimulatedFile {
         // Copy current file content to synced state (makes it durable).
         let files = self.files.lock().expect("files lock poisoned");
         if let Some(content) = files.get(&self.path) {
-            let mut synced = self.synced_files.lock().expect("synced_files lock poisoned");
+            let mut synced = self
+                .synced_files
+                .lock()
+                .expect("synced_files lock poisoned");
             synced.insert(self.path.clone(), content.clone());
         }
 
+        self.record_sync_op();
         Ok(())
     }
 
@@ -1276,7 +1423,10 @@ mod tests {
 
         // Try again - should still fail.
         let result = file.sync().await;
-        assert!(result.is_err(), "100% fsync_fail_rate should consistently fail");
+        assert!(
+            result.is_err(),
+            "100% fsync_fail_rate should consistently fail"
+        );
     }
 
     #[tokio::test]

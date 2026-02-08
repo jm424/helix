@@ -65,7 +65,10 @@ impl RequestId {
     /// Creates a new request ID.
     #[must_use]
     pub const fn new(client_id: ClientId, sequence: u64) -> Self {
-        Self { client_id, sequence }
+        Self {
+            client_id,
+            sequence,
+        }
     }
 }
 
@@ -168,7 +171,11 @@ impl ClientQuery {
 
     /// Creates a query with specified consistency level.
     #[must_use]
-    pub const fn with_consistency(id: RequestId, query: Bytes, consistency: ReadConsistency) -> Self {
+    pub const fn with_consistency(
+        id: RequestId,
+        query: Bytes,
+        consistency: ReadConsistency,
+    ) -> Self {
         Self {
             id,
             query,

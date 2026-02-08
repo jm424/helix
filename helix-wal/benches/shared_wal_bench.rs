@@ -345,21 +345,17 @@ fn bench_pool_scaling(c: &mut Criterion) {
             data_size,
         };
 
-        group.bench_with_input(
-            BenchmarkId::new("k", pool_size),
-            &config,
-            |b, cfg| {
-                b.iter_custom(|iters| {
-                    rt.block_on(async {
-                        let mut total = Duration::ZERO;
-                        for _ in 0..iters {
-                            total += bench_shared_wal_pool(cfg, &data).await;
-                        }
-                        total
-                    })
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("k", pool_size), &config, |b, cfg| {
+            b.iter_custom(|iters| {
+                rt.block_on(async {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        total += bench_shared_wal_pool(cfg, &data).await;
+                    }
+                    total
+                })
+            });
+        });
     }
 
     group.finish();

@@ -138,7 +138,11 @@ impl TransferCoordinator {
         }
 
         // Check pending transfers.
-        if let Some(pos) = self.pending.iter().position(|t| t.transfer_id == transfer_id) {
+        if let Some(pos) = self
+            .pending
+            .iter()
+            .position(|t| t.transfer_id == transfer_id)
+        {
             self.pending.remove(pos);
             return Ok(());
         }
@@ -165,6 +169,7 @@ impl TransferCoordinator {
     }
 
     /// Processes a transfer message and returns outputs.
+    #[allow(clippy::too_many_lines)] // State-machine branch table kept inline for readability.
     pub fn handle_message(
         &mut self,
         message: TransferMessage,
@@ -202,12 +207,13 @@ impl TransferCoordinator {
                 }
             }
             TransferMessage::SnapshotChunk {
-                offset,
-                data,
-                done,
-                ..
+                offset, data, done, ..
             } => {
-                if let TransferState::Transferring { progress: _, total: _ } = transfer.state {
+                if let TransferState::Transferring {
+                    progress: _,
+                    total: _,
+                } = transfer.state
+                {
                     let new_progress = offset + data.len() as u64;
                     transfer.update_progress(new_progress);
 
@@ -428,7 +434,12 @@ mod tests {
         let mut coord = TransferCoordinator::new();
 
         coord
-            .start_transfer(GroupId::new(1), GroupId::new(2), ShardRange::new(0, 1000), 0)
+            .start_transfer(
+                GroupId::new(1),
+                GroupId::new(2),
+                ShardRange::new(0, 1000),
+                0,
+            )
             .unwrap();
 
         assert_eq!(coord.pending_count(), 1);
@@ -455,7 +466,12 @@ mod tests {
         let mut coord = TransferCoordinator::new();
 
         let transfer_id = coord
-            .start_transfer(GroupId::new(1), GroupId::new(2), ShardRange::new(0, 1000), 0)
+            .start_transfer(
+                GroupId::new(1),
+                GroupId::new(2),
+                ShardRange::new(0, 1000),
+                0,
+            )
             .unwrap();
 
         coord.tick(0); // Start the transfer
@@ -472,7 +488,12 @@ mod tests {
         let mut coord = TransferCoordinator::new();
 
         let transfer_id = coord
-            .start_transfer(GroupId::new(1), GroupId::new(2), ShardRange::new(0, 1000), 0)
+            .start_transfer(
+                GroupId::new(1),
+                GroupId::new(2),
+                ShardRange::new(0, 1000),
+                0,
+            )
             .unwrap();
 
         assert_eq!(coord.pending_count(), 1);
@@ -487,7 +508,12 @@ mod tests {
         let mut coord = TransferCoordinator::new();
 
         let transfer_id = coord
-            .start_transfer(GroupId::new(1), GroupId::new(2), ShardRange::new(0, 1000), 0)
+            .start_transfer(
+                GroupId::new(1),
+                GroupId::new(2),
+                ShardRange::new(0, 1000),
+                0,
+            )
             .unwrap();
 
         coord.tick(0); // Start the transfer

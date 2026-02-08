@@ -401,10 +401,12 @@ impl<E: WalEntry> Segment<E> {
     /// # Errors
     /// Returns an error if the position is out of bounds.
     pub fn read_at_position(&self, position: usize) -> WalResult<&E> {
-        self.entries.get(position).ok_or(WalError::PositionOutOfBounds {
-            position,
-            count: self.entries.len(),
-        })
+        self.entries
+            .get(position)
+            .ok_or(WalError::PositionOutOfBounds {
+                position,
+                count: self.entries.len(),
+            })
     }
 
     /// Returns an iterator over all entries in the segment.

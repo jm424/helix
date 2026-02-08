@@ -150,9 +150,7 @@ impl StorageFile for TokioFile {
 
     async fn sync(&self) -> WalResult<()> {
         let file = self.file.lock().await;
-        file.sync_all()
-            .await
-            .map_err(|e| WalError::io("sync", e))
+        file.sync_all().await.map_err(|e| WalError::io("sync", e))
     }
 
     async fn size(&self) -> WalResult<u64> {

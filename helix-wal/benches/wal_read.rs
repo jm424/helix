@@ -15,9 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use tempfile::TempDir;
 use tokio::runtime::Builder;
 use tokio::task::JoinSet;
@@ -37,7 +35,9 @@ async fn setup_populated_wal(
     data_size: usize,
 ) -> (Wal<TokioStorage>, TempDir, u64, u64) {
     let tempdir = match bench_base_dir() {
-        Some(base) => tempfile::tempdir_in(base).expect("failed to create temp dir in HELIX_BENCH_DIR"),
+        Some(base) => {
+            tempfile::tempdir_in(base).expect("failed to create temp dir in HELIX_BENCH_DIR")
+        }
         None => tempfile::tempdir().expect("failed to create temp dir"),
     };
     let config = WalConfig::new(tempdir.path());
@@ -82,7 +82,8 @@ fn bench_wal_read_sequential(c: &mut Criterion) {
 
             group.bench_with_input(BenchmarkId::new("config", &id), &id, |b, _| {
                 // Pre-populate once per benchmark.
-                let (wal, _tmp, first, last) = rt.block_on(setup_populated_wal(entry_count, data_size));
+                let (wal, _tmp, first, last) =
+                    rt.block_on(setup_populated_wal(entry_count, data_size));
 
                 b.iter_custom(|iters| {
                     let total_start = Instant::now();
@@ -126,8 +127,7 @@ fn bench_wal_read_random(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("config", &id), &id, |b, _| {
             // Pre-populate once.
-            let (wal, _tmp, first, last) =
-                rt.block_on(setup_populated_wal(entry_count, data_size));
+            let (wal, _tmp, first, last) = rt.block_on(setup_populated_wal(entry_count, data_size));
 
             // Pre-generate random indices for determinism.
             let range = last - first + 1;
@@ -278,17 +278,16 @@ fn bench_wal_read_after_write(c: &mut Criterion) {
 
                     for _ in 0..iters {
                         let tempdir = match bench_base_dir() {
-                            Some(base) => tempfile::tempdir_in(base).expect("tempdir in HELIX_BENCH_DIR"),
+                            Some(base) => {
+                                tempfile::tempdir_in(base).expect("tempdir in HELIX_BENCH_DIR")
+                            }
                             None => tempfile::tempdir().expect("tempdir"),
                         };
                         let config = WalConfig::new(tempdir.path());
-                        let mut wal = Wal::open(TokioStorage::new(), config)
-                            .await
-                            .expect("open");
+                        let mut wal = Wal::open(TokioStorage::new(), config).await.expect("open");
 
                         for i in 1..=operation_count {
-                            let entry =
-                                Entry::new(1, i, data.clone()).expect("entry");
+                            let entry = Entry::new(1, i, data.clone()).expect("entry");
                             let idx = wal.append(entry).await.expect("append");
 
                             // Immediately read back.

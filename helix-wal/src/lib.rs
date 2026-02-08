@@ -56,7 +56,10 @@ pub use shared_wal::{
 };
 // Re-export WriteDurability for convenience (also available from helix_core).
 pub use helix_core::WriteDurability;
-pub use storage::{create_storage, FaultConfig, FaultStats, SimulatedFile, SimulatedStorage, Storage, StorageFile, TokioStorage};
+pub use storage::{
+    create_storage, FaultConfig, FaultStats, SimulatedFile, SimulatedStorage, Storage, StorageFile,
+    TokioStorage,
+};
 
 // Low-level io_uring types (for direct use within tokio_uring context).
 #[cfg(all(target_os = "linux", feature = "io-uring"))]

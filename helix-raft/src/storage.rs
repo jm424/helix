@@ -384,9 +384,7 @@ impl RaftStorage for MemoryStorage {
     }
 
     fn last_term(&self) -> TermId {
-        self.entries
-            .last()
-            .map_or(TermId::new(0), |e| e.term)
+        self.entries.last().map_or(TermId::new(0), |e| e.term)
     }
 
     fn sync(&mut self) -> StorageResult<()> {
@@ -492,7 +490,9 @@ mod tests {
         assert_eq!(entry.term.get(), 1);
 
         // Get range.
-        let range = storage.get_entries(LogIndex::new(1), LogIndex::new(2)).unwrap();
+        let range = storage
+            .get_entries(LogIndex::new(1), LogIndex::new(2))
+            .unwrap();
         assert_eq!(range.len(), 2);
     }
 

@@ -52,11 +52,11 @@ impl ShardRange {
     /// Panics if mid is not within the range.
     #[must_use]
     pub fn split_at(&self, mid: u32) -> (Self, Self) {
-        assert!(mid > self.start && mid < self.end, "split point must be within range");
-        (
-            Self::new(self.start, mid),
-            Self::new(mid, self.end),
-        )
+        assert!(
+            mid > self.start && mid < self.end,
+            "split point must be within range"
+        );
+        (Self::new(self.start, mid), Self::new(mid, self.end))
     }
 }
 
@@ -180,7 +180,8 @@ impl ShardMap {
 
         // Insert or update.
         let is_new = !self.shards.contains_key(&range.start);
-        self.shards.insert(range.start, ShardEntry { range, group_id });
+        self.shards
+            .insert(range.start, ShardEntry { range, group_id });
 
         if is_new {
             self.shard_count += 1;
@@ -440,7 +441,10 @@ mod tests {
 
         let result = map.groups();
         // Should be sorted and deduplicated.
-        assert_eq!(result, vec![GroupId::new(1), GroupId::new(2), GroupId::new(3)]);
+        assert_eq!(
+            result,
+            vec![GroupId::new(1), GroupId::new(2), GroupId::new(3)]
+        );
     }
 
     #[test]

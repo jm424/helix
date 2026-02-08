@@ -118,9 +118,11 @@ impl WalStorage {
         if let Ok(wal_entry) = self.segment.read(METADATA_INDEX) {
             if wal_entry.term() == METADATA_TERM {
                 // This is a metadata entry.
-                let state = PersistentState::decode(&mut wal_entry.payload.clone())
-                    .ok_or_else(|| StorageError::Corruption {
-                        message: "invalid metadata entry".to_string(),
+                let state =
+                    PersistentState::decode(&mut wal_entry.payload.clone()).ok_or_else(|| {
+                        StorageError::Corruption {
+                            message: "invalid metadata entry".to_string(),
+                        }
                     })?;
                 self.state = Some(state);
             }
@@ -184,12 +186,11 @@ impl RaftStorage for WalStorage {
         // Create a metadata entry.
         let payload = Self::encode_metadata(state);
 
-        let wal_entry = Entry::new(METADATA_TERM, METADATA_INDEX, payload).map_err(|e| {
-            StorageError::Io {
+        let wal_entry =
+            Entry::new(METADATA_TERM, METADATA_INDEX, payload).map_err(|e| StorageError::Io {
                 operation: "save_state",
                 message: format!("failed to create metadata entry: {e}"),
-            }
-        })?;
+            })?;
 
         // For now, we need to recreate the segment to update the metadata
         // at index 0. In a production implementation, we'd use a separate
@@ -200,10 +201,12 @@ impl RaftStorage for WalStorage {
 
         // If the segment is empty, we can just append the metadata.
         if self.segment.entry_count() == 0 {
-            self.segment.append(wal_entry).map_err(|e| StorageError::Io {
-                operation: "save_state",
-                message: format!("failed to append metadata: {e}"),
-            })?;
+            self.segment
+                .append(wal_entry)
+                .map_err(|e| StorageError::Io {
+                    operation: "save_state",
+                    message: format!("failed to append metadata: {e}"),
+                })?;
         }
         // Otherwise, the metadata is cached and will be persisted on full rebuild.
         // This is a simplification - production code would use a separate metadata file.
@@ -219,10 +222,12 @@ impl RaftStorage for WalStorage {
         for entry in entries {
             let wal_entry = Self::log_to_wal_entry(entry)?;
 
-            self.segment.append(wal_entry).map_err(|e| StorageError::Io {
-                operation: "append",
-                message: format!("failed to append entry: {e}"),
-            })?;
+            self.segment
+                .append(wal_entry)
+                .map_err(|e| StorageError::Io {
+                    operation: "append",
+                    message: format!("failed to append entry: {e}"),
+                })?;
 
             // Update tracking.
             if self.first_index == 0 {
@@ -280,10 +285,12 @@ impl RaftStorage for WalStorage {
     }
 
     fn truncate_after(&mut self, last_to_keep: LogIndex) -> StorageResult<()> {
-        self.segment.truncate_after(last_to_keep.get()).map_err(|e| StorageError::Io {
-            operation: "truncate",
-            message: format!("{e}"),
-        })?;
+        self.segment
+            .truncate_after(last_to_keep.get())
+            .map_err(|e| StorageError::Io {
+                operation: "truncate",
+                message: format!("{e}"),
+            })?;
 
         // Update tracking.
         if last_to_keep.get() < self.first_index {
@@ -408,7 +415,9 @@ mod tests {
         let entries = vec![make_entry(1, 1), make_entry(1, 2), make_entry(2, 3)];
         storage.append_entries(&entries).unwrap();
 
-        let range = storage.get_entries(LogIndex::new(1), LogIndex::new(3)).unwrap();
+        let range = storage
+            .get_entries(LogIndex::new(1), LogIndex::new(3))
+            .unwrap();
         assert_eq!(range.len(), 3);
         assert_eq!(range[0].index.get(), 1);
         assert_eq!(range[2].index.get(), 3);

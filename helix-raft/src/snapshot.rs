@@ -361,13 +361,19 @@ impl std::fmt::Display for SnapshotBuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::OutOfOrder { expected, got } => {
-                write!(f, "chunk out of order: expected offset {expected}, got {got}")
+                write!(
+                    f,
+                    "chunk out of order: expected offset {expected}, got {got}"
+                )
             }
             Self::SizeExceeded { expected, got } => {
                 write!(f, "snapshot size exceeded: expected {expected}, got {got}")
             }
             Self::Incomplete { expected, got } => {
-                write!(f, "snapshot incomplete: expected {expected} bytes, got {got}")
+                write!(
+                    f,
+                    "snapshot incomplete: expected {expected} bytes, got {got}"
+                )
             }
         }
     }
@@ -481,11 +487,7 @@ mod tests {
         // Split data into chunks.
         let chunk1 = SnapshotChunk::new(0, original_data.slice(0..10), false);
         let chunk2 = SnapshotChunk::new(10, original_data.slice(10..20), false);
-        let chunk3 = SnapshotChunk::new(
-            20,
-            original_data.slice(20..),
-            true,
-        );
+        let chunk3 = SnapshotChunk::new(20, original_data.slice(20..), true);
 
         builder.add_chunk(&chunk1).unwrap();
         builder.add_chunk(&chunk2).unwrap();

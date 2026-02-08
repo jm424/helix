@@ -34,7 +34,11 @@ fn create_temp_dir() -> tempfile::TempDir {
 /// Benchmark with separate WAL per partition (realistic production pattern).
 /// Pre-creates WALs to measure steady-state write throughput.
 #[allow(dead_code)]
-async fn run_bench_wal_per_partition(num_partitions: usize, entries_per_partition: usize, data_size: usize) {
+async fn run_bench_wal_per_partition(
+    num_partitions: usize,
+    entries_per_partition: usize,
+    data_size: usize,
+) {
     let temp_dir = create_temp_dir();
     let data = Bytes::from(vec![0u8; data_size]);
     let total_entries = num_partitions * entries_per_partition;
@@ -92,7 +96,11 @@ async fn run_bench_wal_per_partition(num_partitions: usize, entries_per_partitio
 
 /// Benchmark with few WALs, many entries each (simulates per-core model).
 /// This is closer to how high-throughput systems with thread-per-core designs operate.
-async fn run_bench_few_wals_many_entries(num_wals: usize, entries_per_wal: usize, data_size: usize) {
+async fn run_bench_few_wals_many_entries(
+    num_wals: usize,
+    entries_per_wal: usize,
+    data_size: usize,
+) {
     let temp_dir = create_temp_dir();
     let data = Bytes::from(vec![0u8; data_size]);
     let total_entries = num_wals * entries_per_wal;

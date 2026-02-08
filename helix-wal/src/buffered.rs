@@ -147,8 +147,7 @@ impl<S: Storage + Send + Sync + 'static> BufferedWal<S> {
         }));
 
         let flush_notify = Arc::new(Notify::new());
-        let flush_task_running =
-            Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flush_task_running = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let buffered_wal = Self {
             inner,
@@ -174,10 +173,7 @@ impl<S: Storage + Send + Sync + 'static> BufferedWal<S> {
     fn start_flush_task(&self) {
         use std::sync::atomic::Ordering;
 
-        if self
-            .flush_task_running
-            .swap(true, Ordering::SeqCst)
-        {
+        if self.flush_task_running.swap(true, Ordering::SeqCst) {
             return; // Already running.
         }
 
@@ -346,14 +342,15 @@ impl<S: Storage + Send + Sync + 'static> BufferedWal<S> {
         // Update state.
         inner.next_index = expected;
         inner.buffer.extend(remaining);
-        inner.buffer_bytes = inner
-            .buffer
-            .iter()
-            .map(|e| e.total_size() as usize)
-            .sum();
+        inner.buffer_bytes = inner.buffer.iter().map(|e| e.total_size() as usize).sum();
         inner.last_flush = Instant::now();
 
-        debug!(entries = count, bytes, next_index = expected, "Flushed buffer");
+        debug!(
+            entries = count,
+            bytes,
+            next_index = expected,
+            "Flushed buffer"
+        );
 
         Ok(())
     }
@@ -446,7 +443,10 @@ impl<S: Storage + Send + Sync + 'static> BufferedWal<S> {
     ///
     /// # Errors
     /// Returns an error if the segment cannot be read.
-    pub async fn read_segment_bytes(&self, segment_id: crate::SegmentId) -> WalResult<bytes::Bytes> {
+    pub async fn read_segment_bytes(
+        &self,
+        segment_id: crate::SegmentId,
+    ) -> WalResult<bytes::Bytes> {
         let guard = self.inner.lock().await;
         guard.wal.read_segment_bytes(segment_id)
     }
@@ -499,8 +499,7 @@ mod tests {
     async fn test_buffered_wal_sync_mode() {
         let temp_dir = tempfile::tempdir().unwrap();
         let wal_config = WalConfig::new(temp_dir.path());
-        let config = BufferedWalConfig::new(wal_config)
-            .with_flush_interval(Duration::ZERO); // Sync mode
+        let config = BufferedWalConfig::new(wal_config).with_flush_interval(Duration::ZERO); // Sync mode
 
         let wal = BufferedWal::open(TokioStorage::new(), config)
             .await
@@ -590,8 +589,8 @@ mod tests {
     async fn test_buffered_wal_batch_append() {
         let temp_dir = tempfile::tempdir().unwrap();
         let wal_config = WalConfig::new(temp_dir.path());
-        let config = BufferedWalConfig::new(wal_config)
-            .with_flush_interval(Duration::from_secs(60));
+        let config =
+            BufferedWalConfig::new(wal_config).with_flush_interval(Duration::from_secs(60));
 
         let wal = BufferedWal::open(TokioStorage::new(), config)
             .await
@@ -617,8 +616,8 @@ mod tests {
     async fn test_buffered_wal_concurrent_access() {
         let temp_dir = tempfile::tempdir().unwrap();
         let wal_config = WalConfig::new(temp_dir.path());
-        let config = BufferedWalConfig::new(wal_config)
-            .with_flush_interval(Duration::from_millis(10));
+        let config =
+            BufferedWalConfig::new(wal_config).with_flush_interval(Duration::from_millis(10));
 
         let wal = BufferedWal::open(TokioStorage::new(), config)
             .await
@@ -654,8 +653,7 @@ mod tests {
         // Mimics the benchmark pattern: shared atomic counter for indices.
         let temp_dir = tempfile::tempdir().unwrap();
         let wal_config = WalConfig::new(temp_dir.path());
-        let config = BufferedWalConfig::new(wal_config)
-            .with_flush_interval(Duration::ZERO); // Sync mode
+        let config = BufferedWalConfig::new(wal_config).with_flush_interval(Duration::ZERO); // Sync mode
 
         let wal = Arc::new(
             BufferedWal::open(TokioStorage::new(), config)
@@ -671,8 +669,7 @@ mod tests {
             let counter_clone = counter.clone();
             handles.push(tokio::spawn(async move {
                 for _ in 0..8 {
-                    let idx =
-                        counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let idx = counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let entry = Entry::new(1, idx, Bytes::from("data")).unwrap();
                     wal_clone.append(entry).await.unwrap();
                 }
@@ -696,8 +693,8 @@ mod tests {
         // Mimics the benchmark pattern with buffered mode.
         let temp_dir = tempfile::tempdir().unwrap();
         let wal_config = WalConfig::new(temp_dir.path());
-        let config = BufferedWalConfig::new(wal_config)
-            .with_flush_interval(Duration::from_millis(10));
+        let config =
+            BufferedWalConfig::new(wal_config).with_flush_interval(Duration::from_millis(10));
 
         let wal = Arc::new(
             BufferedWal::open(TokioStorage::new(), config)
@@ -713,8 +710,7 @@ mod tests {
             let counter_clone = counter.clone();
             handles.push(tokio::spawn(async move {
                 for _ in 0..8 {
-                    let idx =
-                        counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let idx = counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let entry = Entry::new(1, idx, Bytes::from("data")).unwrap();
                     wal_clone.append(entry).await.unwrap();
                 }

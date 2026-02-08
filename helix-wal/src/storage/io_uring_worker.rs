@@ -240,7 +240,10 @@ impl IoUringWorkerStorage {
 
     /// Allocates a new file handle.
     fn alloc_handle(&self) -> FileHandle {
-        let id = self.state.next_handle.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = self
+            .state
+            .next_handle
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         FileHandle(id)
     }
 
@@ -301,7 +304,12 @@ impl Storage for IoUringWorkerStorage {
         let worker = self.worker_for_handle(handle);
         let path = path.to_path_buf();
 
-        Self::send_to_worker(worker, |reply| IoCommand::Open { handle, path, reply }).await?;
+        Self::send_to_worker(worker, |reply| IoCommand::Open {
+            handle,
+            path,
+            reply,
+        })
+        .await?;
 
         Ok(Box::new(IoUringWorkerFile {
             handle,
@@ -315,11 +323,7 @@ impl Storage for IoUringWorkerStorage {
             .await
     }
 
-    async fn list_files(
-        &self,
-        dir: &std::path::Path,
-        extension: &str,
-    ) -> WalResult<Vec<PathBuf>> {
+    async fn list_files(&self, dir: &std::path::Path, extension: &str) -> WalResult<Vec<PathBuf>> {
         let dir = dir.to_path_buf();
         let extension = extension.to_string();
         self.send_to_any_worker(|reply| IoCommand::ListFiles {
@@ -567,7 +571,11 @@ async fn process_batch(
             }
 
             // Metadata operations - must be sequential.
-            IoCommand::Open { handle, path, reply } => {
+            IoCommand::Open {
+                handle,
+                path,
+                reply,
+            } => {
                 let result = storage.open(&path).await;
                 let response = match result {
                     Ok(file) => {
@@ -583,7 +591,11 @@ async fn process_batch(
                 let _ = reply.send(storage.exists(&path));
             }
 
-            IoCommand::ListFiles { dir, extension, reply } => {
+            IoCommand::ListFiles {
+                dir,
+                extension,
+                reply,
+            } => {
                 let _ = reply.send(storage.list_files(&dir, &extension));
             }
 
@@ -601,98 +613,123 @@ async fn process_batch(
 
             // Synchronous file operations.
             IoCommand::Size { handle, reply } => {
-                let result = files
-                    .get(&handle)
-                    .map_or_else(
-                        || Err(WalError::io("size", std::io::Error::new(
-                            std::io::ErrorKind::NotFound, "file handle not found"))),
-                        IoUringFile::size,
-                    );
+                let result = files.get(&handle).map_or_else(
+                    || {
+                        Err(WalError::io(
+                            "size",
+                            std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "file handle not found",
+                            ),
+                        ))
+                    },
+                    IoUringFile::size,
+                );
                 let _ = reply.send(result);
             }
 
             IoCommand::Truncate { handle, len, reply } => {
-                let result = files
-                    .get(&handle)
-                    .map_or_else(
-                        || Err(WalError::io("truncate", std::io::Error::new(
-                            std::io::ErrorKind::NotFound, "file handle not found"))),
-                        |f| f.truncate(len),
-                    );
+                let result = files.get(&handle).map_or_else(
+                    || {
+                        Err(WalError::io(
+                            "truncate",
+                            std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "file handle not found",
+                            ),
+                        ))
+                    },
+                    |f| f.truncate(len),
+                );
                 let _ = reply.send(result);
             }
 
             // I/O operations - collect for concurrent execution.
-            IoCommand::WriteAt { handle, offset, data, reply } => {
-                match files.get(&handle) {
-                    Some(file) => pending_io.push(PendingIo::Write {
-                        file: file.clone(),
-                        offset,
-                        data,
-                        reply,
-                    }),
-                    None => {
-                        let _ = reply.send(Err(WalError::io("write_at", std::io::Error::new(
-                            std::io::ErrorKind::NotFound, "file handle not found"))));
-                    }
+            IoCommand::WriteAt {
+                handle,
+                offset,
+                data,
+                reply,
+            } => match files.get(&handle) {
+                Some(file) => pending_io.push(PendingIo::Write {
+                    file: file.clone(),
+                    offset,
+                    data,
+                    reply,
+                }),
+                None => {
+                    let _ = reply.send(Err(WalError::io(
+                        "write_at",
+                        std::io::Error::new(std::io::ErrorKind::NotFound, "file handle not found"),
+                    )));
                 }
-            }
+            },
 
-            IoCommand::WriteAtAndSync { handle, offset, data, reply } => {
-                match files.get(&handle) {
-                    Some(file) => pending_io.push(PendingIo::WriteAndSync {
-                        file: file.clone(),
-                        offset,
-                        data,
-                        reply,
-                    }),
-                    None => {
-                        let _ = reply.send(Err(WalError::io("write_at_and_sync", std::io::Error::new(
-                            std::io::ErrorKind::NotFound, "file handle not found"))));
-                    }
+            IoCommand::WriteAtAndSync {
+                handle,
+                offset,
+                data,
+                reply,
+            } => match files.get(&handle) {
+                Some(file) => pending_io.push(PendingIo::WriteAndSync {
+                    file: file.clone(),
+                    offset,
+                    data,
+                    reply,
+                }),
+                None => {
+                    let _ = reply.send(Err(WalError::io(
+                        "write_at_and_sync",
+                        std::io::Error::new(std::io::ErrorKind::NotFound, "file handle not found"),
+                    )));
                 }
-            }
+            },
 
-            IoCommand::ReadAt { handle, offset, len, reply } => {
-                match files.get(&handle) {
-                    Some(file) => pending_io.push(PendingIo::Read {
-                        file: file.clone(),
-                        offset,
-                        len,
-                        reply,
-                    }),
-                    None => {
-                        let _ = reply.send(Err(WalError::io("read_at", std::io::Error::new(
-                            std::io::ErrorKind::NotFound, "file handle not found"))));
-                    }
+            IoCommand::ReadAt {
+                handle,
+                offset,
+                len,
+                reply,
+            } => match files.get(&handle) {
+                Some(file) => pending_io.push(PendingIo::Read {
+                    file: file.clone(),
+                    offset,
+                    len,
+                    reply,
+                }),
+                None => {
+                    let _ = reply.send(Err(WalError::io(
+                        "read_at",
+                        std::io::Error::new(std::io::ErrorKind::NotFound, "file handle not found"),
+                    )));
                 }
-            }
+            },
 
-            IoCommand::ReadAll { handle, reply } => {
-                match files.get(&handle) {
-                    Some(file) => pending_io.push(PendingIo::ReadAll {
-                        file: file.clone(),
-                        reply,
-                    }),
-                    None => {
-                        let _ = reply.send(Err(WalError::io("read_all", std::io::Error::new(
-                            std::io::ErrorKind::NotFound, "file handle not found"))));
-                    }
+            IoCommand::ReadAll { handle, reply } => match files.get(&handle) {
+                Some(file) => pending_io.push(PendingIo::ReadAll {
+                    file: file.clone(),
+                    reply,
+                }),
+                None => {
+                    let _ = reply.send(Err(WalError::io(
+                        "read_all",
+                        std::io::Error::new(std::io::ErrorKind::NotFound, "file handle not found"),
+                    )));
                 }
-            }
+            },
 
-            IoCommand::Sync { handle, reply } => {
-                match files.get(&handle) {
-                    Some(file) => pending_io.push(PendingIo::Sync {
-                        file: file.clone(),
-                        reply,
-                    }),
-                    None => {
-                        let _ = reply.send(Err(WalError::io("sync", std::io::Error::new(
-                            std::io::ErrorKind::NotFound, "file handle not found"))));
-                    }
+            IoCommand::Sync { handle, reply } => match files.get(&handle) {
+                Some(file) => pending_io.push(PendingIo::Sync {
+                    file: file.clone(),
+                    reply,
+                }),
+                None => {
+                    let _ = reply.send(Err(WalError::io(
+                        "sync",
+                        std::io::Error::new(std::io::ErrorKind::NotFound, "file handle not found"),
+                    )));
                 }
-            }
+            },
         }
     }
 
@@ -703,18 +740,33 @@ async fn process_batch(
             .into_iter()
             .map(|op| async move {
                 match op {
-                    PendingIo::Write { file, offset, data, reply } => {
+                    PendingIo::Write {
+                        file,
+                        offset,
+                        data,
+                        reply,
+                    } => {
                         let result = file.write_at(offset, &data).await;
                         let _ = reply.send(result);
                     }
-                    PendingIo::WriteAndSync { file, offset, data, reply } => {
+                    PendingIo::WriteAndSync {
+                        file,
+                        offset,
+                        data,
+                        reply,
+                    } => {
                         let result = match file.write_at(offset, &data).await {
                             Ok(()) => file.sync().await,
                             Err(e) => Err(e),
                         };
                         let _ = reply.send(result);
                     }
-                    PendingIo::Read { file, offset, len, reply } => {
+                    PendingIo::Read {
+                        file,
+                        offset,
+                        len,
+                        reply,
+                    } => {
                         let result = file.read_at(offset, len).await;
                         let _ = reply.send(result);
                     }
