@@ -39,7 +39,10 @@ helix-workload = { path = "helix-workload" }
 bloodhound = { git = "https://github.com/nerdsane/bloodhound" }
 
 # Async runtime.
-tokio = { version = "1.35", features = ["full"] }
+# NOTE: We use madsim-tokio which is API-compatible with tokio.
+# When built normally, it's identical to real tokio.
+# When built with RUSTFLAGS="--cfg madsim", it uses MadSim's deterministic runtime.
+tokio = { version = "0.2", package = "madsim-tokio", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tokio-uring = "0.5"
 async-trait = "0.1"
@@ -89,6 +92,9 @@ hdrhistogram = "7.5"
 tempfile = "3.10"
 turmoil = "0.6"
 
+# MadSim - deterministic simulation for async code.
+madsim = "0.2"
+
 # Kafka client.
 rdkafka = { version = "0.36", features = ["cmake-build"] }
 
@@ -100,6 +106,8 @@ crc = "3.0"
 warnings = "deny"
 unsafe_code = "deny"
 missing_docs = "warn"
+# MadSim uses --cfg madsim for conditional compilation.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }
 
 [workspace.lints.clippy]
 # Safety: Strictest clippy settings.
@@ -127,3 +135,7 @@ panic = "abort"
 [profile.bench]
 lto = true
 codegen-units = 1
+
+# Patch transitive dependencies to use MadSim-compatible versions.
+# MadSim deterministic simulation uses madsim-tokio (configured as workspace
+# dependency) which replaces tokio at compile time when RUSTFLAGS="--cfg madsim".
