@@ -6,11 +6,12 @@
 //! ## Test Organization
 //!
 //! **DST Tests** (`*_dst.rs`): Deterministic simulation with fault injection
-//! - `actor_mode_dst`: Actor-mode partition architecture DST
-//! - `helix_service_dst`: Full Helix service E2E DST
 //! - `raft_dst`: Raft consensus DST with Bloodhound simulation
 //! - `wal_dst`: Per-partition WAL DST with `SimulatedStorage`
 //! - `shared_wal_dst`: `SharedWal` DST with `SimulatedStorage`
+//!
+//! **`MadSim` E2E Tests**: Full service-level simulation
+//! - `madsim_e2e_cluster`: Real `HelixService` instances under `MadSim` with fault injection
 //!
 //! **Integration Tests** (`*_tests.rs`): Multi-component integration
 //! - `raft_tests`: Raft consensus safety and liveness properties
@@ -21,13 +22,13 @@
 //!
 //! **Support Modules**:
 //! - `raft_actor`: Raft `SimulatedActor` for Bloodhound simulation
-//! - `helix_service_actor`: Helix service `SimulatedActor` for E2E DST
 //! - `properties`: Property definitions (`SingleLeaderPerTerm`, `LogMatching`, etc.)
 //! - `scenarios`: Reusable test scenarios
 //!
 //! ## Naming Conventions
 //!
 //! - DST tests: `test_dst_<component>_<scenario>`
+//! - E2E tests: `test_e2e_<scenario>`
 //! - Integration tests: `test_<component>_<scenario>`
 //! - Unit tests: Inline in each crate under `#[cfg(test)]`
 
@@ -45,28 +46,9 @@
 #![allow(clippy::cast_possible_wrap)]
 #![allow(clippy::too_many_lines)]
 
-#[cfg(test)]
-use std::sync::OnceLock;
-
-#[cfg(test)]
-/// Initialize tracing for tests (no-op if already initialized).
-pub(crate) fn init_test_tracing() {
-    static INIT: OnceLock<()> = OnceLock::new();
-    INIT.get_or_init(|| {
-        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_test_writer()
-            .try_init();
-    });
-}
-
-pub mod helix_service_actor;
 pub mod properties;
 pub mod raft_actor;
 pub mod scenarios;
-pub mod simulated_transport;
 
 // MadSim modules (requires madsim feature).
 #[cfg(feature = "madsim")]
@@ -77,8 +59,6 @@ pub mod madsim_scenarios;
 pub mod madsim_transport;
 
 // DST test modules (deterministic simulation with fault injection).
-#[cfg(test)]
-mod helix_service_dst;
 #[cfg(test)]
 mod raft_dst;
 #[cfg(test)]

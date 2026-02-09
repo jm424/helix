@@ -50,6 +50,15 @@ pub struct MadSimNetworkState {
     partitioned_pairs: std::collections::BTreeSet<(NodeId, NodeId)>,
     /// Set of currently crashed nodes.
     crashed_nodes: std::collections::BTreeSet<NodeId>,
+    /// Per-node latency multiplier. When set, messages TO this node have
+    /// their delivery latency multiplied by this factor. Used by the
+    /// `SlowFollower` fault scenario.
+    node_latency_multiplier: BTreeMap<NodeId, u32>,
+    /// Global latency multiplier applied to ALL messages. Used by the
+    /// concurrent DST to inflate delivery time so faults injected while
+    /// messages are in-flight (sleeping) are visible at delivery time.
+    /// Default 1 (no effect).
+    global_latency_multiplier: u32,
 }
 
 impl MadSimNetworkState {
@@ -104,6 +113,53 @@ impl MadSimNetworkState {
     pub fn is_crashed(&self, node: NodeId) -> bool {
         self.crashed_nodes.contains(&node)
     }
+
+    /// Sets the latency multiplier for a specific node.
+    ///
+    /// Messages delivered TO this node will have their latency multiplied
+    /// by this factor. A multiplier of 1 is normal latency.
+    /// Pass 0 or 1 to clear the multiplier.
+    pub fn set_node_latency(&mut self, node: NodeId, multiplier: u32) {
+        if multiplier <= 1 {
+            self.node_latency_multiplier.remove(&node);
+        } else {
+            self.node_latency_multiplier.insert(node, multiplier);
+        }
+    }
+
+    /// Returns the latency multiplier for a destination node.
+    ///
+    /// Returns 1 if no multiplier is set (normal latency).
+    #[must_use]
+    pub fn get_latency_multiplier(&self, destination: NodeId) -> u32 {
+        self.node_latency_multiplier
+            .get(&destination)
+            .copied()
+            .unwrap_or(1)
+    }
+
+    /// Sets the global latency multiplier applied to ALL messages.
+    ///
+    /// This inflates `NETWORK_LATENCY` for every message, giving fault
+    /// injection tasks time to modify network state while messages are
+    /// in-flight (sleeping). The transport checks partition/crash state
+    /// AFTER the sleep, so faults injected during the sleep window are
+    /// visible at delivery time.
+    ///
+    /// Pass 0 or 1 to disable.
+    pub fn set_global_latency_multiplier(&mut self, multiplier: u32) {
+        self.global_latency_multiplier = multiplier;
+    }
+
+    /// Returns the effective latency for a message to a destination node.
+    ///
+    /// Combines the global multiplier with the per-node multiplier.
+    #[must_use]
+    pub fn effective_latency(&self, destination: NodeId) -> Duration {
+        let node_mult = self.get_latency_multiplier(destination);
+        let global_mult = self.global_latency_multiplier.max(1);
+        NETWORK_LATENCY * node_mult * global_mult
+    }
 }
 
 /// Shared network state handle for MadSim.
@@ -149,6 +205,53 @@ pub type NodeMailboxReceiver = mpsc::Receiver<IncomingMessage>;
 /// Collection of all node mailboxes in the cluster.
 pub type NodeMailboxes = BTreeMap<NodeId, NodeMailbox>;
 
+/// Shared mailbox collection that supports replacing individual node mailboxes.
+///
+/// When `restart_node()` creates a new mailbox for a restarted node, existing
+/// transports on other nodes automatically route messages to the new mailbox
+/// because they hold `Arc<SharedNodeMailboxes>` and look up the mailbox at
+/// send time.
+#[derive(Debug)]
+pub struct SharedNodeMailboxes {
+    inner: Mutex<BTreeMap<NodeId, NodeMailbox>>,
+}
+
+impl SharedNodeMailboxes {
+    /// Creates a new shared mailbox collection from existing mailboxes.
+    #[must_use]
+    pub const fn new(mailboxes: BTreeMap<NodeId, NodeMailbox>) -> Self {
+        Self {
+            inner: Mutex::new(mailboxes),
+        }
+    }
+
+    /// Gets a cloned sender for a specific node.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    #[must_use]
+    pub fn get(&self, node_id: &NodeId) -> Option<NodeMailbox> {
+        self.inner
+            .lock()
+            .expect("lock poisoned")
+            .get(node_id)
+            .cloned()
+    }
+
+    /// Replaces the mailbox for a node (used during `restart_node`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
+    pub fn replace(&self, node_id: NodeId, mailbox: NodeMailbox) {
+        self.inner
+            .lock()
+            .expect("lock poisoned")
+            .insert(node_id, mailbox);
+    }
+}
+
 // ============================================================================
 // MadSim Transport
 // ============================================================================
@@ -158,28 +261,32 @@ pub type NodeMailboxes = BTreeMap<NodeId, NodeMailbox>;
 /// This transport uses MadSim's deterministic task spawning to deliver
 /// messages with simulated network latency. Network partitions cause
 /// messages to be dropped.
+///
+/// Uses `SharedNodeMailboxes` so that `restart_node()` can swap in a new
+/// mailbox sender while existing transports on other nodes automatically
+/// route to the new mailbox.
 #[derive(Clone)]
 pub struct MadSimTransport {
     /// This node's ID.
     node_id: NodeId,
     /// Network state for partition simulation.
     network_state: SharedMadSimNetworkState,
-    /// Mailboxes for all nodes in the cluster.
-    mailboxes: Arc<NodeMailboxes>,
+    /// Shared mailboxes for all nodes in the cluster.
+    shared_mailboxes: Arc<SharedNodeMailboxes>,
 }
 
 impl MadSimTransport {
-    /// Creates a new MadSim transport.
+    /// Creates a new MadSim transport with shared mailboxes.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         node_id: NodeId,
         network_state: SharedMadSimNetworkState,
-        mailboxes: Arc<NodeMailboxes>,
+        shared_mailboxes: Arc<SharedNodeMailboxes>,
     ) -> Self {
         Self {
             node_id,
             network_state,
-            mailboxes,
+            shared_mailboxes,
         }
     }
 }
@@ -189,7 +296,7 @@ impl TransportService for MadSimTransport {
     async fn send_batch(&self, to: NodeId, messages: Vec<GroupMessage>) -> TransportResult<()> {
         let from = self.node_id;
         let network_state = self.network_state.clone();
-        let mailboxes = self.mailboxes.clone();
+        let shared_mailboxes = self.shared_mailboxes.clone();
 
         // Serialize/deserialize round-trip to test the codec layer.
         // This ensures the MadSim transport exercises the same wire format as production.
@@ -221,8 +328,14 @@ impl TransportService for MadSimTransport {
 
         // Spawn an async task that delivers after network latency.
         madsim::task::spawn(async move {
-            // Simulate network latency.
-            madsim::time::sleep(NETWORK_LATENCY).await;
+            // Simulate network latency (global + per-node multipliers).
+            // Faults injected while this sleep is active will be visible
+            // at delivery time (the partition/crash check runs AFTER sleep).
+            let latency = {
+                let state = network_state.lock().expect("lock poisoned");
+                state.effective_latency(to)
+            };
+            madsim::time::sleep(latency).await;
 
             // Check for partition at delivery time (not send time).
             let is_partitioned = {
@@ -240,7 +353,7 @@ impl TransportService for MadSimTransport {
             }
 
             // Deliver the decoded messages to target mailbox.
-            if let Some(mailbox) = mailboxes.get(&to) {
+            if let Some(mailbox) = shared_mailboxes.get(&to) {
                 let msg = IncomingMessage::Raft(RaftMessage {
                     from,
                     messages: decoded_messages,
@@ -256,7 +369,7 @@ impl TransportService for MadSimTransport {
     async fn send_heartbeat(&self, to: NodeId, heartbeat: &BrokerHeartbeat) -> TransportResult<()> {
         let from = self.node_id;
         let network_state = self.network_state.clone();
-        let mailboxes = self.mailboxes.clone();
+        let shared_mailboxes = self.shared_mailboxes.clone();
 
         // Serialize/deserialize round-trip to test the codec layer.
         let encoded = match encode_broker_heartbeat(heartbeat) {
@@ -287,8 +400,14 @@ impl TransportService for MadSimTransport {
 
         // Spawn an async task that delivers after network latency.
         madsim::task::spawn(async move {
-            // Simulate network latency.
-            madsim::time::sleep(NETWORK_LATENCY).await;
+            // Simulate network latency (global + per-node multipliers).
+            // Faults injected while this sleep is active will be visible
+            // at delivery time (the partition/crash check runs AFTER sleep).
+            let latency = {
+                let state = network_state.lock().expect("lock poisoned");
+                state.effective_latency(to)
+            };
+            madsim::time::sleep(latency).await;
 
             // Check for partition at delivery time.
             let is_partitioned = {
@@ -306,7 +425,7 @@ impl TransportService for MadSimTransport {
             }
 
             // Deliver the decoded heartbeat to target mailbox.
-            if let Some(mailbox) = mailboxes.get(&to) {
+            if let Some(mailbox) = shared_mailboxes.get(&to) {
                 let msg = IncomingMessage::Heartbeat(HeartbeatMessage {
                     heartbeat: decoded_heartbeat,
                 });
@@ -329,11 +448,14 @@ impl TransportService for MadSimTransport {
 
 /// Creates mailboxes for a cluster of nodes.
 ///
-/// Returns the mailbox senders (for transport) and receivers (for nodes).
+/// Returns shared mailboxes (for transport) and receivers (for nodes).
+/// The `SharedNodeMailboxes` wrapper allows `restart_node()` to swap in
+/// new mailbox senders without recreating all transports.
+#[must_use]
 pub fn create_cluster_mailboxes(
     node_ids: &[NodeId],
     capacity: usize,
-) -> (Arc<NodeMailboxes>, BTreeMap<NodeId, NodeMailboxReceiver>) {
+) -> (Arc<SharedNodeMailboxes>, BTreeMap<NodeId, NodeMailboxReceiver>) {
     let mut senders = BTreeMap::new();
     let mut receivers = BTreeMap::new();
 
@@ -343,7 +465,7 @@ pub fn create_cluster_mailboxes(
         receivers.insert(node_id, rx);
     }
 
-    (Arc::new(senders), receivers)
+    (Arc::new(SharedNodeMailboxes::new(senders)), receivers)
 }
 
 // ============================================================================

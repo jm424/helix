@@ -708,7 +708,11 @@ pub struct HelixPropertyState {
     /// Snapshots: `node_id` -> snapshot.
     pub snapshots: BTreeMap<u64, HelixNodeSnapshot>,
     /// Leaders observed per term: term -> set of node IDs.
+    /// This tracks the CONTROLLER group (group 0) only.
     pub leaders_by_term: BTreeMap<u64, BTreeSet<u64>>,
+    /// Leaders observed per (`group_id`, term) -> set of node IDs.
+    /// This tracks ALL Raft groups (controller + data partitions).
+    pub leaders_by_group_and_term: BTreeMap<(u64, u64), BTreeSet<u64>>,
     /// Total events processed.
     pub events_processed: u64,
     /// Total successful produce operations across all nodes.
@@ -776,6 +780,25 @@ impl HelixPropertyState {
         }
 
         self.snapshots.insert(snapshot.node_id, snapshot);
+    }
+
+    /// Records a Raft group snapshot for per-group leader tracking.
+    ///
+    /// Call for ALL Raft groups (controller + data partitions) to verify
+    /// `SingleLeaderPerTerm` across all groups.
+    pub fn update_group_snapshot(
+        &mut self,
+        group_id: u64,
+        term: u64,
+        state: RaftState,
+        node_id: u64,
+    ) {
+        if state == RaftState::Leader {
+            self.leaders_by_group_and_term
+                .entry((group_id, term))
+                .or_default()
+                .insert(node_id);
+        }
     }
 
     /// Increments event counter.
@@ -1016,11 +1039,6 @@ impl HelixPropertyState {
         self.consumer_verified = true;
     }
 
-    /// Marks consumer verification as complete (legacy, prefer `finalize_consumer_verification`).
-    pub const fn mark_consumer_verified(&mut self) {
-        self.consumer_verified = true;
-    }
-
     /// Returns true if all ack'd data is consumable (no consumer violations).
     #[must_use]
     pub fn consumer_integrity_ok(&self) -> bool {
@@ -1141,6 +1159,22 @@ pub fn check_helix_properties(
                 term,
                 leaders: leaders.iter().copied().collect(),
             });
+        }
+    }
+
+    // Check SingleLeaderPerTerm for ALL groups (controller + data partitions).
+    for (&(group_id, term), leaders) in &state.leaders_by_group_and_term {
+        if leaders.len() > 1 {
+            violations.push(HelixViolation::MultipleLeadersInTerm {
+                term,
+                leaders: leaders.iter().copied().collect(),
+            });
+            tracing::warn!(
+                group_id,
+                term,
+                leaders = ?leaders,
+                "SingleLeaderPerTerm violated for data partition group"
+            );
         }
     }
 

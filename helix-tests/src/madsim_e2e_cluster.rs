@@ -16,16 +16,11 @@
 //!   The consumer queries Raft state to find the leader and reads from it,
 //!   ensuring up-to-date data.
 //!
-//! # TODO: Use Public API
+//! # NOTE: Uses KafkaHandler directly (not full TCP socket layer)
 //!
-//! Currently, `produce()` and `consume()` call internal service methods
-//! (`append_blob`, `read_blobs`) directly. For true E2E testing, these should
-//! go through the public API layer:
-//! - gRPC: `WriteRequest`/`ReadRequest` via `helix_server::grpc`
-//! - Kafka: `ProduceRequest`/`FetchRequest` via Kafka protocol handler
-//!
-//! The current approach tests the core service logic correctly, but skips
-//! the serialization/deserialization layer of the public API.
+//! Currently, `produce()` and `consume()` call the `KafkaHandler` directly,
+//! bypassing the TCP socket layer. This tests the core service logic and
+//! Kafka protocol handling correctly, but skips the network I/O layer.
 //!
 //! # Architecture
 //!
@@ -94,7 +89,7 @@ use tracing::info;
 
 use crate::madsim_transport::{
     create_cluster_mailboxes, IncomingMessage as MadSimIncomingMessage, MadSimNetworkState,
-    MadSimTransport, NodeMailboxReceiver, SharedMadSimNetworkState,
+    MadSimTransport, NodeMailboxReceiver, SharedMadSimNetworkState, SharedNodeMailboxes,
 };
 use crate::properties::{
     assert_no_helix_violations, check_helix_properties, HelixNodeSnapshot,
@@ -255,10 +250,9 @@ pub struct E2EClusterConfig {
     /// Enable durable storage with SharedWalPool (production-like config).
     /// When true, uses SharedWalPool + BufferedWal instead of in-memory storage.
     pub use_durable_storage: bool,
-    /// Enable actor mode (lock-free partition architecture).
-    /// When true, uses PartitionActor instances with PartitionRouter instead of
-    /// tick-based MultiRaft approach. This tests the production actor architecture.
-    pub actor_mode: bool,
+    /// Number of shared WALs in the pool (passed to `HelixService`).
+    /// When `None`, uses the server default.
+    pub shared_wal_count: Option<u32>,
 }
 
 impl Default for E2EClusterConfig {
@@ -269,7 +263,7 @@ impl Default for E2EClusterConfig {
             storage_faults: FaultConfig::default(),
             mailbox_capacity: 10000,
             use_durable_storage: true, // Default to production-like config
-            actor_mode: false,         // Default to tick-based mode
+            shared_wal_count: Some(4), // Default to shared WAL pool with 4 WALs
         }
     }
 }
@@ -298,10 +292,18 @@ impl E2EClusterConfig {
         self
     }
 
-    /// Enables actor mode (lock-free partition architecture).
+    /// Sets the number of shared WALs in the pool.
     #[must_use]
-    pub fn with_actor_mode(mut self) -> Self {
-        self.actor_mode = true;
+    pub fn with_shared_wal_count(mut self, count: u32) -> Self {
+        self.shared_wal_count = Some(count);
+        self
+    }
+
+    /// Uses per-partition dedicated WAL instead of shared WAL pool.
+    /// Each partition gets its own WAL file — simpler, no pool coordination.
+    #[must_use]
+    pub fn with_per_partition_wal(mut self) -> Self {
+        self.shared_wal_count = None;
         self
     }
 }
@@ -358,23 +360,22 @@ impl E2ENode {
 /// - Deterministic execution under MadSim
 /// - Property tracking for DST verification (SingleLeaderPerTerm, data integrity)
 ///
-/// # Modes
+/// # Architecture
 ///
-/// The cluster can run in two modes:
-/// - **Tick-based mode** (default): Uses `tick_task_multi_node` with `MultiRaft` locks
-/// - **Actor mode**: Uses `PartitionActor` instances with `PartitionRouter` for lock-free operation
+/// The cluster uses `PartitionActor` instances with `PartitionRouter` for lock-free operation.
 pub struct E2ECluster {
     /// Configuration.
-    #[allow(dead_code)]
     config: E2EClusterConfig,
     /// All nodes in the cluster.
     pub nodes: BTreeMap<NodeId, E2ENode>,
     /// Shared network state for partition simulation.
     network_state: SharedMadSimNetworkState,
+    /// Shared mailboxes for inter-node communication (supports restart_node).
+    shared_mailboxes: Arc<SharedNodeMailboxes>,
+    /// Base data directory for durable storage.
+    base_data_dir: Option<std::path::PathBuf>,
     /// All node IDs for convenience.
     node_ids: Vec<NodeId>,
-    /// Whether the cluster is running in actor mode.
-    pub actor_mode: bool,
     /// Shared property state for DST verification.
     property_state: SharedHelixPropertyState,
 }
@@ -406,12 +407,18 @@ impl E2ECluster {
         let network_state = Arc::new(Mutex::new(MadSimNetworkState::new()));
 
         // Create mailboxes for inter-node communication.
-        let (mailboxes, mut receivers) =
+        let (shared_mailboxes, mut receivers) =
             create_cluster_mailboxes(&node_ids, config.mailbox_capacity);
 
         // Create base data directory for durable storage (if enabled).
+        // Use thread ID to avoid collisions when cargo test runs multiple
+        // test functions in parallel with the same base_seed.
         let base_data_dir = if config.use_durable_storage {
-            let dir = std::path::PathBuf::from(format!("/tmp/helix-e2e-{}", config.base_seed));
+            let thread_id = format!("{:?}", std::thread::current().id());
+            let dir = std::path::PathBuf::from(format!(
+                "/tmp/helix-e2e-{}-{}",
+                config.base_seed, thread_id
+            ));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("Failed to create base data directory");
             Some(dir)
@@ -428,8 +435,9 @@ impl E2ECluster {
             let storage =
                 SimulatedStorage::with_faults(storage_seed, config.storage_faults.clone());
 
-            // Create transport with shared network state.
-            let transport = MadSimTransport::new(node_id, network_state.clone(), mailboxes.clone());
+            // Create transport with shared network state and shared mailboxes.
+            let transport =
+                MadSimTransport::new(node_id, network_state.clone(), shared_mailboxes.clone());
 
             // Get incoming message receiver for this node.
             let madsim_rx = receivers.remove(&node_id).expect("receiver should exist");
@@ -454,9 +462,8 @@ impl E2ECluster {
                 transport.clone(),
                 incoming_rx,
                 node_data_dir.clone(),
-                None, // shared_wal_count (use default)
+                config.shared_wal_count,
                 WriteDurability::Fsync,
-                config.actor_mode,
                 storage.clone(),
             )
             .await;
@@ -492,14 +499,12 @@ impl E2ECluster {
             );
         }
 
-        let actor_mode = config.actor_mode;
         let property_state = Arc::new(Mutex::new(HelixPropertyState::new()));
 
         info!(
             node_count = config.node_count,
             base_seed = config.base_seed,
             durable_storage = config.use_durable_storage,
-            actor_mode,
             "E2E cluster started using production constructor"
         );
 
@@ -507,8 +512,9 @@ impl E2ECluster {
             config,
             nodes,
             network_state,
+            shared_mailboxes,
+            base_data_dir,
             node_ids,
-            actor_mode,
             property_state,
         }
     }
@@ -923,85 +929,74 @@ impl E2ECluster {
         #[allow(clippy::cast_possible_wrap)]
         let partition_i32 = partition as i32;
 
-        const MAX_ATTEMPTS: u32 = 5;
+        // Try available (non-crashed) nodes via the Kafka fetch path.
+        // The Kafka handler routes through the actor router for data partitions,
+        // returning NOT_LEADER if this node isn't the leader. We cycle through
+        // nodes just like a real Kafka client's metadata refresh.
+        let available = self.get_available_nodes();
+        let mut tried = std::collections::BTreeSet::new();
+
+        const MAX_ATTEMPTS: u32 = 10;
         for _attempt in 0..MAX_ATTEMPTS {
-            // Find the leader for this partition by checking each node's Raft state.
-            let leader_node_id = self.find_partition_leader(topic, partition).await;
+            // Pick an untried available node, or cycle through all.
+            let node_id = available
+                .iter()
+                .find(|&&n| !tried.contains(&n))
+                .or_else(|| available.first())
+                .copied();
 
-            if let Some(leader_id) = leader_node_id {
-                // Read from the leader using Kafka handler (has most up-to-date data).
-                if let Some(node) = self.nodes.get(&leader_id) {
-                    match node
-                        .handler
-                        .fetch(topic, partition_i32, start_offset, 1024 * 1024)
-                        .await
-                    {
-                        Ok(response) => {
-                            // Split concatenated RecordBatches into individual batches.
-                            let mut all_batches = Vec::new();
-                            for data in response {
-                                all_batches.extend(split_record_batches(&data));
-                            }
-                            return Ok(all_batches);
-                        }
-                        Err(KafkaError::Protocol { error_code, .. })
-                            if error_code == 6
-                                || error_code == 5
-                                || error_code == 3
-                                || error_code == 9 =>
-                        {
-                            // NOT_LEADER_OR_FOLLOWER / LEADER_NOT_AVAILABLE / UNKNOWN_TOPIC_OR_PARTITION
-                            // / BROKER_NOT_AVAILABLE: refresh leader selection and retry.
-                            tracing::debug!(
-                                error_code,
-                                leader = leader_id.get(),
-                                "fetch hit leader error, retrying"
-                            );
-                            continue;
-                        }
-                        Err(e) => {
-                            return Err(format!("fetch from leader failed: {e}"));
-                        }
+            let Some(node_id) = node_id else {
+                return Err("No available nodes".to_string());
+            };
+            tried.insert(node_id);
+
+            let Some(node) = self.nodes.get(&node_id) else {
+                continue;
+            };
+
+            match node
+                .handler
+                .fetch(topic, partition_i32, start_offset, 1024 * 1024)
+                .await
+            {
+                Ok(response) => {
+                    let mut all_batches = Vec::new();
+                    for data in response {
+                        all_batches.extend(split_record_batches(&data));
                     }
+                    return Ok(all_batches);
                 }
-            }
-
-            // No leader known - probe available nodes (simulates metadata refresh).
-            for node in self.nodes.values() {
-                match node
-                    .handler
-                    .fetch(topic, partition_i32, start_offset, 1024 * 1024)
-                    .await
+                Err(KafkaError::Protocol { error_code, .. })
+                    if error_code == 6
+                        || error_code == 5
+                        || error_code == 3
+                        || error_code == 9 =>
                 {
-                    Ok(response) => {
-                        // Split concatenated RecordBatches into individual batches.
-                        let mut all_batches = Vec::new();
-                        for data in response {
-                            all_batches.extend(split_record_batches(&data));
-                        }
-                        return Ok(all_batches);
-                    }
-                    Err(KafkaError::Protocol { error_code, .. })
-                        if error_code == 6
-                            || error_code == 5
-                            || error_code == 3
-                            || error_code == 9 =>
-                    {
-                        tracing::debug!(error_code, "fetch probe hit leader error");
-                    }
-                    Err(e) => {
-                        tracing::debug!(error = %e, "fetch probe failed");
-                    }
+                    // Retriable: NOT_LEADER (6), LEADER_NOT_AVAILABLE (5),
+                    // UNKNOWN_TOPIC (3), BROKER_NOT_AVAILABLE (9).
+                    tracing::debug!(
+                        node = node_id.get(),
+                        error_code,
+                        "fetch: retriable error, trying next node"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::debug!(node = node_id.get(), error = %e, "fetch failed");
+                    continue;
                 }
             }
         }
 
-        Err("No nodes available for consume after retries".to_string())
+        Err("consume failed after retries on all available nodes".to_string())
     }
 
-    /// Finds the leader node for a topic partition.
+    /// Finds the leader node for a topic partition via `MultiRaft` state.
     ///
+    /// Note: for actor-mode data partitions, leadership lives in partition actors,
+    /// not `MultiRaft`. This method works for controller partitions.
     /// Returns `None` if no leader is known.
+    #[allow(dead_code)] // Used in debug logging.
     async fn find_partition_leader(&self, topic: &str, partition: u32) -> Option<NodeId> {
         use helix_core::PartitionId;
         use helix_raft::RaftState;
@@ -1307,18 +1302,132 @@ impl E2ECluster {
         info!("All network partitions healed");
     }
 
-    /// Crashes a node (stops receiving messages).
+    /// Crashes a node (stops receiving messages and reverts unsynced storage).
+    ///
+    /// This calls `SimulatedStorage::simulate_crash()` to revert any writes
+    /// that were not fsync'd, simulating a real power failure. The node's
+    /// in-memory state (HelixService) continues running but is network-isolated.
+    /// Use `restart_node()` after `recover_node()` for full crash recovery
+    /// with WAL replay.
     pub fn crash_node(&self, node_id: NodeId) {
+        // Revert unsynced writes in storage.
+        if let Some(node) = self.nodes.get(&node_id) {
+            node.storage.simulate_crash();
+        }
         let mut state = self.network_state.lock().expect("lock poisoned");
         state.crash_node(node_id);
-        info!(node = node_id.get(), "Node crashed");
+        info!(node = node_id.get(), "Node crashed (storage crash-reverted)");
     }
 
-    /// Recovers a crashed node.
+    /// Recovers a crashed node (network only — no WAL replay).
+    ///
+    /// This re-enables network communication for the node but does NOT restart
+    /// the service. The existing `HelixService` continues with its in-memory
+    /// state. For full crash recovery with WAL replay, use `restart_node()`.
     pub fn recover_node(&self, node_id: NodeId) {
         let mut state = self.network_state.lock().expect("lock poisoned");
         state.recover_node(node_id);
-        info!(node = node_id.get(), "Node recovered");
+        info!(node = node_id.get(), "Node recovered (network only)");
+    }
+
+    /// Restarts a crashed node with a fresh `HelixService` instance.
+    ///
+    /// This simulates a real crash recovery:
+    /// 1. Gets the node's `SimulatedStorage` (Arc-backed, survives drop)
+    /// 2. Drops the old `E2ENode` (stops old service tasks)
+    /// 3. Creates new mailbox channel, swaps sender into shared mailboxes
+    /// 4. Spawns new `message_bridge_task`
+    /// 5. Creates new `MadSimTransport` with same shared state
+    /// 6. Calls `HelixService::new_multi_node_with_transport()` — this
+    ///    opens `SharedWalPool` which replays from the crash-reverted files
+    /// 7. Creates new `KafkaHandler`, inserts new `E2ENode`
+    /// 8. Clears the crashed flag in network state
+    ///
+    /// The node replays its WAL from the last fsync'd state, catching up
+    /// via Raft replication for entries that were lost in the crash.
+    pub async fn restart_node(&mut self, node_id: NodeId) {
+        use helix_core::WriteDurability;
+
+        // Get storage from the old node (Arc-backed, survives drop).
+        let storage = self
+            .nodes
+            .get(&node_id)
+            .expect("node must exist to restart")
+            .storage
+            .clone();
+
+        let node_data_dir = self.base_data_dir.as_ref().map(|base| {
+            base.join(format!("node-{}", node_id.get()))
+        });
+
+        // Drop the old node (stops background tasks).
+        self.nodes.remove(&node_id);
+
+        // Create new mailbox and swap into shared mailboxes.
+        let (tx, madsim_rx) = mpsc::channel(self.config.mailbox_capacity);
+        self.shared_mailboxes.replace(node_id, tx);
+
+        // Bridge MadSim messages to helix_runtime format.
+        let (incoming_tx, incoming_rx) = mpsc::channel(self.config.mailbox_capacity);
+        tokio::spawn(message_bridge_task(madsim_rx, incoming_tx));
+
+        // Create new transport with same shared state.
+        let transport = MadSimTransport::new(
+            node_id,
+            self.network_state.clone(),
+            self.shared_mailboxes.clone(),
+        );
+
+        // Create new service — this replays WAL from crash-reverted storage.
+        let service = HelixService::new_multi_node_with_transport(
+            "e2e-cluster".to_string(),
+            node_id.get(),
+            self.node_ids.clone(),
+            transport.clone(),
+            incoming_rx,
+            node_data_dir.clone(),
+            self.config.shared_wal_count,
+            WriteDurability::Fsync,
+            storage.clone(),
+        )
+        .await;
+
+        let actor_router = service.actor_router().cloned();
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+
+        let service = Arc::new(service);
+        let handler = Arc::new(KafkaHandler::new(
+            Arc::clone(&service),
+            "127.0.0.1".to_string(),
+            9092,
+            true, // auto_create_topics
+            1,    // auto_create_partitions
+        ));
+
+        self.nodes.insert(
+            node_id,
+            E2ENode {
+                node_id,
+                service,
+                handler,
+                storage,
+                transport,
+                shutdown_tx,
+                data_dir: node_data_dir,
+                actor_router,
+            },
+        );
+
+        // Clear the crashed flag.
+        {
+            let mut state = self.network_state.lock().expect("lock poisoned");
+            state.recover_node(node_id);
+        }
+
+        info!(
+            node = node_id.get(),
+            "Node restarted with fresh service (WAL replayed)"
+        );
     }
 
     /// Sets storage fault configuration for a node.
@@ -1391,15 +1500,18 @@ impl E2ECluster {
             .await?;
 
         // Record client ack for verification.
-        // Get topic_id from controller state.
+        // Get topic_id from controller state — try all nodes since a recently
+        // restarted node may not have replicated controller state yet.
         let topic_id = {
-            let first_node = self.nodes.values().next();
-            if let Some(node) = first_node {
+            let mut found = None;
+            for node in self.nodes.values() {
                 let state = node.service.controller_state().read().await;
-                state.get_topic(topic).map(|info| info.topic_id.get())
-            } else {
-                None
+                if let Some(info) = state.get_topic(topic) {
+                    found = Some(info.topic_id.get());
+                    break;
+                }
             }
+            found
         };
 
         let Some(topic_id) = topic_id else {
@@ -1442,18 +1554,18 @@ impl E2ECluster {
         partition: u32,
         start_offset: u64,
     ) -> Result<Vec<Bytes>, String> {
-        // Get topic_id for verification - FAIL if not found (no silent skip).
+        // Get topic_id for verification - try all nodes since a recently
+        // restarted node may not have replicated controller state yet.
         let topic_id = {
-            let first_node = self
-                .nodes
-                .values()
-                .next()
-                .ok_or_else(|| "no nodes in cluster".to_string())?;
-            let state = first_node.service.controller_state().read().await;
-            state
-                .get_topic(topic)
-                .map(|info| info.topic_id.get())
-                .ok_or_else(|| format!("topic '{}' not found in controller state", topic))?
+            let mut found = None;
+            for node in self.nodes.values() {
+                let state = node.service.controller_state().read().await;
+                if let Some(info) = state.get_topic(topic) {
+                    found = Some(info.topic_id.get());
+                    break;
+                }
+            }
+            found.ok_or_else(|| format!("topic '{}' not found in controller state", topic))?
         };
 
         let records = self.consume(topic, partition, start_offset).await?;
@@ -1741,7 +1853,7 @@ impl E2ECluster {
                 }
             };
 
-            // Update property state with snapshot.
+            // Update property state with snapshot (backward compat for controller).
             if let Ok(mut state) = self.property_state.lock() {
                 state.update_snapshot(HelixNodeSnapshot {
                     node_id: node.node_id.get(),
@@ -1749,6 +1861,24 @@ impl E2ECluster {
                     controller_state,
                     crashed: false,
                 });
+            }
+
+            // Track leaders for ALL groups (controller + data partitions).
+            {
+                let mr = node.service.multi_raft().read().await;
+                let group_ids = mr.group_ids();
+                if let Ok(mut prop_state) = self.property_state.lock() {
+                    for group_id in group_ids {
+                        if let Some(gs) = mr.group_state(group_id) {
+                            prop_state.update_group_snapshot(
+                                group_id.get(),
+                                gs.current_term.get(),
+                                gs.state,
+                                node.node_id.get(),
+                            );
+                        }
+                    }
+                }
             }
         }
     }
@@ -1782,16 +1912,21 @@ impl crate::madsim_scenarios::FaultInjectable for E2ECluster {
     fn set_storage_faults(&self, node_id: NodeId, config: FaultConfig) {
         E2ECluster::set_storage_faults(self, node_id, config);
     }
+
+    fn set_node_latency(&self, node_id: NodeId, multiplier: u32) {
+        let mut state = self.network_state.lock().expect("lock poisoned");
+        state.set_node_latency(node_id, multiplier);
+        info!(
+            node = node_id.get(),
+            multiplier, "Node latency multiplier set"
+        );
+    }
 }
 
 impl E2ECluster {
     /// Debug: prints router partition counts for all nodes.
     #[allow(dead_code)]
     pub async fn debug_print_router_state(&self) {
-        if !self.actor_mode {
-            eprintln!("[DEBUG] Not in actor mode, no routers");
-            return;
-        }
         for (node_id, node) in &self.nodes {
             if let Some(router) = &node.actor_router {
                 let count = router.partition_count().await;
@@ -1868,6 +2003,326 @@ impl E2ECluster {
             "produce failed after {max_retries} retries: {last_error}"
         ))
     }
+
+    /// Creates a fault injector handle that can be moved into a spawned task.
+    /// Implements `FaultInjectable` using only `Arc`-cloned state.
+    #[cfg(test)]
+    fn create_fault_injector_handle(&self) -> FaultInjectorHandle {
+        let storages: Vec<_> = self
+            .nodes
+            .iter()
+            .map(|(&id, node)| (id, node.storage.clone()))
+            .collect();
+        FaultInjectorHandle {
+            network_state: self.network_state.clone(),
+            node_ids: self.node_ids.clone(),
+            storages,
+        }
+    }
+
+    /// Creates a handle that can be moved into a spawned concurrent producer
+    /// task. The handle holds only `Arc`-cloned references, so the `E2ECluster`
+    /// remains exclusively owned by the main task for fault injection.
+    #[cfg(test)]
+    fn create_producer_handle(&self) -> ConcurrentProducerHandle {
+        let handlers: Vec<_> = self
+            .nodes
+            .iter()
+            .map(|(&id, node)| (id, Arc::clone(&node.handler)))
+            .collect();
+        let services: Vec<_> = self
+            .nodes
+            .iter()
+            .map(|(&id, node)| (id, Arc::clone(&node.service)))
+            .collect();
+        ConcurrentProducerHandle {
+            handlers,
+            services,
+            network_state: self.network_state.clone(),
+            node_ids: self.node_ids.clone(),
+            property_state: self.property_state.clone(),
+        }
+    }
+}
+
+// ============================================================================
+// Concurrent Producer Infrastructure (test-only)
+// ============================================================================
+
+/// Handle for a background producer task that runs concurrently with fault
+/// injection. Holds only `Arc`-cloned references so the `E2ECluster` owner
+/// can inject faults on the main task without contention.
+#[cfg(test)]
+struct ConcurrentProducerHandle {
+    /// Node handlers for producing (`Arc`-cloned from `E2ECluster`).
+    handlers: Vec<(NodeId, Arc<E2EKafkaHandler>)>,
+    /// Node services for topic_id lookup (`Arc`-cloned from `E2ECluster`).
+    services: Vec<(NodeId, Arc<E2EHelixService>)>,
+    /// Shared network state (to check which nodes are available).
+    network_state: SharedMadSimNetworkState,
+    /// All node IDs.
+    node_ids: Vec<NodeId>,
+    /// Property state for recording acked produces.
+    property_state: SharedHelixPropertyState,
+}
+
+#[cfg(test)]
+impl ConcurrentProducerHandle {
+    /// Returns node IDs that are not crashed.
+    fn get_available_nodes(&self) -> Vec<NodeId> {
+        let state = self.network_state.lock().expect("lock poisoned");
+        self.node_ids
+            .iter()
+            .filter(|&&node_id| !state.is_crashed(node_id))
+            .copied()
+            .collect()
+    }
+
+    /// Produces a record, retrying across available nodes.
+    /// Returns `Ok(offset)` on ack, `Err(reason)` on failure.
+    async fn produce(
+        &self,
+        topic: &str,
+        partition: u32,
+        record_batch: Bytes,
+    ) -> Result<Offset, String> {
+        use helix_server::kafka::KafkaError;
+
+        #[allow(clippy::cast_possible_wrap)]
+        let partition_i32 = partition as i32;
+
+        let available_nodes = self.get_available_nodes();
+        let mut current_node_id = available_nodes
+            .first()
+            .or_else(|| self.node_ids.first())
+            .copied();
+        let mut tried_nodes = std::collections::BTreeSet::new();
+        let mut last_error = String::new();
+
+        for _attempt in 0..5 {
+            let Some(node_id) = current_node_id else {
+                return Err("No node available".to_string());
+            };
+
+            let Some((_, handler)) = self.handlers.iter().find(|(id, _)| *id == node_id) else {
+                return Err(format!("Node {} not found", node_id.get()));
+            };
+
+            tried_nodes.insert(node_id);
+
+            match handler
+                .produce(topic, partition_i32, record_batch.clone())
+                .await
+            {
+                Ok(offset) => return Ok(Offset::new(offset)),
+                Err(KafkaError::Protocol { error_code, .. })
+                    if error_code == 6 || error_code == 3 || error_code == 5 || error_code == -1 =>
+                {
+                    // NOT_LEADER (6), UNKNOWN_TOPIC (3), LEADER_NOT_AVAILABLE (5), UNKNOWN (-1).
+                    current_node_id = available_nodes
+                        .iter()
+                        .find(|&&n| !tried_nodes.contains(&n))
+                        .copied()
+                        .or_else(|| {
+                            let idx = self
+                                .node_ids
+                                .iter()
+                                .position(|&n| n == node_id)
+                                .unwrap_or(0);
+                            self.node_ids.get((idx + 1) % self.node_ids.len()).copied()
+                        });
+                    last_error = format!("retriable error_code={error_code}");
+                }
+                Err(KafkaError::Protocol {
+                    error_code,
+                    ref message,
+                }) if error_code == 9 =>
+                {
+                    // BROKER_NOT_AVAILABLE — try another node.
+                    current_node_id = available_nodes
+                        .iter()
+                        .find(|&&n| !tried_nodes.contains(&n))
+                        .copied();
+                    last_error = format!("broker_not_available: {message}");
+                }
+                Err(e) => {
+                    return Err(format!("produce failed: {e}"));
+                }
+            }
+        }
+
+        Err(format!("no leader after retries: {last_error}"))
+    }
+
+    /// Produces with retries, sleeping between attempts to let Raft advance.
+    async fn produce_with_retry(
+        &self,
+        topic: &str,
+        partition: u32,
+        record_batch: Bytes,
+        max_retries: u32,
+    ) -> Result<Offset, String> {
+        let mut last_error = String::new();
+        for _attempt in 0..max_retries {
+            match self.produce(topic, partition, record_batch.clone()).await {
+                Ok(offset) => return Ok(offset),
+                Err(e) => {
+                    last_error = e;
+                    madsim::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+        Err(format!(
+            "produce failed after {max_retries} retries: {last_error}"
+        ))
+    }
+
+    /// Produces a record, retries across nodes, and records the ack in
+    /// property state for later verification.
+    async fn produce_and_track(
+        &self,
+        topic: &str,
+        partition: u32,
+        data: Bytes,
+        max_retries: u32,
+    ) -> Result<Offset, String> {
+        let payload_hash = E2ECluster::simple_hash(&data);
+        let record_batch = create_test_record_batch(&data);
+
+        let offset = self
+            .produce_with_retry(topic, partition, record_batch, max_retries)
+            .await?;
+
+        // Look up topic_id from controller state — try all services.
+        let topic_id = {
+            let mut found = None;
+            for (_, service) in &self.services {
+                let state = service.controller_state().read().await;
+                if let Some(info) = state.get_topic(topic) {
+                    found = Some(info.topic_id.get());
+                    break;
+                }
+            }
+            found
+        };
+
+        let Some(topic_id) = topic_id else {
+            return Err(format!("topic_id lookup failed for topic={topic}"));
+        };
+
+        if let Ok(mut state) = self.property_state.lock() {
+            state.record_client_ack(topic_id, u64::from(partition), offset.get(), payload_hash);
+            state.record_expected_payload(topic_id, u64::from(partition), offset.get(), data);
+        }
+
+        Ok(offset)
+    }
+}
+
+/// Lightweight handle for injecting faults from a spawned task.
+///
+/// Implements `FaultInjectable` so it can be used with `ScenarioExecutor`.
+/// Only holds `Arc`-cloned references, so the `E2ECluster` owner can
+/// still access the cluster after creating this handle.
+#[cfg(test)]
+struct FaultInjectorHandle {
+    /// Shared network state for partition/crash simulation.
+    network_state: SharedMadSimNetworkState,
+    /// All node IDs.
+    node_ids: Vec<NodeId>,
+    /// Per-node storage for `simulate_crash()`.
+    storages: Vec<(NodeId, SimulatedStorage)>,
+}
+
+#[cfg(test)]
+impl crate::madsim_scenarios::FaultInjectable for FaultInjectorHandle {
+    fn node_ids(&self) -> &[NodeId] {
+        &self.node_ids
+    }
+
+    fn partition(&self, nodes: &[NodeId]) {
+        let mut state = self.network_state.lock().expect("lock poisoned");
+        state.partition(nodes);
+    }
+
+    fn heal(&self, nodes: &[NodeId]) {
+        let mut state = self.network_state.lock().expect("lock poisoned");
+        state.heal(nodes);
+    }
+
+    fn crash_node(&self, node_id: NodeId) {
+        if let Some((_, storage)) = self.storages.iter().find(|(id, _)| *id == node_id) {
+            storage.simulate_crash();
+        }
+        let mut state = self.network_state.lock().expect("lock poisoned");
+        state.crash_node(node_id);
+    }
+
+    fn recover_node(&self, node_id: NodeId) {
+        let mut state = self.network_state.lock().expect("lock poisoned");
+        state.recover_node(node_id);
+    }
+
+    fn set_storage_faults(&self, node_id: NodeId, config: FaultConfig) {
+        if let Some((_, storage)) = self.storages.iter().find(|(id, _)| *id == node_id) {
+            *storage.fault_config() = config;
+        }
+    }
+
+    fn set_node_latency(&self, node_id: NodeId, multiplier: u32) {
+        let mut state = self.network_state.lock().expect("lock poisoned");
+        state.set_node_latency(node_id, multiplier);
+    }
+}
+
+/// Result from a concurrent background producer task.
+#[cfg(test)]
+struct ProducerResult {
+    /// Number of records successfully acked.
+    acked: u64,
+    /// Number of records that failed (timeout, no leader, etc.).
+    failed: u64,
+}
+
+/// Background producer task that continuously pushes records concurrently
+/// with fault injection on the main task.
+///
+/// Runs until signaled to stop via the shutdown channel. Under MadSim's
+/// deterministic scheduler, this task interleaves with the fault injection
+/// loop whenever the main task calls `sleep()`.
+#[cfg(test)]
+async fn background_producer_task(
+    handle: ConcurrentProducerHandle,
+    topic: String,
+    partition_count: u32,
+    produce_interval: Duration,
+    producer_id: u32,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> ProducerResult {
+    let mut result = ProducerResult { acked: 0, failed: 0 };
+    let mut record_num: u64 = 0;
+
+    loop {
+        if *shutdown_rx.borrow() {
+            break;
+        }
+
+        let partition = (record_num as u32) % partition_count;
+        let payload = format!("concurrent-p{producer_id}-r{record_num}");
+
+        match handle
+            .produce_and_track(&topic, partition, Bytes::from(payload), 5)
+            .await
+        {
+            Ok(_offset) => result.acked += 1,
+            Err(_) => result.failed += 1,
+        }
+
+        record_num += 1;
+        madsim::time::sleep(produce_interval).await;
+    }
+
+    result
 }
 
 // ============================================================================
@@ -2040,49 +2495,8 @@ mod tests {
             // Create topic using REAL API.
             let result = cluster.create_topic("test-topic", 1).await;
 
-            match result {
-                Ok(()) => {
-                    eprintln!("[PASS] test_e2e_create_topic: Created topic");
-                }
-                Err(e) => {
-                    eprintln!("[INFO] test_e2e_create_topic: {}", e);
-                    // This is expected to fail initially until we wire everything up.
-                }
-            }
-        });
-    }
-
-    #[test]
-    fn test_e2e_single_node() {
-        // Test E2E with single node (no Raft replication needed).
-        let rt = Runtime::with_seed_and_config(42, Default::default());
-        rt.block_on(async {
-            let cluster = E2ECluster::start(1).await;
-
-            // Wait for cluster to stabilize.
-            cluster.sleep(Duration::from_millis(500)).await;
-
-            // Create topic.
-            cluster
-                .create_topic("test-topic", 1)
-                .await
-                .expect("create topic");
-
-            // Produce data with retries (leader election happens in background).
-            for i in 0..5 {
-                let offset = cluster
-                    .produce_with_retry("test-topic", 0, format!("record-{i}"), 50)
-                    .await;
-                assert!(offset.is_ok(), "Produce should succeed: {:?}", offset);
-                eprintln!("[INFO] Produced record {} at offset {:?}", i, offset);
-            }
-
-            // Consume data.
-            let records = cluster.consume("test-topic", 0, 0).await;
-            assert!(records.is_ok(), "Consume should succeed");
-            assert_eq!(records.unwrap().len(), 5, "Should have 5 records");
-
-            eprintln!("[PASS] test_e2e_single_node: Full E2E works in single-node mode");
+            result.expect("test_e2e_create_topic: topic creation must succeed");
+            eprintln!("[PASS] test_e2e_create_topic: Created topic");
         });
     }
 
@@ -2115,12 +2529,13 @@ mod tests {
             );
 
             // Wait for cluster to stabilize.
-            cluster.sleep(Duration::from_millis(500)).await;
+            // Wait for controller election.
+            cluster.sleep(Duration::from_secs(2)).await;
 
             // Create topic and produce data.
             cluster.create_topic("durable-test", 1).await.expect("create topic");
             for i in 0..10 {
-                cluster.produce_with_retry("durable-test", 0, format!("record-{i}"), 50).await
+                cluster.produce_with_retry("durable-test", 0, format!("record-{i}"), 100).await
                     .expect("produce should succeed");
             }
 
@@ -2189,9 +2604,12 @@ mod tests {
                 }
             }
 
+            // Wait for partition actor leader election.
+            cluster.sleep(Duration::from_secs(1)).await;
+
             // Produce some records successfully first.
             for i in 0..5 {
-                cluster.produce_with_retry("fault-test", 0, format!("record-{i}"), 50).await
+                cluster.produce_with_retry("fault-test", 0, format!("record-{i}"), 100).await
                     .expect("produce should succeed");
             }
 
@@ -2587,6 +3005,17 @@ mod tests {
     /// this test uses `FaultScenario::random(seed)` to deterministically generate
     /// varied fault patterns.
     ///
+    /// # Known Limitation: Sequential Produce-Then-Fault
+    ///
+    /// The DST loop follows a sequential pattern: produce records, then inject
+    /// faults, then sleep. It never produces concurrently with active fault
+    /// injection within the same tick. This means certain race conditions
+    /// (e.g., a write in progress when a crash occurs) are not exercised here.
+    ///
+    /// The helix-workload E2E tests (which spawn real `helix-server` processes)
+    /// DO exercise concurrent production during faults, because the producer
+    /// and fault injector run in separate threads.
+    ///
     /// # Verification
     ///
     /// This test performs three levels of verification:
@@ -2635,7 +3064,8 @@ mod tests {
             let result = std::panic::catch_unwind(|| {
                 let rt = Runtime::with_seed_and_config(seed, Default::default());
                 rt.block_on(async {
-                    let cluster = E2ECluster::start(3).await;
+                    let config = E2EClusterConfig::with_nodes(3);
+                    let mut cluster = E2ECluster::start_with_config(config).await;
                     let mut executor = ScenarioExecutor::new(scenario.clone());
 
                     // Wait for controller election (reduced from 500ms).
@@ -2692,7 +3122,28 @@ mod tests {
 
                     // Heal all partitions after test.
                     cluster.heal_all();
-                    cluster.sleep(Duration::from_millis(500)).await; // Reduced from 2s
+
+                    // Restart any crashed nodes for full WAL replay recovery.
+                    let crashed_nodes: Vec<NodeId> = {
+                        let state = cluster.network_state.lock().expect("lock poisoned");
+                        cluster
+                            .node_ids
+                            .iter()
+                            .filter(|&&n| state.is_crashed(n))
+                            .copied()
+                            .collect()
+                    };
+                    let had_restarts = !crashed_nodes.is_empty();
+                    for node_id in crashed_nodes {
+                        cluster.restart_node(node_id).await;
+                    }
+
+                    // Extra stabilization time when nodes were restarted so
+                    // controller state (topic metadata) replicates via Raft.
+                    if had_restarts {
+                        cluster.sleep(Duration::from_secs(3)).await;
+                    }
+                    cluster.sleep(Duration::from_millis(500)).await;
                     if partition_count > 1 {
                         // Extra stabilization time for multi-partition metadata to propagate.
                         cluster.sleep(Duration::from_millis(1000)).await;
@@ -2903,16 +3354,6 @@ mod tests {
         eprintln!("[TOTAL] elapsed {:?}", suite_start.elapsed());
     }
 
-    #[test]
-    fn test_e2e_dst_random_faults() {
-        run_e2e_dst_random_faults(500, 20, 20, "dst-topic", 1, 10);
-    }
-
-    #[test]
-    fn test_e2e_dst_random_faults_multi_partition() {
-        run_e2e_dst_random_faults(200, 20, 20, "dst-topic-mp", 3, 10);
-    }
-
     /// Extended DST test - runs 1000 seeds (ignored by default, run manually).
     #[test]
     #[ignore]
@@ -2921,18 +3362,363 @@ mod tests {
     }
 
     // ========================================================================
-    // Actor Mode Tests
+    // Concurrent Production During Fault Injection DST
+    // ========================================================================
+
+    /// Runs DST with background producers that operate concurrently with fault
+    /// injection. Unlike `run_e2e_dst_random_faults` where production and faults
+    /// are sequential, this exercises writes that are in-flight when faults hit.
+    ///
+    /// The invariant being tested: **if a produce was acked, that data must be
+    /// readable after recovery.** Failed produces (expected during faults) are
+    /// not tracked and not verified.
+    #[allow(clippy::too_many_arguments)]
+    fn run_e2e_dst_concurrent_faults(
+        total_seeds: u64,
+        test_duration_ms: u64,
+        fault_tick_interval_ms: u64,
+        producer_count: u32,
+        produce_interval_ms: u64,
+        topic: &str,
+        partition_count: u32,
+        progress_mod: u64,
+    ) {
+        use crate::madsim_scenarios::{FaultScenario, ScenarioExecutor};
+
+        let mut failures: Vec<(u64, String, String)> = Vec::new();
+        let mut scenario_counts: std::collections::HashMap<&'static str, u64> =
+            std::collections::HashMap::new();
+        let seed_filter = std::env::var("MADSIM_SEED")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
+
+        let suite_start = std::time::Instant::now();
+        for seed in 0..total_seeds {
+            if seed_filter.is_some_and(|s| s != seed) {
+                continue;
+            }
+
+            let scenario = FaultScenario::random(seed);
+            let scenario_name = scenario.name();
+            *scenario_counts.entry(scenario_name).or_default() += 1;
+
+            if seed % progress_mod == 0 {
+                eprintln!(
+                    "[PROGRESS] Concurrent seed {}/{} - scenario: {}",
+                    seed, total_seeds, scenario_name
+                );
+            }
+
+            let seed_start = std::time::Instant::now();
+            let result = std::panic::catch_unwind(|| {
+                let rt = Runtime::with_seed_and_config(seed, Default::default());
+                rt.block_on(async {
+                    // ===== PHASE 1: SETUP =====
+                    let config = E2EClusterConfig::with_nodes(3);
+                    let mut cluster = E2ECluster::start_with_config(config).await;
+                    let executor = ScenarioExecutor::new(scenario.clone());
+
+                    cluster.sleep(Duration::from_millis(200)).await;
+                    for attempt in 0..10 {
+                        if cluster.create_topic(topic, partition_count).await.is_ok() {
+                            break;
+                        }
+                        cluster.sleep(Duration::from_millis(50)).await;
+                        if attempt == 9 {
+                            panic!("Failed to create topic after 10 attempts");
+                        }
+                    }
+
+                    // ===== PHASE 2: START CONCURRENT PRODUCERS =====
+                    // Inflate network latency so messages are in-flight long
+                    // enough for the fault injection task to modify network
+                    // state while they're sleeping. With 50x multiplier,
+                    // NETWORK_LATENCY (1ms) becomes 50ms per hop, making Raft
+                    // replication take ~100ms round-trip. Fault ticks at 10ms
+                    // intervals can then hit mid-replication.
+                    {
+                        let mut net = cluster.network_state.lock().expect("lock poisoned");
+                        net.set_global_latency_multiplier(50);
+                    }
+
+                    let (shutdown_tx, shutdown_rx) =
+                        tokio::sync::watch::channel(false);
+                    let mut producer_handles = Vec::with_capacity(producer_count as usize);
+
+                    for producer_id in 0..producer_count {
+                        let handle = cluster.create_producer_handle();
+                        let rx = shutdown_rx.clone();
+                        let topic_owned = topic.to_string();
+
+                        let join_handle = tokio::spawn(background_producer_task(
+                            handle,
+                            topic_owned,
+                            partition_count,
+                            Duration::from_millis(produce_interval_ms),
+                            producer_id,
+                            rx,
+                        ));
+                        producer_handles.push(join_handle);
+                    }
+
+                    // ===== PHASE 3: FAULT INJECTION (CONCURRENT WITH PRODUCERS) =====
+                    // Fault injection runs in its own spawned task at the same
+                    // scheduler level as producers. Under MadSim's cooperative
+                    // scheduler, faults interleave with producers at `.await`
+                    // yield points (the `madsim::time::sleep` between produces).
+                    //
+                    // KNOWN LIMITATION: MadSim completes the full produce→Raft
+                    // commit→response chain atomically because the transport's
+                    // 5ms network latency is too short for the fault task to
+                    // interleave mid-replication. Faults effectively hit BETWEEN
+                    // produce calls, not during in-flight Raft replication.
+                    // This still tests that:
+                    // - Producers handle faults on subsequent attempts (retry logic)
+                    // - Acked data survives fault/recovery cycles
+                    // - Multiple producers competing during faults don't corrupt state
+                    // Testing in-flight replication faults requires transport-level
+                    // fault injection (e.g., dropping messages mid-delivery).
+                    let fault_handle = cluster.create_fault_injector_handle();
+                    let fault_shutdown_rx = shutdown_rx.clone();
+                    let fault_tick_count = test_duration_ms / fault_tick_interval_ms;
+
+                    let fault_task = tokio::spawn(async move {
+                        let mut executor = executor;
+                        for _tick in 0..fault_tick_count {
+                            if *fault_shutdown_rx.borrow() {
+                                break;
+                            }
+                            if let Some(_action) = executor.tick(&fault_handle, None) {
+                                // Fault injected mid-produce.
+                            }
+                            madsim::time::sleep(
+                                Duration::from_millis(fault_tick_interval_ms),
+                            )
+                            .await;
+                        }
+                    });
+
+                    // Main task just waits for the test duration. The producers
+                    // and fault injector are both spawned tasks competing for
+                    // scheduler time.
+                    cluster
+                        .sleep(Duration::from_millis(test_duration_ms + 100))
+                        .await;
+
+                    // ===== PHASE 4: STOP PRODUCERS =====
+                    let _ = shutdown_tx.send(true);
+                    // Sleep to let producers and fault task see the shutdown signal.
+                    cluster.sleep(Duration::from_millis(100)).await;
+                    // Wait for fault task to finish.
+                    let _ = fault_task.await;
+
+                    let mut total_acked: u64 = 0;
+                    let mut total_failed: u64 = 0;
+                    for handle in producer_handles {
+                        if let Ok(result) = handle.await {
+                            total_acked += result.acked;
+                            total_failed += result.failed;
+                        }
+                    }
+
+                    // Fidelity check: producers must have actually run.
+                    assert!(
+                        total_acked + total_failed > 0,
+                        "Seed {}: producers never ran (acked={}, failed={})",
+                        seed, total_acked, total_failed
+                    );
+
+                    if seed % progress_mod == 0 {
+                        eprintln!(
+                            "[STATS] Seed {}: acked={} failed={} ({}% failure rate)",
+                            seed,
+                            total_acked,
+                            total_failed,
+                            if total_acked + total_failed > 0 {
+                                total_failed * 100 / (total_acked + total_failed)
+                            } else {
+                                0
+                            }
+                        );
+                    }
+
+                    // ===== PHASE 5: HEAL AND VERIFY =====
+                    // Reset latency to normal speed for verification.
+                    {
+                        let mut net = cluster.network_state.lock().expect("lock poisoned");
+                        net.set_global_latency_multiplier(1);
+                    }
+                    cluster.heal_all();
+
+                    // Restart crashed nodes for WAL replay.
+                    let crashed_nodes: Vec<NodeId> = {
+                        let state = cluster.network_state.lock().expect("lock poisoned");
+                        cluster
+                            .node_ids
+                            .iter()
+                            .filter(|&&n| state.is_crashed(n))
+                            .copied()
+                            .collect()
+                    };
+                    let had_restarts = !crashed_nodes.is_empty();
+                    for node_id in crashed_nodes {
+                        cluster.restart_node(node_id).await;
+                    }
+
+                    if had_restarts {
+                        cluster.sleep(Duration::from_secs(3)).await;
+                    }
+                    cluster.sleep(Duration::from_millis(500)).await;
+                    if partition_count > 1 {
+                        cluster.sleep(Duration::from_millis(1000)).await;
+                    }
+
+                    // Final snapshot collection.
+                    cluster.collect_raft_snapshots().await;
+
+                    // Cross-replica consistency check (with retries for convergence).
+                    for partition in 0..partition_count {
+                        let mut last_error: Option<String> = None;
+                        for attempt in 0..20 {
+                            match cluster.verify_replica_consistency(topic, partition).await {
+                                Ok(()) => {
+                                    last_error = None;
+                                    break;
+                                }
+                                Err(e) => {
+                                    last_error = Some(e);
+                                    if attempt < 19 {
+                                        cluster.sleep(Duration::from_millis(200)).await;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(e) = last_error {
+                            panic!("Seed {} partition {}: {}", seed, partition, e);
+                        }
+                    }
+
+                    // Consume and verify all acked data is readable.
+                    if total_acked > 0 {
+                        for partition in 0..partition_count {
+                            cluster
+                                .consume_and_verify(topic, partition, 0)
+                                .await
+                                .expect("consume should succeed");
+                        }
+
+                        let check_result = cluster.finalize_verification();
+
+                        if !check_result.violations.is_empty() {
+                            let strs: Vec<_> = check_result
+                                .violations
+                                .iter()
+                                .map(|v| format!("{v}"))
+                                .collect();
+                            panic!(
+                                "Seed {}: Raft invariant violations: {}",
+                                seed,
+                                strs.join(", ")
+                            );
+                        }
+
+                        if !check_result.consumer_violations.is_empty() {
+                            panic!(
+                                "Seed {}: {} data integrity violations: {:?}",
+                                seed,
+                                check_result.consumer_violations.len(),
+                                check_result.consumer_violations
+                            );
+                        }
+                    }
+
+                    tracing::debug!(
+                        seed,
+                        total_acked,
+                        total_failed,
+                        "Concurrent DST seed completed"
+                    );
+                });
+            });
+
+            if let Err(e) = result {
+                let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "Unknown panic".to_string()
+                };
+                let seed_elapsed = seed_start.elapsed();
+                eprintln!("[SEED] {} elapsed {:?} (failed)", seed, seed_elapsed);
+                eprintln!("[FAIL] Seed {} ({}): {}", seed, scenario_name, msg);
+                failures.push((seed, scenario_name.to_string(), msg));
+            } else {
+                let seed_elapsed = seed_start.elapsed();
+                if seed % progress_mod == 0 {
+                    eprintln!("[SEED] {} elapsed {:?}", seed, seed_elapsed);
+                }
+            }
+        }
+
+        eprintln!("\n=== Scenario Distribution ===");
+        for (name, count) in &scenario_counts {
+            eprintln!("  {}: {} seeds", name, count);
+        }
+
+        eprintln!("\n=== Concurrent DST Results ===");
+        eprintln!("Total seeds: {}", total_seeds);
+        eprintln!("Passed: {}", total_seeds - failures.len() as u64);
+        eprintln!("Failed: {}", failures.len());
+
+        if !failures.is_empty() {
+            eprintln!("\nFailed seeds:");
+            for (seed, scenario, msg) in &failures {
+                eprintln!("  Seed {} ({}): {}", seed, scenario, msg);
+            }
+            panic!("{} seeds failed", failures.len());
+        }
+
+        eprintln!(
+            "[PASS] All {} concurrent DST seeds passed",
+            total_seeds
+        );
+        eprintln!("[TOTAL] elapsed {:?}", suite_start.elapsed());
+    }
+
+    /// Concurrent DST: single partition, 200 seeds.
+    ///
+    /// Uses inflated network latency (50x) so faults injected while Raft
+    /// messages are in-flight (sleeping) take effect at delivery time.
+    #[test]
+    fn test_e2e_dst_concurrent_faults() {
+        run_e2e_dst_concurrent_faults(200, 2000, 50, 2, 10, "concurrent-dst", 1, 10);
+    }
+
+    /// Concurrent DST: 3 partitions, 100 seeds.
+    #[test]
+    fn test_e2e_dst_concurrent_faults_multi_partition() {
+        run_e2e_dst_concurrent_faults(100, 2000, 50, 3, 10, "concurrent-dst-mp", 3, 10);
+    }
+
+    /// Extended concurrent DST: 1000 seeds (manual run).
+    #[test]
+    #[ignore]
+    fn test_e2e_dst_concurrent_extended() {
+        run_e2e_dst_concurrent_faults(1000, 3000, 50, 2, 10, "concurrent-ext", 1, 25);
+    }
+
+    // ========================================================================
+    // Single/Multi-Node Tests
     // ========================================================================
 
     #[test]
-    fn test_e2e_actor_mode_single_node() {
-        // Test actor mode with single node (no Raft replication needed).
+    fn test_e2e_single_node() {
+        // Test single node (no Raft replication needed).
         let rt = Runtime::with_seed_and_config(42, Default::default());
         rt.block_on(async {
-            let config = E2EClusterConfig::with_nodes(1).with_actor_mode();
+            let config = E2EClusterConfig::with_nodes(1);
             let cluster = E2ECluster::start_with_config(config).await;
-
-            assert!(cluster.actor_mode, "Should be in actor mode");
 
             // Wait for cluster to stabilize (single-node needs time for controller election).
             cluster.sleep(Duration::from_secs(2)).await;
@@ -2941,7 +3727,7 @@ mod tests {
             for attempt in 0..30 {
                 if cluster.create_topic("actor-test", 1).await.is_ok() {
                     eprintln!(
-                        "[INFO] Single-node actor mode: Topic created on attempt {}",
+                        "[INFO] Single-node: Topic created on attempt {}",
                         attempt
                     );
                     break;
@@ -2965,7 +3751,7 @@ mod tests {
                     .await;
                 assert!(offset.is_ok(), "Produce should succeed: {:?}", offset);
                 eprintln!(
-                    "[INFO] Actor mode: Produced record {} at offset {:?}",
+                    "[INFO] Produced record {} at offset {:?}",
                     i, offset
                 );
             }
@@ -2975,28 +3761,26 @@ mod tests {
             assert!(records.is_ok(), "Consume should succeed");
             assert_eq!(records.unwrap().len(), 5, "Should have 5 records");
 
-            eprintln!("[PASS] test_e2e_actor_mode_single_node: Actor mode works in single-node");
+            eprintln!("[PASS] test_e2e_single_node: Single-node produce/consume works");
         });
     }
 
     #[test]
-    fn test_e2e_actor_mode_multi_node() {
-        // Test actor mode with 3-node cluster using Raft replication.
+    fn test_e2e_multi_node() {
+        // Test 3-node cluster using Raft replication.
         let rt = Runtime::with_seed_and_config(42, Default::default());
         rt.block_on(async {
-            let config = E2EClusterConfig::with_nodes(3).with_actor_mode();
+            let config = E2EClusterConfig::with_nodes(3);
             let cluster = E2ECluster::start_with_config(config).await;
 
-            assert!(cluster.actor_mode, "Should be in actor mode");
-
-            // Wait for cluster to stabilize (controller election takes longer in actor mode).
+            // Wait for cluster to stabilize (controller election takes time).
             cluster.sleep(Duration::from_secs(5)).await;
 
             // Create topic - uses controller in multi-node mode.
             // Retry multiple times as controller election may still be in progress.
             for attempt in 0..30 {
                 if cluster.create_topic("actor-orders", 1).await.is_ok() {
-                    eprintln!("[INFO] Actor mode: Topic created on attempt {}", attempt);
+                    eprintln!("[INFO] Topic created on attempt {}", attempt);
                     break;
                 }
                 cluster.sleep(Duration::from_millis(200)).await;
@@ -3020,7 +3804,7 @@ mod tests {
                     .await;
                 assert!(offset.is_ok(), "Produce should succeed: {:?}", offset);
                 eprintln!(
-                    "[INFO] Actor mode: Produced record {} at offset {:?}",
+                    "[INFO] Produced record {} at offset {:?}",
                     i, offset
                 );
             }
@@ -3033,19 +3817,19 @@ mod tests {
                 .consume("actor-orders", 0, 0)
                 .await
                 .expect("consume should succeed");
-            eprintln!("[INFO] Actor mode: Consumed {} records", records.len());
+            eprintln!("[INFO] Consumed {} records", records.len());
             assert_eq!(records.len(), 10, "Should have 10 records");
 
-            eprintln!("[PASS] test_e2e_actor_mode_multi_node: Actor mode works with multi-node");
+            eprintln!("[PASS] test_e2e_multi_node: Multi-node produce/consume works");
         });
     }
 
     #[test]
-    fn test_e2e_actor_mode_with_partition() {
-        // Test actor mode survives network partitions.
+    fn test_e2e_with_partition() {
+        // Test cluster survives network partitions.
         let rt = Runtime::with_seed_and_config(42, Default::default());
         rt.block_on(async {
-            let config = E2EClusterConfig::with_nodes(3).with_actor_mode();
+            let config = E2EClusterConfig::with_nodes(3);
             let cluster = E2ECluster::start_with_config(config).await;
 
             // Wait for cluster to stabilize.
@@ -3064,12 +3848,12 @@ mod tests {
                     .await
                     .expect("produce should succeed");
             }
-            eprintln!("[INFO] Actor mode: Produced 5 records before partition");
+            eprintln!("[INFO] Produced 5 records before partition");
 
             // Partition node 1 from nodes 2 and 3.
             cluster.partition(&[NodeId::new(1), NodeId::new(2)]);
             cluster.partition(&[NodeId::new(1), NodeId::new(3)]);
-            eprintln!("[INFO] Actor mode: Network partition created");
+            eprintln!("[INFO] Network partition created");
 
             // Wait for leader election.
             cluster.sleep(Duration::from_secs(3)).await;
@@ -3081,7 +3865,7 @@ mod tests {
                     .await
                     .expect("produce should succeed after partition");
             }
-            eprintln!("[INFO] Actor mode: Produced 5 more records during partition");
+            eprintln!("[INFO] Produced 5 more records during partition");
 
             // Heal the partition.
             cluster.heal_all();
@@ -3093,21 +3877,21 @@ mod tests {
                 .await
                 .expect("consume should succeed");
             eprintln!(
-                "[INFO] Actor mode: Consumed {} records after healing",
+                "[INFO] Consumed {} records after healing",
                 records.len()
             );
             assert_eq!(records.len(), 10, "All 10 records should be available");
 
-            eprintln!("[PASS] test_e2e_actor_mode_with_partition: Actor mode survives partitions");
+            eprintln!("[PASS] test_e2e_with_partition: Cluster survives partitions");
         });
     }
 
     #[test]
-    fn test_e2e_actor_mode_with_crash() {
-        // Test actor mode survives node crashes.
+    fn test_e2e_with_crash() {
+        // Test cluster survives node crashes.
         let rt = Runtime::with_seed_and_config(42, Default::default());
         rt.block_on(async {
-            let config = E2EClusterConfig::with_nodes(3).with_actor_mode();
+            let config = E2EClusterConfig::with_nodes(3);
             let cluster = E2ECluster::start_with_config(config).await;
 
             // Wait for cluster to stabilize.
@@ -3126,11 +3910,11 @@ mod tests {
                     .await
                     .expect("produce should succeed");
             }
-            eprintln!("[INFO] Actor mode: Produced 5 records before crash");
+            eprintln!("[INFO] Produced 5 records before crash");
 
             // Crash node 1.
             cluster.crash_node(NodeId::new(1));
-            eprintln!("[INFO] Actor mode: Node 1 crashed");
+            eprintln!("[INFO] Node 1 crashed");
 
             // Wait for failover.
             cluster.sleep(Duration::from_secs(3)).await;
@@ -3142,7 +3926,7 @@ mod tests {
                     .await
                     .expect("produce should succeed after crash");
             }
-            eprintln!("[INFO] Actor mode: Produced 5 more records after crash");
+            eprintln!("[INFO] Produced 5 more records after crash");
 
             // Wait for replication.
             cluster.sleep(Duration::from_secs(2)).await;
@@ -3152,202 +3936,756 @@ mod tests {
                 .consume("actor-orders", 0, 0)
                 .await
                 .expect("consume should succeed");
-            eprintln!("[INFO] Actor mode: Consumed {} records", records.len());
+            eprintln!("[INFO] Consumed {} records", records.len());
             assert_eq!(records.len(), 10, "All 10 records should be available");
 
-            eprintln!("[PASS] test_e2e_actor_mode_with_crash: Actor mode survives crashes");
+            eprintln!("[PASS] test_e2e_with_crash: Cluster survives crashes");
         });
     }
 
-    /// Actor mode DST test with random fault injection.
-    ///
-    /// # Verification
-    ///
-    /// This test performs three levels of verification:
-    /// 1. **Raft invariants**: `SingleLeaderPerTerm` via property state snapshots
-    /// 2. **Data integrity**: Payload hashes match between produce and consume
-    /// 3. **Count check**: At least 50% of produced records are consumable
     #[test]
-    fn test_e2e_actor_mode_dst_random_faults() {
-        use crate::madsim_scenarios::{FaultScenario, ScenarioExecutor};
+    fn test_e2e_multi_partition_leader_failure() {
+        // Multi-partition leader failure with real Kafka protocol path.
+        //
+        // Produces use acks=all, so every Ok(offset) means the record is
+        // Raft-committed on a quorum. After a node crash and re-election,
+        // ALL acked records must be consumable — no timing hacks needed.
+        //
+        // This exercises the full path: Kafka handler → batcher → partition
+        // actor → Raft propose → quorum commit → ack. On NOT_LEADER,
+        // produce_with_retry cycles nodes just like a real Kafka client.
+        let rt = Runtime::with_seed_and_config(42, Default::default());
+        rt.block_on(async {
+            let config = E2EClusterConfig::with_nodes(3);
+            let cluster = E2ECluster::start_with_config(config).await;
 
-        const TOTAL_SEEDS: u64 = 100;
-        const RECORDS_PER_SEED: usize = 20;
-        const TICKS_PER_SEED: u32 = 20;
+            cluster.sleep(Duration::from_secs(2)).await;
 
-        let mut failures: Vec<(u64, String, String)> = Vec::new();
-        let mut scenario_counts: std::collections::HashMap<&'static str, u64> =
-            std::collections::HashMap::new();
+            cluster
+                .create_topic("multi-part", 3)
+                .await
+                .expect("create topic");
+            cluster.sleep(Duration::from_secs(1)).await;
 
-        for seed in 0..TOTAL_SEEDS {
-            let scenario = FaultScenario::random(seed);
-            let scenario_name = scenario.name();
-            *scenario_counts.entry(scenario_name).or_default() += 1;
+            const RECORDS_PER_PHASE: usize = 10;
+            const PARTITION_COUNT: u32 = 3;
 
-            if seed % 10 == 0 {
-                eprintln!(
-                    "[PROGRESS] Actor mode seed {}/{} - scenario: {}",
-                    seed, TOTAL_SEEDS, scenario_name
+            // Phase 1: Produce to all partitions (healthy cluster).
+            // Every ack means quorum-committed.
+            let mut acked_per_partition: Vec<usize> =
+                vec![0; PARTITION_COUNT as usize];
+            for i in 0..RECORDS_PER_PHASE {
+                for p in 0..PARTITION_COUNT {
+                    let payload = format!("phase1-p{p}-{i}");
+                    cluster
+                        .produce_with_retry("multi-part", p, payload, 50)
+                        .await
+                        .unwrap_or_else(|e| {
+                            panic!("phase1 p{p} record {i}: {e}")
+                        });
+                    acked_per_partition[p as usize] += 1;
+                }
+            }
+            eprintln!(
+                "[Phase 1] {RECORDS_PER_PHASE} acked per partition (healthy)"
+            );
+
+            // Crash node 1 (may be leader for some partitions).
+            cluster.crash_node(NodeId::new(1));
+            eprintln!("[Crash] Node 1 down");
+
+            // Leader re-election happens within Raft election timeout (~150-300ms
+            // simulated). produce_with_retry handles NOT_LEADER by cycling nodes,
+            // so we don't need an explicit sleep — the retry loop does the waiting.
+
+            // Phase 2: Produce to all partitions (degraded cluster, 2 of 3 nodes).
+            for i in 0..RECORDS_PER_PHASE {
+                for p in 0..PARTITION_COUNT {
+                    let payload = format!("phase2-p{p}-{i}");
+                    cluster
+                        .produce_with_retry("multi-part", p, payload, 200)
+                        .await
+                        .unwrap_or_else(|e| {
+                            panic!("phase2 p{p} record {i}: {e}")
+                        });
+                    acked_per_partition[p as usize] += 1;
+                }
+            }
+            eprintln!(
+                "[Phase 2] {RECORDS_PER_PHASE} more acked per partition (degraded)"
+            );
+
+            // Verify: every acked record must be consumable. read_blobs now
+            // gates on leadership (like Kafka), so consume() only gets data from
+            // the leader which has the latest applied state. No retries needed.
+            for p in 0..PARTITION_COUNT {
+                let expected = acked_per_partition[p as usize];
+
+                let records = cluster
+                    .consume("multi-part", p, 0)
+                    .await
+                    .unwrap_or_else(|e| panic!("consume p{p}: {e}"));
+
+                eprintln!("[Verify] p{p}: acked={expected}, consumed={}", records.len());
+                assert_eq!(
+                    records.len(),
+                    expected,
+                    "Partition {p}: acked {expected} but consumed {actual} \
+                     (data loss after leader failure)",
+                    actual = records.len()
                 );
             }
 
-            let result = std::panic::catch_unwind(|| {
-                let rt = Runtime::with_seed_and_config(seed, Default::default());
-                rt.block_on(async {
-                    let config = E2EClusterConfig::with_nodes(3).with_actor_mode();
-                    let cluster = E2ECluster::start_with_config(config).await;
-                    let mut executor = ScenarioExecutor::new(scenario.clone());
-
-                    // Wait for controller election.
-                    cluster.sleep(Duration::from_millis(200)).await;
-                    for attempt in 0..10 {
-                        if cluster.create_topic("actor-dst-topic", 1).await.is_ok() {
-                            break;
-                        }
-                        cluster.sleep(Duration::from_millis(50)).await;
-                        if attempt == 9 {
-                            panic!("Failed to create topic after 10 attempts");
-                        }
-                    }
-
-                    // Interleave production with fault injection.
-                    let mut produced = 0;
-                    let records_per_tick = RECORDS_PER_SEED / TICKS_PER_SEED as usize;
-                    let records_per_tick = records_per_tick.max(1);
-
-                    for tick in 0..TICKS_PER_SEED {
-                        // Produce some records with tracking for verification.
-                        for i in 0..records_per_tick {
-                            let record_num = tick as usize * records_per_tick + i;
-                            if record_num >= RECORDS_PER_SEED {
-                                break;
-                            }
-                            if cluster
-                                .produce_and_track(
-                                    "actor-dst-topic",
-                                    0,
-                                    format!("record-{}", record_num),
-                                    5,
-                                )
-                                .await
-                                .is_ok()
-                            {
-                                produced += 1;
-                            }
-                        }
-
-                        // Collect Raft snapshots for property verification.
-                        cluster.collect_raft_snapshots().await;
-
-                        // Apply fault scenario.
-                        if let Some(action) = executor.tick(&cluster, None) {
-                            tracing::debug!(seed, tick, action, "Actor mode fault injected");
-                        }
-
-                        // Small sleep to advance simulated time.
-                        cluster.sleep(Duration::from_millis(20)).await;
-                    }
-
-                    // Heal all partitions after test.
-                    cluster.heal_all();
-                    cluster.sleep(Duration::from_millis(500)).await;
-
-                    // Collect final Raft snapshots.
-                    cluster.collect_raft_snapshots().await;
-
-                    // NEW: Verify cross-replica consistency after healing.
-                    if let Err(e) = cluster
-                        .verify_replica_consistency("actor-dst-topic", 0)
-                        .await
-                    {
-                        panic!("Actor mode seed {}: {}", seed, e);
-                    }
-
-                    // Verify data with integrity checking.
-                    let records = cluster
-                        .consume_and_verify("actor-dst-topic", 0, 0)
-                        .await
-                        .expect("consume should succeed");
-
-                    // Finalize verification and check for property violations.
-                    let check_result = cluster.finalize_verification();
-
-                    // Check Raft invariants (SingleLeaderPerTerm).
-                    if !check_result.violations.is_empty() {
-                        let violation_strs: Vec<_> = check_result
-                            .violations
-                            .iter()
-                            .map(|v| format!("{v}"))
-                            .collect();
-                        panic!(
-                            "Seed {}: Raft invariant violations: {}",
-                            seed,
-                            violation_strs.join(", ")
-                        );
-                    }
-
-                    // Check data integrity violations (hash mismatches).
-                    // ALL acked data must be readable and have correct content.
-                    if !check_result.consumer_violations.is_empty() {
-                        panic!(
-                            "Seed {}: {} data integrity violations: {:?}",
-                            seed,
-                            check_result.consumer_violations.len(),
-                            check_result.consumer_violations
-                        );
-                    }
-
-                    // With fault injection, we may lose some records depending on scenario.
-                    // Verify we got a reasonable number of records.
-                    let consumed = records.len();
-                    tracing::debug!(
-                        seed,
-                        produced,
-                        consumed,
-                        "Actor mode seed completed - all {} consumed records verified correct",
-                        consumed
-                    );
-                });
-            });
-
-            if let Err(e) = result {
-                let msg = if let Some(s) = e.downcast_ref::<&str>() {
-                    s.to_string()
-                } else if let Some(s) = e.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "Unknown panic".to_string()
-                };
-                eprintln!(
-                    "[FAIL] Actor mode seed {} ({}): {}",
-                    seed, scenario_name, msg
-                );
-                failures.push((seed, scenario_name.to_string(), msg));
+            // Cross-replica consistency on surviving nodes.
+            for p in 0..PARTITION_COUNT {
+                if let Err(e) = cluster
+                    .verify_replica_consistency("multi-part", p)
+                    .await
+                {
+                    panic!("Partition {p} replica consistency: {e}");
+                }
             }
-        }
 
-        // Print scenario distribution.
-        eprintln!("\n=== Actor Mode Scenario Distribution ===");
-        for (name, count) in &scenario_counts {
-            eprintln!("  {}: {} seeds", name, count);
-        }
+            let total = acked_per_partition.iter().sum::<usize>();
+            eprintln!(
+                "[PASS] {PARTITION_COUNT} partitions, {total} total records, \
+                 zero data loss after leader failure"
+            );
+        });
+    }
 
-        eprintln!("\n=== E2E Actor Mode DST Results ===");
-        eprintln!("Total seeds: {}", TOTAL_SEEDS);
-        eprintln!("Passed: {}", TOTAL_SEEDS - failures.len() as u64);
-        eprintln!("Failed: {}", failures.len());
+    /// DST test with random fault injection (100 seeds).
+    #[test]
+    fn test_e2e_dst_random_faults() {
+        run_e2e_dst_random_faults(100, 20, 20, "dst-topic", 1, 10);
+    }
 
-        if !failures.is_empty() {
-            eprintln!("\nFailed seeds:");
-            for (seed, scenario, msg) in &failures {
-                eprintln!("  Seed {} ({}): {}", seed, scenario, msg);
+    /// DST with random fault injection (500 seeds).
+    #[test]
+    fn test_e2e_dst_random_faults_500() {
+        run_e2e_dst_random_faults(500, 20, 20, "dst-topic", 1, 10);
+    }
+
+    /// DST with multiple partitions (100 seeds).
+    #[test]
+    fn test_e2e_dst_random_faults_multi_partition() {
+        run_e2e_dst_random_faults(100, 20, 20, "dst-mp", 3, 10);
+    }
+
+    /// DST with multiple partitions (200 seeds).
+    #[test]
+    fn test_e2e_dst_random_faults_multi_partition_200() {
+        run_e2e_dst_random_faults(200, 20, 20, "dst-mp", 3, 10);
+    }
+
+    // ========================================================================
+    // Coverage Gap Tests (migrated from Bloodhound service DST)
+    // ========================================================================
+
+    /// Helper for five-node cluster test, parameterized by config.
+    fn run_five_node_cluster(config: E2EClusterConfig, test_name: &str) {
+        let rt = Runtime::with_seed_and_config(42, Default::default());
+        rt.block_on(async {
+            let cluster = E2ECluster::start_with_config(config).await;
+
+            assert_eq!(cluster.node_ids().len(), 5);
+            cluster.sleep(Duration::from_secs(2)).await;
+
+            // Create topic.
+            cluster
+                .create_topic("five-node", 1)
+                .await
+                .expect("create topic");
+
+            // Phase 1: produce on healthy cluster.
+            for i in 0..5 {
+                cluster
+                    .produce_and_track("five-node", 0, format!("before-{i}"), 100)
+                    .await
+                    .expect("produce before crash");
             }
-            panic!("{} seeds failed", failures.len());
-        }
+            eprintln!("[INFO] Produced 5 records on healthy 5-node cluster");
 
-        eprintln!(
-            "[PASS] Actor mode: All {} seeds passed with random fault injection",
-            TOTAL_SEEDS
+            // Crash nodes 1 and 2 (cluster still has quorum: 3 of 5).
+            cluster.crash_node(NodeId::new(1));
+            cluster.crash_node(NodeId::new(2));
+            eprintln!("[INFO] Nodes 1 and 2 crashed");
+
+            cluster.sleep(Duration::from_secs(3)).await;
+
+            // Phase 2: produce during degraded state.
+            for i in 0..5 {
+                cluster
+                    .produce_and_track("five-node", 0, format!("during-{i}"), 100)
+                    .await
+                    .expect("produce during crash");
+            }
+            eprintln!("[INFO] Produced 5 records on degraded cluster");
+
+            // Recover both nodes.
+            cluster.recover_node(NodeId::new(1));
+            cluster.recover_node(NodeId::new(2));
+            cluster.sleep(Duration::from_secs(5)).await;
+
+            // Phase 3: produce after recovery.
+            for i in 0..5 {
+                cluster
+                    .produce_and_track("five-node", 0, format!("after-{i}"), 100)
+                    .await
+                    .expect("produce after recovery");
+            }
+            eprintln!("[INFO] Produced 5 records after recovery");
+
+            // Wait for replication to converge.
+            cluster.sleep(Duration::from_secs(3)).await;
+
+            // Verify all 15 records are consumable with correct content.
+            let records = cluster
+                .consume_and_verify("five-node", 0, 0)
+                .await
+                .expect("consume should succeed");
+            assert_eq!(records.len(), 15, "All 15 acked records must be present");
+
+            // Verify cross-replica consistency on all 5 nodes.
+            cluster
+                .verify_replica_consistency("five-node", 0)
+                .await
+                .expect("all 5 replicas should be consistent");
+
+            cluster.assert_no_violations(test_name);
+            eprintln!("[PASS] {test_name}: 15 records, 5 replicas consistent");
+        });
+    }
+
+    #[test]
+    fn test_e2e_five_node_cluster() {
+        run_five_node_cluster(
+            E2EClusterConfig::with_nodes(5),
+            "test_e2e_five_node_cluster",
         );
+    }
+
+    #[test]
+    fn test_e2e_rapid_crash_recovery() {
+        // 3 nodes, crash/recover node 1 three times, produce after each recovery.
+        let rt = Runtime::with_seed_and_config(42, Default::default());
+        rt.block_on(async {
+            let cluster = E2ECluster::start(3).await;
+
+            cluster.sleep(Duration::from_secs(2)).await;
+
+            cluster
+                .create_topic("rapid-crash", 1)
+                .await
+                .expect("create topic");
+
+            let mut total_produced = 0u32;
+
+            for cycle in 0..3 {
+                // Crash node 1.
+                cluster.crash_node(NodeId::new(1));
+                eprintln!("[INFO] Cycle {cycle}: node 1 crashed");
+                cluster.sleep(Duration::from_secs(2)).await;
+
+                // Recover node 1.
+                cluster.recover_node(NodeId::new(1));
+                eprintln!("[INFO] Cycle {cycle}: node 1 recovered");
+                cluster.sleep(Duration::from_secs(3)).await;
+
+                // Produce 5 records after recovery.
+                for i in 0..5 {
+                    cluster
+                        .produce_and_track(
+                            "rapid-crash",
+                            0,
+                            format!("cycle{cycle}-{i}"),
+                            100,
+                        )
+                        .await
+                        .expect("produce after recovery");
+                    total_produced += 1;
+                }
+                eprintln!("[INFO] Cycle {cycle}: produced 5 records (total={total_produced})");
+            }
+
+            // Wait for final replication.
+            cluster.sleep(Duration::from_secs(3)).await;
+
+            let records = cluster
+                .consume_and_verify("rapid-crash", 0, 0)
+                .await
+                .expect("consume should succeed");
+            assert_eq!(
+                records.len(),
+                total_produced as usize,
+                "All {total_produced} acked records must be present"
+            );
+
+            cluster.assert_no_violations("test_e2e_rapid_crash_recovery");
+            eprintln!("[PASS] test_e2e_rapid_crash_recovery: {total_produced} records after 3 crash/recover cycles");
+        });
+    }
+
+    #[test]
+    fn test_e2e_storage_faults_with_crash() {
+        // 3 nodes with flaky storage, produce, crash a node, produce more,
+        // recover, verify data integrity.
+        let rt = Runtime::with_seed_and_config(42, Default::default());
+        rt.block_on(async {
+            let config = E2EClusterConfig::with_nodes(3);
+            let cluster = E2ECluster::start_with_config(config).await;
+
+            cluster.sleep(Duration::from_secs(2)).await;
+
+            cluster
+                .create_topic("fault-crash", 1)
+                .await
+                .expect("create topic");
+
+            // Enable flaky storage on all nodes.
+            let flaky = FaultConfig::flaky_runtime();
+            for &nid in cluster.node_ids() {
+                cluster.set_storage_faults(nid, flaky.clone());
+            }
+            eprintln!("[INFO] Enabled flaky_runtime faults on all nodes");
+
+            // Produce with faults active.
+            let mut acked = 0u32;
+            for i in 0..10 {
+                if cluster
+                    .produce_and_track("fault-crash", 0, format!("pre-{i}"), 20)
+                    .await
+                    .is_ok()
+                {
+                    acked += 1;
+                }
+            }
+            eprintln!("[INFO] Produced {acked}/10 with faults active");
+
+            // Crash node 1.
+            cluster.crash_node(NodeId::new(1));
+            cluster.sleep(Duration::from_secs(3)).await;
+
+            // Produce more on surviving nodes.
+            for i in 0..10 {
+                if cluster
+                    .produce_and_track("fault-crash", 0, format!("post-{i}"), 20)
+                    .await
+                    .is_ok()
+                {
+                    acked += 1;
+                }
+            }
+            eprintln!("[INFO] Produced total {acked} acked records");
+
+            // Recover and disable faults.
+            cluster.recover_node(NodeId::new(1));
+            for &nid in cluster.node_ids() {
+                cluster.set_storage_faults(nid, FaultConfig::default());
+            }
+            cluster.sleep(Duration::from_secs(5)).await;
+
+            // Verify: all acked records must be present and correct.
+            let records = cluster
+                .consume_and_verify("fault-crash", 0, 0)
+                .await
+                .expect("consume should succeed");
+            assert!(
+                records.len() >= acked as usize,
+                "Expected at least {acked} records, got {}",
+                records.len()
+            );
+
+            cluster.assert_no_violations("test_e2e_storage_faults_with_crash");
+            eprintln!(
+                "[PASS] test_e2e_storage_faults_with_crash: {} records verified under faults + crash",
+                records.len()
+            );
+        });
+    }
+
+    /// Helper for storage-faults-all-types test, parameterized by config.
+    fn run_storage_faults_all_types(config: E2EClusterConfig, test_name: &str) {
+        let rt = Runtime::with_seed_and_config(42, Default::default());
+        rt.block_on(async {
+            let cluster = E2ECluster::start_with_config(config).await;
+
+            cluster.sleep(Duration::from_secs(2)).await;
+
+            cluster
+                .create_topic("fault-all", 1)
+                .await
+                .expect("create topic");
+
+            // Phase 1: Healthy produce.
+            for i in 0..5 {
+                cluster
+                    .produce_and_track("fault-all", 0, format!("healthy-{i}"), 100)
+                    .await
+                    .expect("healthy produce");
+            }
+            eprintln!("[INFO] Phase 1: 5 records on healthy cluster");
+
+            // Phase 2: Enable aggressive faults (torn writes + fsync + write failures).
+            let aggressive = FaultConfig {
+                torn_write_rate: 0.05,
+                fsync_fail_rate: 0.05,
+                write_fail_rate: 0.1,
+                ..Default::default()
+            };
+            for &nid in cluster.node_ids() {
+                cluster.set_storage_faults(nid, aggressive.clone());
+            }
+
+            let mut acked_faults = 0u32;
+            for i in 0..10 {
+                if cluster
+                    .produce_and_track("fault-all", 0, format!("faulty-{i}"), 20)
+                    .await
+                    .is_ok()
+                {
+                    acked_faults += 1;
+                }
+            }
+            eprintln!("[INFO] Phase 2: {acked_faults}/10 acked under aggressive faults");
+
+            // Phase 3: Network partition (node 1 isolated).
+            cluster.partition(&[NodeId::new(1), NodeId::new(2)]);
+            cluster.partition(&[NodeId::new(1), NodeId::new(3)]);
+            cluster.sleep(Duration::from_secs(3)).await;
+
+            let mut acked_partition = 0u32;
+            for i in 0..5 {
+                if cluster
+                    .produce_and_track("fault-all", 0, format!("part-{i}"), 20)
+                    .await
+                    .is_ok()
+                {
+                    acked_partition += 1;
+                }
+            }
+            eprintln!("[INFO] Phase 3: {acked_partition}/5 acked during partition + faults");
+
+            // Phase 4: Crash node 2 (only node 3 remains fully healthy).
+            cluster.crash_node(NodeId::new(2));
+            cluster.sleep(Duration::from_secs(2)).await;
+
+            // Phase 5: Heal everything and recover.
+            cluster.heal_all();
+            cluster.recover_node(NodeId::new(2));
+            for &nid in cluster.node_ids() {
+                cluster.set_storage_faults(nid, FaultConfig::default());
+            }
+            cluster.sleep(Duration::from_secs(5)).await;
+
+            // Final produce on healthy cluster.
+            for i in 0..5 {
+                cluster
+                    .produce_and_track("fault-all", 0, format!("final-{i}"), 100)
+                    .await
+                    .expect("final produce");
+            }
+
+            cluster.sleep(Duration::from_secs(3)).await;
+
+            // Verify all acked data is intact.
+            let records = cluster
+                .consume_and_verify("fault-all", 0, 0)
+                .await
+                .expect("consume should succeed");
+            let min_expected = 5 + acked_faults + acked_partition + 5;
+            assert!(
+                records.len() >= min_expected as usize,
+                "Expected at least {min_expected} records, got {}",
+                records.len()
+            );
+
+            cluster
+                .verify_replica_consistency("fault-all", 0)
+                .await
+                .expect("replicas should be consistent after full recovery");
+
+            cluster.assert_no_violations(test_name);
+            eprintln!(
+                "[PASS] {test_name}: {} records through all fault types",
+                records.len()
+            );
+        });
+    }
+
+    #[test]
+    fn test_e2e_storage_faults_all_types() {
+        run_storage_faults_all_types(
+            E2EClusterConfig::with_nodes(3),
+            "test_e2e_storage_faults_all_types",
+        );
+    }
+
+    #[test]
+    fn test_e2e_shared_wal_pool_sizes() {
+        // Test different shared WAL pool sizes (K=1,2,4,8).
+        for &wal_count in &[1u32, 2, 4, 8] {
+            eprintln!("[INFO] Testing shared_wal_count={wal_count}");
+
+            let rt = Runtime::with_seed_and_config(42 + u64::from(wal_count), Default::default());
+            rt.block_on(async {
+                let config = E2EClusterConfig::with_nodes(3)
+                    .with_shared_wal_count(wal_count);
+                let cluster = E2ECluster::start_with_config(config).await;
+
+                cluster.sleep(Duration::from_secs(2)).await;
+
+                let topic = format!("wal-k{wal_count}");
+                cluster
+                    .create_topic(&topic, 1)
+                    .await
+                    .expect("create topic");
+
+                // Produce before crash.
+                for i in 0..5 {
+                    cluster
+                        .produce_and_track(&topic, 0, format!("pre-{i}"), 100)
+                        .await
+                        .expect("produce before crash");
+                }
+
+                // Crash node 1.
+                cluster.crash_node(NodeId::new(1));
+                cluster.sleep(Duration::from_secs(3)).await;
+
+                // Produce after crash.
+                for i in 0..5 {
+                    cluster
+                        .produce_and_track(&topic, 0, format!("post-{i}"), 100)
+                        .await
+                        .expect("produce after crash");
+                }
+
+                // Recover and wait for replication.
+                cluster.recover_node(NodeId::new(1));
+                cluster.sleep(Duration::from_secs(5)).await;
+
+                // Verify all 10 records.
+                let records = cluster
+                    .consume_and_verify(&topic, 0, 0)
+                    .await
+                    .expect("consume should succeed");
+                assert_eq!(
+                    records.len(),
+                    10,
+                    "shared_wal_count={wal_count}: expected 10 records, got {}",
+                    records.len()
+                );
+
+                cluster
+                    .verify_replica_consistency(&topic, 0)
+                    .await
+                    .expect("replicas should be consistent");
+
+                cluster.assert_no_violations(
+                    &format!("test_e2e_shared_wal_pool_sizes(K={wal_count})"),
+                );
+                eprintln!("[PASS] shared_wal_count={wal_count}: 10 records, replicas consistent");
+            });
+        }
+
+        eprintln!("[PASS] test_e2e_shared_wal_pool_sizes: All pool sizes work correctly");
+    }
+
+    #[test]
+    fn test_e2e_per_partition_wal() {
+        // Test per-partition dedicated WAL mode (no SharedWalPool).
+        // Each partition gets its own WAL file — simpler than shared pool.
+        let rt = Runtime::with_seed_and_config(42, Default::default());
+        rt.block_on(async {
+            let config = E2EClusterConfig::with_nodes(3)
+                .with_per_partition_wal();
+            let cluster = E2ECluster::start_with_config(config).await;
+
+            // Verify no SharedWalPool was created.
+            let node = cluster.node(NodeId::new(1)).expect("node 1");
+            assert!(
+                node.service.shared_wal_pool().is_none(),
+                "SharedWalPool should NOT be present in per-partition WAL mode"
+            );
+            assert!(
+                node.service.data_dir().is_some(),
+                "data_dir should be set for durable storage"
+            );
+
+            cluster.sleep(Duration::from_secs(2)).await;
+
+            cluster
+                .create_topic("wal-test", 1)
+                .await
+                .expect("create topic");
+
+            // Produce records — these go through per-partition dedicated WAL.
+            for i in 0..10 {
+                cluster
+                    .produce_and_track("wal-test", 0, format!("record-{i}"), 100)
+                    .await
+                    .expect("produce should succeed");
+            }
+
+            // Verify data is readable before crash.
+            let pre_crash = cluster
+                .consume("wal-test", 0, 0)
+                .await
+                .expect("consume before crash");
+            assert_eq!(pre_crash.len(), 10, "All 10 records should be readable before crash");
+
+            // Crash node 1, produce more on survivors.
+            cluster.crash_node(NodeId::new(1));
+            cluster.sleep(Duration::from_secs(3)).await;
+
+            for i in 10..15 {
+                cluster
+                    .produce_and_track("wal-test", 0, format!("record-{i}"), 100)
+                    .await
+                    .expect("produce after crash");
+            }
+
+            // Recover and verify all acked data.
+            cluster.recover_node(NodeId::new(1));
+            cluster.sleep(Duration::from_secs(5)).await;
+
+            let records = cluster
+                .consume_and_verify("wal-test", 0, 0)
+                .await
+                .expect("consume should succeed");
+            assert_eq!(records.len(), 15, "All 15 acked records must be present");
+
+            cluster
+                .verify_replica_consistency("wal-test", 0)
+                .await
+                .expect("replicas should be consistent");
+
+            cluster.assert_no_violations("test_e2e_per_partition_wal");
+            eprintln!(
+                "[PASS] test_e2e_per_partition_wal: 15 records, replicas consistent"
+            );
+        });
+    }
+
+    // ========================================================================
+    // Crash Recovery with WAL Replay Tests
+    // ========================================================================
+
+    #[test]
+    fn test_e2e_crash_recovery_with_wal_replay() {
+        // Tests real crash recovery: crash a node (reverts unsynced storage),
+        // produce more on survivors, restart the crashed node (replays WAL),
+        // verify the restarted node catches up and all data is consistent.
+        let rt = Runtime::with_seed_and_config(42, Default::default());
+        rt.block_on(async {
+            let mut cluster =
+                E2ECluster::start_with_config(E2EClusterConfig::with_nodes(3)).await;
+
+            cluster.sleep(Duration::from_secs(2)).await;
+
+            cluster
+                .create_topic("wal-replay", 1)
+                .await
+                .expect("create topic");
+
+            // Phase 1: Produce 10 records on healthy cluster.
+            for i in 0..10 {
+                cluster
+                    .produce_and_track("wal-replay", 0, format!("before-{i}"), 100)
+                    .await
+                    .expect("produce before crash");
+            }
+            eprintln!("[INFO] Produced 10 records before crash");
+
+            // Wait for replication to all nodes.
+            cluster.sleep(Duration::from_secs(1)).await;
+
+            // Get storage stats before crash for later comparison.
+            let pre_crash_stats = cluster
+                .node(NodeId::new(1))
+                .expect("node 1")
+                .storage
+                .fault_stats();
+            eprintln!(
+                "[INFO] Node 1 pre-crash: writes={}, syncs={}",
+                pre_crash_stats.write_ops, pre_crash_stats.sync_ops
+            );
+
+            // Crash node 1 (reverts unsynced writes via simulate_crash).
+            cluster.crash_node(NodeId::new(1));
+            eprintln!("[INFO] Node 1 crashed (storage reverted to last fsync)");
+
+            // Wait for failover.
+            cluster.sleep(Duration::from_secs(3)).await;
+
+            // Phase 2: Produce 10 more records on surviving nodes.
+            for i in 10..20 {
+                cluster
+                    .produce_and_track("wal-replay", 0, format!("during-{i}"), 100)
+                    .await
+                    .expect("produce during crash");
+            }
+            eprintln!("[INFO] Produced 10 more records on survivors");
+
+            // Wait for replication on survivors.
+            cluster.sleep(Duration::from_secs(1)).await;
+
+            // Restart node 1 (creates fresh HelixService, replays WAL).
+            cluster.restart_node(NodeId::new(1)).await;
+            eprintln!("[INFO] Node 1 restarted (WAL replayed)");
+
+            // Wait for the restarted node to catch up via Raft replication.
+            cluster.sleep(Duration::from_secs(5)).await;
+
+            // Get storage stats after restart to verify reads (WAL replay).
+            let post_restart_stats = cluster
+                .node(NodeId::new(1))
+                .expect("node 1")
+                .storage
+                .fault_stats();
+            eprintln!(
+                "[INFO] Node 1 post-restart: writes={}, reads={}, syncs={}",
+                post_restart_stats.write_ops,
+                post_restart_stats.read_ops,
+                post_restart_stats.sync_ops
+            );
+
+            // Verify: the restarted node should have read from storage (WAL replay).
+            assert!(
+                post_restart_stats.read_ops > 0,
+                "Restarted node should have WAL replay reads, got 0"
+            );
+
+            // Phase 3: Produce 5 more records to verify the restarted node participates.
+            for i in 20..25 {
+                cluster
+                    .produce_and_track("wal-replay", 0, format!("after-{i}"), 100)
+                    .await
+                    .expect("produce after restart");
+            }
+            eprintln!("[INFO] Produced 5 records after restart");
+
+            cluster.sleep(Duration::from_secs(3)).await;
+
+            // Verify all 25 records are consumable with correct content.
+            let records = cluster
+                .consume_and_verify("wal-replay", 0, 0)
+                .await
+                .expect("consume should succeed");
+            assert_eq!(records.len(), 25, "All 25 acked records must be present");
+
+            // Verify cross-replica consistency on ALL 3 nodes (including restarted).
+            cluster
+                .verify_replica_consistency("wal-replay", 0)
+                .await
+                .expect("all 3 replicas (including restarted) should be consistent");
+
+            cluster.assert_no_violations("test_e2e_crash_recovery_with_wal_replay");
+            eprintln!(
+                "[PASS] test_e2e_crash_recovery_with_wal_replay: \
+                 25 records, 3 replicas consistent after WAL replay"
+            );
+        });
     }
 }

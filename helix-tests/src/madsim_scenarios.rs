@@ -50,6 +50,13 @@ pub trait FaultInjectable {
 
     /// Sets storage fault configuration on a node.
     fn set_storage_faults(&self, node_id: NodeId, config: FaultConfig);
+
+    /// Sets the network latency multiplier for a node.
+    ///
+    /// Messages TO this node will have their delivery latency multiplied
+    /// by this factor. A value of 1 means normal latency.
+    /// Default implementation is a no-op for backward compatibility.
+    fn set_node_latency(&self, _node_id: NodeId, _multiplier: u32) {}
 }
 
 // ============================================================================
@@ -198,7 +205,7 @@ impl FaultScenario {
     pub fn random(seed: u64) -> Self {
         let mut rng = ChaChaRng::seed_from_u64(seed);
 
-        match rng.gen_range(0..14) {
+        match rng.gen_range(0..13) {
             0 => Self::NoFaults,
             1 => Self::LeaderCrash {
                 after_ticks: rng.gen_range(5..50),
@@ -542,12 +549,18 @@ impl ScenarioExecutor {
                 None
             }
 
-            FaultScenario::SlowFollower { .. } => {
-                // Note: Implementing slow followers would require changes to MadSimTransport
-                // to support per-node latency. For now, this is a placeholder.
+            FaultScenario::SlowFollower {
+                slow_node,
+                delay_multiplier,
+            } => {
                 if !self.fault_applied {
+                    cluster.set_node_latency(*slow_node, *delay_multiplier);
                     self.fault_applied = true;
-                    return Some("SlowFollower scenario (latency not yet implemented)".to_string());
+                    return Some(format!(
+                        "SlowFollower: node {} latency {}x",
+                        slow_node.get(),
+                        delay_multiplier
+                    ));
                 }
                 None
             }
@@ -585,7 +598,7 @@ impl ScenarioExecutor {
             FaultScenario::CrashAndRecover {
                 node,
                 crash_after_ticks,
-                recover_after_ticks,
+                ..
             } => {
                 if !self.fault_applied && self.tick_count >= *crash_after_ticks {
                     cluster.crash_node(*node);
@@ -593,14 +606,11 @@ impl ScenarioExecutor {
                     return Some(format!("Crashed node {}", node.get()));
                 }
 
-                if self.fault_applied
-                    && !self.fault_healed
-                    && self.tick_count >= crash_after_ticks + recover_after_ticks
-                {
-                    cluster.recover_node(*node);
-                    self.fault_healed = true;
-                    return Some(format!("Recovered node {}", node.get()));
-                }
+                // Node stays crashed — the test harness detects crashed nodes
+                // and calls restart_node() (full WAL replay) during the recovery
+                // phase. recover_node() (network-only) is wrong here: it leaves
+                // the old HelixService running with an in-memory Raft log that
+                // references entries reverted from storage by simulate_crash().
                 None
             }
 
@@ -667,7 +677,7 @@ impl ScenarioExecutor {
             FaultScenario::LeaderStorageFault { .. } => self.fault_applied,
             FaultScenario::SlowFollower { .. } => self.fault_applied,
             FaultScenario::RandomFaults { .. } => false, // Never "complete" - runs indefinitely.
-            FaultScenario::CrashAndRecover { .. } => self.fault_healed,
+            FaultScenario::CrashAndRecover { .. } => self.fault_applied,
             FaultScenario::LeaderCrashThenPartition { .. } => self.phase >= 3,
         }
     }
