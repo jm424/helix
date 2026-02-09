@@ -76,7 +76,7 @@ fn test_data_dir(test_name: &str) -> PathBuf {
     dir
 }
 
-/// Creates a 3-node actor-mode cluster for controller failover testing.
+/// Creates a 3-node cluster for controller failover testing.
 async fn setup_cluster(test_name: &str, base_port: u16, raft_base_port: u16) -> RealCluster {
     RealCluster::builder()
         .nodes(3)
@@ -87,7 +87,6 @@ async fn setup_cluster(test_name: &str, base_port: u16, raft_base_port: u16) -> 
         .auto_create_topics(true)
         .default_replication_factor(3)
         .log_level("debug")
-        .actor_mode(true)
         .build()
         .expect("failed to start cluster")
 }

@@ -1,13 +1,12 @@
-//! Actor mode correctness tests for helix-workload.
+//! Cluster correctness tests for helix-workload.
 //!
-//! These tests verify that actor mode (per-partition batch pending tracking)
-//! works correctly under various conditions including:
+//! These tests verify that the cluster works correctly under various
+//! conditions including:
 //! - Multi-partition concurrent writes
 //! - Node failures during load
 //! - High concurrency stress
 //!
-//! Actor mode is the production architecture where each partition actor tracks
-//! its own pending batches rather than using a shared map.
+//! Each partition actor tracks its own pending batches independently.
 
 // Test-specific lint allowances - these are acceptable in test code
 #![allow(clippy::too_many_lines)] // Complex tests with many verification steps
@@ -63,7 +62,7 @@ fn binary_path() -> PathBuf {
 /// Creates a unique data directory for a test.
 fn test_data_dir(test_name: &str) -> PathBuf {
     let dir = std::env::temp_dir()
-        .join("helix-actor-mode-tests")
+        .join("helix-cluster-tests")
         .join(test_name)
         .join(format!("{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -94,8 +93,8 @@ fn find_available_base_port(start: u16, count: u16) -> u16 {
     panic!("unable to find available port block (count={count}) starting at {start}");
 }
 
-/// Creates an actor-mode enabled cluster with the given configuration.
-async fn setup_actor_mode_cluster(
+/// Creates a cluster with the given configuration.
+async fn setup_cluster(
     test_name: &str,
     nodes: u32,
     base_port: u16,
@@ -109,25 +108,24 @@ async fn setup_actor_mode_cluster(
         .data_dir(test_data_dir(test_name))
         .auto_create_topics(true)
         .default_replication_factor(3)
-        .actor_mode(true)
         .build()
-        .expect("failed to start actor mode cluster")
+        .expect("failed to start cluster")
 }
 
 // ============================================================================
 // Basic Tests
 // ============================================================================
 
-/// Basic single-partition actor mode test.
+/// Basic single-partition cluster test.
 ///
-/// Verifies that actor mode works correctly with a single partition.
+/// Verifies that the cluster works correctly with a single partition.
 #[tokio::test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+    ignore = "E2E workload cluster tests are slow in debug; run: cargo test --release -p helix-workload --test cluster_correctness"
 )]
-async fn test_actor_mode_single_partition() {
-    let cluster = setup_actor_mode_cluster("single_partition", 3, 20100, 20200).await;
+async fn test_single_partition() {
+    let cluster = setup_cluster("single_partition", 3, 20100, 20200).await;
 
     let executor = RealExecutor::new(&cluster).expect("failed to create executor");
     executor
@@ -145,7 +143,7 @@ async fn test_actor_mode_single_partition() {
 
     let stats: WorkloadStats = workload.run(&executor).await;
 
-    println!("=== Actor Mode Single Partition ===");
+    println!("=== Cluster Single Partition ===");
     stats.print_summary();
 
     assert!(
@@ -166,17 +164,17 @@ async fn test_actor_mode_single_partition() {
     );
 }
 
-/// Multi-partition actor mode test.
+/// Multi-partition cluster test.
 ///
-/// Verifies that actor mode correctly handles multiple partitions with
+/// Verifies that the cluster correctly handles multiple partitions with
 /// per-partition ordering maintained.
 #[tokio::test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+    ignore = "E2E workload cluster tests are slow in debug; run: cargo test --release -p helix-workload --test cluster_correctness"
 )]
-async fn test_actor_mode_multi_partition() {
-    let cluster = setup_actor_mode_cluster("multi_partition", 3, 20300, 20400).await;
+async fn test_multi_partition() {
+    let cluster = setup_cluster("multi_partition", 3, 20300, 20400).await;
 
     let executor = RealExecutor::new(&cluster).expect("failed to create executor");
     executor
@@ -197,7 +195,7 @@ async fn test_actor_mode_multi_partition() {
 
     let stats: WorkloadStats = workload.run(&executor).await;
 
-    println!("=== Actor Mode Multi Partition ===");
+    println!("=== Cluster Multi Partition ===");
     stats.print_summary();
 
     assert!(
@@ -224,16 +222,16 @@ async fn test_actor_mode_multi_partition() {
 
 /// Concurrent producers writing to different partitions.
 ///
-/// Verifies that actor mode correctly handles concurrent writes from multiple
+/// Verifies that the cluster correctly handles concurrent writes from multiple
 /// producers to different partitions without interference.
 /// Uses the Workload framework for proper topic creation and verification.
 #[tokio::test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+    ignore = "E2E workload cluster tests are slow in debug; run: cargo test --release -p helix-workload --test cluster_correctness"
 )]
-async fn test_actor_mode_concurrent_producers() {
-    let cluster = setup_actor_mode_cluster("concurrent_producers", 3, 20500, 20600).await;
+async fn test_concurrent_producers() {
+    let cluster = setup_cluster("concurrent_producers", 3, 20500, 20600).await;
 
     let bootstrap_servers = cluster.bootstrap_servers().to_string();
 
@@ -304,7 +302,7 @@ async fn test_actor_mode_concurrent_producers() {
         .filter(|v| !matches!(v, Violation::OffsetGap { .. }))
         .collect();
 
-    println!("=== Actor Mode Concurrent Producers ===");
+    println!("=== Cluster Concurrent Producers ===");
     println!("  Total sends: {total_sends}");
     println!("  Total failed: {total_failed}");
     println!(
@@ -336,14 +334,14 @@ async fn test_actor_mode_concurrent_producers() {
 
 /// High concurrency stress test.
 ///
-/// Verifies actor mode under high load with many partitions and operations.
+/// Verifies cluster behavior under high load with many partitions and operations.
 #[tokio::test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+    ignore = "E2E workload cluster tests are slow in debug; run: cargo test --release -p helix-workload --test cluster_correctness"
 )]
-async fn test_actor_mode_high_concurrency_stress() {
-    let cluster = setup_actor_mode_cluster("high_concurrency", 3, 20700, 20800).await;
+async fn test_high_concurrency_stress() {
+    let cluster = setup_cluster("high_concurrency", 3, 20700, 20800).await;
 
     let executor = RealExecutor::new(&cluster).expect("failed to create executor");
     executor
@@ -365,7 +363,7 @@ async fn test_actor_mode_high_concurrency_stress() {
 
     let stats: WorkloadStats = workload.run(&executor).await;
 
-    println!("=== Actor Mode High Concurrency Stress ===");
+    println!("=== Cluster High Concurrency Stress ===");
     stats.print_summary();
 
     assert!(
@@ -392,17 +390,17 @@ async fn test_actor_mode_high_concurrency_stress() {
 
 /// Leader failure during sustained load with full verification.
 ///
-/// Verifies that actor mode correctly handles leader failure:
+/// Verifies that the cluster correctly handles leader failure:
 /// - All pre-failure writes must succeed (healthy cluster)
 /// - All acknowledged writes (pre and post failure) are readable
 /// - No data loss or corruption
 #[tokio::test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+    ignore = "E2E workload cluster tests are slow in debug; run: cargo test --release -p helix-workload --test cluster_correctness"
 )]
-async fn test_actor_mode_leader_failure() {
-    let mut cluster = setup_actor_mode_cluster("leader_failure", 3, 20900, 21000).await;
+async fn test_leader_failure() {
+    let mut cluster = setup_cluster("leader_failure", 3, 20900, 21000).await;
 
     let bootstrap_servers = cluster.bootstrap_servers().to_string();
     let executor = RealExecutor::with_mode(&bootstrap_servers, ProducerMode::LowLatency)
@@ -522,7 +520,7 @@ async fn test_actor_mode_leader_failure() {
     }
 
     let total_ack = acknowledged.len();
-    println!("\n=== Actor Mode Leader Failure ===");
+    println!("\n=== Cluster Leader Failure ===");
     println!("  Acknowledged: {total_ack}");
     println!("  Verified: {verified}");
     println!("  Errors: {errors}");
@@ -539,17 +537,17 @@ async fn test_actor_mode_leader_failure() {
 
 /// Node failure during multi-partition load with full verification.
 ///
-/// Verifies that actor mode handles node failure correctly:
+/// Verifies that the cluster handles node failure correctly:
 /// - All pre-failure writes must succeed (healthy cluster)
 /// - All acknowledged writes are readable after recovery
 /// - No data loss or corruption
 #[tokio::test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+    ignore = "E2E workload cluster tests are slow in debug; run: cargo test --release -p helix-workload --test cluster_correctness"
 )]
-async fn test_actor_mode_node_failure_multi_partition() {
-    let mut cluster = setup_actor_mode_cluster("node_failure_multi", 3, 21100, 21200).await;
+async fn test_node_failure_multi_partition() {
+    let mut cluster = setup_cluster("node_failure_multi", 3, 21100, 21200).await;
 
     let bootstrap_servers = cluster.bootstrap_servers().to_string();
     let executor = RealExecutor::with_mode(&bootstrap_servers, ProducerMode::LowLatency)
@@ -669,7 +667,7 @@ async fn test_actor_mode_node_failure_multi_partition() {
         }
     }
 
-    println!("\n=== Actor Mode Node Failure Multi-Partition ===");
+    println!("\n=== Cluster Node Failure Multi-Partition ===");
     println!("  Acknowledged: {total_acknowledged}");
     println!("  Verified: {verified}");
     println!("  Errors: {errors}");
@@ -695,10 +693,10 @@ async fn test_actor_mode_node_failure_multi_partition() {
 #[tokio::test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+    ignore = "E2E workload cluster tests are slow in debug; run: cargo test --release -p helix-workload --test cluster_correctness"
 )]
-async fn test_actor_mode_producer_consumer() {
-    let cluster = setup_actor_mode_cluster("producer_consumer", 3, 21300, 21400).await;
+async fn test_producer_consumer() {
+    let cluster = setup_cluster("producer_consumer", 3, 21300, 21400).await;
 
     let bootstrap_servers = cluster.bootstrap_servers().to_string();
     let executor = RealExecutor::with_mode(&bootstrap_servers, ProducerMode::LowLatency)
@@ -798,7 +796,7 @@ async fn test_actor_mode_producer_consumer() {
         }
     }
 
-    println!("\n=== Actor Mode Producer-Consumer ===");
+    println!("\n=== Cluster Producer-Consumer ===");
     println!("  Produced: {total_produced}");
     println!("  Verified: {verified}");
     println!("  Ordering errors: {ordering_errors}");
@@ -826,7 +824,7 @@ async fn test_actor_mode_producer_consumer() {
 /// Runs multiple iterations with different seeds to catch rare bugs.
 #[tokio::test]
 #[ignore = "long-running stress test - run manually with --ignored"]
-async fn test_actor_mode_stress_many_seeds() {
+async fn test_stress_many_seeds() {
     let mut total_violations = 0;
     let mut total_successes = 0u64;
 
@@ -834,7 +832,7 @@ async fn test_actor_mode_stress_many_seeds() {
         // Use port range 25000+ to avoid conflicts with other tests.
         // Each seed gets 200 ports (100 for kafka, 100 for raft).
         let port_base = 25000 + (seed as u16 * 200);
-        let cluster = setup_actor_mode_cluster(
+        let cluster = setup_cluster(
             &format!("stress_seed_{seed}"),
             3,
             port_base,
@@ -873,7 +871,7 @@ async fn test_actor_mode_stress_many_seeds() {
         }
     }
 
-    println!("\n=== Actor Mode Stress Many Seeds ===");
+    println!("\n=== Cluster Stress Many Seeds ===");
     println!("  Seeds: 20");
     println!("  Total successes: {total_successes}");
     println!("  Total violations: {total_violations}");
@@ -906,11 +904,11 @@ async fn test_actor_mode_stress_many_seeds() {
 #[tokio::test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+    ignore = "E2E workload cluster tests are slow in debug; run: cargo test --release -p helix-workload --test cluster_correctness"
 )]
-async fn test_actor_mode_multi_partition_leader_failover_verified() {
+async fn test_multi_partition_leader_failover_verified() {
     let mut cluster =
-        setup_actor_mode_cluster("multi_partition_leader_failover", 3, 23000, 23100).await;
+        setup_cluster("multi_partition_leader_failover", 3, 23000, 23100).await;
 
     let bootstrap_servers = cluster.bootstrap_servers().to_string();
     let executor = RealExecutor::with_mode(&bootstrap_servers, ProducerMode::LowLatency)
@@ -1107,10 +1105,10 @@ async fn test_actor_mode_multi_partition_leader_failover_verified() {
 #[tokio::test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+    ignore = "E2E workload cluster tests are slow in debug; run: cargo test --release -p helix-workload --test cluster_correctness"
 )]
-async fn test_actor_mode_rolling_restart_verified() {
-    let mut cluster = setup_actor_mode_cluster("rolling_restart", 3, 23200, 23300).await;
+async fn test_rolling_restart_verified() {
+    let mut cluster = setup_cluster("rolling_restart", 3, 23200, 23300).await;
 
     let bootstrap_servers = cluster.bootstrap_servers().to_string();
     let executor = RealExecutor::with_mode(&bootstrap_servers, ProducerMode::LowLatency)
@@ -1304,10 +1302,10 @@ async fn test_actor_mode_rolling_restart_verified() {
 #[tokio::test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+    ignore = "E2E workload cluster tests are slow in debug; run: cargo test --release -p helix-workload --test cluster_correctness"
 )]
-async fn test_actor_mode_crash_recovery_from_wal() {
-    let mut cluster = setup_actor_mode_cluster("crash_recovery", 3, 23400, 23500).await;
+async fn test_crash_recovery_from_wal() {
+    let mut cluster = setup_cluster("crash_recovery", 3, 23400, 23500).await;
 
     let bootstrap_servers = cluster.bootstrap_servers().to_string();
     let executor = RealExecutor::with_mode(&bootstrap_servers, ProducerMode::LowLatency)
@@ -1458,10 +1456,10 @@ async fn test_actor_mode_crash_recovery_from_wal() {
 #[tokio::test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+    ignore = "E2E workload cluster tests are slow in debug; run: cargo test --release -p helix-workload --test cluster_correctness"
 )]
-async fn test_actor_mode_quorum_loss_recovery() {
-    let mut cluster = setup_actor_mode_cluster("quorum_loss", 3, 23600, 23700).await;
+async fn test_quorum_loss_recovery() {
+    let mut cluster = setup_cluster("quorum_loss", 3, 23600, 23700).await;
 
     let bootstrap_servers = cluster.bootstrap_servers().to_string();
     let executor = RealExecutor::with_mode(&bootstrap_servers, ProducerMode::LowLatency)
@@ -1638,13 +1636,12 @@ async fn test_actor_mode_quorum_loss_recovery() {
     );
 }
 
-/// Helper to set up a cluster with configurable actor mode.
+/// Helper to set up a cluster.
 async fn setup_cluster_with_mode(
     test_name: &str,
     nodes: u32,
     base_port: u16,
     raft_base_port: u16,
-    actor_mode: bool,
 ) -> RealCluster {
     RealCluster::builder()
         .nodes(nodes)
@@ -1654,7 +1651,6 @@ async fn setup_cluster_with_mode(
         .data_dir(test_data_dir(test_name))
         .auto_create_topics(true)
         .default_replication_factor(3)
-        .actor_mode(actor_mode)
         .build()
         .expect("failed to start cluster")
 }
@@ -1687,12 +1683,12 @@ async fn setup_cluster_with_mode(
 /// # What We DON'T Validate (not Kafka requirements)
 ///
 /// - Sequential offsets in consumed data (gaps are expected when writes fail)
-async fn run_rapid_failover_stress_test(actor_mode: bool, base_port: u16, raft_base_port: u16) {
-    let mode_str = if actor_mode { "actor" } else { "non-actor" };
+async fn run_rapid_failover_stress_test(base_port: u16, raft_base_port: u16) {
+    let mode_str = "cluster";
     let test_name = format!("rapid_failover_{mode_str}");
 
     let mut cluster =
-        setup_cluster_with_mode(&test_name, 3, base_port, raft_base_port, actor_mode).await;
+        setup_cluster_with_mode(&test_name, 3, base_port, raft_base_port).await;
 
     let bootstrap_servers = cluster.bootstrap_servers().to_string();
     let executor = RealExecutor::with_mode(&bootstrap_servers, ProducerMode::LowLatency)
@@ -1967,35 +1963,22 @@ async fn run_rapid_failover_stress_test(actor_mode: bool, base_port: u16, raft_b
     );
 }
 
-/// Rapid failover stress test - actor mode.
+/// Rapid failover stress test.
 #[tokio::test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
+    ignore = "E2E workload cluster tests are slow in debug; run: cargo test --release -p helix-workload --test cluster_correctness"
 )]
-async fn test_actor_mode_rapid_failover_stress() {
-    run_rapid_failover_stress_test(true, 23800, 23900).await;
-}
-
-/// Rapid failover stress test - non-actor mode.
-///
-/// Tests the same bug scenario as the actor mode test, but using the
-/// traditional tick-based processing path in helix-server.
-#[tokio::test]
-#[cfg_attr(
-    debug_assertions,
-    ignore = "E2E workload actor-mode tests are slow in debug; run: cargo test --release -p helix-workload --test actor_mode_correctness"
-)]
-async fn test_non_actor_mode_rapid_failover_stress() {
-    run_rapid_failover_stress_test(false, 23950, 24050).await;
+async fn test_rapid_failover_stress() {
+    run_rapid_failover_stress_test(23800, 23900).await;
 }
 
 // ============================================================================
 // Phase 3: Extended Stress Tests
 // ============================================================================
 //
-// These tests are for extended validation before making actor mode the default.
-// Run with: cargo test -p helix-workload --test actor_mode_correctness -- --ignored
+// These tests are for extended validation of cluster correctness.
+// Run with: cargo test -p helix-workload --test cluster_correctness -- --ignored
 
 /// Extended stress test: 500 seeds, 500 operations per seed.
 ///
@@ -2003,7 +1986,7 @@ async fn test_non_actor_mode_rapid_failover_stress() {
 /// Expected runtime: 30-60 minutes depending on hardware.
 #[tokio::test]
 #[ignore = "extended stress test (Phase 3) - run with --ignored"]
-async fn test_actor_mode_stress_500_seeds() {
+async fn test_stress_500_seeds() {
     let mut total_violations = 0;
     let mut total_successes = 0u64;
     let mut seeds_completed = 0u64;
@@ -2013,7 +1996,7 @@ async fn test_actor_mode_stress_500_seeds() {
         // Each seed gets 200 ports (100 for kafka, 100 for raft).
         let port_base = 30000 + ((seed % 100) as u16 * 200);
         let cluster =
-            setup_actor_mode_cluster(&format!("ext_stress_{seed}"), 3, port_base, port_base + 100)
+            setup_cluster(&format!("ext_stress_{seed}"), 3, port_base, port_base + 100)
                 .await;
 
         let executor = RealExecutor::new(&cluster).expect("failed to create executor");
@@ -2048,7 +2031,7 @@ async fn test_actor_mode_stress_500_seeds() {
         }
     }
 
-    println!("\n=== Extended Actor Mode Stress (500 Seeds) ===");
+    println!("\n=== Extended Cluster Stress (500 Seeds) ===");
     println!("  Seeds completed: {seeds_completed}");
     println!("  Total successes: {total_successes}");
     println!("  Total violations: {total_violations}");
@@ -2066,7 +2049,7 @@ async fn test_actor_mode_stress_500_seeds() {
 /// that only manifests after multiple failover cycles.
 #[tokio::test]
 #[ignore = "extended failover test (Phase 3) - run with --ignored"]
-async fn test_actor_mode_extended_rapid_failover() {
+async fn test_extended_rapid_failover() {
     for seed in 0..50u64 {
         // Use per-seed moving windows and probe availability to avoid reuse collisions.
         let seed_u16 = u16::try_from(seed).unwrap_or(0);
@@ -2076,7 +2059,7 @@ async fn test_actor_mode_extended_rapid_failover() {
         let raft_base = find_available_base_port(raft_start, 3);
 
         let mut cluster =
-            setup_actor_mode_cluster(&format!("ext_failover_{seed}"), 3, port_base, raft_base)
+            setup_cluster(&format!("ext_failover_{seed}"), 3, port_base, raft_base)
                 .await;
 
         let executor = RealExecutor::new(&cluster).expect("failed to create executor");
@@ -2180,7 +2163,7 @@ async fn test_actor_mode_extended_rapid_failover() {
 
         if seed % 10 == 0 {
             println!(
-                "Seed {seed}/100: {verified}/{total_acknowledged} writes verified after 20 failover cycles"
+                "Seed {seed}/50: {verified}/{total_acknowledged} writes verified after 3 failover cycles"
             );
         }
 
@@ -2194,15 +2177,15 @@ async fn test_actor_mode_extended_rapid_failover() {
         );
     }
 
-    println!("\n=== Extended Rapid Failover (100 seeds × 20 cycles) ===");
+    println!("\n=== Extended Rapid Failover (50 seeds x 3 cycles) ===");
     println!("  All seeds passed");
 }
 
-// Note: Fine-grained fault injection testing is done via DST in helix-tests/src/helix_service_dst.rs
-// with actor_mode: true. DST provides:
+// Note: Fine-grained fault injection testing is done via MadSim E2E in
+// helix-tests/src/madsim_e2e_cluster.rs. MadSim provides:
 // - Deterministic reproduction (same seed = same behavior)
-// - Fine-grained faults (disk write failures, message drops/delays)
-// - SimulatedStorage and SimulatedTransport
-// - Property-based validation (VERIFY_INTEGRITY, VERIFY_CONSUMER)
+// - Fine-grained faults (disk write failures, network partitions, node crashes)
+// - SimulatedStorage and MadSimTransport
+// - Property-based validation (SingleLeaderPerTerm, data integrity)
 //
 // The E2E tests here focus on real process behavior with coarse-grained faults (node kill/restart).
