@@ -241,10 +241,6 @@ pub struct RealClusterConfig {
     pub tiering_config: TieringTestConfig,
     /// Log level for server nodes (trace, debug, info, warn, error).
     pub log_level: String,
-
-    // === Experimental ===
-    /// Enable actor-based architecture for lock-free multi-partition.
-    pub actor_mode: bool,
 }
 
 impl Default for RealClusterConfig {
@@ -263,7 +259,6 @@ impl Default for RealClusterConfig {
             s3_config: None,
             tiering_config: TieringTestConfig::default(),
             log_level: String::from("info"),
-            actor_mode: false,
         }
     }
 }
@@ -422,13 +417,6 @@ impl RealClusterBuilder {
         self
     }
 
-    /// Enables actor-based architecture for lock-free multi-partition.
-    #[must_use]
-    pub const fn actor_mode(mut self, enabled: bool) -> Self {
-        self.config.actor_mode = enabled;
-        self
-    }
-
     /// Builds and starts the cluster.
     ///
     /// # Errors
@@ -572,11 +560,6 @@ impl RealCluster {
                 // Pass min age when S3 is configured.
                 cmd.arg("--tier-min-age-secs")
                     .arg(config.tiering_config.min_age_secs.to_string());
-            }
-
-            // Enable actor mode if configured.
-            if config.actor_mode {
-                cmd.arg("--actor-mode");
             }
 
             // Suppress stdout; configure stderr based on test log mode.
@@ -741,6 +724,7 @@ impl RealCluster {
     ///
     /// Returns an error if the node cannot be restarted.
     #[allow(clippy::cast_possible_truncation)] // node_id bounded by node_count.
+    #[allow(clippy::too_many_lines)] // Restart logic with all config options.
     pub fn restart_node(&mut self, node_id: u64) -> Result<(), ExecutorError> {
         let idx = node_id as usize - 1;
         if idx >= self.processes.len() {
@@ -818,11 +802,6 @@ impl RealCluster {
             // Pass min age when S3 is configured.
             cmd.arg("--tier-min-age-secs")
                 .arg(self.config.tiering_config.min_age_secs.to_string());
-        }
-
-        // Enable actor mode if configured.
-        if self.config.actor_mode {
-            cmd.arg("--actor-mode");
         }
 
         cmd.stdout(Stdio::null()).envs(std::env::vars());

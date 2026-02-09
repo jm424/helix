@@ -595,7 +595,7 @@ async fn flush_batch<S: Storage + Clone + Send + Sync + 'static, T: TransportSer
 
     // CRITICAL: Capture base_offset and propose atomically while holding multi_raft write lock.
     //
-    // Race condition this fixes (non-actor mode):
+    // Race condition this fixes:
     // 1. Tick task calls tick(), gets CommitEntry for PREVIOUS_TERM entry, releases lock
     // 2. Batcher acquires lock, captures base_offset (BEFORE tick task applies entry!)
     // 3. Tick task applies entry, advances storage offset

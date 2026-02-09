@@ -4,7 +4,7 @@ use helix_core::PartitionId;
 use helix_raft::multi::MultiRaftOutput;
 use helix_raft::RaftState;
 use tokio::sync::oneshot;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use helix_runtime::TransportService;
 use helix_wal::Storage;
@@ -232,9 +232,10 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
 
         let (result_tx, result_rx) = oneshot::channel();
 
-        // For single-node actor mode, we need to process propose outputs immediately
-        // because commits happen during propose, not during tick.
-        let is_single_node_actor = self.cluster_nodes.len() == 1 && self.actor_mode;
+        // For single-node with actor infrastructure, we need to process propose outputs
+        // immediately because commits happen during propose, not during tick.
+        let is_single_node_actor =
+            self.cluster_nodes.len() == 1 && self.actor_router.is_some();
 
         let (proposed_index, propose_outputs) = {
             let mut mr = self.multi_raft.write().await;
@@ -285,6 +286,10 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     router,
                     output_tx,
                     None, // vote_store not available here
+                    self.shared_wal_pool.as_ref(),
+                    self.data_dir.as_ref(),
+                    Some(&self.recovered_entries),
+                    Some(&self.storage),
                 )
                 .await;
             }
@@ -355,48 +360,10 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
         }
 
-        // Step 3: Wait for data Raft groups to elect leaders.
-        // This ensures clients can immediately produce/consume after topic creation.
-        if self.actor_mode {
-            // In actor mode, data partitions are managed by partition actors, not MultiRaft.
-            // Skip the leader check since the partition actors will elect leaders independently.
-            // Clients will get LEADER_NOT_AVAILABLE and retry if leaders aren't ready yet.
-            debug!(topic = %name, "Actor mode: skipping leader election check");
-        } else {
-            loop {
-                let all_have_leaders = {
-                    let state = self.controller_state.read().await;
-                    let mr = self.multi_raft.read().await;
-
-                    (0..partition_count).all(|p| {
-                        let partition_id = PartitionId::new(u64::from(p));
-                        state
-                            .get_assignment(topic_id, partition_id)
-                            .is_some_and(|assignment| {
-                                mr.group_state(assignment.group_id)
-                                    .is_some_and(|gs| gs.leader_id.is_some())
-                            })
-                    })
-                };
-
-                if all_have_leaders {
-                    debug!(topic = %name, "All partitions have leaders");
-                    break;
-                }
-
-                if tokio::time::Instant::now() >= deadline {
-                    warn!(
-                        topic = %name,
-                        "Timeout waiting for leader election, returning success anyway"
-                    );
-                    // Don't fail here - partitions are created, just leaders not elected yet.
-                    // Clients will get LEADER_NOT_AVAILABLE and retry.
-                    break;
-                }
-
-                tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
-            }
-        }
+        // Step 3: Data partitions are managed by partition actors, not MultiRaft.
+        // Skip the leader check since the partition actors elect leaders independently.
+        // Clients will get LEADER_NOT_AVAILABLE and retry if leaders aren't ready yet.
+        debug!(topic = %name, "Skipping leader election check (actor mode)");
 
         info!(
             topic = %name,
@@ -409,22 +376,22 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
     }
 
     /// Gets topic metadata by name.
+    #[allow(clippy::significant_drop_tightening)] // Lock dropped before fallback lookup.
     pub(crate) async fn get_topic(&self, name: &str) -> Option<TopicMetadata> {
-        // In multi-node mode, first check controller state.
-        if self.is_multi_node_generic() {
-            let state = self.controller_state.read().await;
-            if let Some(info) = state.get_topic(name) {
-                // Safe cast: partition_count is bounded by 256.
-                #[allow(clippy::cast_possible_wrap)]
-                return Some(TopicMetadata {
-                    topic_id: info.topic_id,
-                    partition_count: info.partition_count as i32,
-                });
-            }
-            // Fall through to check local topics map.
+        // Check controller state first — all topic metadata is managed
+        // by the controller partition.
+        let state = self.controller_state.read().await;
+        if let Some(info) = state.get_topic(name) {
+            // Safe cast: partition_count is bounded by 256.
+            #[allow(clippy::cast_possible_wrap)]
+            return Some(TopicMetadata {
+                topic_id: info.topic_id,
+                partition_count: info.partition_count as i32,
+            });
         }
+        drop(state);
 
-        // Check local topics map (single-node mode, or fallback for multi-node).
+        // Fallback to local topics map (legacy single-node path).
         let topics = self.topics.read().await;
         topics.get(name).cloned()
     }
@@ -433,37 +400,21 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
     ///
     /// Returns a list of (`topic_name`, `partition_count`) pairs.
     pub async fn get_all_topics(&self) -> Vec<(String, i32)> {
-        // In multi-node mode, read from controller state.
-        if self.is_multi_node_generic() {
-            let state = self.controller_state.read().await;
-            return state
-                .topics()
-                .map(|info| {
-                    // Safe cast: partition_count is bounded by 256.
-                    #[allow(clippy::cast_possible_wrap)]
-                    (info.name.clone(), info.partition_count as i32)
-                })
-                .collect();
-        }
-
-        // Single-node mode uses local topics map.
-        let topics = self.topics.read().await;
-        topics
-            .iter()
-            .map(|(name, meta)| (name.clone(), meta.partition_count))
+        // All topic metadata is managed by the controller partition.
+        let state = self.controller_state.read().await;
+        state
+            .topics()
+            .map(|info| {
+                // Safe cast: partition_count is bounded by 256.
+                #[allow(clippy::cast_possible_wrap)]
+                (info.name.clone(), info.partition_count as i32)
+            })
             .collect()
     }
 
     /// Checks if a topic exists.
     pub async fn topic_exists(&self, topic: &str) -> bool {
-        // In multi-node mode, check controller state.
-        if self.is_multi_node_generic() {
-            let state = self.controller_state.read().await;
-            return state.topic_exists(topic);
-        }
-
-        // Single-node mode uses local topics map.
-        let topics = self.topics.read().await;
-        topics.contains_key(topic)
+        let state = self.controller_state.read().await;
+        state.topic_exists(topic)
     }
 }

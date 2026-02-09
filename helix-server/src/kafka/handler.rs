@@ -302,7 +302,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
 
                 if self.auto_create_topics {
                     // Auto-create topic with configured partition count.
-                    // In multi-node mode, use controller (forward if needed); in single-node, use direct creation.
+                    // Use controller (forward to leader if needed).
                     let replication_factor = u32::try_from(self.service.cluster_nodes().len())
                         .unwrap_or(3)
                         .max(1);
@@ -310,34 +310,29 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
                     #[allow(clippy::cast_possible_wrap)]
                     let partition_count_i32 = partition_count as i32;
 
-                    let create_result = if self.service.is_multi_node() {
-                        // Try direct creation first (works if we're the controller).
-                        match self
-                            .service
-                            .create_topic_via_controller(
-                                topic_name.clone(),
+                    // Always use controller path — partition actors are created
+                    // via AssignPartition commands from the controller.
+                    let create_result = match self
+                        .service
+                        .create_topic_via_controller(
+                            topic_name.clone(),
+                            partition_count,
+                            replication_factor,
+                        )
+                        .await
+                    {
+                        Ok(()) => Ok(()),
+                        Err(crate::error::ServerError::NotController { .. }) => {
+                            // Not the controller - forward to controller.
+                            self.forward_create_topic_to_controller(
+                                topic_name,
                                 partition_count,
                                 replication_factor,
                             )
                             .await
-                        {
-                            Ok(()) => Ok(()),
-                            Err(crate::error::ServerError::NotController { .. }) => {
-                                // Not the controller - forward to controller.
-                                self.forward_create_topic_to_controller(
-                                    topic_name,
-                                    partition_count,
-                                    replication_factor,
-                                )
-                                .await
-                                .map_err(|e| crate::error::ServerError::Internal { message: e })
-                            }
-                            Err(e) => Err(e),
+                            .map_err(|e| crate::error::ServerError::Internal { message: e })
                         }
-                    } else {
-                        self.service
-                            .create_topic(topic_name.clone(), partition_count_i32)
-                            .await
+                        Err(e) => Err(e),
                     };
 
                     match create_result {
@@ -584,43 +579,35 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
         // Ensure topic exists (auto-create if enabled).
         if !self.service.topic_exists(topic).await {
             if self.auto_create_topics {
-                // In multi-node mode, use controller (forward if needed); in single-node, use direct creation.
+                // Use controller (forward to leader if needed).
                 let replication_factor = u32::try_from(self.service.cluster_nodes().len())
                     .unwrap_or(3)
                     .max(1);
 
-                // Cast to i32 for single-node API, keep u32 for controller API.
-                #[allow(clippy::cast_possible_wrap)]
-                let partition_count_i32 = self.auto_create_partitions as i32;
                 let partition_count = self.auto_create_partitions;
-                let create_result = if self.service.is_multi_node() {
-                    // Try direct creation first (works if we're the controller).
-                    match self
-                        .service
-                        .create_topic_via_controller(
-                            topic.to_string(),
+                // Always use controller path — partition actors are created
+                // via AssignPartition commands from the controller.
+                let create_result = match self
+                    .service
+                    .create_topic_via_controller(
+                        topic.to_string(),
+                        partition_count,
+                        replication_factor,
+                    )
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(crate::ServerError::NotController { .. }) => {
+                        // Not the controller - forward to controller.
+                        self.forward_create_topic_to_controller(
+                            topic,
                             partition_count,
                             replication_factor,
                         )
                         .await
-                    {
-                        Ok(()) => Ok(()),
-                        Err(crate::ServerError::NotController { .. }) => {
-                            // Not the controller - forward to controller.
-                            self.forward_create_topic_to_controller(
-                                topic,
-                                partition_count,
-                                replication_factor,
-                            )
-                            .await
-                            .map_err(|e| crate::ServerError::Internal { message: e })
-                        }
-                        Err(e) => Err(e),
+                        .map_err(|e| crate::ServerError::Internal { message: e })
                     }
-                } else {
-                    self.service
-                        .create_topic(topic.to_string(), partition_count_i32)
-                        .await
+                    Err(e) => Err(e),
                 };
 
                 if let Err(e) = create_result {
@@ -1286,19 +1273,15 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
         )
     }
 
+    #[allow(clippy::significant_drop_tightening)] // Lock scope is the entire function body.
     async fn topic_name_by_id(&self) -> HashMap<TopicId, String> {
         let mut mapping = HashMap::new();
 
-        if self.service.is_multi_node() {
-            let state = self.service.controller_state.read().await;
-            for info in state.topics() {
-                mapping.insert(info.topic_id, info.name.clone());
-            }
-        } else {
-            let topics = self.service.topics.read().await;
-            for (name, meta) in topics.iter() {
-                mapping.insert(meta.topic_id, name.clone());
-            }
+        // Always use controller state — all topic metadata is managed by
+        // the controller partition (even for single-node clusters).
+        let state = self.service.controller_state.read().await;
+        for info in state.topics() {
+            mapping.insert(info.topic_id, info.name.clone());
         }
 
         mapping
@@ -1400,38 +1383,30 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
                 continue;
             }
 
-            // Create the topic (forward to controller if needed).
-            // Actor mode uses controller path even for single-node because
-            // partition actors are created via AssignPartition commands.
+            // Always use controller path — partition actors are created
+            // via AssignPartition commands from the controller.
             #[allow(clippy::cast_sign_loss)]
-            let create_result = if self.service.is_multi_node() || self.service.is_actor_mode() {
-                // Multi-node or actor mode: use controller path.
-                match self
-                    .service
-                    .create_topic_via_controller(
-                        topic_name.clone(),
+            let create_result = match self
+                .service
+                .create_topic_via_controller(
+                    topic_name.clone(),
+                    num_partitions as u32,
+                    replication_factor as u32,
+                )
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(crate::error::ServerError::NotController { .. }) => {
+                    // Not the controller - forward to controller.
+                    self.forward_create_topic_to_controller(
+                        &topic_name,
                         num_partitions as u32,
                         replication_factor as u32,
                     )
                     .await
-                {
-                    Ok(()) => Ok(()),
-                    Err(crate::error::ServerError::NotController { .. }) => {
-                        // Not the controller - forward to controller.
-                        self.forward_create_topic_to_controller(
-                            &topic_name,
-                            num_partitions as u32,
-                            replication_factor as u32,
-                        )
-                        .await
-                        .map_err(|e| crate::error::ServerError::Internal { message: e })
-                    }
-                    Err(e) => Err(e),
+                    .map_err(|e| crate::error::ServerError::Internal { message: e })
                 }
-            } else {
-                self.service
-                    .create_topic(topic_name.clone(), num_partitions)
-                    .await
+                Err(e) => Err(e),
             };
 
             let result = match create_result {
@@ -2032,7 +2007,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_metadata_error_mapping_single_node_keeps_unknown_for_absent_topic() {
+    async fn test_metadata_error_mapping_single_node_returns_retriable_for_absent_topic() {
+        // After removing non-actor mode, all nodes use the controller path.
+        // Single-node clusters return LEADER_NOT_AVAILABLE (retriable) rather
+        // than UNKNOWN_TOPIC because the controller may not be ready yet.
         let storage = SimulatedStorage::new(42);
         let service: HelixService<SimulatedStorage> =
             HelixService::new_for_test("test-cluster".to_string(), 1, storage).await;
@@ -2041,7 +2019,7 @@ mod tests {
         let error = crate::error::ServerError::TopicNotFound {
             topic: "missing".to_string(),
         };
-        assert_eq!(handler.metadata_error_code_for_create_error(&error), 3);
+        assert_eq!(handler.metadata_error_code_for_create_error(&error), 5);
     }
 
     #[tokio::test]

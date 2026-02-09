@@ -438,24 +438,21 @@ pub struct HelixService<
     pub(crate) batcher_handle: Option<batcher::BatcherHandle>,
     /// Aggregated batcher performance stats (multi-node mode only).
     pub(crate) batcher_stats: Option<Arc<BatcherStats>>,
-    /// Whether actor mode is enabled (lock-free multi-partition).
-    #[allow(dead_code)] // Used by handlers in follow-up integration.
-    pub(crate) actor_mode: bool,
-    /// Partition router for actor mode (lock-free request dispatch).
-    #[allow(dead_code)] // Used by handlers in follow-up integration.
+    /// Partition router for actor-based lock-free request dispatch (multi-node only).
     pub(crate) actor_router: Option<Arc<PartitionRouter>>,
-    /// Output channel for partition actors (actor mode only).
+    /// Output channel for partition actors.
     /// Used to process propose outputs for single-node clusters.
-    #[allow(dead_code)] // Used by handlers for single-node actor mode.
     pub(crate) actor_output_tx: Option<mpsc::Sender<partition_actor::GroupedOutput>>,
     /// Shutdown sender for actor tick task (data partitions).
-    #[allow(dead_code)] // Used for graceful shutdown in follow-up.
+    /// Kept alive to prevent premature task shutdown via channel close.
+    #[allow(dead_code)]
     pub(crate) actor_shutdown_tx: Option<mpsc::Sender<()>>,
-    /// Shutdown sender for controller tick task (actor mode only).
-    #[allow(dead_code)] // Used for graceful shutdown in follow-up.
+    /// Shutdown sender for controller tick task.
+    /// Kept alive to prevent premature task shutdown via channel close.
+    #[allow(dead_code)]
     pub(crate) controller_shutdown_tx: Option<mpsc::Sender<()>>,
-    /// Backpressure state for actor mode.
-    #[allow(dead_code)] // Used by handlers in follow-up integration.
+    /// Backpressure state for actor-based flow control.
+    #[allow(dead_code)]
     pub(crate) actor_backpressure: Option<Arc<batcher::BackpressureState>>,
     /// Vote store for persisting Raft vote state (multi-node only).
     /// Uses Arc<Mutex> for thread-safe access from tick tasks.
@@ -672,7 +669,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             batch_pending_proposals: Arc::new(RwLock::new(HashMap::new())),
             batcher_handle: None, // No batching in single-node mode.
             batcher_stats: None,
-            actor_mode: false, // Single-node uses lock-based approach.
             actor_router: None,
             actor_output_tx: None,
             actor_shutdown_tx: None,
@@ -692,7 +688,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
     /// # Arguments
     /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
     /// * `write_durability` - Durability mode for writes
-    /// * `enable_actor_mode` - If true, uses lock-free actor-based architecture
     /// * `storage` - Storage backend for WAL operations
     ///
     /// # Errors
@@ -717,7 +712,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
         kafka_peer_addrs: HashMap<NodeId, String>,
         shared_wal_count: Option<u32>,
         write_durability: WriteDurability,
-        enable_actor_mode: bool,
         storage: S,
     ) -> Result<Self, TransportError> {
         Self::new_multi_node_internal(
@@ -733,7 +727,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             kafka_peer_addrs,
             shared_wal_count,
             write_durability,
-            enable_actor_mode,
             storage,
         )
         .await
@@ -747,7 +740,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
     /// # Arguments
     /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
     /// * `write_durability` - Durability mode for writes
-    /// * `enable_actor_mode` - If true, uses lock-free actor-based architecture
     /// * `storage` - Storage backend for WAL operations
     ///
     /// # Errors
@@ -770,7 +762,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
         kafka_peer_addrs: HashMap<NodeId, String>,
         shared_wal_count: Option<u32>,
         write_durability: WriteDurability,
-        enable_actor_mode: bool,
         storage: S,
     ) -> Result<Self, TransportError> {
         Self::new_multi_node_internal(
@@ -785,7 +776,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             kafka_peer_addrs,
             shared_wal_count,
             write_durability,
-            enable_actor_mode,
             storage,
         )
         .await
@@ -805,7 +795,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
         kafka_peer_addrs: HashMap<NodeId, String>,
         shared_wal_count: Option<u32>,
         write_durability: WriteDurability,
-        enable_actor_mode: bool,
         storage: S,
     ) -> Result<Self, TransportError> {
         let node_id = NodeId::new(node_id);
@@ -983,173 +972,70 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             (None, Arc::new(RwLock::new(HashMap::new())))
         };
 
-        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
 
         // Create batch pending proposals map.
         let batch_pending_proposals: BatchPendingProposalMap =
             Arc::new(RwLock::new(HashMap::new()));
 
-        // Branch based on actor mode.
-        let (
-            batcher_handle,
-            batcher_stats,
-            actor_router,
-            actor_output_tx,
-            actor_shutdown_tx,
-            controller_shutdown_tx,
-            actor_backpressure,
-        ) = if enable_actor_mode {
-            // Actor mode: use lock-free actor-based architecture.
-            info!("Initializing actor mode for multi-node service");
+        // Actor-based architecture: lock-free per-partition actors with message-passing.
+        info!("Initializing actor mode for multi-node service");
 
-            // Create actor-based setup with empty initial groups.
-            // Data partitions will be created dynamically via AssignPartition.
-            let actor_handles = actor_setup::setup_multi_partition(
-                node_id,
-                cluster_nodes.clone(),
-                HashMap::new(), // Empty initial groups - created via controller.
+        // Create actor-based setup with empty initial groups.
+        // Data partitions will be created dynamically via AssignPartition.
+        let actor_handles = actor_setup::setup_multi_partition(
+            node_id,
+            cluster_nodes.clone(),
+            HashMap::new(), // Empty initial groups - created via controller.
+            Arc::clone(&partition_storage),
+            Arc::clone(&group_map),
+            Arc::clone(&controller_state),
+            Arc::clone(&pending_proposals),
+            Arc::clone(&pending_controller_proposals),
+            Arc::clone(&batch_pending_proposals),
+            Arc::clone(&local_broker_heartbeats),
+            Arc::clone(&multi_raft),
+            transport_handle.clone(),
+            incoming_rx,
+            actor_setup::ActorSetupConfig::default(),
+            vote_store.clone(),
+            shared_wal_pool.clone(),
+            data_dir.clone(),
+            Arc::clone(&recovered_entries),
+            storage.clone(),
+        )
+        .await;
+
+        // Spawn controller tick task (handles controller partition via MultiRaft).
+        let controller_shutdown_tx = {
+            let (tx, rx) = mpsc::channel(1);
+            tokio::spawn(tick::tick_task_controller(
+                Arc::clone(&multi_raft),
                 Arc::clone(&partition_storage),
                 Arc::clone(&group_map),
                 Arc::clone(&controller_state),
                 Arc::clone(&pending_proposals),
                 Arc::clone(&pending_controller_proposals),
-                Arc::clone(&batch_pending_proposals),
-                Arc::clone(&local_broker_heartbeats),
-                Arc::clone(&multi_raft),
+                cluster_nodes.clone(),
                 transport_handle.clone(),
-                incoming_rx,
-                actor_setup::ActorSetupConfig::default(),
+                Arc::clone(&actor_handles.router),
+                actor_handles.output_tx.clone(),
                 vote_store.clone(),
-            )
-            .await;
-
-            // Spawn controller tick task (handles controller partition via MultiRaft).
-            let controller_shutdown_rx = {
-                let (tx, rx) = mpsc::channel(1);
-                // Store tx in actor_shutdown_tx to signal shutdown.
-                // For now, we'll use the actor_handles.shutdown_tx for the actor tick,
-                // and spawn a separate controller tick.
-                tokio::spawn(tick::tick_task_controller(
-                    Arc::clone(&multi_raft),
-                    Arc::clone(&partition_storage),
-                    Arc::clone(&group_map),
-                    Arc::clone(&controller_state),
-                    Arc::clone(&pending_proposals),
-                    Arc::clone(&pending_controller_proposals),
-                    cluster_nodes.clone(),
-                    transport_handle.clone(),
-                    Arc::clone(&actor_handles.router),
-                    actor_handles.output_tx.clone(),
-                    vote_store.clone(),
-                    rx,
-                ));
-                tx
-            };
-
-            info!(
-                node_id = node_id.get(),
-                listen_addr = %listen_addr,
-                peer_count = peers.len(),
-                "Started multi-node Helix service (actor mode)"
-            );
-
-            // Return actor handles - keep both shutdown channels alive.
-            (
-                Some(actor_handles.batcher_handle),
-                Some(actor_handles.batcher_stats),
-                Some(actor_handles.router),
-                Some(actor_handles.output_tx.clone()),
-                Some(actor_handles.shutdown_tx), // Actor tick task (data partitions)
-                Some(controller_shutdown_rx),    // Controller tick task
-                Some(actor_handles.backpressure),
-            )
-        } else {
-            // Lock-based mode: use existing MultiRaft-based architecture.
-
-            // Create and spawn the batcher task.
-            let batcher_stats = Arc::new(BatcherStats::default());
-            let (batcher_handle, batcher_rx, backpressure_state) = batcher::create_batcher();
-            tokio::spawn(batcher::batcher_task(
-                batcher_rx,
-                Arc::clone(&multi_raft),
-                Arc::clone(&batch_pending_proposals),
-                Some(transport_handle.clone()),
-                Arc::clone(&batcher_stats),
-                batcher::BatcherConfig::default(),
-                Arc::clone(&backpressure_state),
-                Arc::clone(&partition_storage),
-            ));
-
-            info!("Started request batcher for multi-node");
-
-            // Start background tick task with transport.
-            #[cfg(feature = "s3")]
-            tokio::spawn(tick::tick_task_multi_node(
-                Arc::clone(&multi_raft),
-                Arc::clone(&partition_storage),
-                Arc::clone(&group_map),
-                Arc::clone(&controller_state),
-                Arc::clone(&pending_proposals),
-                Arc::clone(&pending_controller_proposals),
-                Arc::clone(&batch_pending_proposals),
-                Arc::clone(&local_broker_heartbeats),
-                cluster_nodes.clone(),
-                transport_handle.clone(),
-                storage.clone(),
-                data_dir.clone(),
-                object_storage_dir.clone(),
-                s3_config.clone(),
-                tiering_config.clone(),
                 shared_wal_pool.clone(),
-                Arc::clone(&recovered_entries),
-                Some(Arc::clone(&batcher_stats)),
-                Some(backpressure_state.clone()),
-                vote_store.clone(),
-                incoming_rx,
-                shutdown_rx,
-            ));
-            #[cfg(not(feature = "s3"))]
-            tokio::spawn(tick::tick_task_multi_node(
-                Arc::clone(&multi_raft),
-                Arc::clone(&partition_storage),
-                Arc::clone(&group_map),
-                Arc::clone(&controller_state),
-                Arc::clone(&pending_proposals),
-                Arc::clone(&pending_controller_proposals),
-                Arc::clone(&batch_pending_proposals),
-                Arc::clone(&local_broker_heartbeats),
-                cluster_nodes.clone(),
-                transport_handle.clone(),
-                storage.clone(),
                 data_dir.clone(),
-                object_storage_dir.clone(),
-                tiering_config.clone(),
-                shared_wal_pool.clone(),
                 Arc::clone(&recovered_entries),
-                Some(Arc::clone(&batcher_stats)),
-                Some(backpressure_state.clone()),
-                vote_store.clone(),
-                incoming_rx,
-                shutdown_rx,
+                storage.clone(),
+                rx,
             ));
-
-            info!(
-                node_id = node_id.get(),
-                listen_addr = %listen_addr,
-                peer_count = peers.len(),
-                "Started multi-node Helix service"
-            );
-
-            (
-                Some(batcher_handle),
-                Some(batcher_stats),
-                None, // No actor router in lock-based mode
-                None, // No actor output channel in lock-based mode
-                None, // No actor shutdown in lock-based mode
-                None, // No controller shutdown in lock-based mode
-                Some(backpressure_state),
-            )
+            tx
         };
+
+        info!(
+            node_id = node_id.get(),
+            listen_addr = %listen_addr,
+            peer_count = peers.len(),
+            "Started multi-node Helix service"
+        );
 
         // Build Kafka peer addresses map (includes self).
         let mut peer_addrs = kafka_peer_addrs;
@@ -1181,14 +1067,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             shared_wal_pool,
             recovered_entries,
             batch_pending_proposals,
-            batcher_handle,
-            batcher_stats,
-            actor_mode: enable_actor_mode,
-            actor_router,
-            actor_output_tx,
-            actor_shutdown_tx,
-            controller_shutdown_tx,
-            actor_backpressure,
+            batcher_handle: Some(actor_handles.batcher_handle),
+            batcher_stats: Some(actor_handles.batcher_stats),
+            actor_router: Some(actor_handles.router),
+            actor_output_tx: Some(actor_handles.output_tx.clone()),
+            actor_shutdown_tx: Some(actor_handles.shutdown_tx),
+            controller_shutdown_tx: Some(controller_shutdown_tx),
+            actor_backpressure: Some(actor_handles.backpressure),
             vote_store,
         })
     }
@@ -1229,10 +1114,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
         timeout: std::time::Duration,
     ) -> crate::error::ServerResult<()> {
         use crate::error::ServerError;
-
-        if !self.is_multi_node() {
-            return Ok(());
-        }
 
         let deadline = tokio::time::Instant::now() + timeout;
         let poll_interval = std::time::Duration::from_millis(100);
@@ -1359,7 +1240,6 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             batch_pending_proposals: Arc::new(RwLock::new(HashMap::new())),
             batcher_handle: None,
             batcher_stats: None,
-            actor_mode: false,
             actor_router: None,
             actor_output_tx: None,
             actor_shutdown_tx: None,
@@ -1367,216 +1247,6 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             actor_backpressure: None,
             vote_store: None,
         }
-    }
-
-    /// Creates a new Helix service for E2E testing with full multi-node capabilities.
-    ///
-    /// Unlike `new_for_test()`, this constructor sets up the batcher for proper
-    /// concurrent produce handling. Use this for E2E tests that exercise the
-    /// full service stack with concurrent producers.
-    ///
-    /// Returns the service and the batcher components needed for spawning background tasks.
-    ///
-    /// # Arguments
-    /// * `cluster_id` - Unique cluster identifier
-    /// * `node_id` - This node's ID
-    /// * `storage` - Storage backend (e.g., `SimulatedStorage` for DST)
-    ///
-    /// # Returns
-    /// A tuple of (service, `batcher_rx`, `batcher_stats`, `backpressure_state`)
-    #[allow(clippy::type_complexity)]
-    pub fn new_for_e2e(
-        cluster_id: String,
-        node_id: u64,
-        storage: S,
-    ) -> (
-        Self,
-        batcher::BatcherHandle,
-        tokio::sync::mpsc::Receiver<batcher::BatcherMessage>,
-        Arc<BatcherStats>,
-        Arc<batcher::BackpressureState>,
-    ) {
-        let node_id_typed = NodeId::new(node_id);
-        let cluster_nodes = vec![node_id_typed];
-
-        let multi_raft = Arc::new(RwLock::new(MultiRaft::new(node_id_typed)));
-        let partition_storage: GenericPartitionStorageMap<S> =
-            Arc::new(RwLock::new(HashMap::new()));
-        let group_map = Arc::new(RwLock::new(GroupMap::new()));
-        let pending_proposals: PendingProposalMap = Arc::new(RwLock::new(HashMap::new()));
-
-        let progress_store = SimulatedProgressStore::new(node_id);
-        let progress_config = ProgressConfig::for_testing();
-        let progress_manager = Arc::new(ProgressManager::new(progress_store, progress_config));
-
-        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
-
-        // Create batcher for concurrent produce handling.
-        let batcher_stats = Arc::new(BatcherStats::default());
-        let (batcher_handle, batcher_rx, backpressure_state) = batcher::create_batcher();
-
-        let service = Self {
-            cluster_id,
-            node_id: node_id_typed,
-            multi_raft,
-            partition_storage,
-            storage,
-            group_map,
-            topics: Arc::new(RwLock::new(HashMap::new())),
-            next_topic_id: Arc::new(RwLock::new(1)),
-            cluster_nodes,
-            peer_addrs: HashMap::new(),
-            _shutdown_tx: shutdown_tx,
-            data_dir: None,
-            object_storage_dir: None,
-            #[cfg(feature = "s3")]
-            s3_config: None,
-            tiering_config: None,
-            transport_handle: None,
-            progress_manager,
-            controller_state: Arc::new(RwLock::new(ControllerState::new())),
-            pending_proposals,
-            pending_controller_proposals: Arc::new(RwLock::new(Vec::new())),
-            local_broker_heartbeats: Arc::new(RwLock::new(HashMap::new())),
-            shared_wal_pool: None,
-            recovered_entries: Arc::new(RwLock::new(HashMap::new())),
-            batch_pending_proposals: Arc::new(RwLock::new(HashMap::new())),
-            batcher_handle: Some(batcher_handle.clone()),
-            batcher_stats: Some(Arc::clone(&batcher_stats)),
-            actor_mode: false,
-            actor_router: None,
-            actor_output_tx: None,
-            actor_shutdown_tx: None,
-            controller_shutdown_tx: None,
-            actor_backpressure: None,
-            vote_store: None,
-        };
-
-        (
-            service,
-            batcher_handle,
-            batcher_rx,
-            batcher_stats,
-            backpressure_state,
-        )
-    }
-
-    /// Creates a new Helix service for E2E testing with durable storage (`SharedWalPool`).
-    ///
-    /// This is the **production-like** E2E constructor that exercises the full
-    /// durable storage path:
-    /// - `SharedWalPool` for fsync amortization
-    /// - `BufferedWal` for durable partition storage
-    /// - Background flush tasks
-    ///
-    /// Use this for E2E DST tests that need to verify the complete storage stack.
-    ///
-    /// # Arguments
-    /// * `cluster_id` - Unique cluster identifier
-    /// * `node_id` - This node's ID
-    /// * `data_dir` - Directory for durable storage (`SharedWalPool` files)
-    /// * `storage` - Storage backend (e.g., `SimulatedStorage` for DST)
-    ///
-    /// # Returns
-    /// A tuple of (service, `batcher_handle`, `batcher_rx`, `batcher_stats`, `backpressure_state`)
-    ///
-    /// # Panics
-    /// Panics if the `SharedWalPool` fails to open (indicates storage issues).
-    #[allow(clippy::type_complexity)]
-    pub async fn new_for_e2e_durable(
-        cluster_id: String,
-        node_id: u64,
-        data_dir: PathBuf,
-        storage: S,
-    ) -> (
-        Self,
-        batcher::BatcherHandle,
-        tokio::sync::mpsc::Receiver<batcher::BatcherMessage>,
-        Arc<BatcherStats>,
-        Arc<batcher::BackpressureState>,
-    ) {
-        let node_id_typed = NodeId::new(node_id);
-        let cluster_nodes = vec![node_id_typed];
-
-        let multi_raft = Arc::new(RwLock::new(MultiRaft::new(node_id_typed)));
-        let partition_storage: GenericPartitionStorageMap<S> =
-            Arc::new(RwLock::new(HashMap::new()));
-        let group_map = Arc::new(RwLock::new(GroupMap::new()));
-        let pending_proposals: PendingProposalMap = Arc::new(RwLock::new(HashMap::new()));
-
-        let progress_store = SimulatedProgressStore::new(node_id);
-        let progress_config = ProgressConfig::for_testing();
-        let progress_manager = Arc::new(ProgressManager::new(progress_store, progress_config));
-
-        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
-
-        // Create batcher for concurrent produce handling.
-        let batcher_stats = Arc::new(BatcherStats::default());
-        let (batcher_handle, batcher_rx, backpressure_state) = batcher::create_batcher();
-
-        // Initialize SharedWalPool for durable storage.
-        let wal_count = 4; // Default for E2E testing
-        let pool_config = PoolConfig::new(data_dir.join("shared-wal"), wal_count)
-            .with_flush_interval(std::time::Duration::from_millis(1))
-            .with_durability(WriteDurability::Fsync);
-
-        let pool = SharedWalPool::open(storage.clone(), pool_config)
-            .await
-            .expect("Failed to open SharedWalPool for E2E testing");
-
-        // Recover any existing partitions (empty for fresh test).
-        let recovered = pool
-            .recover()
-            .await
-            .expect("Failed to recover from SharedWalPool");
-
-        let shared_wal_pool = Some(Arc::new(pool));
-        let recovered_entries = Arc::new(RwLock::new(recovered));
-
-        let service = Self {
-            cluster_id,
-            node_id: node_id_typed,
-            multi_raft,
-            partition_storage,
-            storage,
-            group_map,
-            topics: Arc::new(RwLock::new(HashMap::new())),
-            next_topic_id: Arc::new(RwLock::new(1)),
-            cluster_nodes,
-            peer_addrs: HashMap::new(),
-            _shutdown_tx: shutdown_tx,
-            data_dir: Some(data_dir),
-            object_storage_dir: None,
-            #[cfg(feature = "s3")]
-            s3_config: None,
-            tiering_config: None,
-            transport_handle: None,
-            progress_manager,
-            controller_state: Arc::new(RwLock::new(ControllerState::new())),
-            pending_proposals,
-            pending_controller_proposals: Arc::new(RwLock::new(Vec::new())),
-            local_broker_heartbeats: Arc::new(RwLock::new(HashMap::new())),
-            shared_wal_pool,
-            recovered_entries,
-            batch_pending_proposals: Arc::new(RwLock::new(HashMap::new())),
-            batcher_handle: Some(batcher_handle.clone()),
-            batcher_stats: Some(Arc::clone(&batcher_stats)),
-            actor_mode: false,
-            actor_router: None,
-            actor_output_tx: None,
-            actor_shutdown_tx: None,
-            controller_shutdown_tx: None,
-            actor_backpressure: None,
-            vote_store: None,
-        };
-
-        (
-            service,
-            batcher_handle,
-            batcher_rx,
-            batcher_stats,
-            backpressure_state,
-        )
     }
 
     /// Returns the shared WAL pool (if durable storage is enabled).
@@ -1621,7 +1291,6 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
     /// the service to query partition actors for leadership and routing.
     pub fn set_actor_router(&mut self, router: Arc<router::PartitionRouter>) {
         self.actor_router = Some(router);
-        self.actor_mode = true;
     }
 
     /// Returns a reference to the actor router, if set.
@@ -1634,7 +1303,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
 
     /// Ticks all Raft groups and returns outputs.
     ///
-    /// This is the DST equivalent of the periodic tick in `tick_task_multi_node`.
+    /// This is the DST equivalent of the periodic tick in `tick_task_actor`.
     /// The test harness should call this periodically to advance Raft state.
     ///
     /// Returns a list of `MultiRaftOutput` that need processing.
@@ -1646,7 +1315,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
     /// Processes incoming Raft messages from other nodes.
     ///
     /// This is the DST equivalent of handling `IncomingMessage::Batch` in
-    /// `tick_task_multi_node`. The test harness calls this when messages
+    /// `tick_task_actor`. The test harness calls this when messages
     /// arrive from the simulated transport.
     ///
     /// Returns a list of `MultiRaftOutput` that need processing.
@@ -1668,7 +1337,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
     /// Processes an incoming broker heartbeat.
     ///
     /// This is the DST equivalent of handling `IncomingMessage::Heartbeat` in
-    /// `tick_task_multi_node`. Updates local heartbeat soft state.
+    /// `tick_task_actor`. Updates local heartbeat soft state.
     pub async fn process_broker_heartbeat(&self, heartbeat: helix_runtime::BrokerHeartbeat) {
         let mut heartbeats = self.local_broker_heartbeats.write().await;
         heartbeats.insert(heartbeat.node_id, heartbeat.timestamp_ms);
@@ -1751,26 +1420,21 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
         topics.get(name).cloned()
     }
 
-    /// Returns whether this is a multi-node cluster.
+    /// Returns whether this service uses the controller partition for topic
+    /// and partition management. After the removal of non-actor mode, all
+    /// nodes — including single-node clusters — use the controller path.
     #[must_use]
     pub fn is_multi_node(&self) -> bool {
-        self.cluster_nodes.len() > 1
+        // All nodes now use the controller partition (Raft group 0) for topic
+        // and partition management. The name is historical; a single-node
+        // cluster still runs the controller Raft group with quorum of 1.
+        !self.cluster_nodes.is_empty()
     }
 
     /// Alias for backwards compatibility.
     #[must_use]
     pub fn is_multi_node_generic(&self) -> bool {
         self.is_multi_node()
-    }
-
-    /// Returns whether actor mode is enabled.
-    ///
-    /// In actor mode, data partitions are managed by dedicated partition actors
-    /// instead of a shared `MultiRaft` instance. This requires using the controller
-    /// path for topic creation even in single-node clusters.
-    #[must_use]
-    pub const fn is_actor_mode(&self) -> bool {
-        self.actor_mode
     }
 
     /// Returns the cluster ID.
@@ -1793,15 +1457,10 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
 
     /// Returns live brokers based on heartbeat status.
     ///
-    /// In single-node mode, returns all nodes.
-    /// In multi-node mode, returns only nodes with recent heartbeats.
+    /// Returns only nodes with recent heartbeats. If no heartbeats have
+    /// been recorded yet (initial startup), assumes all brokers are live.
     #[allow(clippy::significant_drop_tightening)]
     pub async fn live_brokers(&self) -> Vec<NodeId> {
-        // In single-node mode, all brokers are "live".
-        if !self.is_multi_node() {
-            return self.cluster_nodes.clone();
-        }
-
         // Get current time in milliseconds.
         // Safe truncation: milliseconds won't overflow u64 for ~584 million years.
         #[allow(clippy::cast_possible_truncation)]
@@ -1872,7 +1531,6 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
     /// * `data_dir` - Optional directory for durable storage (`SharedWalPool`)
     /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
     /// * `write_durability` - Durability mode for writes
-    /// * `enable_actor_mode` - If true, uses lock-free actor-based architecture
     /// * `storage` - Storage backend (e.g., `SimulatedStorage` for DST)
     ///
     /// # Example
@@ -1889,7 +1547,6 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
     ///         Some(data_dir),
     ///         None,
     ///         WriteDurability::Fsync,
-    ///         true, // actor mode
     ///         storage,
     ///     ).await;
     /// ```
@@ -1908,7 +1565,6 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
         data_dir: Option<PathBuf>,
         shared_wal_count: Option<u32>,
         write_durability: WriteDurability,
-        enable_actor_mode: bool,
         storage: S,
     ) -> Self {
         let node_id = NodeId::new(node_id);
@@ -1950,172 +1606,107 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
         let progress_config = ProgressConfig::for_testing();
         let progress_manager = Arc::new(ProgressManager::new(progress_store, progress_config));
 
-        // Initialize SharedWalPool if data_dir is set.
-        let (shared_wal_pool, recovered_entries) = if let Some(ref dir) = data_dir {
-            let wal_count = shared_wal_count.unwrap_or(4);
-            assert!(
-                (1..=16).contains(&wal_count),
-                "shared_wal_count must be in range [1, 16]"
-            );
+        // Initialize SharedWalPool if data_dir and shared_wal_count are set.
+        // When shared_wal_count is None, per-partition WAL mode is used instead.
+        let (shared_wal_pool, recovered_entries) =
+            if let (Some(ref dir), Some(wal_count)) = (&data_dir, shared_wal_count) {
+                assert!(
+                    (1..=16).contains(&wal_count),
+                    "shared_wal_count must be in range [1, 16]"
+                );
 
-            info!(
-                wal_count,
-                data_dir = ?dir,
-                "Initializing SharedWalPool for DST multi-node"
-            );
+                info!(
+                    wal_count,
+                    data_dir = ?dir,
+                    "Initializing SharedWalPool for DST multi-node"
+                );
 
-            let pool_config = PoolConfig::new(dir.join("shared-wal"), wal_count)
-                .with_flush_interval(std::time::Duration::from_millis(1))
-                .with_max_buffer_entries(1000)
-                .with_durability(write_durability);
+                let pool_config = PoolConfig::new(dir.join("shared-wal"), wal_count)
+                    .with_flush_interval(std::time::Duration::from_millis(1))
+                    .with_max_buffer_entries(1000)
+                    .with_durability(write_durability);
 
-            let pool = SharedWalPool::open(storage.clone(), pool_config)
-                .await
-                .expect("Failed to open SharedWalPool");
+                let pool = SharedWalPool::open(storage.clone(), pool_config)
+                    .await
+                    .expect("Failed to open SharedWalPool");
 
-            let recovered = pool
-                .recover()
-                .await
-                .expect("Failed to recover from SharedWalPool");
+                let recovered = pool
+                    .recover()
+                    .await
+                    .expect("Failed to recover from SharedWalPool");
 
-            info!(
-                partitions = recovered.len(),
-                "SharedWalPool recovery complete for DST multi-node"
-            );
+                info!(
+                    partitions = recovered.len(),
+                    "SharedWalPool recovery complete for DST multi-node"
+                );
 
-            (Some(Arc::new(pool)), Arc::new(RwLock::new(recovered)))
-        } else {
-            (None, Arc::new(RwLock::new(HashMap::new())))
-        };
+                (Some(Arc::new(pool)), Arc::new(RwLock::new(recovered)))
+            } else {
+                if data_dir.is_some() {
+                    info!("Using per-partition WAL mode (no SharedWalPool)");
+                }
+                (None, Arc::new(RwLock::new(HashMap::new())))
+            };
 
-        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
         let batch_pending_proposals: BatchPendingProposalMap =
             Arc::new(RwLock::new(HashMap::new()));
 
-        // Branch based on actor mode - same logic as production.
-        let (
-            batcher_handle,
-            batcher_stats,
-            actor_router,
-            actor_output_tx,
-            actor_shutdown_tx,
-            controller_shutdown_tx,
-            actor_backpressure,
-        ) = if enable_actor_mode {
-            info!("Initializing actor mode for DST multi-node service");
+        // Actor-based architecture: lock-free per-partition actors.
+        info!("Initializing actor mode for DST multi-node service");
 
-            // Use the production actor setup.
-            let actor_handles = actor_setup::setup_multi_partition(
-                node_id,
-                cluster_nodes.clone(),
-                HashMap::new(), // Empty initial groups - created via controller.
+        let actor_handles = actor_setup::setup_multi_partition(
+            node_id,
+            cluster_nodes.clone(),
+            HashMap::new(), // Empty initial groups - created via controller.
+            Arc::clone(&partition_storage),
+            Arc::clone(&group_map),
+            Arc::clone(&controller_state),
+            Arc::clone(&pending_proposals),
+            Arc::clone(&pending_controller_proposals),
+            Arc::clone(&batch_pending_proposals),
+            Arc::clone(&local_broker_heartbeats),
+            Arc::clone(&multi_raft),
+            transport.clone(),
+            incoming_rx,
+            actor_setup::ActorSetupConfig::default(),
+            vote_store.clone(),
+            shared_wal_pool.clone(),
+            data_dir.clone(),
+            Arc::clone(&recovered_entries),
+            storage.clone(),
+        )
+        .await;
+
+        // Spawn controller tick task.
+        let controller_shutdown_tx = {
+            let (tx, rx) = mpsc::channel(1);
+            tokio::spawn(tick::tick_task_controller(
+                Arc::clone(&multi_raft),
                 Arc::clone(&partition_storage),
                 Arc::clone(&group_map),
                 Arc::clone(&controller_state),
                 Arc::clone(&pending_proposals),
                 Arc::clone(&pending_controller_proposals),
-                Arc::clone(&batch_pending_proposals),
-                Arc::clone(&local_broker_heartbeats),
-                Arc::clone(&multi_raft),
+                cluster_nodes.clone(),
                 transport.clone(),
-                incoming_rx,
-                actor_setup::ActorSetupConfig::default(),
+                Arc::clone(&actor_handles.router),
+                actor_handles.output_tx.clone(),
                 vote_store.clone(),
-            )
-            .await;
-
-            // Spawn controller tick task.
-            let controller_shutdown_rx = {
-                let (tx, rx) = mpsc::channel(1);
-                tokio::spawn(tick::tick_task_controller(
-                    Arc::clone(&multi_raft),
-                    Arc::clone(&partition_storage),
-                    Arc::clone(&group_map),
-                    Arc::clone(&controller_state),
-                    Arc::clone(&pending_proposals),
-                    Arc::clone(&pending_controller_proposals),
-                    cluster_nodes.clone(),
-                    transport.clone(),
-                    Arc::clone(&actor_handles.router),
-                    actor_handles.output_tx.clone(),
-                    vote_store.clone(),
-                    rx,
-                ));
-                tx
-            };
-
-            info!(
-                node_id = node_id.get(),
-                cluster_size = cluster_nodes.len(),
-                "Started DST multi-node Helix service (actor mode)"
-            );
-
-            (
-                Some(actor_handles.batcher_handle),
-                Some(actor_handles.batcher_stats),
-                Some(actor_handles.router),
-                Some(actor_handles.output_tx.clone()),
-                Some(actor_handles.shutdown_tx),
-                Some(controller_shutdown_rx),
-                Some(actor_handles.backpressure),
-            )
-        } else {
-            // Tick-based mode.
-            let batcher_stats = Arc::new(BatcherStats::default());
-            let (batcher_handle, batcher_rx, backpressure_state) = batcher::create_batcher();
-            tokio::spawn(batcher::batcher_task(
-                batcher_rx,
-                Arc::clone(&multi_raft),
-                Arc::clone(&batch_pending_proposals),
-                Some(transport.clone()),
-                Arc::clone(&batcher_stats),
-                batcher::BatcherConfig::default(),
-                Arc::clone(&backpressure_state),
-                Arc::clone(&partition_storage),
-            ));
-
-            info!("Started request batcher for DST multi-node");
-
-            // Spawn tick task - note: tick_task_multi_node requires specific storage/tiering params.
-            // For DST, we use a simplified version without S3/tiering.
-            tokio::spawn(tick::tick_task_multi_node_dst(
-                Arc::clone(&multi_raft),
-                Arc::clone(&partition_storage),
-                Arc::clone(&group_map),
-                Arc::clone(&controller_state),
-                Arc::clone(&pending_proposals),
-                Arc::clone(&pending_controller_proposals),
-                Arc::clone(&batch_pending_proposals),
-                Arc::clone(&local_broker_heartbeats),
-                cluster_nodes.clone(),
-                transport.clone(),
-                storage.clone(),
-                data_dir.clone(),
                 shared_wal_pool.clone(),
+                data_dir.clone(),
                 Arc::clone(&recovered_entries),
-                Some(Arc::clone(&batcher_stats)),
-                Some(backpressure_state.clone()),
-                vote_store.clone(),
-                incoming_rx,
-                shutdown_rx,
+                storage.clone(),
+                rx,
             ));
-
-            info!(
-                node_id = node_id.get(),
-                cluster_size = cluster_nodes.len(),
-                "Started DST multi-node Helix service (tick-based)"
-            );
-
-            (
-                Some(batcher_handle),
-                Some(batcher_stats),
-                None, // No actor router in tick-based mode
-                None, // No actor output channel in tick-based mode
-                None, // No actor shutdown in tick-based mode
-                None, // No controller shutdown in tick-based mode
-                Some(backpressure_state),
-            )
+            tx
         };
+
+        info!(
+            node_id = node_id.get(),
+            cluster_size = cluster_nodes.len(),
+            "Started DST multi-node Helix service"
+        );
 
         // Build peer addresses map - use placeholder addresses for DST.
         let peer_addrs: HashMap<NodeId, String> = cluster_nodes
@@ -2149,14 +1740,13 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             shared_wal_pool,
             recovered_entries,
             batch_pending_proposals,
-            batcher_handle,
-            batcher_stats,
-            actor_mode: enable_actor_mode,
-            actor_router,
-            actor_output_tx,
-            actor_shutdown_tx,
-            controller_shutdown_tx,
-            actor_backpressure,
+            batcher_handle: Some(actor_handles.batcher_handle),
+            batcher_stats: Some(actor_handles.batcher_stats),
+            actor_router: Some(actor_handles.router),
+            actor_output_tx: Some(actor_handles.output_tx.clone()),
+            actor_shutdown_tx: Some(actor_handles.shutdown_tx),
+            controller_shutdown_tx: Some(controller_shutdown_tx),
+            actor_backpressure: Some(actor_handles.backpressure),
             vote_store,
         }
     }
@@ -2288,7 +1878,6 @@ impl ProductionHelixService {
     /// # Arguments
     /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
     /// * `write_durability` - Durability mode for writes
-    /// * `enable_actor_mode` - If true, uses lock-free actor-based architecture
     ///
     /// # Errors
     /// Returns an error if the transport cannot be started.
@@ -2311,7 +1900,6 @@ impl ProductionHelixService {
         kafka_peer_addrs: HashMap<NodeId, String>,
         shared_wal_count: Option<u32>,
         write_durability: WriteDurability,
-        enable_actor_mode: bool,
     ) -> Result<Self, TransportError> {
         Self::new_multi_node_with_storage(
             cluster_id,
@@ -2326,7 +1914,6 @@ impl ProductionHelixService {
             kafka_peer_addrs,
             shared_wal_count,
             write_durability,
-            enable_actor_mode,
             TokioStorage::new(),
         )
         .await
@@ -2340,7 +1927,6 @@ impl ProductionHelixService {
     /// # Arguments
     /// * `shared_wal_count` - Number of shared WALs in pool (default: 4)
     /// * `write_durability` - Durability mode for writes
-    /// * `enable_actor_mode` - If true, uses lock-free actor-based architecture
     ///
     /// # Errors
     /// Returns an error if the transport cannot be started.
@@ -2362,7 +1948,6 @@ impl ProductionHelixService {
         kafka_peer_addrs: HashMap<NodeId, String>,
         shared_wal_count: Option<u32>,
         write_durability: WriteDurability,
-        enable_actor_mode: bool,
     ) -> Result<Self, TransportError> {
         Self::new_multi_node_with_storage(
             cluster_id,
@@ -2376,7 +1961,6 @@ impl ProductionHelixService {
             kafka_peer_addrs,
             shared_wal_count,
             write_durability,
-            enable_actor_mode,
             TokioStorage::new(),
         )
         .await

@@ -9,11 +9,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use helix_core::{GroupId, LogIndex, NodeId, Offset, TermId};
+use helix_core::{GroupId, LogIndex, NodeId, Offset, PartitionId, TermId};
 use helix_raft::multi::{MultiRaft, MultiRaftOutput};
 use helix_raft::RaftState;
 use helix_runtime::{BrokerHeartbeat, IncomingMessage, TransportService};
-use helix_wal::Storage;
+use helix_wal::{SharedEntry, SharedWalPool, Storage};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
@@ -23,14 +23,9 @@ use crate::controller::{ControllerCommand, ControllerState, CONTROLLER_GROUP_ID}
 use crate::error::ServerError;
 use crate::group_map::GroupMap;
 use crate::partition_storage::PartitionStorage;
-use crate::storage::PartitionCommand;
-#[cfg(feature = "s3")]
-use helix_tier::S3Config;
-use helix_tier::TieringConfig;
-
 use super::{
-    output_processor::extract_and_record_producer_state, BatchPendingProposal, BatcherStats,
-    PendingControllerProposal, PendingProposal, TICK_INTERVAL_MS,
+    output_processor::extract_and_record_producer_state, PendingControllerProposal,
+    PendingProposal, TICK_INTERVAL_MS,
 };
 
 /// Interval for sending broker heartbeats to the controller (in milliseconds).
@@ -49,44 +44,6 @@ pub const HEARTBEAT_INTERVAL_MS: u64 = 1_000; // 1 second.
 /// - Marking committed segments as eligible for tiering
 /// - Uploading eligible segments to object storage (S3/filesystem)
 pub const TIERING_INTERVAL_MS: u64 = 5_000; // 5 seconds.
-
-/// Extract a payload preview from a `CommitEntry`'s data for diagnostic logging.
-///
-/// Decodes the `PartitionCommand` and extracts the first ~30 bytes of ASCII text
-/// from the first blob (if present). This helps correlate `NOTIFY_CLIENT` logs
-/// with the actual data being committed.
-fn extract_commit_payload_preview(data: &bytes::Bytes) -> String {
-    let Some(command) = PartitionCommand::decode(data) else {
-        return "<decode failed>".to_string();
-    };
-
-    let blob = match &command {
-        PartitionCommand::AppendBlob { blob, .. } => blob,
-        PartitionCommand::AppendBlobBatch { blobs, .. } => {
-            if blobs.is_empty() {
-                return "<empty batch>".to_string();
-            }
-            &blobs[0].blob
-        }
-        _ => return "<non-blob command>".to_string(),
-    };
-
-    // Extract ASCII text from the end of the blob (where payload typically is).
-    if blob.len() < 60 {
-        return format!("<blob len={}>", blob.len());
-    }
-
-    let mut preview = Vec::new();
-    for &b in blob.iter().rev().take(50) {
-        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' {
-            preview.push(b);
-        } else if !preview.is_empty() {
-            break;
-        }
-    }
-    preview.reverse();
-    String::from_utf8(preview).unwrap_or_else(|_| "<non-utf8>".to_string())
-}
 
 /// Background task to handle Raft ticks for all groups (single-node).
 #[allow(clippy::significant_drop_tightening, clippy::implicit_hasher)]
@@ -129,429 +86,14 @@ pub async fn tick_task<S: Storage + Clone + Send + Sync + 'static>(
     }
 }
 
-/// Background task for multi-node operation.
-#[allow(clippy::significant_drop_tightening, clippy::implicit_hasher)]
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub async fn tick_task_multi_node<
-    S: Storage + Clone + Send + Sync + 'static,
-    T: TransportService,
->(
-    multi_raft: Arc<RwLock<MultiRaft>>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
-    group_map: Arc<RwLock<GroupMap>>,
-    controller_state: Arc<RwLock<ControllerState>>,
-    pending_proposals: Arc<
-        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>,
-    >,
-    pending_controller_proposals: Arc<RwLock<Vec<PendingControllerProposal>>>,
-    batch_pending_proposals: Arc<
-        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
-    >,
-    local_broker_heartbeats: Arc<RwLock<HashMap<NodeId, u64>>>,
-    cluster_nodes: Vec<NodeId>,
-    transport_handle: T,
-    storage: S,
-    data_dir: Option<PathBuf>,
-    object_storage_dir: Option<PathBuf>,
-    #[cfg(feature = "s3")] s3_config: Option<S3Config>,
-    tiering_config: Option<TieringConfig>,
-    shared_wal_pool: Option<Arc<helix_wal::SharedWalPool<S>>>,
-    recovered_entries: Arc<RwLock<HashMap<helix_core::PartitionId, Vec<helix_wal::SharedEntry>>>>,
-    batcher_stats: Option<Arc<BatcherStats>>,
-    batcher_backpressure: Option<Arc<crate::service::batcher::BackpressureState>>,
-    vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
-    mut incoming_rx: mpsc::Receiver<IncomingMessage>,
-    mut shutdown_rx: mpsc::Receiver<()>,
-) {
-    let mut tick_interval =
-        tokio::time::interval(tokio::time::Duration::from_millis(TICK_INTERVAL_MS));
-    let mut heartbeat_interval =
-        tokio::time::interval(tokio::time::Duration::from_millis(HEARTBEAT_INTERVAL_MS));
-    let mut tiering_interval =
-        tokio::time::interval(tokio::time::Duration::from_millis(TIERING_INTERVAL_MS));
-
-    // Get our node ID for heartbeats.
-    let node_id = {
-        let mr = multi_raft.read().await;
-        mr.node_id()
-    };
-
-    loop {
-        tokio::select! {
-            _ = shutdown_rx.recv() => {
-                debug!("Multi-node tick task shutting down");
-                break;
-            }
-            _ = tick_interval.tick() => {
-                let outputs = {
-                    let mut mr = multi_raft.write().await;
-                    mr.tick()
-                };
-                #[cfg(feature = "s3")]
-                process_outputs_multi_node(
-                    &outputs,
-                    node_id,
-                    &multi_raft,
-                    &partition_storage,
-                    &group_map,
-                    &controller_state,
-                    &pending_proposals,
-                    &pending_controller_proposals,
-                    &batch_pending_proposals,
-                    &batcher_stats,
-                    &batcher_backpressure,
-                    &cluster_nodes,
-                    &transport_handle,
-                    &storage,
-                    &data_dir,
-                    &object_storage_dir,
-                    &s3_config,
-                    &tiering_config,
-                    &shared_wal_pool,
-                    &recovered_entries,
-                    vote_store.as_ref(),
-                ).await;
-                #[cfg(not(feature = "s3"))]
-                process_outputs_multi_node(
-                    &outputs,
-                    node_id,
-                    &multi_raft,
-                    &partition_storage,
-                    &group_map,
-                    &controller_state,
-                    &pending_proposals,
-                    &pending_controller_proposals,
-                    &batch_pending_proposals,
-                    &batcher_stats,
-                    &batcher_backpressure,
-                    &cluster_nodes,
-                    &transport_handle,
-                    &storage,
-                    &data_dir,
-                    &object_storage_dir,
-                    &tiering_config,
-                    &shared_wal_pool,
-                    &recovered_entries,
-                    vote_store.as_ref(),
-                ).await;
-            }
-            _ = heartbeat_interval.tick() => {
-                // Send broker heartbeat via transport to all peers (Kafka KRaft pattern).
-                // Unlike Raft-replicated state, heartbeats are soft state maintained locally
-                // on each node based on received heartbeat messages.
-                send_broker_heartbeats_to_peers(
-                    &local_broker_heartbeats,
-                    node_id,
-                    &cluster_nodes,
-                    &transport_handle,
-                ).await;
-            }
-            _ = tiering_interval.tick() => {
-                // Process tiering for all durable partitions.
-                process_tiering(&partition_storage).await;
-            }
-            Some(incoming) = incoming_rx.recv() => {
-                let outputs = match incoming {
-                    IncomingMessage::Single(_message) => {
-                        warn!("Received single message in multi-node mode, expected batch");
-                        vec![]
-                    }
-                    IncomingMessage::Batch(group_messages) => {
-                        let mut mr = multi_raft.write().await;
-                        let mut all_outputs = Vec::new();
-                        for group_msg in group_messages {
-                            let outputs = mr.handle_message(
-                                group_msg.group_id,
-                                group_msg.message,
-                            );
-                            all_outputs.extend(outputs);
-                        }
-
-                        // Flush any pending outbound messages immediately.
-                        // This ensures responses and commit advancements are sent
-                        // without waiting for the next tick (50ms), reducing latency.
-                        all_outputs.extend(mr.flush());
-                        all_outputs
-                    }
-                    IncomingMessage::Heartbeat(heartbeat) => {
-                        // Update local heartbeat soft state.
-                        let mut heartbeats = local_broker_heartbeats.write().await;
-                        heartbeats.insert(heartbeat.node_id, heartbeat.timestamp_ms);
-                        debug!(
-                            from = heartbeat.node_id.get(),
-                            timestamp_ms = heartbeat.timestamp_ms,
-                            "Recorded heartbeat from peer"
-                        );
-                        vec![] // No Raft outputs for heartbeats.
-                    }
-                };
-                #[cfg(feature = "s3")]
-                process_outputs_multi_node(
-                    &outputs,
-                    node_id,
-                    &multi_raft,
-                    &partition_storage,
-                    &group_map,
-                    &controller_state,
-                    &pending_proposals,
-                    &pending_controller_proposals,
-                    &batch_pending_proposals,
-                    &batcher_stats,
-                    &batcher_backpressure,
-                    &cluster_nodes,
-                    &transport_handle,
-                    &storage,
-                    &data_dir,
-                    &object_storage_dir,
-                    &s3_config,
-                    &tiering_config,
-                    &shared_wal_pool,
-                    &recovered_entries,
-                    vote_store.as_ref(),
-                ).await;
-                #[cfg(not(feature = "s3"))]
-                process_outputs_multi_node(
-                    &outputs,
-                    node_id,
-                    &multi_raft,
-                    &partition_storage,
-                    &group_map,
-                    &controller_state,
-                    &pending_proposals,
-                    &pending_controller_proposals,
-                    &batch_pending_proposals,
-                    &batcher_stats,
-                    &batcher_backpressure,
-                    &cluster_nodes,
-                    &transport_handle,
-                    &storage,
-                    &data_dir,
-                    &object_storage_dir,
-                    &tiering_config,
-                    &shared_wal_pool,
-                    &recovered_entries,
-                    vote_store.as_ref(),
-                ).await;
-            }
-        }
-    }
-}
-
-/// Background tick task for multi-node DST (Deterministic Simulation Testing).
-///
-/// This is a simplified version of `tick_task_multi_node` for DST use:
-/// - No S3/tiering configuration (uses None for tiering params)
-/// - Works with any `TransportService` (e.g., `MadSimTransport`)
-/// - Same core logic as production for high-fidelity testing
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::implicit_hasher,
-    clippy::significant_drop_tightening
-)]
-pub async fn tick_task_multi_node_dst<
-    S: Storage + Clone + Send + Sync + 'static,
-    T: TransportService,
->(
-    multi_raft: Arc<RwLock<MultiRaft>>,
-    partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
-    group_map: Arc<RwLock<GroupMap>>,
-    controller_state: Arc<RwLock<ControllerState>>,
-    pending_proposals: Arc<
-        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>,
-    >,
-    pending_controller_proposals: Arc<RwLock<Vec<PendingControllerProposal>>>,
-    batch_pending_proposals: Arc<
-        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
-    >,
-    local_broker_heartbeats: Arc<RwLock<HashMap<NodeId, u64>>>,
-    cluster_nodes: Vec<NodeId>,
-    transport_handle: T,
-    storage: S,
-    data_dir: Option<PathBuf>,
-    shared_wal_pool: Option<Arc<helix_wal::SharedWalPool<S>>>,
-    recovered_entries: Arc<RwLock<HashMap<helix_core::PartitionId, Vec<helix_wal::SharedEntry>>>>,
-    batcher_stats: Option<Arc<BatcherStats>>,
-    batcher_backpressure: Option<Arc<crate::service::batcher::BackpressureState>>,
-    vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
-    mut incoming_rx: mpsc::Receiver<IncomingMessage>,
-    mut shutdown_rx: mpsc::Receiver<()>,
-) {
-    let mut tick_interval =
-        tokio::time::interval(tokio::time::Duration::from_millis(TICK_INTERVAL_MS));
-    let mut heartbeat_interval =
-        tokio::time::interval(tokio::time::Duration::from_millis(HEARTBEAT_INTERVAL_MS));
-    let mut tiering_interval =
-        tokio::time::interval(tokio::time::Duration::from_millis(TIERING_INTERVAL_MS));
-
-    let node_id = {
-        let mr = multi_raft.read().await;
-        mr.node_id()
-    };
-
-    // DST uses None for tiering-related params.
-    let object_storage_dir: Option<PathBuf> = None;
-    let tiering_config: Option<TieringConfig> = None;
-    #[cfg(feature = "s3")]
-    let s3_config: Option<S3Config> = None;
-
-    loop {
-        tokio::select! {
-            _ = shutdown_rx.recv() => {
-                debug!("DST multi-node tick task shutting down");
-                break;
-            }
-            _ = tick_interval.tick() => {
-                let outputs = {
-                    let mut mr = multi_raft.write().await;
-                    mr.tick()
-                };
-                #[cfg(feature = "s3")]
-                process_outputs_multi_node(
-                    &outputs,
-                    node_id,
-                    &multi_raft,
-                    &partition_storage,
-                    &group_map,
-                    &controller_state,
-                    &pending_proposals,
-                    &pending_controller_proposals,
-                    &batch_pending_proposals,
-                    &batcher_stats,
-                    &batcher_backpressure,
-                    &cluster_nodes,
-                    &transport_handle,
-                    &storage,
-                    &data_dir,
-                    &object_storage_dir,
-                    &s3_config,
-                    &tiering_config,
-                    &shared_wal_pool,
-                    &recovered_entries,
-                    vote_store.as_ref(),
-                ).await;
-                #[cfg(not(feature = "s3"))]
-                process_outputs_multi_node(
-                    &outputs,
-                    node_id,
-                    &multi_raft,
-                    &partition_storage,
-                    &group_map,
-                    &controller_state,
-                    &pending_proposals,
-                    &pending_controller_proposals,
-                    &batch_pending_proposals,
-                    &batcher_stats,
-                    &batcher_backpressure,
-                    &cluster_nodes,
-                    &transport_handle,
-                    &storage,
-                    &data_dir,
-                    &object_storage_dir,
-                    &tiering_config,
-                    &shared_wal_pool,
-                    &recovered_entries,
-                    vote_store.as_ref(),
-                ).await;
-            }
-            _ = heartbeat_interval.tick() => {
-                send_broker_heartbeats_to_peers(
-                    &local_broker_heartbeats,
-                    node_id,
-                    &cluster_nodes,
-                    &transport_handle,
-                ).await;
-            }
-            _ = tiering_interval.tick() => {
-                process_tiering(&partition_storage).await;
-            }
-            Some(incoming) = incoming_rx.recv() => {
-                let outputs = match incoming {
-                    IncomingMessage::Single(_message) => {
-                        warn!("Received single message in DST multi-node mode, expected batch");
-                        vec![]
-                    }
-                    IncomingMessage::Batch(group_messages) => {
-                        let mut mr = multi_raft.write().await;
-                        let mut all_outputs = Vec::new();
-                        for group_msg in group_messages {
-                            let outputs = mr.handle_message(
-                                group_msg.group_id,
-                                group_msg.message,
-                            );
-                            all_outputs.extend(outputs);
-                        }
-                        all_outputs.extend(mr.flush());
-                        all_outputs
-                    }
-                    IncomingMessage::Heartbeat(heartbeat) => {
-                        let mut heartbeats = local_broker_heartbeats.write().await;
-                        heartbeats.insert(heartbeat.node_id, heartbeat.timestamp_ms);
-                        debug!(
-                            from = heartbeat.node_id.get(),
-                            timestamp_ms = heartbeat.timestamp_ms,
-                            "DST: Recorded heartbeat from peer"
-                        );
-                        vec![]
-                    }
-                };
-                #[cfg(feature = "s3")]
-                process_outputs_multi_node(
-                    &outputs,
-                    node_id,
-                    &multi_raft,
-                    &partition_storage,
-                    &group_map,
-                    &controller_state,
-                    &pending_proposals,
-                    &pending_controller_proposals,
-                    &batch_pending_proposals,
-                    &batcher_stats,
-                    &batcher_backpressure,
-                    &cluster_nodes,
-                    &transport_handle,
-                    &storage,
-                    &data_dir,
-                    &object_storage_dir,
-                    &s3_config,
-                    &tiering_config,
-                    &shared_wal_pool,
-                    &recovered_entries,
-                    vote_store.as_ref(),
-                ).await;
-                #[cfg(not(feature = "s3"))]
-                process_outputs_multi_node(
-                    &outputs,
-                    node_id,
-                    &multi_raft,
-                    &partition_storage,
-                    &group_map,
-                    &controller_state,
-                    &pending_proposals,
-                    &pending_controller_proposals,
-                    &batch_pending_proposals,
-                    &batcher_stats,
-                    &batcher_backpressure,
-                    &cluster_nodes,
-                    &transport_handle,
-                    &storage,
-                    &data_dir,
-                    &object_storage_dir,
-                    &tiering_config,
-                    &shared_wal_pool,
-                    &recovered_entries,
-                    vote_store.as_ref(),
-                ).await;
-            }
-        }
-    }
-}
+// Legacy non-actor tick tasks were removed in ADR-0006.
+// All multi-node operation now uses tick_task_actor + tick_task_controller.
 
 /// Background tick task for actor-based multi-node operation.
 ///
-/// This is the actor-based alternative to `tick_task_multi_node`. Instead of
-/// using `Arc<RwLock<MultiRaft>>`, it routes ticks and messages to partition
-/// actors via the `PartitionRouter`, eliminating lock contention.
+/// Routes ticks and messages to partition actors via the `PartitionRouter`,
+/// eliminating lock contention. The controller partition is handled separately
+/// by `tick_task_controller`.
 ///
 /// # Responsibilities
 ///
@@ -561,13 +103,6 @@ pub async fn tick_task_multi_node_dst<
 ///    the appropriate partition actors via `router.route_messages()`.
 /// 3. **Heartbeats**: Sends broker heartbeats to all peers (Kafka `KRaft` pattern).
 /// 4. **Tiering**: Processes tiering for durable partitions.
-///
-/// # Key Differences from `tick_task_multi_node`
-///
-/// - No `multi_raft` lock - ticks are sent via channels to partition actors
-/// - No `process_outputs_multi_node` - outputs go through the shared output
-///   channel and are processed by the `OutputProcessor`
-/// - Simpler control flow since output processing is decoupled
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
 pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: TransportService>(
     router: Arc<super::router::PartitionRouter>,
@@ -585,6 +120,10 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
     transport_handle: T,
     output_tx: mpsc::Sender<super::partition_actor::GroupedOutput>,
     vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
+    shared_wal_pool: Option<Arc<SharedWalPool<S>>>,
+    data_dir: Option<PathBuf>,
+    recovered_entries: Arc<RwLock<HashMap<PartitionId, Vec<SharedEntry>>>>,
+    storage: S,
     mut incoming_rx: mpsc::Receiver<IncomingMessage>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
@@ -615,8 +154,7 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
             }
             _ = heartbeat_interval.tick() => {
                 // Send broker heartbeats to all peers (Kafka KRaft pattern).
-                // This is unchanged from the lock-based approach since heartbeats
-                // are soft state that doesn't require Raft consensus.
+                // Heartbeats are soft state that doesn't require Raft consensus.
                 send_broker_heartbeats_to_peers(
                     &local_broker_heartbeats,
                     node_id,
@@ -626,7 +164,6 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
             }
             _ = tiering_interval.tick() => {
                 // Process tiering for all durable partitions.
-                // This is unchanged from the lock-based approach.
                 process_tiering(&partition_storage).await;
             }
             Some(incoming) = incoming_rx.recv() => {
@@ -672,6 +209,10 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
                                 &router,
                                 &output_tx,
                                 vote_store.as_ref(),
+                                shared_wal_pool.as_ref(),
+                                data_dir.as_ref(),
+                                Some(&recovered_entries),
+                                Some(&storage),
                             ).await;
                         }
 
@@ -685,7 +226,6 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
                     }
                     IncomingMessage::Heartbeat(heartbeat) => {
                         // Update local heartbeat soft state.
-                        // This is unchanged from the lock-based approach.
                         local_broker_heartbeats
                             .write()
                             .await
@@ -733,6 +273,10 @@ pub async fn tick_task_controller<
     router: Arc<super::router::PartitionRouter>,
     output_tx: mpsc::Sender<super::partition_actor::GroupedOutput>,
     vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
+    shared_wal_pool: Option<Arc<SharedWalPool<S>>>,
+    data_dir: Option<PathBuf>,
+    recovered_entries: Arc<RwLock<HashMap<PartitionId, Vec<SharedEntry>>>>,
+    storage: S,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
     let mut tick_interval =
@@ -745,7 +289,7 @@ pub async fn tick_task_controller<
 
     info!(
         node_id = node_id.get(),
-        "Controller tick task started (actor mode)"
+        "Controller tick task started"
     );
 
     loop {
@@ -775,6 +319,10 @@ pub async fn tick_task_controller<
                     &router,
                     &output_tx,
                     vote_store.as_ref(),
+                    shared_wal_pool.as_ref(),
+                    data_dir.as_ref(),
+                    Some(&recovered_entries),
+                    Some(&storage),
                 ).await;
             }
         }
@@ -812,6 +360,10 @@ pub async fn process_controller_outputs<
     router: &Arc<super::router::PartitionRouter>,
     output_tx: &mpsc::Sender<super::partition_actor::GroupedOutput>,
     vote_store: Option<&Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
+    shared_wal_pool: Option<&Arc<SharedWalPool<S>>>,
+    data_dir: Option<&PathBuf>,
+    recovered_entries: Option<&Arc<RwLock<HashMap<PartitionId, Vec<SharedEntry>>>>>,
+    storage: Option<&S>,
 ) {
     // Collect follow-up outputs for single-node processing.
     // For single-node clusters, propose() returns CommitEntry immediately,
@@ -942,14 +494,21 @@ pub async fn process_controller_outputs<
                             gm.insert(topic_id, partition_id, data_group_id);
                         }
 
-                        // Create partition storage (in-memory for now).
+                        // Create partition storage (durable if SharedWalPool available).
                         {
                             let mut ps_map = partition_storage.write().await;
                             if let std::collections::hash_map::Entry::Vacant(e) =
                                 ps_map.entry(data_group_id)
                             {
-                                let ps =
-                                    PartitionStorage::<S>::new_in_memory(topic_id, partition_id);
+                                let ps = create_partition_storage(
+                                    topic_id,
+                                    partition_id,
+                                    shared_wal_pool,
+                                    data_dir,
+                                    recovered_entries,
+                                    storage,
+                                )
+                                .await;
                                 e.insert(Arc::new(RwLock::new(ps)));
                             }
                         }
@@ -1107,14 +666,21 @@ pub async fn process_controller_outputs<
                             gm.insert(topic_id, partition_id, data_group_id);
                         }
 
-                        // Create partition storage.
+                        // Create partition storage (durable if SharedWalPool available).
                         {
                             let mut ps_map = partition_storage.write().await;
                             if let std::collections::hash_map::Entry::Vacant(e) =
                                 ps_map.entry(data_group_id)
                             {
-                                let ps =
-                                    PartitionStorage::<S>::new_in_memory(topic_id, partition_id);
+                                let ps = create_partition_storage(
+                                    topic_id,
+                                    partition_id,
+                                    shared_wal_pool,
+                                    data_dir,
+                                    recovered_entries,
+                                    storage,
+                                )
+                                .await;
                                 e.insert(Arc::new(RwLock::new(ps)));
                             }
                         }
@@ -1153,6 +719,125 @@ pub async fn process_controller_outputs<
             }
         }
     }
+}
+
+/// Creates partition storage using the best available durability mode:
+/// 1. Shared WAL pool (when `shared_wal_pool` is set) — fsync amortization
+/// 2. Per-partition dedicated WAL (when `data_dir` is set) — simpler, one WAL per partition
+/// 3. In-memory (fallback) — no durability
+async fn create_partition_storage<S: Storage + Clone + Send + Sync + 'static>(
+    topic_id: helix_core::TopicId,
+    partition_id: PartitionId,
+    shared_wal_pool: Option<&Arc<SharedWalPool<S>>>,
+    data_dir: Option<&PathBuf>,
+    recovered_entries: Option<&Arc<RwLock<HashMap<PartitionId, Vec<SharedEntry>>>>>,
+    storage: Option<&S>,
+) -> PartitionStorage<S> {
+    // Mode 1: Shared WAL pool.
+    if let (Some(pool), Some(dir)) = (shared_wal_pool, data_dir) {
+        let wal_handle = pool.handle(partition_id);
+        let recovered = if let Some(entries) = recovered_entries {
+            entries
+                .write()
+                .await
+                .remove(&partition_id)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        #[cfg(feature = "s3")]
+        let result = PartitionStorage::new_durable_with_shared_wal(
+            dir,
+            topic_id,
+            partition_id,
+            wal_handle,
+            recovered,
+            None, // object_storage_dir
+            None, // s3_config
+            None, // tiering_config
+        )
+        .await;
+        #[cfg(not(feature = "s3"))]
+        let result = PartitionStorage::new_durable_with_shared_wal(
+            dir,
+            topic_id,
+            partition_id,
+            wal_handle,
+            recovered,
+            None, // object_storage_dir
+            None, // tiering_config
+        )
+        .await;
+
+        return match result {
+            Ok(ps) => {
+                info!(
+                    topic = topic_id.get(),
+                    partition = partition_id.get(),
+                    "Created durable partition storage via SharedWalPool"
+                );
+                ps
+            }
+            Err(e) => {
+                warn!(
+                    topic = topic_id.get(),
+                    partition = partition_id.get(),
+                    error = %e,
+                    "Failed to create shared WAL storage, falling back to in-memory"
+                );
+                PartitionStorage::new_in_memory(topic_id, partition_id)
+            }
+        };
+    }
+
+    // Mode 2: Per-partition dedicated WAL.
+    if let (Some(dir), Some(storage)) = (data_dir, storage) {
+        #[cfg(feature = "s3")]
+        let result = PartitionStorage::new_durable(
+            storage.clone(),
+            dir,
+            None, // object_storage_dir
+            None, // s3_config
+            None, // tiering_config
+            topic_id,
+            partition_id,
+        )
+        .await;
+        #[cfg(not(feature = "s3"))]
+        let result = PartitionStorage::new_durable(
+            storage.clone(),
+            dir,
+            None, // object_storage_dir
+            None, // tiering_config
+            topic_id,
+            partition_id,
+        )
+        .await;
+
+        return match result {
+            Ok(ps) => {
+                info!(
+                    topic = topic_id.get(),
+                    partition = partition_id.get(),
+                    "Created durable partition storage with per-partition WAL"
+                );
+                ps
+            }
+            Err(e) => {
+                warn!(
+                    topic = topic_id.get(),
+                    partition = partition_id.get(),
+                    error = %e,
+                    "Failed to create per-partition WAL storage, falling back to in-memory"
+                );
+                PartitionStorage::new_in_memory(topic_id, partition_id)
+            }
+        };
+    }
+
+    // Mode 3: In-memory.
+    PartitionStorage::new_in_memory(topic_id, partition_id)
 }
 
 /// Sends broker heartbeats to all peers via transport (Kafka `KRaft` pattern).
@@ -1368,826 +1053,6 @@ async fn process_outputs<S: Storage + Clone + Send + Sync + 'static>(
                 );
                 // Single-node mode doesn't persist vote state.
                 // Multi-node mode uses the VoteStore for persistence.
-            }
-        }
-    }
-}
-
-/// Processes Multi-Raft outputs with transport for sending messages.
-#[allow(
-    clippy::too_many_arguments,
-    clippy::too_many_lines,
-    clippy::ref_option,
-    clippy::significant_drop_tightening
-)]
-#[tracing::instrument(skip_all, name = "process_outputs", fields(output_count = outputs.len(), node_id = node_id.get()))]
-async fn process_outputs_multi_node<
-    S: Storage + Clone + Send + Sync + 'static,
-    T: TransportService,
->(
-    outputs: &[MultiRaftOutput],
-    node_id: NodeId,
-    multi_raft: &Arc<RwLock<MultiRaft>>,
-    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
-    group_map: &Arc<RwLock<GroupMap>>,
-    controller_state: &Arc<RwLock<ControllerState>>,
-    pending_proposals: &Arc<
-        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, PendingProposal>>>>>,
-    >,
-    pending_controller_proposals: &Arc<RwLock<Vec<PendingControllerProposal>>>,
-    batch_pending_proposals: &Arc<
-        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
-    >,
-    batcher_stats: &Option<Arc<BatcherStats>>,
-    batcher_backpressure: &Option<Arc<crate::service::batcher::BackpressureState>>,
-    cluster_nodes: &[NodeId],
-    transport_handle: &T,
-    storage: &S,
-    data_dir: &Option<PathBuf>,
-    object_storage_dir: &Option<PathBuf>,
-    #[cfg(feature = "s3")] s3_config: &Option<S3Config>,
-    tiering_config: &Option<TieringConfig>,
-    shared_wal_pool: &Option<Arc<helix_wal::SharedWalPool<S>>>,
-    recovered_entries: &Arc<RwLock<HashMap<helix_core::PartitionId, Vec<helix_wal::SharedEntry>>>>,
-    vote_store: Option<&Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
-) {
-    for output in outputs {
-        match output {
-            MultiRaftOutput::CommitEntry {
-                group_id,
-                index,
-                data,
-            } => {
-                info!(
-                    node = node_id.get(),
-                    group = group_id.get(),
-                    index = index.get(),
-                    data_len = data.len(),
-                    "COMMIT_ENTRY: received"
-                );
-
-                // Check if this is a controller partition commit.
-                if *group_id == CONTROLLER_GROUP_ID {
-                    info!(
-                        index = index.get(),
-                        data_len = data.len(),
-                        pending_proposals_ptr = ?std::sync::Arc::as_ptr(pending_controller_proposals),
-                        "CommitEntry received for controller group"
-                    );
-
-                    let Some(cmd) = ControllerCommand::decode(data) else {
-                        warn!(
-                            index = index.get(),
-                            data_len = data.len(),
-                            "Failed to decode controller command"
-                        );
-                        continue;
-                    };
-
-                    info!(
-                        index = index.get(),
-                        command = ?cmd,
-                        "Applying controller command"
-                    );
-                    let mut state = controller_state.write().await;
-                    let follow_ups = state.apply(&cmd, cluster_nodes);
-
-                    // Notify any pending controller proposals for this index.
-                    {
-                        let proposals = pending_controller_proposals.read().await;
-                        let pending_indexes: Vec<u64> =
-                            proposals.iter().map(|p| p.log_index.get()).collect();
-                        info!(
-                            index = index.get(),
-                            pending_count = proposals.len(),
-                            pending_indexes = ?pending_indexes,
-                            "Checking for pending proposal to notify"
-                        );
-                        drop(proposals);
-
-                        let mut proposals = pending_controller_proposals.write().await;
-                        if let Some(pos) = proposals.iter().position(|p| p.log_index == *index) {
-                            let proposal = proposals.swap_remove(pos);
-                            let _ = proposal.result_tx.send(Ok(()));
-                            info!(index = index.get(), "Notified pending controller proposal");
-                        } else {
-                            info!(
-                                index = index.get(),
-                                "No pending proposal found for this index"
-                            );
-                        }
-                    }
-
-                    // Propose follow-up commands if we're the leader.
-                    if !follow_ups.is_empty() {
-                        let is_leader = {
-                            let mr = multi_raft.read().await;
-                            mr.group_state(CONTROLLER_GROUP_ID)
-                                .is_some_and(|s| s.state == RaftState::Leader)
-                        };
-
-                        if is_leader {
-                            let mut mr = multi_raft.write().await;
-                            for follow_up in follow_ups {
-                                let encoded = follow_up.encode();
-                                if mr.propose(CONTROLLER_GROUP_ID, encoded).is_none() {
-                                    warn!(
-                                        command = ?follow_up,
-                                        "Failed to propose follow-up controller command"
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    // Handle AssignPartition by creating the data Raft group.
-                    if let ControllerCommand::AssignPartition {
-                        topic_id,
-                        partition_id,
-                        group_id: data_group_id,
-                        ref replicas,
-                    } = cmd
-                    {
-                        let node_id = {
-                            let mr = multi_raft.read().await;
-                            mr.node_id()
-                        };
-
-                        if replicas.contains(&node_id) {
-                            // Look up any persisted vote state for this partition.
-                            let (term, voted_for, observation_mode) = vote_store
-                                .and_then(|vs| vs.lock().ok())
-                                .and_then(|store| {
-                                    store
-                                        .state()
-                                        .get_group(data_group_id)
-                                        .map(|v| (v.term, v.voted_for, false))
-                                })
-                                .unwrap_or((TermId::new(0), None, false));
-
-                            info!(
-                                topic = topic_id.get(),
-                                partition = partition_id.get(),
-                                group = data_group_id.get(),
-                                term = term.get(),
-                                voted_for = voted_for.map(NodeId::get),
-                                replicas = ?replicas.iter().map(|n| n.get()).collect::<Vec<_>>(),
-                                "Creating data partition from controller assignment"
-                            );
-
-                            // Create the data Raft group with restored vote state if available.
-                            let mut mr = multi_raft.write().await;
-                            let existing_groups = mr.group_ids();
-                            if !existing_groups.contains(&data_group_id) {
-                                let create_result = mr.create_group_with_state(
-                                    data_group_id,
-                                    replicas.clone(),
-                                    term,
-                                    voted_for,
-                                    observation_mode,
-                                );
-                                if let Err(e) = create_result {
-                                    warn!(
-                                        error = %e,
-                                        group = data_group_id.get(),
-                                        "Failed to create data Raft group"
-                                    );
-                                }
-                            }
-                            drop(mr);
-
-                            // Update group map.
-                            {
-                                let mut gm = group_map.write().await;
-                                gm.insert(topic_id, partition_id, data_group_id);
-                            }
-
-                            // Create partition storage (durable if data_dir is set).
-                            {
-                                let mut ps_map = partition_storage.write().await;
-                                if let std::collections::hash_map::Entry::Vacant(e) =
-                                    ps_map.entry(data_group_id)
-                                {
-                                    let ps = if let Some(ref pool) = shared_wal_pool {
-                                        // Shared WAL mode: get handle from pool and recovered entries.
-                                        let dir = data_dir
-                                            .as_ref()
-                                            .expect("data_dir must be set with shared_wal_pool");
-                                        let wal_handle = pool.handle(partition_id);
-                                        let recovered = recovered_entries
-                                            .write()
-                                            .await
-                                            .remove(&partition_id)
-                                            .unwrap_or_default();
-
-                                        #[cfg(feature = "s3")]
-                                        let ps_result =
-                                            PartitionStorage::<S>::new_durable_with_shared_wal(
-                                                dir,
-                                                topic_id,
-                                                partition_id,
-                                                wal_handle,
-                                                recovered,
-                                                object_storage_dir.as_ref(),
-                                                s3_config.as_ref(),
-                                                tiering_config.as_ref(),
-                                            )
-                                            .await;
-                                        #[cfg(not(feature = "s3"))]
-                                        let ps_result =
-                                            PartitionStorage::<S>::new_durable_with_shared_wal(
-                                                dir,
-                                                topic_id,
-                                                partition_id,
-                                                wal_handle,
-                                                recovered,
-                                                object_storage_dir.as_ref(),
-                                                tiering_config.as_ref(),
-                                            )
-                                            .await;
-
-                                        match ps_result {
-                                            Ok(durable) => durable,
-                                            Err(e) => {
-                                                error!(
-                                                    topic = topic_id.get(),
-                                                    partition = partition_id.get(),
-                                                    error = %e,
-                                                    "Failed to create partition with shared WAL, falling back to in-memory"
-                                                );
-                                                PartitionStorage::<S>::new_in_memory(
-                                                    topic_id,
-                                                    partition_id,
-                                                )
-                                            }
-                                        }
-                                    } else {
-                                        // Dedicated WAL mode (used when shared WAL is not available).
-                                        #[cfg(feature = "s3")]
-                                        let ps_inner = if let Some(dir) = data_dir {
-                                            match PartitionStorage::<S>::new_durable(
-                                                storage.clone(),
-                                                dir,
-                                                object_storage_dir.as_ref(),
-                                                s3_config.as_ref(),
-                                                tiering_config.as_ref(),
-                                                topic_id,
-                                                partition_id,
-                                            )
-                                            .await
-                                            {
-                                                Ok(durable) => durable,
-                                                Err(e) => {
-                                                    error!(
-                                                        topic = topic_id.get(),
-                                                        partition = partition_id.get(),
-                                                        error = %e,
-                                                        "Failed to create durable partition, falling back to in-memory"
-                                                    );
-                                                    PartitionStorage::<S>::new_in_memory(
-                                                        topic_id,
-                                                        partition_id,
-                                                    )
-                                                }
-                                            }
-                                        } else {
-                                            PartitionStorage::<S>::new_in_memory(
-                                                topic_id,
-                                                partition_id,
-                                            )
-                                        };
-                                        #[cfg(not(feature = "s3"))]
-                                        let ps_inner = if let Some(dir) = data_dir {
-                                            match PartitionStorage::<S>::new_durable(
-                                                storage.clone(),
-                                                dir,
-                                                object_storage_dir.as_ref(),
-                                                tiering_config.as_ref(),
-                                                topic_id,
-                                                partition_id,
-                                            )
-                                            .await
-                                            {
-                                                Ok(durable) => durable,
-                                                Err(e) => {
-                                                    error!(
-                                                        topic = topic_id.get(),
-                                                        partition = partition_id.get(),
-                                                        error = %e,
-                                                        "Failed to create durable partition, falling back to in-memory"
-                                                    );
-                                                    PartitionStorage::<S>::new_in_memory(
-                                                        topic_id,
-                                                        partition_id,
-                                                    )
-                                                }
-                                            }
-                                        } else {
-                                            PartitionStorage::<S>::new_in_memory(
-                                                topic_id,
-                                                partition_id,
-                                            )
-                                        };
-                                        ps_inner
-                                    };
-                                    e.insert(Arc::new(RwLock::new(ps)));
-                                }
-                            }
-                        }
-                    }
-                    continue;
-                }
-
-                // Regular data partition commit.
-                let key = {
-                    let gm = group_map.read().await;
-                    gm.get_key(*group_id)
-                };
-
-                if let Some((topic_id, partition_id)) = key {
-                    // Check for batch pending proposal first.
-                    let batch_proposal = {
-                        let inner_lock = {
-                            let batch_proposals = batch_pending_proposals.read().await;
-                            batch_proposals.get(group_id).cloned()
-                        };
-                        if let Some(inner_lock) = inner_lock {
-                            let mut inner = inner_lock.write().await;
-                            inner.remove(index)
-                        } else {
-                            None
-                        }
-                    };
-
-                    // Also check for single pending proposal to determine entry type.
-                    let has_single_proposal = {
-                        let inner_lock = {
-                            let proposals = pending_proposals.read().await;
-                            proposals.get(group_id).cloned()
-                        };
-                        if let Some(inner_lock) = inner_lock {
-                            let inner = inner_lock.read().await;
-                            inner.contains_key(index)
-                        } else {
-                            false
-                        }
-                    };
-
-                    // Log the offset BEFORE applying to detect interleaving.
-                    let offset_before = {
-                        let ps_lock = {
-                            let storage = partition_storage.read().await;
-                            storage.get(group_id).cloned()
-                        };
-                        if let Some(ps_lock) = ps_lock {
-                            let ps = ps_lock.read().await;
-                            ps.blob_log_end_offset().get()
-                        } else {
-                            0
-                        }
-                    };
-
-                    // Determine entry type for logging
-                    let entry_type = if batch_proposal.is_some() {
-                        "BATCH_CLIENT"
-                    } else if has_single_proposal {
-                        "SINGLE_CLIENT"
-                    } else {
-                        "PREVIOUS_TERM" // No pending proposal = replicated from old leader
-                    };
-
-                    info!(
-                        node = node_id.get(),
-                        group = group_id.get(),
-                        index = index.get(),
-                        entry_type = entry_type,
-                        offset_before = offset_before,
-                        has_batch_proposal = batch_proposal.is_some(),
-                        has_single_proposal = has_single_proposal,
-                        topic = topic_id.get(),
-                        partition = partition_id.get(),
-                        "ENTRY_TYPE: determined entry type before apply"
-                    );
-
-                    if let Some(batch_proposal) = batch_proposal {
-                        // DEFENSIVE ASSERTION: Verify the batch_proposal's stored index matches
-                        // the CommitEntry index. If these don't match, there's a bug in the lookup.
-                        if batch_proposal.log_index != *index {
-                            error!(
-                                node = node_id.get(),
-                                group = group_id.get(),
-                                commit_index = index.get(),
-                                stored_index = batch_proposal.log_index.get(),
-                                "BUG: batch_proposal log_index mismatch! This indicates a lookup error."
-                            );
-                        }
-
-                        // Batch proposal path: apply and use the returned base_offset.
-                        // The apply_entry_async function returns the actual base_offset used,
-                        // which is captured atomically during the apply operation.
-                        let apply_result: Result<Option<Offset>, ServerError> = {
-                            let ps_lock = {
-                                let storage = partition_storage.read().await;
-                                storage.get(group_id).cloned()
-                            };
-                            if let Some(ps_lock) = ps_lock {
-                                let mut ps = ps_lock.write().await;
-                                let result = ps.apply_entry_async(*index, data).await;
-                                let offset_after = ps.blob_log_end_offset().get();
-                                info!(
-                                    node = node_id.get(),
-                                    group = group_id.get(),
-                                    index = index.get(),
-                                    offset_before = offset_before,
-                                    offset_after = offset_after,
-                                    returned_offset = ?result.as_ref().ok().and_then(|o| o.map(helix_core::Offset::get)),
-                                    "BATCH: apply_entry_async completed"
-                                );
-                                result
-                            } else {
-                                Err(ServerError::PartitionNotFound {
-                                    topic: topic_id.get().to_string(),
-                                    partition: i32::try_from(partition_id.get()).unwrap_or(0),
-                                })
-                            }
-                        };
-
-                        // Notify each waiter with the offset returned by apply.
-                        let batch_size = batch_proposal.record_counts.len();
-                        match apply_result {
-                            Ok(Some(base_offset)) => {
-                                // DEFENSIVE CHECK: The offset returned by apply should match
-                                // what we observed before apply. If they differ, something else
-                                // modified storage (indicates a race condition or bug).
-                                if base_offset.get() != offset_before {
-                                    // Safety: offsets are u64 but in practice will never exceed
-                                    // i64::MAX (9 exabytes). Cast to i64 for signed delta display.
-                                    #[allow(clippy::cast_possible_wrap)]
-                                    let delta = base_offset.get() as i64 - offset_before as i64;
-                                    error!(
-                                        node = node_id.get(),
-                                        group = group_id.get(),
-                                        index = index.get(),
-                                        offset_before = offset_before,
-                                        base_offset = base_offset.get(),
-                                        delta,
-                                        "BUG: apply returned different offset than expected! \
-                                         Storage was modified between offset capture and apply."
-                                    );
-                                }
-
-                                // Extract and record producer state from committed entry.
-                                // Critical for PREVIOUS_TERM entries on new leader.
-                                extract_and_record_producer_state(
-                                    data,
-                                    base_offset,
-                                    *group_id,
-                                    partition_storage,
-                                )
-                                .await;
-
-                                let commit_latency = batch_proposal.proposed_at.elapsed();
-                                let total_age = batch_proposal.first_request_at.elapsed();
-                                let batch_wait = batch_proposal
-                                    .proposed_at
-                                    .duration_since(batch_proposal.first_request_at);
-                                if let Some(stats) = batcher_stats.as_ref() {
-                                    // Safety: durations will never exceed u64::MAX microseconds
-                                    // (would require running for millions of years).
-                                    #[allow(clippy::cast_possible_truncation)]
-                                    stats.record_commit(
-                                        u64::from(batch_proposal.batch_size),
-                                        u64::from(batch_proposal.batch_bytes),
-                                        batch_proposal.total_records,
-                                        batch_wait.as_micros() as u64,
-                                        commit_latency.as_micros() as u64,
-                                        total_age.as_micros() as u64,
-                                    );
-                                }
-                                // Extract payload preview for diagnostic logging.
-                                let commit_payload = extract_commit_payload_preview(data);
-
-                                let mut cumulative = 0u64;
-                                for (i, (record_count, result_tx)) in batch_proposal
-                                    .record_counts
-                                    .iter()
-                                    .zip(batch_proposal.result_txs)
-                                    .enumerate()
-                                {
-                                    let offset = Offset::new(base_offset.get() + cumulative);
-                                    debug!(
-                                        node = node_id.get(),
-                                        group = group_id.get(),
-                                        index = index.get(),
-                                        waiter_index = i,
-                                        base_offset = base_offset.get(),
-                                        cumulative = cumulative,
-                                        sent_offset = offset.get(),
-                                        record_count = record_count,
-                                        commit_payload = %commit_payload,
-                                        "NOTIFY_CLIENT: sending offset to waiter"
-                                    );
-                                    let _ = result_tx.send(Ok(offset));
-                                    cumulative += u64::from(*record_count);
-                                }
-                                // Decrement backpressure counters now that requests are complete.
-                                if let Some(ref bp) = batcher_backpressure {
-                                    bp.pending_requests.fetch_sub(
-                                        u64::from(batch_proposal.batch_size),
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
-                                    bp.pending_bytes.fetch_sub(
-                                        u64::from(batch_proposal.batch_bytes),
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
-                                }
-                                // Safety: durations will never exceed u64::MAX microseconds
-                                // (would require running for millions of years).
-                                #[allow(clippy::cast_possible_truncation)]
-                                {
-                                    info!(
-                                        group = group_id.get(),
-                                        index = index.get(),
-                                        batch_size = batch_proposal.batch_size,
-                                        batch_bytes = batch_proposal.batch_bytes,
-                                        total_records = batch_proposal.total_records,
-                                        batch_wait_us = batch_wait.as_micros() as u64,
-                                        commit_latency_us = commit_latency.as_micros() as u64,
-                                        total_age_us = total_age.as_micros() as u64,
-                                        "Batch committed"
-                                    );
-                                }
-                                debug!(
-                                    group = group_id.get(),
-                                    index = index.get(),
-                                    batch_size,
-                                    base_offset = base_offset.get(),
-                                    "Notified batch pending proposal"
-                                );
-                            }
-                            Ok(None) => {
-                                // Entry was already applied or empty - shouldn't happen for batches.
-                                // Decrement backpressure and notify waiters with error.
-                                if let Some(ref bp) = batcher_backpressure {
-                                    bp.pending_requests.fetch_sub(
-                                        u64::from(batch_proposal.batch_size),
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
-                                    bp.pending_bytes.fetch_sub(
-                                        u64::from(batch_proposal.batch_bytes),
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
-                                }
-                                let err = ServerError::Internal {
-                                    message:
-                                        "batch apply returned no offset (already applied or empty)"
-                                            .to_string(),
-                                };
-                                for result_tx in batch_proposal.result_txs {
-                                    let _ = result_tx.send(Err(err.clone()));
-                                }
-                                warn!(
-                                    topic = topic_id.get(),
-                                    partition = partition_id.get(),
-                                    group = group_id.get(),
-                                    index = index.get(),
-                                    "Batch apply returned None - entry was already applied or empty"
-                                );
-                            }
-                            Err(ref e) => {
-                                // Decrement backpressure counters now that requests are complete (failed).
-                                if let Some(ref bp) = batcher_backpressure {
-                                    bp.pending_requests.fetch_sub(
-                                        u64::from(batch_proposal.batch_size),
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
-                                    bp.pending_bytes.fetch_sub(
-                                        u64::from(batch_proposal.batch_bytes),
-                                        std::sync::atomic::Ordering::Relaxed,
-                                    );
-                                }
-                                if let Some(stats) = batcher_stats.as_ref() {
-                                    stats.record_apply_error();
-                                }
-                                let err = ServerError::Internal {
-                                    message: format!("batch apply failed: {e}"),
-                                };
-                                for result_tx in batch_proposal.result_txs {
-                                    let _ = result_tx.send(Err(err.clone()));
-                                }
-                                warn!(
-                                    topic = topic_id.get(),
-                                    partition = partition_id.get(),
-                                    error = %e,
-                                    "Failed to apply batch committed entry"
-                                );
-                            }
-                        }
-                    } else {
-                        // Single proposal path (existing logic) or PREVIOUS_TERM entry.
-                        // Apply first, then use the returned offset for everything.
-                        // This eliminates the TOCTOU race where base_offset could be
-                        // captured before concurrent PREVIOUS_TERM entries are applied.
-                        let apply_result: Result<Option<Offset>, ServerError> = {
-                            let ps_lock = {
-                                let storage = partition_storage.read().await;
-                                storage.get(group_id).cloned()
-                            };
-                            if let Some(ps_lock) = ps_lock {
-                                let mut ps = ps_lock.write().await;
-                                let result = ps.apply_entry_async(*index, data).await;
-                                let offset_after = ps.blob_log_end_offset().get();
-                                info!(
-                                    node = node_id.get(),
-                                    group = group_id.get(),
-                                    index = index.get(),
-                                    offset_before = offset_before,
-                                    offset_after = offset_after,
-                                    returned_offset = ?result.as_ref().ok().and_then(|o| o.map(helix_core::Offset::get)),
-                                    "NON-BATCH: apply_entry_async completed"
-                                );
-                                result
-                            } else {
-                                Err(ServerError::PartitionNotFound {
-                                    topic: topic_id.get().to_string(),
-                                    partition: i32::try_from(partition_id.get()).unwrap_or(0),
-                                })
-                            }
-                        };
-
-                        // Extract and record producer state from committed entry.
-                        // Critical for PREVIOUS_TERM entries on new leader.
-                        // Use the offset returned by apply (not pre-captured) to avoid races.
-                        if let Ok(Some(applied_offset)) = &apply_result {
-                            extract_and_record_producer_state(
-                                data,
-                                *applied_offset,
-                                *group_id,
-                                partition_storage,
-                            )
-                            .await;
-                        }
-
-                        // Find and notify any pending proposal (O(1) lookup).
-                        let inner_lock = {
-                            let proposals = pending_proposals.read().await;
-                            proposals.get(group_id).cloned()
-                        };
-                        let had_proposal = if let Some(ref inner_lock) = inner_lock {
-                            let inner = inner_lock.read().await;
-                            inner.contains_key(index)
-                        } else {
-                            false
-                        };
-                        if let Some(inner_lock) = inner_lock {
-                            let mut group_proposals = inner_lock.write().await;
-                            if let Some(proposal) = group_proposals.remove(index) {
-                                let result = match &apply_result {
-                                    Ok(Some(offset)) => {
-                                        debug!(
-                                            topic = topic_id.get(),
-                                            partition = partition_id.get(),
-                                            group = group_id.get(),
-                                            index = index.get(),
-                                            offset = offset.get(),
-                                            "Notifying pending proposal"
-                                        );
-                                        Ok(*offset)
-                                    }
-                                    Ok(None) => {
-                                        // Apply returned None - entry was empty or already applied.
-                                        // This should NOT happen for client entries with pending proposals.
-                                        // Log an error and return a failure instead of guessing offset.
-                                        error!(
-                                            topic = topic_id.get(),
-                                            partition = partition_id.get(),
-                                            group = group_id.get(),
-                                            index = index.get(),
-                                            "BUG: apply returned None for entry with pending proposal"
-                                        );
-                                        Err(ServerError::Internal {
-                                            message: "apply returned None for client entry"
-                                                .to_string(),
-                                        })
-                                    }
-                                    Err(e) => Err(ServerError::Internal {
-                                        message: format!("apply failed: {e}"),
-                                    }),
-                                };
-                                if proposal.result_tx.send(result).is_err() {
-                                    debug!(
-                                        group = group_id.get(),
-                                        index = index.get(),
-                                        "Pending proposal receiver dropped"
-                                    );
-                                }
-                            }
-                        }
-
-                        // Log PREVIOUS_TERM entries that consumed offsets without client notification.
-                        // These are critical because they "steal" offsets from subsequent client entries.
-                        if !had_proposal {
-                            if let Ok(Some(offset)) = &apply_result {
-                                let payload = extract_commit_payload_preview(data);
-                                debug!(
-                                    node = node_id.get(),
-                                    group = group_id.get(),
-                                    index = index.get(),
-                                    offset = offset.get(),
-                                    payload = %payload,
-                                    "PREVIOUS_TERM: applied entry without client notification"
-                                );
-                            }
-                        }
-
-                        if let Err(e) = apply_result {
-                            warn!(
-                                topic = topic_id.get(),
-                                partition = partition_id.get(),
-                                error = %e,
-                                "Failed to apply committed entry"
-                            );
-                        }
-                    }
-                }
-            }
-            MultiRaftOutput::BecameLeader { group_id } => {
-                if *group_id == CONTROLLER_GROUP_ID {
-                    info!("Became controller leader");
-                    continue;
-                }
-
-                let key = {
-                    let gm = group_map.read().await;
-                    gm.get_key(*group_id)
-                };
-                if let Some((topic_id, partition_id)) = key {
-                    info!(
-                        topic = topic_id.get(),
-                        partition = partition_id.get(),
-                        group = group_id.get(),
-                        "Became leader"
-                    );
-                }
-            }
-            MultiRaftOutput::SteppedDown { group_id } => {
-                if *group_id == CONTROLLER_GROUP_ID {
-                    info!("Stepped down from controller leader");
-                    continue;
-                }
-
-                let key = {
-                    let gm = group_map.read().await;
-                    gm.get_key(*group_id)
-                };
-                if let Some((topic_id, partition_id)) = key {
-                    info!(
-                        topic = topic_id.get(),
-                        partition = partition_id.get(),
-                        group = group_id.get(),
-                        "Stepped down from leader"
-                    );
-                }
-            }
-            MultiRaftOutput::SendMessages { to, messages } => {
-                if let Err(e) = transport_handle.send_batch(*to, messages.clone()).await {
-                    error!(
-                        to = to.get(),
-                        count = messages.len(),
-                        error = %e,
-                        "Failed to send messages to peer"
-                    );
-                } else {
-                    debug!(
-                        to = to.get(),
-                        count = messages.len(),
-                        "Sent messages to peer"
-                    );
-                }
-            }
-            MultiRaftOutput::VoteStateChanged {
-                group_id,
-                term,
-                voted_for,
-            } => {
-                debug!(
-                    group = group_id.get(),
-                    term = term.get(),
-                    voted_for = ?voted_for.map(helix_core::NodeId::get),
-                    "Vote state changed (multi-node)"
-                );
-                // Persist vote state to local file + async S3 backup.
-                if let Some(vs) = vote_store {
-                    if let Ok(mut store) = vs.lock() {
-                        if let Err(e) = store.save(*group_id, *term, *voted_for) {
-                            error!(
-                                group = group_id.get(),
-                                error = %e,
-                                "Failed to persist vote state"
-                            );
-                        }
-                    }
-                }
             }
         }
     }

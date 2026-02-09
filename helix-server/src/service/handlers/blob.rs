@@ -29,6 +29,33 @@ pub struct IdempotentProducerInfo {
 }
 
 impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixService<S, T> {
+    /// Checks if this node is the leader for the given group.
+    ///
+    /// Returns `(is_leader, leader_hint)`. In actor mode, queries the partition
+    /// actor; otherwise queries `MultiRaft`.
+    #[allow(clippy::significant_drop_tightening)] // Lock dropped after group_state returns owned value.
+    async fn check_leadership(
+        &self,
+        group_id: helix_core::GroupId,
+    ) -> (bool, Option<NodeId>) {
+        if let Some(router) = &self.actor_router {
+            match router.partition(group_id).await {
+                Ok(handle) => {
+                    let is_leader = handle.is_leader().await.unwrap_or(false);
+                    let leader = handle.leader_id().await.ok().flatten();
+                    (is_leader, leader)
+                }
+                Err(_) => (false, None),
+            }
+        } else {
+            let state = self.multi_raft.read().await.group_state(group_id);
+            let is_leader =
+                state.as_ref().is_some_and(|s| s.state == RaftState::Leader);
+            let leader = state.and_then(|s| s.leader_id);
+            (is_leader, leader)
+        }
+    }
+
     /// Appends a blob (Kafka `RecordBatch`) to a partition through Raft.
     ///
     /// Returns the base offset assigned to this batch.
@@ -75,30 +102,8 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             })?
         };
 
-        // Check if we're the leader.
-        // In actor mode, data partitions are managed by partition actors, not MultiRaft.
-        let (is_leader, leader_hint) = if let Some(router) = &self.actor_router {
-            // Actor mode: query partition actor for leadership.
-            match router.partition(group_id).await {
-                Ok(handle) => {
-                    let is_leader = handle.is_leader().await.unwrap_or(false);
-                    let leader = handle.leader_id().await.ok().flatten();
-                    (is_leader, leader)
-                }
-                Err(_) => {
-                    // Partition not yet in router - not leader.
-                    (false, None)
-                }
-            }
-        } else {
-            // Non-actor mode: query MultiRaft for leadership.
-            let mr = self.multi_raft.read().await;
-            let state = mr.group_state(group_id);
-            let is_leader = state.as_ref().is_some_and(|s| s.state == RaftState::Leader);
-            let leader = state.and_then(|s| s.leader_id);
-            (is_leader, leader)
-        };
-
+        // Only the leader handles writes.
+        let (is_leader, leader_hint) = self.check_leadership(group_id).await;
         if !is_leader {
             return Err(ServerError::NotLeader {
                 topic: topic.to_string(),
@@ -346,51 +351,9 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             })?
         };
 
-        // Check if we're the leader.
-        // In actor mode, data partitions are managed by partition actors, not MultiRaft.
-        let (is_leader, leader_hint) = if let Some(router) = &self.actor_router {
-            // Actor mode: query partition actor for leadership.
-            if let Ok(handle) = router.partition(group_id).await {
-                let is_leader_result = handle.is_leader().await;
-                let is_leader_err = is_leader_result.is_err();
-                let is_leader = is_leader_result.unwrap_or(false);
-                let leader = handle.leader_id().await.ok().flatten();
-                info!(
-                    topic = %topic,
-                    partition,
-                    group_id = group_id.get(),
-                    is_leader,
-                    is_leader_err,
-                    leader_id = ?leader.map(NodeId::get),
-                    "Actor mode leadership check"
-                );
-                (is_leader, leader)
-            } else {
-                // Partition not yet in router - not leader.
-                info!(
-                    topic = %topic,
-                    partition,
-                    group_id = group_id.get(),
-                    "Actor mode: partition not in router"
-                );
-                (false, None)
-            }
-        } else {
-            // Non-actor mode: query MultiRaft for leadership.
-            let mr = self.multi_raft.read().await;
-            let state = mr.group_state(group_id);
-            let is_leader = state.as_ref().is_some_and(|s| s.state == RaftState::Leader);
-            let leader = state.and_then(|s| s.leader_id);
-            (is_leader, leader)
-        };
-
+        // Only the leader handles writes.
+        let (is_leader, leader_hint) = self.check_leadership(group_id).await;
         if !is_leader {
-            debug!(
-                topic = %topic,
-                partition,
-                leader_hint = ?leader_hint.map(NodeId::get),
-                "Not leader, returning error"
-            );
             return Err(ServerError::NotLeader {
                 topic: topic.to_string(),
                 partition,
@@ -725,7 +688,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
     ///
     /// # Errors
     ///
-    /// Returns an error if the topic/partition doesn't exist.
+    /// Returns an error if the topic/partition doesn't exist or this node is not leader.
     #[allow(clippy::significant_drop_tightening)]
     pub async fn read_blobs(
         &self,
@@ -764,6 +727,19 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                 }
             })?
         };
+
+        // Only the leader serves reads (Kafka semantics). Followers may have
+        // stale state if their output processor hasn't applied all committed
+        // entries yet. Returning NotLeader forces the client to find the leader,
+        // which always has the latest applied state.
+        let (is_leader, leader_hint) = self.check_leadership(group_id).await;
+        if !is_leader {
+            return Err(ServerError::NotLeader {
+                topic: topic.to_string(),
+                partition,
+                leader_hint: leader_hint.map(NodeId::get),
+            });
+        }
 
         // Read blobs from storage.
         let ps_lock = {

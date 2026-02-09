@@ -31,15 +31,16 @@
 #![allow(clippy::type_complexity)]
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use helix_core::{GroupId, LogIndex, NodeId};
+use helix_core::{GroupId, LogIndex, NodeId, PartitionId};
 use helix_raft::{RaftConfig, RaftNode};
 use helix_runtime::{IncomingMessage, TransportService};
 use tokio::sync::{mpsc, RwLock};
 use tracing::info;
 
-use helix_wal::Storage;
+use helix_wal::{SharedEntry, SharedWalPool, Storage};
 
 use crate::vote_store::{LocalFileVoteStorage, VoteStore};
 
@@ -238,6 +239,10 @@ pub async fn setup_multi_partition<
     incoming_rx: mpsc::Receiver<IncomingMessage>,
     config: ActorSetupConfig,
     vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
+    shared_wal_pool: Option<Arc<SharedWalPool<S>>>,
+    data_dir: Option<PathBuf>,
+    recovered_entries: Arc<RwLock<HashMap<PartitionId, Vec<SharedEntry>>>>,
+    storage: S,
 ) -> ActorSetupHandles {
     let group_count = initial_groups.len();
 
@@ -313,6 +318,10 @@ pub async fn setup_multi_partition<
         transport_handle,
         output_tx.clone(),
         vote_store,
+        shared_wal_pool,
+        data_dir,
+        recovered_entries,
+        storage,
         incoming_rx,
         shutdown_rx,
     ));

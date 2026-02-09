@@ -421,7 +421,7 @@ impl WalActor {
 
 **Files to modify:**
 - `helix-tests/src/actor_dst.rs` (new)
-- `helix-tests/src/helix_service_actor.rs` (update for actors)
+- `helix-tests/src/madsim_e2e_cluster.rs` (MadSim E2E tests with actor mode)
 - `helix-tests/src/properties.rs` (add actor-specific properties)
 
 **Tasks:**
