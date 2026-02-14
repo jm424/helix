@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use helix_core::{GroupId, LogIndex, NodeId, Offset};
 use helix_raft::multi::GroupMessage;
 use helix_raft::{ClientRequest, Message, RaftNode};
@@ -968,6 +968,13 @@ impl PartitionActorShared {
             }
             return;
         }
+
+        // Patch base_offset to ensure monotonicity. The batcher
+        // reads blob_log_end_offset (committed only), so concurrent
+        // batches can get the same stale offset. The actor's
+        // next_base_offset accounts for uncommitted proposals.
+        let data = self.patch_batch_base_offset(data, &batch_info);
+
         let request = ClientRequest::new(data);
         if let Some(outputs) =
             self.raft_node.handle_client_request(request)
@@ -1000,6 +1007,66 @@ impl PartitionActorShared {
                 let _ = result_tx.send(Err(err.clone()));
             }
         }
+    }
+
+    /// Patches `base_offset` in an `AppendBlobBatch` command to
+    /// ensure monotonically increasing offsets across concurrent
+    /// proposals.
+    ///
+    /// The batcher reads `blob_log_end_offset` (committed only) as
+    /// its suggested offset. When two batches flush before the first
+    /// commits, both get the same stale offset. This method uses the
+    /// actor's `next_base_offset` — which accounts for uncommitted
+    /// proposals — to guarantee monotonicity.
+    fn patch_batch_base_offset(
+        &mut self,
+        data: Bytes,
+        batch_info: &BatchProposalInfo,
+    ) -> Bytes {
+        const APPEND_BLOB_BATCH_TYPE: u8 = 4;
+        // type (1 byte) + base_offset (8 bytes).
+        const HEADER_LEN: usize = 9;
+
+        if data.len() < HEADER_LEN
+            || data[0] != APPEND_BLOB_BATCH_TYPE
+        {
+            return data;
+        }
+
+        let batcher_offset = Offset::new(u64::from_le_bytes(
+            data[1..9]
+                .try_into()
+                .expect("base_offset slice is 8 bytes"),
+        ));
+
+        // Seed from batcher on first propose after leadership change.
+        if !self.offset_seeded {
+            self.next_base_offset = batcher_offset;
+            self.offset_seeded = true;
+        }
+
+        let actual_offset =
+            std::cmp::max(self.next_base_offset, batcher_offset);
+
+        // Advance tracker past this batch's records.
+        self.next_base_offset =
+            Offset::new(actual_offset.get() + batch_info.total_records);
+
+        if actual_offset == batcher_offset {
+            return data;
+        }
+
+        // Patch bytes 1..9 with the corrected offset.
+        debug!(
+            group_id = self.group_id.get(),
+            batcher_offset = batcher_offset.get(),
+            actual_offset = actual_offset.get(),
+            "Patching stale base_offset in ProposeBatch"
+        );
+        let mut buf = BytesMut::from(&data[..]);
+        buf[1..9]
+            .copy_from_slice(&actual_offset.get().to_le_bytes());
+        buf.freeze()
     }
 
     async fn handle_propose(
@@ -1728,5 +1795,168 @@ mod tests {
         );
         assert!(!handle.is_leader_cached());
         handle.shutdown().await.ok();
+    }
+
+    /// Helper to build a `PartitionActorShared` for unit-testing
+    /// `patch_batch_base_offset` without spawning a full actor loop.
+    fn create_test_shared_actor(
+        next_base_offset: Offset,
+        offset_seeded: bool,
+    ) -> (
+        PartitionActorShared,
+        mpsc::Receiver<GroupedOutput>,
+        mpsc::Sender<PartitionCommand>,
+    ) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (output_tx, output_rx) = mpsc::channel(16);
+        let raft_node = create_test_raft_node(1, vec![1, 2, 3]);
+        let actor = PartitionActorShared {
+            group_id: GroupId::new(1),
+            raft_node,
+            cmd_rx,
+            output_tx,
+            pending_proposals: HashMap::new(),
+            batch_pending_proposals: HashMap::new(),
+            pending_batch: AccumulatedBatch::new(),
+            batch_config: PartitionBatchConfig::default(),
+            backpressure: PartitionBackpressure::new(
+                25 * 1024 * 1024,
+                500,
+            ),
+            next_base_offset,
+            offset_seeded,
+            is_leader_cache: Arc::new(AtomicBool::new(false)),
+            batcher_stats: None,
+            global_backpressure: None,
+        };
+        (actor, output_rx, cmd_tx)
+    }
+
+    /// Encodes a minimal `AppendBlobBatch` with the given
+    /// `base_offset` and `record_count` for one blob.
+    fn encode_blob_batch(
+        base_offset: Offset,
+        record_count: u32,
+    ) -> Bytes {
+        StoragePartitionCommand::AppendBlobBatch {
+            blobs: vec![BatchedBlob {
+                blob: Bytes::from(vec![0u8; 32]),
+                record_count,
+                format: BlobFormat::Raw,
+            }],
+            base_offset,
+        }
+        .encode()
+    }
+
+    fn make_batch_info(total_records: u64) -> BatchProposalInfo {
+        let (tx, _rx) = oneshot::channel();
+        BatchProposalInfo {
+            first_request_at: Instant::now(),
+            batch_size: 1,
+            batch_bytes: 32,
+            total_records,
+            record_counts: vec![
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    total_records as u32
+                },
+            ],
+            result_txs: vec![tx],
+        }
+    }
+
+    #[test]
+    fn test_patch_base_offset_seeds_on_first_propose() {
+        let (mut actor, _output_rx, _cmd_tx) =
+            create_test_shared_actor(Offset::new(0), false);
+
+        assert!(!actor.offset_seeded);
+        let data =
+            encode_blob_batch(Offset::new(500), 100);
+        let info = make_batch_info(100);
+        let patched = actor.patch_batch_base_offset(data, &info);
+
+        // First propose seeds from batcher offset.
+        assert!(actor.offset_seeded);
+        // No patch needed — batcher offset becomes the seed.
+        let offset_bytes: [u8; 8] =
+            patched[1..9].try_into().unwrap();
+        assert_eq!(
+            u64::from_le_bytes(offset_bytes),
+            500,
+            "first propose should use batcher's offset"
+        );
+        assert_eq!(
+            actor.next_base_offset,
+            Offset::new(600),
+            "tracker should advance by total_records"
+        );
+    }
+
+    #[test]
+    fn test_patch_base_offset_corrects_stale_offset() {
+        let (mut actor, _output_rx, _cmd_tx) =
+            create_test_shared_actor(Offset::new(0), false);
+
+        // First batch: seeds offset from batcher (603), 125 records.
+        let data1 =
+            encode_blob_batch(Offset::new(603), 125);
+        let info1 = make_batch_info(125);
+        let patched1 =
+            actor.patch_batch_base_offset(data1, &info1);
+        let o1: [u8; 8] = patched1[1..9].try_into().unwrap();
+        assert_eq!(u64::from_le_bytes(o1), 603);
+        assert_eq!(actor.next_base_offset, Offset::new(728));
+
+        // Second batch: batcher still reads stale 603 (first
+        // batch not yet committed).
+        let data2 =
+            encode_blob_batch(Offset::new(603), 100);
+        let info2 = make_batch_info(100);
+        let patched2 =
+            actor.patch_batch_base_offset(data2, &info2);
+        let o2: [u8; 8] = patched2[1..9].try_into().unwrap();
+        assert_eq!(
+            u64::from_le_bytes(o2),
+            728,
+            "stale offset 603 should be patched to 728"
+        );
+        assert_eq!(
+            actor.next_base_offset,
+            Offset::new(828),
+            "tracker should be 728 + 100"
+        );
+    }
+
+    #[test]
+    fn test_patch_base_offset_no_patch_when_current() {
+        // Actor already seeded at 1000.
+        let (mut actor, _output_rx, _cmd_tx) =
+            create_test_shared_actor(Offset::new(1000), true);
+
+        // Batcher reads the same offset. No patch needed.
+        let data =
+            encode_blob_batch(Offset::new(1000), 50);
+        let info = make_batch_info(50);
+        let patched = actor.patch_batch_base_offset(data, &info);
+        let o: [u8; 8] = patched[1..9].try_into().unwrap();
+        assert_eq!(u64::from_le_bytes(o), 1000);
+        assert_eq!(actor.next_base_offset, Offset::new(1050));
+    }
+
+    #[test]
+    fn test_patch_base_offset_non_blob_batch_passthrough() {
+        let (mut actor, _output_rx, _cmd_tx) =
+            create_test_shared_actor(Offset::new(500), true);
+
+        // A non-AppendBlobBatch command (type byte != 4).
+        let data = Bytes::from(vec![0u8; 20]);
+        let info = make_batch_info(10);
+        let patched = actor.patch_batch_base_offset(data.clone(), &info);
+        // Should be returned unmodified.
+        assert_eq!(patched, data);
+        // Tracker should NOT advance for non-blob commands.
+        assert_eq!(actor.next_base_offset, Offset::new(500));
     }
 }
