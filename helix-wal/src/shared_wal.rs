@@ -9,7 +9,7 @@
 //! - Entries are tagged with partition ID via [`SharedEntry`]
 //! - Partition-local indices are used (not WAL-global)
 //! - Recovery scans sequentially and groups entries by partition
-//! - No in-memory index; sequential access via `entries()` iterator
+//! - Per-partition `BTreeMap` index for O(log n) entry lookups
 //!
 //! # Example
 //!
@@ -35,7 +35,7 @@
 //! let by_partition = wal.recover()?;
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use bytes::Bytes;
@@ -116,6 +116,12 @@ pub struct SharedWal<S: Storage> {
     /// Per-partition truncation point (entries with index > this are logically deleted).
     /// None means no truncation has occurred for that partition.
     partition_truncated_after: HashMap<PartitionId, u64>,
+    /// Per-partition index for O(log n) entry lookups.
+    ///
+    /// Maps `(partition_id, raft_index) → SharedEntry`. Maintained in sync with
+    /// append/truncate/recover operations. `SharedEntry` payload is `Bytes`
+    /// (Arc-backed), so clones share data cheaply (~56 bytes of header + pointer).
+    partition_index: HashMap<PartitionId, BTreeMap<u64, SharedEntry>>,
 }
 
 /// Per-partition state for assertion checking.
@@ -141,6 +147,7 @@ impl<S: Storage> SharedWal<S> {
             partition_state: HashMap::new(),
             partition_durable: HashMap::new(),
             partition_truncated_after: HashMap::new(),
+            partition_index: HashMap::new(),
         })
     }
 
@@ -207,7 +214,7 @@ impl<S: Storage> SharedWal<S> {
         }
 
         let entry = SharedEntry::new(partition_id, term, index, payload)?;
-        self.wal.append(entry).await?;
+        self.wal.append(entry.clone()).await?;
 
         // Update partition state.
         self.partition_state.insert(
@@ -217,6 +224,12 @@ impl<S: Storage> SharedWal<S> {
                 last_term: term,
             },
         );
+
+        // Update partition index.
+        self.partition_index
+            .entry(partition_id)
+            .or_default()
+            .insert(index, entry);
 
         Ok(())
     }
@@ -277,6 +290,14 @@ impl<S: Storage> SharedWal<S> {
 
         // Single batched write.
         self.wal.append_batch(entries).await?;
+
+        // Update partition index.
+        for entry in entries {
+            self.partition_index
+                .entry(entry.partition_id())
+                .or_default()
+                .insert(entry.index(), entry.clone());
+        }
 
         Ok(())
     }
@@ -373,6 +394,12 @@ impl<S: Storage> SharedWal<S> {
                 *durable = after_index;
             }
         }
+
+        // Trim partition index: remove entries with index > after_index.
+        if let Some(btree) = self.partition_index.get_mut(&partition_id) {
+            // split_off returns entries >= key, so split at after_index + 1.
+            let _ = btree.split_off(&(after_index + 1));
+        }
     }
 
     /// Returns the truncation point for a partition, if any.
@@ -448,6 +475,14 @@ impl<S: Storage> SharedWal<S> {
                 .insert(*partition_id, state.last_index);
         }
 
+        // Populate partition index from recovered entries.
+        self.partition_index.clear();
+        for (partition_id, entries) in &by_partition {
+            let btree: BTreeMap<u64, SharedEntry> =
+                entries.iter().map(|e| (e.index(), e.clone())).collect();
+            self.partition_index.insert(*partition_id, btree);
+        }
+
         // Clear truncation tracking since we've recovered to a consistent state.
         self.partition_truncated_after.clear();
 
@@ -456,43 +491,14 @@ impl<S: Storage> SharedWal<S> {
 
     /// Returns entries for a specific partition.
     ///
-    /// This scans the entire WAL and filters by partition ID.
-    /// For recovery, prefer [`recover`](Self::recover) which scans once.
-    ///
-    /// # Last-Write-Wins and Truncation
-    ///
-    /// - Uses last-write-wins for duplicate indices (after truncation + re-append).
-    /// - Respects truncation point: entries beyond the truncation point are excluded
-    ///   unless newer entries have been appended.
+    /// Uses the per-partition `BTreeMap` index, which returns entries in sorted
+    /// order. The index is kept in sync with truncation, so no filtering needed.
     #[must_use]
     pub fn entries_for_partition(&self, partition_id: PartitionId) -> Vec<SharedEntry> {
-        // Use HashMap for last-write-wins deduplication.
-        let mut index_map: HashMap<u64, SharedEntry> = HashMap::new();
-
-        for entry in self.wal.entries() {
-            if entry.partition_id() == partition_id {
-                // Last-write-wins: later entries overwrite earlier ones.
-                index_map.insert(entry.index(), entry.clone());
-            }
-        }
-
-        // Filter by truncation point if set.
-        let max_valid_index = self
-            .partition_state
+        self.partition_index
             .get(&partition_id)
-            .map(|s| s.last_index);
-
-        // Sort by index and filter.
-        let mut entries: Vec<SharedEntry> = index_map
-            .into_values()
-            .filter(|e| {
-                // Only include entries up to the current last_index.
-                max_valid_index.is_none_or(|max| e.index() <= max)
-            })
-            .collect();
-
-        entries.sort_by_key(SharedEntry::index);
-        entries
+            .map(|btree| btree.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Reads a specific entry by partition ID and index.
@@ -500,8 +506,7 @@ impl<S: Storage> SharedWal<S> {
     /// Returns `None` if no entry exists for the given partition and index,
     /// or if the index is beyond the current valid range (after truncation).
     ///
-    /// Uses last-write-wins: if multiple entries exist with the same index
-    /// (due to truncation and re-append), returns the last one.
+    /// Uses the per-partition `BTreeMap` index for O(log n) lookup.
     #[must_use]
     pub fn read(&self, partition_id: PartitionId, index: u64) -> Option<SharedEntry> {
         // Check if index is beyond current valid range.
@@ -511,12 +516,40 @@ impl<S: Storage> SharedWal<S> {
             }
         }
 
-        // Find last occurrence (last-write-wins).
-        self.wal
-            .entries()
-            .filter(|e| e.partition_id() == partition_id && e.index() == index)
-            .last()
-            .cloned()
+        self.partition_index
+            .get(&partition_id)
+            .and_then(|btree| btree.get(&index).cloned())
+    }
+
+    /// Reads a range of entries for a partition, bounded by byte size.
+    ///
+    /// Returns entries from `start_index` to `end_index` (inclusive), stopping
+    /// when adding the next entry would exceed `max_bytes`. Always includes at
+    /// least one entry if any exist in the range.
+    #[must_use]
+    pub fn read_entries_range(
+        &self,
+        partition_id: PartitionId,
+        start_index: u64,
+        end_index: u64,
+        max_bytes: u64,
+    ) -> Vec<SharedEntry> {
+        let Some(btree) = self.partition_index.get(&partition_id) else {
+            return Vec::new();
+        };
+
+        let mut result = Vec::new();
+        let mut total_bytes = 0u64;
+        for (_index, entry) in btree.range(start_index..=end_index) {
+            let entry_size = entry.payload.len() as u64;
+            // Always include at least one entry.
+            if !result.is_empty() && total_bytes + entry_size > max_bytes {
+                break;
+            }
+            total_bytes += entry_size;
+            result.push(entry.clone());
+        }
+        result
     }
 
     /// Returns the set of partition IDs that have entries in this WAL.
@@ -843,6 +876,30 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
     pub async fn append_nowait(&self, term: u64, payload: Bytes) -> WalResult<u64> {
         let (index, _rx) = self.append_auto_async(term, payload).await?;
         Ok(index)
+    }
+
+    /// Reads a specific entry by Raft index for this partition.
+    ///
+    /// Uses the per-partition `BTreeMap` index for O(log n) lookup.
+    /// Returns `None` if no entry exists at the given index.
+    pub async fn read_entry(&self, index: u64) -> Option<SharedEntry> {
+        let wal = self.inner.wal.lock().await;
+        wal.read(self.partition_id, index)
+    }
+
+    /// Reads a range of entries for this partition, bounded by byte size.
+    ///
+    /// Returns entries from `start_index` to `end_index` (inclusive), stopping
+    /// when adding the next entry would exceed `max_bytes`. Always includes at
+    /// least one entry if any exist in the range.
+    pub async fn read_entries_range(
+        &self,
+        start_index: u64,
+        end_index: u64,
+        max_bytes: u64,
+    ) -> Vec<SharedEntry> {
+        let wal = self.inner.wal.lock().await;
+        wal.read_entries_range(self.partition_id, start_index, end_index, max_bytes)
     }
 
     /// Returns the partition ID for this handle.
