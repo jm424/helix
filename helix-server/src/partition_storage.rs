@@ -10,7 +10,7 @@ use helix_core::{
     LogIndex, Offset, PartitionId, ProducerEpoch, ProducerId, Record, SequenceNum, TopicId,
 };
 use helix_wal::{SharedEntry, SharedWalHandle, Storage, TokioStorage};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Extract a preview of the payload from a Kafka `RecordBatch` for debugging.
 /// Returns the first ~30 bytes of the record value as a string.
@@ -83,6 +83,8 @@ pub struct PartitionStorage<S: Storage + Clone + Send + Sync + 'static> {
     pub(crate) inner: PartitionStorageInner<S>,
     /// Last applied Raft log index.
     last_applied: LogIndex,
+    /// Term of the last applied Raft log entry.
+    last_applied_term: helix_core::TermId,
     /// Producer state for idempotent deduplication.
     #[allow(dead_code)] // Used in append_blob integration (coming soon).
     producer_state: PartitionProducerState,
@@ -101,6 +103,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
             partition_id,
             inner: PartitionStorageInner::InMemory(Partition::new(config)),
             last_applied: LogIndex::new(0),
+            last_applied_term: helix_core::TermId::new(0),
             producer_state: PartitionProducerState::new(),
         }
     }
@@ -142,11 +145,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         let durable = DurablePartition::open(storage, config).await?;
         // Initialize last_applied from recovered WAL state for proper idempotency.
         let last_applied = LogIndex::new(durable.last_applied_index());
+        let last_applied_term = helix_core::TermId::new(durable.last_applied_term());
         Ok(Self {
             topic_id,
             partition_id,
             inner: PartitionStorageInner::Durable(Box::new(durable)),
             last_applied,
+            last_applied_term,
             producer_state: PartitionProducerState::new(),
         })
     }
@@ -184,11 +189,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         let durable = DurablePartition::open(storage, config).await?;
         // Initialize last_applied from recovered WAL state for proper idempotency.
         let last_applied = LogIndex::new(durable.last_applied_index());
+        let last_applied_term = helix_core::TermId::new(durable.last_applied_term());
         Ok(Self {
             topic_id,
             partition_id,
             inner: PartitionStorageInner::Durable(Box::new(durable)),
             last_applied,
+            last_applied_term,
             producer_state: PartitionProducerState::new(),
         })
     }
@@ -235,11 +242,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
             DurablePartition::open_with_shared_wal(config, wal_handle, recovered_entries).await?;
         // Initialize last_applied from recovered WAL state for proper idempotency.
         let last_applied = LogIndex::new(durable.last_applied_index());
+        let last_applied_term = helix_core::TermId::new(durable.last_applied_term());
         Ok(Self {
             topic_id,
             partition_id,
             inner: PartitionStorageInner::Durable(Box::new(durable)),
             last_applied,
+            last_applied_term,
             producer_state: PartitionProducerState::new(),
         })
     }
@@ -272,11 +281,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
             DurablePartition::open_with_shared_wal(config, wal_handle, recovered_entries).await?;
         // Initialize last_applied from recovered WAL state for proper idempotency.
         let last_applied = LogIndex::new(durable.last_applied_index());
+        let last_applied_term = helix_core::TermId::new(durable.last_applied_term());
         Ok(Self {
             topic_id,
             partition_id,
             inner: PartitionStorageInner::Durable(Box::new(durable)),
             last_applied,
+            last_applied_term,
             producer_state: PartitionProducerState::new(),
         })
     }
@@ -320,10 +331,15 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     }
 
     /// Returns the last applied Raft log index.
-    #[allow(dead_code)]
     #[must_use]
     pub const fn last_applied(&self) -> LogIndex {
         self.last_applied
+    }
+
+    /// Returns the term of the last applied Raft log entry.
+    #[must_use]
+    pub const fn last_applied_term(&self) -> helix_core::TermId {
+        self.last_applied_term
     }
 
     /// Checks if a produce request is a duplicate.
@@ -402,6 +418,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     pub fn apply_entry_sync(
         &mut self,
         index: LogIndex,
+        term: helix_core::TermId,
         data: &Bytes,
     ) -> ServerResult<Option<Offset>> {
         // Skip if already applied.
@@ -556,6 +573,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         };
 
         self.last_applied = index;
+        self.last_applied_term = term;
         Ok(base_offset)
     }
 
@@ -569,6 +587,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     pub async fn apply_entry_async(
         &mut self,
         index: LogIndex,
+        term: helix_core::TermId,
         data: &Bytes,
     ) -> ServerResult<Option<Offset>> {
         // Skip if already applied.
@@ -685,9 +704,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                     // This ensures all replicas use the same offset for consistency.
 
                     // Apply each blob in sequence starting from leader-assigned offset.
+                    // Iterate by value to avoid cloning blob data.
                     let mut current_offset = base_offset;
-                    for batched in &blobs {
-                        let payload_preview = extract_payload_preview(&batched.blob);
+                    for batched in blobs {
+                        let payload_preview =
+                            extract_payload_preview(&batched.blob);
                         info!(
                             topic = %self.topic_id,
                             partition = %self.partition_id,
@@ -696,10 +717,15 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                             payload = %payload_preview,
                             "APPLY_BATCH: storing blob"
                         );
+                        // Move blob directly for Raw; patch_kafka takes
+                        // ownership and may reuse the buffer in-place.
                         let blob_to_store = match batched.format {
-                            BlobFormat::Raw => batched.blob.clone(),
+                            BlobFormat::Raw => batched.blob,
                             BlobFormat::KafkaRecordBatch => {
-                                patch_kafka_base_offset(batched.blob.clone(), current_offset)
+                                patch_kafka_base_offset(
+                                    batched.blob,
+                                    current_offset,
+                                )
                             }
                         };
                         // Use append_blob_at_offset to store at the leader-assigned offset.
@@ -710,10 +736,14 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                                 current_offset,
                             )
                             .map_err(|e| ServerError::Internal {
-                                message: format!("failed to append blob in batch: {e}"),
+                                message: format!(
+                                    "failed to append blob in batch: {e}"
+                                ),
                             })?;
-                        current_offset =
-                            Offset::new(current_offset.get() + u64::from(batched.record_count));
+                        current_offset = Offset::new(
+                            current_offset.get()
+                                + u64::from(batched.record_count),
+                        );
                     }
 
                     let new_hwm = partition.blob_log_end_offset();
@@ -730,99 +760,28 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                     Some(base_offset)
                 }
             },
-            PartitionStorageInner::Durable(partition) => match command {
-                PartitionCommand::Append { records, .. } => {
-                    // Use append_at_index with the Raft index to ensure proper
-                    // idempotency tracking after crash recovery.
-                    let offset = partition
-                        .append_at_index(index.get(), records)
-                        .await
-                        .map_err(|e| ServerError::Internal {
-                            message: format!("failed to append: {e}"),
-                        })?;
-                    Some(offset)
-                }
-                PartitionCommand::AppendBlob {
-                    blob,
-                    record_count,
-                    format,
-                    base_offset,
-                } => {
-                    // Use base_offset from command - assigned by leader at propose time.
+            PartitionStorageInner::Durable(partition) => {
+                // Unified WAL write path: one Raft commit = one WAL entry.
+                // Write the raw encoded command bytes as a single entry, then
+                // decode and apply to the in-memory cache separately.
+                partition
+                    .write_wal_entry(index.get(), term.get(), data.clone())
+                    .await
+                    .map_err(|e| ServerError::Internal {
+                        message: format!("failed to write WAL entry: {e}"),
+                    })?;
 
-                    // Apply protocol-specific patching if needed.
-                    let blob_to_store = match format {
-                        BlobFormat::Raw => blob,
-                        BlobFormat::KafkaRecordBatch => patch_kafka_base_offset(blob, base_offset),
-                    };
-
-                    // Use append_blob_at_index with the Raft index AND leader-assigned offset.
-                    partition
-                        .append_blob_at_index(index.get(), blob_to_store, record_count, base_offset)
-                        .await
-                        .map_err(|e| ServerError::Internal {
-                            message: format!("failed to append blob: {e}"),
-                        })?;
-                    Some(base_offset)
-                }
-                PartitionCommand::Truncate { from_offset: _ } => {
-                    // TODO: Implement truncate for durable partition.
-                    warn!("Truncate not yet implemented for durable partition");
-                    None
-                }
-                PartitionCommand::UpdateHighWatermark { high_watermark } => {
-                    partition.set_high_watermark(high_watermark);
-                    None
-                }
-                PartitionCommand::AppendBlobBatch { blobs, base_offset } => {
-                    // Use base_offset from command - assigned by leader at propose time.
-                    // This ensures all replicas use the same offset for consistency.
-                    let mut current_offset = base_offset;
-                    for batched in &blobs {
-                        let payload_preview = extract_payload_preview(&batched.blob);
-                        info!(
-                            topic = %self.topic_id,
-                            partition = %self.partition_id,
-                            index = %index,
-                            offset = %current_offset,
-                            payload = %payload_preview,
-                            "APPLY_BATCH: storing blob"
-                        );
-                        let blob_to_store = match batched.format {
-                            BlobFormat::Raw => batched.blob.clone(),
-                            BlobFormat::KafkaRecordBatch => {
-                                patch_kafka_base_offset(batched.blob.clone(), current_offset)
-                            }
-                        };
-                        partition
-                            .append_blob_at_index(
-                                index.get(),
-                                blob_to_store,
-                                batched.record_count,
-                                current_offset,
-                            )
-                            .await
-                            .map_err(|e| ServerError::Internal {
-                                message: format!("failed to append blob in batch: {e}"),
-                            })?;
-                        current_offset =
-                            Offset::new(current_offset.get() + u64::from(batched.record_count));
-                    }
-
-                    debug!(
-                        topic = %self.topic_id,
-                        partition = %self.partition_id,
-                        index = %index,
-                        base_offset = %base_offset,
-                        new_log_end = %partition.blob_log_end_offset(),
-                        "applied blob batch (durable)"
-                    );
-                    Some(base_offset)
-                }
-            },
+                // Decode and apply to cache only (no additional WAL writes).
+                partition
+                    .apply_command_to_cache(data)
+                    .map_err(|e| ServerError::Internal {
+                        message: format!("failed to apply to cache: {e}"),
+                    })?
+            }
         };
 
         self.last_applied = index;
+        self.last_applied_term = term;
         Ok(base_offset)
     }
 
@@ -900,6 +859,58 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                         message: format!("tiering upload failed: {e}"),
                     })
             }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // WAL Read Methods (for WAL-backed AppendEntries)
+    // -------------------------------------------------------------------------
+
+    /// Reads WAL entries sequentially for serving via `AppendEntries`.
+    ///
+    /// Returns `None` for in-memory storage (no WAL).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL read fails.
+    pub async fn read_wal_entries(
+        &self,
+        start: u64,
+        max_bytes: u64,
+    ) -> ServerResult<Option<Vec<helix_wal::Entry>>> {
+        match &self.inner {
+            PartitionStorageInner::InMemory(_) => Ok(None),
+            PartitionStorageInner::Durable(p) => {
+                let entries = p
+                    .read_wal_entries(start, max_bytes)
+                    .await
+                    .map_err(|e| ServerError::Internal {
+                        message: format!("WAL read failed: {e}"),
+                    })?;
+                Ok(Some(entries))
+            }
+        }
+    }
+
+    /// Reads a single WAL entry by Raft index.
+    ///
+    /// Returns `None` for in-memory storage (no WAL).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL read fails.
+    pub async fn read_wal_entry(
+        &self,
+        index: u64,
+    ) -> ServerResult<Option<helix_wal::Entry>> {
+        match &self.inner {
+            PartitionStorageInner::InMemory(_) => Ok(None),
+            PartitionStorageInner::Durable(p) => p
+                .read_wal_entry(index)
+                .await
+                .map_err(|e| ServerError::Internal {
+                    message: format!("WAL read failed: {e}"),
+                }),
         }
     }
 }

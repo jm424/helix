@@ -146,22 +146,23 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
         //
         // In multi-node mode, outputs won't contain CommitEntry (needs replication),
         // so we always register a pending proposal and wait for the tick task.
-        let mut committed_entry_data: Option<Bytes> = None;
+        let mut committed_entry_data: Option<(Bytes, helix_core::TermId)> = None;
         for output in &outputs {
             if let MultiRaftOutput::CommitEntry {
                 group_id: gid,
                 index,
+                term,
                 data: entry_data,
             } = output
             {
                 if *gid == group_id && *index == proposed_index {
-                    committed_entry_data = Some(entry_data.clone());
+                    committed_entry_data = Some((entry_data.clone(), *term));
                 }
             }
         }
 
         // If we got a CommitEntry (single-node mode), apply with ordering.
-        let base_offset = if let Some(entry_data) = committed_entry_data {
+        let base_offset = if let Some((entry_data, entry_term)) = committed_entry_data {
             // Single-node fast path: apply in order.
             // Loop until it's our turn to apply (bounded by MAX_CONCURRENT_APPLY_RETRIES).
             const MAX_CONCURRENT_APPLY_RETRIES: u32 = 10_000;
@@ -202,7 +203,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
 
                 if proposed_index == expected_next {
                     // It's our turn to apply.
-                    match ps.apply_entry_async(proposed_index, &entry_data).await {
+                    match ps.apply_entry_async(proposed_index, entry_term, &entry_data).await {
                         Ok(Some(offset)) => {
                             return Ok(WriteResponse {
                                 base_offset: offset.get(),

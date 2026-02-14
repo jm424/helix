@@ -13,6 +13,7 @@ workspace = true
 [features]
 default = []
 s3 = ["helix-tier/s3"]
+dhat-heap = ["dhat"]
 
 [[bin]]
 name = "helix-server"
@@ -40,6 +41,7 @@ thiserror = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 hdrhistogram = { workspace = true }
+dhat = { version = "0.3", optional = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }

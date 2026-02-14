@@ -35,12 +35,24 @@ impl LogEntry {
 ///
 /// This is a simple in-memory implementation for simulation testing.
 /// Production would use the WAL for persistence.
+///
+/// # Compacted State
+///
+/// After restart with an ephemeral log, `compacted_index` and `compacted_term`
+/// represent the last committed entry recovered from the data WAL. This makes
+/// `last_index()`, `last_term()`, `term_at()`, and `is_up_to_date()` return
+/// correct values so that election safety holds without any changes to the
+/// election call sites.
 #[derive(Debug, Default)]
 pub struct RaftLog {
     /// Log entries (0-indexed internally, but `LogIndex` starts at 1).
     entries: Vec<LogEntry>,
     /// Index of first entry (1 if non-empty, 0 if empty).
     first_index: u64,
+    /// Floor for `last_index()` when entries is empty (recovered commit index).
+    compacted_index: u64,
+    /// Term at `compacted_index` (recovered commit term).
+    compacted_term: u64,
 }
 
 impl RaftLog {
@@ -50,6 +62,24 @@ impl RaftLog {
         Self {
             entries: Vec::new(),
             first_index: 0,
+            compacted_index: 0,
+            compacted_term: 0,
+        }
+    }
+
+    /// Creates a log with compacted state from recovery.
+    ///
+    /// After restart, the data WAL tells us the last committed index and term.
+    /// Setting these as compacted state makes `last_index()`, `last_term()`,
+    /// `term_at()`, and `is_up_to_date()` return correct values so that
+    /// election safety holds automatically.
+    #[must_use]
+    pub const fn with_compacted(index: u64, term: u64) -> Self {
+        Self {
+            entries: Vec::new(),
+            first_index: 0,
+            compacted_index: index,
+            compacted_term: term,
         }
     }
 
@@ -79,10 +109,14 @@ impl RaftLog {
     }
 
     /// Returns the last log index, or 0 if empty.
+    ///
+    /// When entries is empty but compacted state exists, returns `compacted_index`
+    /// so that election comparisons reflect recovered WAL state.
     #[must_use]
     pub fn last_index(&self) -> LogIndex {
         if self.entries.is_empty() {
-            LogIndex::new(0)
+            // Return compacted_index as floor (0 if no compacted state).
+            LogIndex::new(self.compacted_index)
         } else {
             // Safe cast: entries.len() is bounded by system memory which always fits in u64.
             #[allow(clippy::cast_possible_truncation)]
@@ -92,9 +126,15 @@ impl RaftLog {
     }
 
     /// Returns the term of the last entry, or 0 if empty.
+    ///
+    /// When entries is empty but compacted state exists, returns `compacted_term`
+    /// so that election comparisons reflect recovered WAL state.
     #[must_use]
     pub fn last_term(&self) -> TermId {
-        self.entries.last().map_or(TermId::new(0), |e| e.term)
+        self.entries.last().map_or_else(
+            || TermId::new(self.compacted_term),
+            |e| e.term,
+        )
     }
 
     /// Gets an entry by index.
@@ -110,19 +150,39 @@ impl RaftLog {
     }
 
     /// Returns the term at a given index, or 0 if not found.
+    ///
+    /// Returns `compacted_term` when `index == compacted_index` and the entry
+    /// is not in the vec (i.e., after recovery before new entries are appended).
     #[must_use]
     pub fn term_at(&self, index: LogIndex) -> TermId {
-        self.get(index).map_or(TermId::new(0), |e| e.term)
+        if let Some(entry) = self.get(index) {
+            return entry.term;
+        }
+        // Check compacted state for the boundary index.
+        if self.compacted_index > 0 && index.get() == self.compacted_index {
+            return TermId::new(self.compacted_term);
+        }
+        TermId::new(0)
     }
 
     /// Appends an entry to the log.
+    ///
+    /// When entries is empty and compacted state exists, the expected index
+    /// is `compacted_index + 1` (first entry after recovered state).
     ///
     /// # Panics
     /// Panics if the entry index is not sequential.
     pub fn append(&mut self, entry: LogEntry) {
         let expected_index = if self.entries.is_empty() {
-            self.first_index = entry.index.get();
-            entry.index.get()
+            if self.compacted_index > 0 {
+                // First entry after recovery: must follow compacted state.
+                let idx = self.compacted_index + 1;
+                self.first_index = idx;
+                idx
+            } else {
+                self.first_index = entry.index.get();
+                entry.index.get()
+            }
         } else {
             self.last_index().get() + 1
         };
@@ -162,15 +222,20 @@ impl RaftLog {
     /// Truncates the log after the given index.
     ///
     /// Keeps entries up to and including `last_to_keep`.
+    /// Compacted state is preserved as an immutable floor.
     pub fn truncate_after(&mut self, last_to_keep: LogIndex) {
         if self.entries.is_empty() {
             return;
         }
 
         if last_to_keep.get() < self.first_index {
-            // Truncate everything.
+            // Truncate all entries, but preserve compacted state.
             self.entries.clear();
-            self.first_index = 0;
+            if self.compacted_index > 0 {
+                self.first_index = self.compacted_index + 1;
+            } else {
+                self.first_index = 0;
+            }
             return;
         }
 
@@ -489,5 +554,91 @@ mod tests {
 
         let entries = log.entries_from_limited(LogIndex::new(5), 1000);
         assert!(entries.is_empty());
+    }
+
+    // ========================================================================
+    // Compacted State Tests
+    // ========================================================================
+
+    #[test]
+    fn test_log_compacted_last_index_term() {
+        // Empty log with compacted state returns correct values.
+        let log = RaftLog::with_compacted(10, 3);
+
+        assert!(log.is_empty()); // entries vec is empty
+        assert_eq!(log.last_index().get(), 10);
+        assert_eq!(log.last_term().get(), 3);
+    }
+
+    #[test]
+    fn test_log_compacted_term_at() {
+        let log = RaftLog::with_compacted(10, 3);
+
+        // Returns compacted_term at compacted_index.
+        assert_eq!(log.term_at(LogIndex::new(10)).get(), 3);
+        // Returns 0 for other indices.
+        assert_eq!(log.term_at(LogIndex::new(9)).get(), 0);
+        assert_eq!(log.term_at(LogIndex::new(11)).get(), 0);
+    }
+
+    #[test]
+    fn test_log_compacted_append() {
+        let mut log = RaftLog::with_compacted(10, 3);
+
+        // Appending at compacted_index+1 works.
+        log.append(make_entry(4, 11));
+        assert_eq!(log.last_index().get(), 11);
+        assert_eq!(log.last_term().get(), 4);
+        assert_eq!(log.len(), 1);
+
+        // Can continue appending.
+        log.append(make_entry(4, 12));
+        assert_eq!(log.last_index().get(), 12);
+        assert_eq!(log.len(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "log entry index must be sequential")]
+    fn test_log_compacted_append_wrong_index() {
+        let mut log = RaftLog::with_compacted(10, 3);
+        // Appending at wrong index panics.
+        log.append(make_entry(4, 15));
+    }
+
+    #[test]
+    fn test_log_compacted_truncate_floor() {
+        let mut log = RaftLog::with_compacted(10, 3);
+        log.append(make_entry(4, 11));
+        log.append(make_entry(4, 12));
+
+        // Truncate below compacted keeps compacted state.
+        log.truncate_after(LogIndex::new(5));
+        assert!(log.is_empty());
+        assert_eq!(log.last_index().get(), 10);
+        assert_eq!(log.last_term().get(), 3);
+
+        // Can still append at compacted_index + 1.
+        log.append(make_entry(5, 11));
+        assert_eq!(log.last_index().get(), 11);
+    }
+
+    #[test]
+    fn test_log_compacted_is_up_to_date() {
+        let log = RaftLog::with_compacted(10, 3);
+
+        // Candidate with higher term is more up-to-date.
+        assert!(log.is_up_to_date(TermId::new(4), LogIndex::new(1)));
+
+        // Candidate with same term, higher index is more up-to-date.
+        assert!(log.is_up_to_date(TermId::new(3), LogIndex::new(11)));
+
+        // Candidate with same term, same index is equal.
+        assert!(log.is_up_to_date(TermId::new(3), LogIndex::new(10)));
+
+        // Candidate with lower term is less up-to-date.
+        assert!(!log.is_up_to_date(TermId::new(2), LogIndex::new(100)));
+
+        // Candidate with same term but shorter log is less up-to-date.
+        assert!(!log.is_up_to_date(TermId::new(3), LogIndex::new(9)));
     }
 }

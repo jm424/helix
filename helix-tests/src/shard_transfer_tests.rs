@@ -197,6 +197,7 @@ fn encode_raft_message(msg: &Message) -> Vec<u8> {
             buf.extend(&resp.to.get().to_le_bytes());
             buf.push(u8::from(resp.success));
             buf.extend(&resp.match_index.get().to_le_bytes());
+            buf.extend(&resp.persisted_commit_index.get().to_le_bytes());
         }
         Message::TimeoutNow(req) => {
             buf.push(6);
@@ -371,6 +372,7 @@ fn decode_raft_message(payload: &[u8]) -> Option<(Message, usize)> {
             let to = NodeId::new(read_u64!());
             let success = read_bool!();
             let match_index = LogIndex::new(read_u64!());
+            let persisted_commit_index = LogIndex::new(read_u64!());
             Some((
                 Message::AppendEntriesResponse(AppendEntriesResponse::new(
                     term,
@@ -378,6 +380,7 @@ fn decode_raft_message(payload: &[u8]) -> Option<(Message, usize)> {
                     to,
                     success,
                     match_index,
+                    persisted_commit_index,
                 )),
                 offset,
             ))

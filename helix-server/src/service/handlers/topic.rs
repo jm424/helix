@@ -151,13 +151,14 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                         if let MultiRaftOutput::CommitEntry {
                             group_id: gid,
                             index,
+                            term,
                             data,
                         } = output
                         {
                             if *gid == group_id {
                                 if let Some(ps_lock) = partition_storage.get(&group_id) {
                                     let mut ps = ps_lock.write().await;
-                                    let _ = ps.apply_entry_async(*index, data).await;
+                                    let _ = ps.apply_entry_async(*index, *term, data).await;
                                 }
                             }
                         }

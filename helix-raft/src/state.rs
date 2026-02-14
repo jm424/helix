@@ -86,6 +86,8 @@ pub enum RaftOutput {
     CommitEntry {
         /// The log index of the committed entry.
         index: LogIndex,
+        /// The Raft term of the committed entry.
+        term: TermId,
         /// The data payload of the committed entry.
         data: Bytes,
     },
@@ -102,6 +104,21 @@ pub enum RaftOutput {
         term: TermId,
         /// Who we voted for in the new term (None if haven't voted).
         voted_for: Option<NodeId>,
+    },
+    /// Leader needs entries from the data WAL to serve a follower.
+    ///
+    /// Emitted when the leader's in-memory log doesn't have entries that
+    /// exist in the data WAL (after restart with ephemeral log). The caller
+    /// should read entries from the WAL and call `provide_entries()`.
+    NeedEntries {
+        /// The follower that needs entries.
+        follower_id: NodeId,
+        /// First entry index to read from the WAL.
+        start_index: LogIndex,
+        /// Index before `start_index` (for `prev_log_term` lookup).
+        prev_log_index: LogIndex,
+        /// Maximum bytes of entries to read.
+        max_bytes: u64,
     },
 }
 
@@ -239,6 +256,20 @@ pub struct RaftNode {
     ///
     /// Decremented each tick. When it reaches 0, observation mode ends.
     observation_ticks_remaining: u32,
+
+    // Recovery state (for crash recovery with ephemeral log).
+    /// Last committed index recovered from the data WAL.
+    /// Used by Part B for fast-forward commit on followers.
+    persisted_commit_index: LogIndex,
+
+    /// Term of the last committed entry recovered from the data WAL.
+    persisted_commit_term: TermId,
+
+    /// Followers for which a WAL read is pending.
+    ///
+    /// While a WAL read is in-flight for a follower, we suppress sending
+    /// additional `AppendEntries` to avoid duplicate reads.
+    wal_read_pending: HashSet<NodeId>,
 }
 
 impl RaftNode {
@@ -309,6 +340,69 @@ impl RaftNode {
             rng,
             observation_mode,
             observation_ticks_remaining: observation_ticks,
+            persisted_commit_index: LogIndex::new(0),
+            persisted_commit_term: TermId::new(0),
+            wal_read_pending: HashSet::new(),
+        }
+    }
+
+    /// Creates a Raft node with recovery state from the data WAL.
+    ///
+    /// After restart with an ephemeral log, the data WAL tells us the last
+    /// committed index and term. This state is set on the `RaftLog` as
+    /// compacted state so `last_index()`, `last_term()`, and `is_up_to_date()`
+    /// return correct values. Election safety is preserved automatically.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Node configuration
+    /// * `term` - Persisted vote term
+    /// * `voted_for` - Who we voted for in the persisted term
+    /// * `observation_mode` - Enable observation mode for safe S3 recovery
+    /// * `commit_index` - Last committed Raft log index from data WAL
+    /// * `commit_term` - Term of the last committed entry from data WAL
+    #[must_use]
+    pub fn with_recovery_state(
+        config: RaftConfig,
+        term: TermId,
+        voted_for: Option<NodeId>,
+        observation_mode: bool,
+        commit_index: LogIndex,
+        commit_term: TermId,
+    ) -> Self {
+        let mut rng = SimpleRng::new(config.random_seed);
+        let election_tick = config.election_tick;
+        let randomized_timeout = rng.range(election_tick, election_tick * 2);
+
+        let observation_ticks = if observation_mode {
+            randomized_timeout
+        } else {
+            0
+        };
+
+        Self {
+            config,
+            current_term: term,
+            voted_for,
+            log: RaftLog::with_compacted(commit_index.get(), commit_term.get()),
+            state: RaftState::Follower,
+            commit_index,
+            last_applied: commit_index,
+            replication_state: HashMap::new(),
+            pre_votes_received: HashSet::new(),
+            votes_received: HashSet::new(),
+            leader_id: None,
+            transfer_target: None,
+            snapshot_meta: None,
+            election_elapsed: 0,
+            heartbeat_elapsed: 0,
+            randomized_election_timeout: randomized_timeout,
+            rng,
+            observation_mode,
+            observation_ticks_remaining: observation_ticks,
+            persisted_commit_index: commit_index,
+            persisted_commit_term: commit_term,
+            wal_read_pending: HashSet::new(),
         }
     }
 
@@ -364,6 +458,18 @@ impl RaftNode {
     #[must_use]
     pub const fn last_applied(&self) -> LogIndex {
         self.last_applied
+    }
+
+    /// Returns the persisted commit index recovered from the data WAL.
+    #[must_use]
+    pub const fn persisted_commit_index(&self) -> LogIndex {
+        self.persisted_commit_index
+    }
+
+    /// Returns the persisted commit term recovered from the data WAL.
+    #[must_use]
+    pub const fn persisted_commit_term(&self) -> TermId {
+        self.persisted_commit_term
     }
 
     /// Returns a reference to the log.
@@ -654,6 +760,7 @@ impl RaftNode {
         self.pre_votes_received.clear();
         self.votes_received.clear();
         self.transfer_target = None;
+        self.wal_read_pending.clear();
 
         // Reset election timeout when stepping down.
         self.reset_election_elapsed();
@@ -860,6 +967,7 @@ impl RaftNode {
         self.state = RaftState::Leader;
         self.leader_id = Some(self.config.node_id);
         self.heartbeat_elapsed = 0;
+        self.wal_read_pending.clear();
 
         // Initialize leader state.
         // next_index starts at last_index + 1 (optimistic).
@@ -917,6 +1025,7 @@ impl RaftNode {
                 req.leader_id,
                 false,
                 self.log.last_index(),
+                self.persisted_commit_index,
             );
             outputs.push(RaftOutput::SendMessage(Message::AppendEntriesResponse(
                 response,
@@ -947,9 +1056,22 @@ impl RaftNode {
         self.reset_election_elapsed();
 
         // Check if we have the prev_log entry.
-        let log_ok = req.prev_log_index.get() == 0
-            || (self.log.get(req.prev_log_index).is_some()
-                && self.log.term_at(req.prev_log_index) == req.prev_log_term);
+        // Three cases:
+        // 1. prev_log_index == 0: beginning of log, always ok.
+        // 2. prev_log_index <= persisted_commit_index: the entry was committed
+        //    and is in our data WAL. Committed entries are identical on all
+        //    nodes, so accept without checking the (empty) in-memory log.
+        // 3. Otherwise: check the in-memory log normally.
+        let log_ok = if req.prev_log_index.get() == 0 {
+            true
+        } else if req.prev_log_index <= self.persisted_commit_index {
+            // Committed entries are identical on all nodes.
+            // Accept without checking the (empty) in-memory log.
+            true
+        } else {
+            req.prev_log_index <= self.log.last_index()
+                && self.log.term_at(req.prev_log_index) == req.prev_log_term
+        };
 
         if !log_ok {
             // Log doesn't contain an entry at prev_log_index with matching term.
@@ -959,6 +1081,7 @@ impl RaftNode {
                 req.leader_id,
                 false,
                 self.log.last_index(),
+                self.persisted_commit_index,
             );
             outputs.push(RaftOutput::SendMessage(Message::AppendEntriesResponse(
                 response,
@@ -984,6 +1107,7 @@ impl RaftNode {
             req.leader_id,
             true,
             self.log.last_index(),
+            self.persisted_commit_index,
         );
         outputs.push(RaftOutput::SendMessage(Message::AppendEntriesResponse(
             response,
@@ -1056,10 +1180,13 @@ impl RaftNode {
             // since we don't know which ones will fail.
             state.inflight_count = 0;
 
-            // Use the follower's match_index for fast backup.
-            // The follower tells us the last index it has, so we should
-            // start sending from match_index + 1.
-            state.next_index = LogIndex::new(resp.match_index.get() + 1);
+            // Fast-forward using the follower's persisted_commit_index when
+            // available. The follower has committed entries in its WAL that
+            // may not be in its in-memory log after restart. Skip directly
+            // to persisted_commit_index + 1 instead of backing up entry-by-entry.
+            let fast_forward = resp.persisted_commit_index.get() + 1;
+            let backup = resp.match_index.get() + 1;
+            state.next_index = LogIndex::new(fast_forward.max(backup).max(1));
 
             // Immediately retry with corrected next_index.
             outputs.extend(self.send_append_entries(resp.from));
@@ -1347,8 +1474,17 @@ impl RaftNode {
     /// With pipelining, this function may send multiple requests without
     /// waiting for responses, up to `MAX_INFLIGHT_APPEND_ENTRIES`. The
     /// `next_index` is speculatively advanced after each send.
+    ///
+    /// If entries exist in the data WAL but not in the in-memory log
+    /// (after restart), emits `NeedEntries` instead. The caller reads
+    /// the WAL and calls `provide_entries()` to resume replication.
     fn send_append_entries(&mut self, peer: NodeId) -> Vec<RaftOutput> {
         let mut outputs = Vec::new();
+
+        // Suppress sends while a WAL read is pending for this follower.
+        if self.wal_read_pending.contains(&peer) {
+            return outputs;
+        }
 
         let Some(state) = self.replication_state.get_mut(&peer) else {
             tracing::debug!(
@@ -1379,6 +1515,24 @@ impl RaftNode {
         let entries = self.log.entries_from_limited(next_idx, max_entries_bytes);
         let entries_count = entries.len();
 
+        // If the requested entries are below the in-memory log's range but
+        // exist in the data WAL, request a WAL read instead. This happens
+        // after restart when the in-memory log only has the no-op entry
+        // but the data WAL has committed entries at lower indices.
+        let log_first = self.log.first_index();
+        let need_wal = next_idx <= self.persisted_commit_index
+            && (log_first.get() == 0 || next_idx < log_first);
+        if need_wal {
+            outputs.push(RaftOutput::NeedEntries {
+                follower_id: peer,
+                start_index: next_idx,
+                prev_log_index: prev_idx,
+                max_bytes: max_entries_bytes,
+            });
+            self.wal_read_pending.insert(peer);
+            return outputs;
+        }
+
         // Speculatively advance next_index to the end of entries being sent.
         // This allows subsequent sends to pipeline more entries.
         if entries_count > 0 {
@@ -1397,6 +1551,61 @@ impl RaftNode {
             peer,
             prev_idx,
             prev_term,
+            entries,
+            self.commit_index,
+        );
+        outputs.push(RaftOutput::SendMessage(Message::AppendEntries(request)));
+
+        outputs
+    }
+
+    /// Provides entries read from the data WAL for a follower.
+    ///
+    /// Called by the partition actor after reading entries from the WAL in
+    /// response to a `NeedEntries` output. Constructs an `AppendEntries`
+    /// request with the provided entries and sends it to the follower.
+    ///
+    /// # Arguments
+    ///
+    /// * `follower_id` - The follower that needs entries
+    /// * `prev_log_index` - Index before the first provided entry
+    /// * `prev_log_term` - Term at `prev_log_index` (from WAL)
+    /// * `entries` - Entries read from the WAL
+    pub fn provide_entries(
+        &mut self,
+        follower_id: NodeId,
+        prev_log_index: LogIndex,
+        prev_log_term: TermId,
+        entries: Vec<LogEntry>,
+    ) -> Vec<RaftOutput> {
+        let mut outputs = Vec::new();
+
+        // Clear the pending flag regardless of outcome.
+        self.wal_read_pending.remove(&follower_id);
+
+        // Only send if we're still leader.
+        if self.state != RaftState::Leader {
+            return outputs;
+        }
+
+        let Some(state) = self.replication_state.get_mut(&follower_id) else {
+            return outputs;
+        };
+
+        // Advance next_index past the entries being sent.
+        if !entries.is_empty() {
+            let last_entry_index = entries[entries.len() - 1].index;
+            state.next_index = LogIndex::new(last_entry_index.get() + 1);
+        }
+
+        state.inflight_count += 1;
+
+        let request = AppendEntriesRequest::new(
+            self.current_term,
+            self.config.node_id,
+            follower_id,
+            prev_log_index,
+            prev_log_term,
             entries,
             self.commit_index,
         );
@@ -1466,8 +1675,16 @@ impl RaftNode {
 
     /// Applies committed entries up to the given index.
     fn apply_committed_entries(&mut self, new_commit: LogIndex) -> Vec<RaftOutput> {
-        // Precondition: new_commit must be valid log index.
-        debug_assert!(new_commit <= self.log.last_index());
+        // Precondition: new_commit must be within the valid log range.
+        // After recovery, entries may exist in the log since they were appended
+        // before commit advanced, so we check against last_index which includes
+        // both entries and compacted state.
+        debug_assert!(
+            new_commit <= self.log.last_index(),
+            "new_commit {} > log.last_index() {}",
+            new_commit.get(),
+            self.log.last_index().get(),
+        );
 
         let mut outputs = Vec::new();
         let prev_last_applied = self.last_applied;
@@ -1493,6 +1710,7 @@ impl RaftNode {
                 );
                 outputs.push(RaftOutput::CommitEntry {
                     index: idx,
+                    term: entry.term,
                     data: entry.data.clone(),
                 });
             }
@@ -1904,6 +2122,7 @@ mod tests {
             node.node_id(),
             true,
             LogIndex::new(0),
+            LogIndex::new(0),
         );
         let outputs = node.handle_message(Message::AppendEntriesResponse(response));
 
@@ -1944,6 +2163,7 @@ mod tests {
             node.node_id(),
             false,
             LogIndex::new(2),
+            LogIndex::new(0),
         );
         node.handle_message(Message::AppendEntriesResponse(response));
 
@@ -2016,6 +2236,7 @@ mod tests {
             node.node_id(),
             true,
             LogIndex::new(3),
+            LogIndex::new(0),
         );
         node.handle_message(Message::AppendEntriesResponse(response));
 
@@ -2032,6 +2253,7 @@ mod tests {
             node.node_id(),
             true,
             LogIndex::new(2),
+            LogIndex::new(0),
         );
         node.handle_message(Message::AppendEntriesResponse(response));
 
@@ -2039,6 +2261,417 @@ mod tests {
         assert_eq!(
             node.replication_state.get(&peer).unwrap().match_index.get(),
             3
+        );
+    }
+
+    // ========================================================================
+    // Recovery State Tests
+    // ========================================================================
+
+    #[test]
+    fn test_recovery_election_rejects_stale_candidate() {
+        // Node 1 has recovery state (committed up to index 10, term 3).
+        let config1 = make_config(1);
+        let node = RaftNode::with_recovery_state(
+            config1,
+            TermId::new(3),
+            None,
+            false,
+            LogIndex::new(10),
+            TermId::new(3),
+        );
+
+        // A stale candidate (term 2, index 5) should be rejected.
+        let req = RequestVoteRequest::new(
+            TermId::new(4),
+            NodeId::new(2),
+            NodeId::new(1),
+            LogIndex::new(5),
+            TermId::new(2),
+        );
+        assert!(
+            !node.should_grant_vote(&req),
+            "Should reject candidate with stale log"
+        );
+
+        // A candidate with matching state should be accepted.
+        let req = RequestVoteRequest::new(
+            TermId::new(4),
+            NodeId::new(2),
+            NodeId::new(1),
+            LogIndex::new(10),
+            TermId::new(3),
+        );
+        assert!(
+            node.should_grant_vote(&req),
+            "Should accept candidate with matching log"
+        );
+
+        // A candidate with higher term should be accepted.
+        let req = RequestVoteRequest::new(
+            TermId::new(4),
+            NodeId::new(2),
+            NodeId::new(1),
+            LogIndex::new(1),
+            TermId::new(4),
+        );
+        assert!(
+            node.should_grant_vote(&req),
+            "Should accept candidate with higher term"
+        );
+    }
+
+    #[test]
+    fn test_recovery_become_leader_noop_index() {
+        // Single-node cluster with recovery state.
+        let config = RaftConfig::new(NodeId::new(1), vec![NodeId::new(1)])
+            .with_tick_config(5, 1);
+        let mut node = RaftNode::with_recovery_state(
+            config,
+            TermId::new(3),
+            None,
+            false,
+            LogIndex::new(10),
+            TermId::new(3),
+        );
+
+        // Tick until election.
+        let _outputs = tick_until_election(&mut node);
+        assert!(node.is_leader());
+
+        // No-op should be placed at compacted_index + 1.
+        assert_eq!(node.log().last_index().get(), 11);
+    }
+
+    #[test]
+    fn test_recovery_append_entries_at_commit_boundary() {
+        // Follower with recovery state.
+        let config = make_config(1);
+        let mut node = RaftNode::with_recovery_state(
+            config,
+            TermId::new(3),
+            None,
+            false,
+            LogIndex::new(10),
+            TermId::new(3),
+        );
+
+        // Leader sends AppendEntries with prev_log_index = 10 (compacted).
+        let entries = vec![LogEntry::new(
+            TermId::new(4),
+            LogIndex::new(11),
+            Bytes::from("new-entry"),
+        )];
+        let req = AppendEntriesRequest::new(
+            TermId::new(4),
+            NodeId::new(2),
+            NodeId::new(1),
+            LogIndex::new(10), // prev_log_index = compacted_index
+            TermId::new(3),    // prev_log_term = compacted_term
+            entries,
+            LogIndex::new(11),
+        );
+        let outputs = node.handle_message(Message::AppendEntries(req));
+
+        // Should succeed (not reject).
+        let response = outputs.iter().find_map(|o| match o {
+            RaftOutput::SendMessage(Message::AppendEntriesResponse(r)) => Some(r),
+            _ => None,
+        });
+        assert!(response.is_some());
+        assert!(
+            response.unwrap().success,
+            "Should accept AppendEntries at compacted boundary"
+        );
+        assert_eq!(node.log().last_index().get(), 11);
+    }
+
+    #[test]
+    fn test_recovery_prevote_uses_compacted_state() {
+        // Node with recovery state starts pre-election.
+        let config = make_config(1);
+        let mut node = RaftNode::with_recovery_state(
+            config,
+            TermId::new(3),
+            None,
+            false,
+            LogIndex::new(10),
+            TermId::new(3),
+        );
+
+        // Tick until pre-election.
+        let outputs = tick_until_election(&mut node);
+        assert_eq!(node.state(), RaftState::PreCandidate);
+
+        // Verify PreVote messages include compacted state.
+        let prevote = outputs.iter().find_map(|o| match o {
+            RaftOutput::SendMessage(Message::PreVote(r)) => Some(r),
+            _ => None,
+        });
+        assert!(prevote.is_some());
+        let pv = prevote.unwrap();
+        assert_eq!(pv.last_log_index.get(), 10);
+        assert_eq!(pv.last_log_term.get(), 3);
+    }
+
+    // =========================================================================
+    // Part B: WAL-Backed AppendEntries Tests
+    // =========================================================================
+
+    /// Helper: create a recovered leader (recovery state + become leader).
+    ///
+    /// The leader has `persisted_commit_index = commit_index` and an empty
+    /// in-memory log (except the no-op appended on `become_leader`).
+    fn make_recovered_leader(commit_index: u64, commit_term: u64) -> RaftNode {
+        let config = make_config(1);
+        let mut node = RaftNode::with_recovery_state(
+            config,
+            TermId::new(commit_term),
+            None,
+            false,
+            LogIndex::new(commit_index),
+            TermId::new(commit_term),
+        );
+        make_leader(&mut node);
+        assert!(node.is_leader());
+        node
+    }
+
+    #[test]
+    fn test_need_entries_emitted_when_log_missing() {
+        // Leader recovered with commit_index=10 but empty in-memory log.
+        // When a follower needs entries starting from index 5,
+        // the leader should emit NeedEntries (entries are in WAL, not memory).
+        let mut node = make_recovered_leader(10, 3);
+        let peer = NodeId::new(2);
+
+        // Set the follower's next_index to 5 (below persisted_commit_index).
+        if let Some(state) = node.replication_state.get_mut(&peer) {
+            state.next_index = LogIndex::new(5);
+        }
+
+        let outputs = node.send_append_entries(peer);
+
+        // Should emit NeedEntries, not a regular AppendEntries.
+        let need = outputs.iter().find(|o| matches!(o, RaftOutput::NeedEntries { .. }));
+        assert!(need.is_some(), "Should emit NeedEntries for WAL-backed entries");
+
+        if let RaftOutput::NeedEntries {
+            follower_id,
+            start_index,
+            prev_log_index,
+            ..
+        } = need.unwrap()
+        {
+            assert_eq!(*follower_id, peer);
+            assert_eq!(start_index.get(), 5);
+            assert_eq!(prev_log_index.get(), 4);
+        }
+    }
+
+    #[test]
+    fn test_provide_entries_sends_append_entries() {
+        let mut node = make_recovered_leader(10, 3);
+        let peer = NodeId::new(2);
+
+        // Mark as pending (simulating that NeedEntries was emitted).
+        node.wal_read_pending.insert(peer);
+
+        // Provide entries as if read from WAL.
+        let entries = vec![
+            LogEntry::new(TermId::new(3), LogIndex::new(5), Bytes::from("cmd-5")),
+            LogEntry::new(TermId::new(3), LogIndex::new(6), Bytes::from("cmd-6")),
+        ];
+
+        let outputs = node.provide_entries(
+            peer,
+            LogIndex::new(4),
+            TermId::new(3),
+            entries,
+        );
+
+        // Should produce an AppendEntries message.
+        let ae = outputs.iter().find_map(|o| match o {
+            RaftOutput::SendMessage(Message::AppendEntries(req)) => Some(req),
+            _ => None,
+        });
+        assert!(ae.is_some(), "Should send AppendEntries after provide_entries");
+
+        let req = ae.unwrap();
+        assert_eq!(req.prev_log_index.get(), 4);
+        assert_eq!(req.prev_log_term.get(), 3);
+        assert_eq!(req.entries.len(), 2);
+        assert_eq!(req.entries[0].index.get(), 5);
+        assert_eq!(req.entries[1].index.get(), 6);
+    }
+
+    #[test]
+    fn test_wal_read_pending_suppresses_sends() {
+        let mut node = make_recovered_leader(10, 3);
+        let peer = NodeId::new(2);
+
+        // Set next_index below persisted_commit_index to trigger NeedEntries.
+        if let Some(state) = node.replication_state.get_mut(&peer) {
+            state.next_index = LogIndex::new(5);
+        }
+
+        // First call should emit NeedEntries and set pending.
+        let outputs = node.send_append_entries(peer);
+        assert!(
+            outputs.iter().any(|o| matches!(o, RaftOutput::NeedEntries { .. })),
+            "First call should emit NeedEntries"
+        );
+
+        // Second call should be suppressed (WAL read is pending).
+        let outputs = node.send_append_entries(peer);
+        assert!(
+            outputs.is_empty(),
+            "Should suppress sends while WAL read is pending"
+        );
+    }
+
+    #[test]
+    fn test_wal_read_pending_cleared_on_provide() {
+        let mut node = make_recovered_leader(10, 3);
+        let peer = NodeId::new(2);
+
+        // Mark as pending.
+        node.wal_read_pending.insert(peer);
+        assert!(node.wal_read_pending.contains(&peer));
+
+        // Provide entries clears the pending flag.
+        let _ = node.provide_entries(
+            peer,
+            LogIndex::new(4),
+            TermId::new(3),
+            vec![LogEntry::new(TermId::new(3), LogIndex::new(5), Bytes::from("cmd"))],
+        );
+
+        assert!(
+            !node.wal_read_pending.contains(&peer),
+            "provide_entries should clear wal_read_pending"
+        );
+    }
+
+    #[test]
+    fn test_wal_read_pending_cleared_on_step_down() {
+        let mut node = make_recovered_leader(10, 3);
+        let peer = NodeId::new(2);
+
+        // Mark as pending.
+        node.wal_read_pending.insert(peer);
+        assert!(node.wal_read_pending.contains(&peer));
+
+        // Step down clears pending.
+        node.step_down(TermId::new(5));
+
+        assert!(
+            node.wal_read_pending.is_empty(),
+            "step_down should clear wal_read_pending"
+        );
+    }
+
+    #[test]
+    fn test_follower_accepts_prev_at_persisted_commit() {
+        // Follower recovered with commit_index=10 (in-memory log is empty).
+        // Leader sends AppendEntries with prev_log_index=10. The follower
+        // should accept because index 10 is within persisted_commit_index.
+        let config = make_config(2);
+        let mut node = RaftNode::with_recovery_state(
+            config,
+            TermId::new(3),
+            None,
+            false,
+            LogIndex::new(10),
+            TermId::new(3),
+        );
+
+        let req = AppendEntriesRequest::new(
+            TermId::new(4),
+            NodeId::new(1), // leader
+            NodeId::new(2), // us
+            LogIndex::new(10),
+            TermId::new(3),
+            vec![LogEntry::new(TermId::new(4), LogIndex::new(11), Bytes::from("data"))],
+            LogIndex::new(10),
+        );
+
+        let outputs = node.handle_message(Message::AppendEntries(req));
+
+        let resp = outputs.iter().find_map(|o| match o {
+            RaftOutput::SendMessage(Message::AppendEntriesResponse(r)) => Some(r),
+            _ => None,
+        });
+        assert!(resp.is_some());
+        assert!(
+            resp.unwrap().success,
+            "Should accept when prev_log_index <= persisted_commit_index"
+        );
+    }
+
+    #[test]
+    fn test_follower_rejects_prev_above_persisted_commit() {
+        // Follower recovered with commit_index=10 (in-memory log is empty).
+        // Leader sends AppendEntries with prev_log_index=15. The follower
+        // should REJECT because index 15 is above persisted_commit_index
+        // and also not in the in-memory log.
+        let config = make_config(2);
+        let mut node = RaftNode::with_recovery_state(
+            config,
+            TermId::new(3),
+            None,
+            false,
+            LogIndex::new(10),
+            TermId::new(3),
+        );
+
+        let req = AppendEntriesRequest::new(
+            TermId::new(4),
+            NodeId::new(1),
+            NodeId::new(2),
+            LogIndex::new(15), // Above persisted commit and not in memory.
+            TermId::new(3),
+            vec![],
+            LogIndex::new(10),
+        );
+
+        let outputs = node.handle_message(Message::AppendEntries(req));
+
+        let resp = outputs.iter().find_map(|o| match o {
+            RaftOutput::SendMessage(Message::AppendEntriesResponse(r)) => Some(r),
+            _ => None,
+        });
+        assert!(resp.is_some());
+        assert!(
+            !resp.unwrap().success,
+            "Should reject when prev_log_index > persisted_commit_index and not in log"
+        );
+    }
+
+    #[test]
+    fn test_leader_fast_forward_on_rejection() {
+        // Leader receives rejection with persisted_commit_index=8, match_index=0.
+        // Fast-forward should set next_index = max(8+1, 0+1) = 9.
+        let mut node = make_recovered_leader(10, 3);
+        let peer = NodeId::new(2);
+
+        let resp = AppendEntriesResponse::new(
+            node.current_term(),
+            peer,
+            node.node_id(),
+            false,
+            LogIndex::new(0),  // match_index
+            LogIndex::new(8),  // persisted_commit_index
+        );
+
+        node.handle_message(Message::AppendEntriesResponse(resp));
+
+        let state = node.replication_state.get(&peer).unwrap();
+        // next_index should be max(8+1, 0+1) = 9.
+        assert_eq!(
+            state.next_index.get(),
+            9,
+            "Should fast-forward to persisted_commit_index + 1"
         );
     }
 }

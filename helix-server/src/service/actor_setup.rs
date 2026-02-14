@@ -168,6 +168,7 @@ pub async fn setup_single_partition<
         Some(Arc::clone(&batcher_stats)),
         Some(Arc::clone(&backpressure)),
         vote_store,
+        Some(Arc::clone(&router)),
     ));
 
     info!(
@@ -298,6 +299,7 @@ pub async fn setup_multi_partition<
         Some(Arc::clone(&batcher_stats)),
         Some(Arc::clone(&backpressure)),
         vote_store.clone(),
+        Some(Arc::clone(&router)),
     ));
 
     // Create shutdown channel for tick task.
@@ -380,9 +382,11 @@ pub fn create_partition_actor(
     spawn_partition_actor_shared(group_id, raft_node, config, output_tx)
 }
 
-/// Creates a partition actor with restored vote state.
+/// Creates a partition actor with restored vote state and recovery metadata.
 ///
-/// Used when creating partitions after recovering from a restart with persisted vote state.
+/// Used when creating partitions after recovering from a restart with persisted
+/// vote state. The `commit_index` and `commit_term` from the data WAL are used
+/// to initialize the Raft log's compacted state so that election safety holds.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn create_partition_actor_with_state(
@@ -392,11 +396,20 @@ pub fn create_partition_actor_with_state(
     term: helix_core::TermId,
     voted_for: Option<NodeId>,
     observation_mode: bool,
+    commit_index: helix_core::LogIndex,
+    commit_term: helix_core::TermId,
     output_tx: mpsc::Sender<GroupedOutput>,
     config: PartitionActorConfig,
 ) -> PartitionActorHandle {
     let raft_config = RaftConfig::new(node_id, replicas);
-    let raft_node = RaftNode::with_vote_state(raft_config, term, voted_for, observation_mode);
+    let raft_node = RaftNode::with_recovery_state(
+        raft_config,
+        term,
+        voted_for,
+        observation_mode,
+        commit_index,
+        commit_term,
+    );
 
     spawn_partition_actor_shared(group_id, raft_node, config, output_tx)
 }

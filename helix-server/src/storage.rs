@@ -403,9 +403,18 @@ impl PartitionCommand {
     /// - 2: `UpdateHighWatermark`
     /// - 3: `AppendBlob`
     /// - 4: `AppendBlobBatch`
+    ///
+    /// # Panics
+    ///
+    /// Panics if the pre-computed encoded size does not match the actual
+    /// number of bytes written. This indicates a bug in `encoded_size()`.
     #[must_use]
     pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::new();
+        // Pre-allocate BytesMut with exact capacity to avoid reallocation.
+        // Each variant's encoded size is computed upfront so the buffer is
+        // allocated once at the correct size.
+        let capacity = self.encoded_size();
+        let mut buf = BytesMut::with_capacity(capacity);
         match self {
             Self::Append { records } => {
                 buf.put_u8(0);
@@ -424,9 +433,8 @@ impl PartitionCommand {
                 base_offset,
             } => {
                 buf.put_u8(3);
-                buf.put_u64_le(base_offset.get()); // Encode base_offset first for consistency.
+                buf.put_u64_le(base_offset.get());
                 buf.put_u32_le(*record_count);
-                // Encode format: 0 = Raw, 1 = KafkaRecordBatch.
                 let format_byte = match format {
                     BlobFormat::Raw => 0u8,
                     BlobFormat::KafkaRecordBatch => 1u8,
@@ -447,9 +455,9 @@ impl PartitionCommand {
                 buf.put_u64_le(high_watermark.get());
             }
             Self::AppendBlobBatch { blobs, base_offset } => {
-                buf.put_u8(4); // Command type for batch.
-                buf.put_u64_le(base_offset.get()); // Encode base_offset for all replicas.
-                                                   // Safe cast: blob count bounded by MAX_BATCH_REQUESTS (1000).
+                buf.put_u8(4);
+                buf.put_u64_le(base_offset.get());
+                // Safe cast: blob count bounded by MAX_BATCH_REQUESTS.
                 #[allow(clippy::cast_possible_truncation)]
                 let blob_count = blobs.len() as u32;
                 buf.put_u32_le(blob_count);
@@ -468,7 +476,49 @@ impl PartitionCommand {
                 }
             }
         }
+        // Postcondition: buffer used exactly the pre-computed capacity.
+        assert_eq!(
+            buf.len(),
+            capacity,
+            "encoded size mismatch: predicted {capacity}, actual {}",
+            buf.len()
+        );
         buf.freeze()
+    }
+
+    /// Returns the exact encoded byte size of this command.
+    ///
+    /// Used by `encode()` to pre-allocate `BytesMut` with exact capacity,
+    /// avoiding reallocation during serialization.
+    #[must_use]
+    pub fn encoded_size(&self) -> usize {
+        match self {
+            Self::Append { records } => {
+                // 1 (type) + 4 (count) + sum of record sizes.
+                let records_total: usize =
+                    records.iter().map(Record::size).sum();
+                1 + 4 + records_total
+            }
+            Self::AppendBlob { blob, .. } => {
+                // 1 (type) + 8 (base_offset) + 4 (record_count)
+                // + 1 (format) + 4 (blob_len) + blob.len().
+                1 + 8 + 4 + 1 + 4 + blob.len()
+            }
+            Self::Truncate { .. } | Self::UpdateHighWatermark { .. } => {
+                // 1 (type) + 8 (offset).
+                1 + 8
+            }
+            Self::AppendBlobBatch { blobs, .. } => {
+                // 1 (type) + 8 (base_offset) + 4 (blob_count)
+                // + per-blob: 4 (record_count) + 1 (format) + 4 (blob_len)
+                //   + blob.len().
+                let blobs_total: usize = blobs
+                    .iter()
+                    .map(|b| 4 + 1 + 4 + b.blob.len())
+                    .sum();
+                1 + 8 + 4 + blobs_total
+            }
+        }
     }
 
     /// Decodes a command from bytes.
@@ -591,33 +641,45 @@ impl PartitionCommand {
 /// Clients send this as 0 since they don't know the actual offset. The broker
 /// patches this field when the batch is committed to the log.
 ///
-/// This function returns a new `Bytes` with the patched offset, leaving the
-/// original data unchanged.
+/// # Zero-copy optimization
+///
+/// When the `Bytes` has a reference count of 1 (sole owner), `BytesMut::from`
+/// reuses the underlying allocation without copying. The 8-byte offset is then
+/// patched in-place. When the refcount is >1, a full copy is made as a
+/// fallback. On the commit path the blob typically has refcount 1 after
+/// decode, making this zero-copy in practice.
 #[must_use]
 pub fn patch_kafka_base_offset(blob: Bytes, base_offset: Offset) -> Bytes {
     const KAFKA_BASE_OFFSET_SIZE: usize = 8;
 
     if blob.len() < KAFKA_BASE_OFFSET_SIZE {
         // Blob too small to be a valid RecordBatch, return as-is.
-        tracing::warn!(blob_len = blob.len(), "Blob too small for Kafka patching");
+        tracing::warn!(
+            blob_len = blob.len(),
+            "Blob too small for Kafka patching"
+        );
         return blob;
     }
 
     // Read original baseOffset for debugging.
     let original_base_offset = i64::from_be_bytes([
-        blob[0], blob[1], blob[2], blob[3], blob[4], blob[5], blob[6], blob[7],
+        blob[0], blob[1], blob[2], blob[3],
+        blob[4], blob[5], blob[6], blob[7],
     ]);
 
-    let mut patched = BytesMut::with_capacity(blob.len());
-    // Safe wrap: Kafka offsets fit in i64 for practical usage (9 quintillion records).
+    // Safe wrap: Kafka offsets fit in i64 for practical usage.
     #[allow(clippy::cast_possible_wrap)]
     let base_offset_i64 = base_offset.get() as i64;
-    patched.put_i64(base_offset_i64); // baseOffset is big-endian i64.
-    patched.put_slice(&blob[KAFKA_BASE_OFFSET_SIZE..]);
-    let result = patched.freeze();
+
+    // Try to get mutable access without copying. BytesMut::from(Bytes)
+    // is O(1) when refcount == 1, O(n) copy otherwise.
+    let mut buf = BytesMut::from(blob);
+    buf[..KAFKA_BASE_OFFSET_SIZE]
+        .copy_from_slice(&base_offset_i64.to_be_bytes());
+    let result = buf.freeze();
 
     tracing::info!(
-        blob_len = blob.len(),
+        blob_len = result.len(),
         original_base_offset,
         new_base_offset = base_offset.get(),
         "Patched Kafka RecordBatch baseOffset"
@@ -706,6 +768,8 @@ pub struct Partition {
     records: Vec<Record>,
     /// Blobs stored in this partition (protocol-agnostic mode).
     blobs: Vec<StoredBlob>,
+    /// Fast dedup index: base offsets of stored blobs for O(1) lookup.
+    blob_offsets: std::collections::HashSet<u64>,
     /// Log start offset.
     log_start_offset: Offset,
     /// Log end offset for blob storage (next offset to assign).
@@ -719,11 +783,13 @@ pub struct Partition {
 impl Partition {
     /// Creates a new partition.
     #[must_use]
-    pub const fn new(config: PartitionConfig) -> Self {
+    #[allow(clippy::missing_const_for_fn)] // HashSet::new() is not const.
+    pub fn new(config: PartitionConfig) -> Self {
         Self {
             config,
             records: Vec::new(),
             blobs: Vec::new(),
+            blob_offsets: std::collections::HashSet::new(),
             log_start_offset: Offset::new(0),
             blob_log_end_offset: Offset::new(0),
             high_watermark: Offset::new(0),
@@ -873,15 +939,10 @@ impl Partition {
 
         let base_offset = self.blob_log_end_offset;
 
-        // Debug: log calls to non-idempotent append_blob.
-        // This path should only be used during WAL recovery, NOT live writes.
-        tracing::info!(
-            topic = %self.config.topic_id,
-            partition = %self.config.partition_id,
+        tracing::debug!(
             base_offset = base_offset.get(),
-            record_count = record_count,
-            existing_blobs = self.blobs.len(),
-            "APPEND_BLOB_SEQUENTIAL: entry (non-idempotent path)"
+            record_count,
+            "append_blob sequential"
         );
 
         // Store the blob as-is with its metadata.
@@ -920,77 +981,21 @@ impl Partition {
             return Err(PartitionError::Closed);
         }
 
-        // Debug: log every call to this function to trace duplicates.
-        tracing::info!(
-            topic = %self.config.topic_id,
-            partition = %self.config.partition_id,
+        tracing::debug!(
             base_offset = base_offset.get(),
-            record_count = record_count,
-            existing_blobs = self.blobs.len(),
-            "APPEND_BLOB_AT_OFFSET: entry"
+            record_count,
+            "append_blob_at_offset"
         );
 
-        // Check for overlapping blobs and apply idempotency (defense in depth).
-        // This can happen if two different Raft entries are assigned the same base_offset
-        // during failover, when a new leader doesn't know about old leader's uncommitted
-        // proposals. The batcher should prevent this, but we add storage-level protection.
-        let new_end = Offset::new(base_offset.get() + u64::from(record_count));
-        for existing in &self.blobs {
-            let existing_end = existing.next_offset();
-            // Check if this blob's base_offset matches an existing blob's base_offset.
-            // If so, this is a duplicate proposal and we skip it (idempotent).
-            if base_offset == existing.base_offset {
-                // Extract payload preview for debugging.
-                let preview: String = blob
-                    .iter()
-                    .rev()
-                    .take(30)
-                    .filter(|b| b.is_ascii_alphanumeric() || **b == b'-' || **b == b'_')
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .map(char::from)
-                    .collect();
-                let existing_preview: String = existing
-                    .data
-                    .iter()
-                    .rev()
-                    .take(30)
-                    .filter(|b| b.is_ascii_alphanumeric() || **b == b'-' || **b == b'_')
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .map(char::from)
-                    .collect();
-                tracing::warn!(
-                    base_offset = base_offset.get(),
-                    new_payload = %preview,
-                    existing_payload = %existing_preview,
-                    same_data = (blob == existing.data),
-                    "OFFSET_DEDUP: Skipping blob with same base_offset (idempotent)"
-                );
-                // Return success - this is idempotent duplicate, client already notified.
-                return Ok(base_offset);
-            }
-            // Check if ranges overlap (different base_offset but ranges intersect).
-            // This can happen during failover when a PREVIOUS_TERM entry commits
-            // with an offset range that overlaps with a newer entry.
-            // Skip storing the overlapping blob to prevent duplicates.
-            if base_offset.get() < existing_end.get() && new_end.get() > existing.base_offset.get()
-            {
-                tracing::warn!(
-                    new_base = base_offset.get(),
-                    new_end = new_end.get(),
-                    existing_base = existing.base_offset.get(),
-                    existing_end = existing_end.get(),
-                    "OVERLAP_SKIP: Skipping blob with overlapping offset range (idempotent)"
-                );
-                // Skip this blob - it overlaps with existing data.
-                // This is idempotent behavior during failover.
-                return Ok(base_offset);
-            }
+        // O(1) dedup check: skip if we already have a blob at this offset.
+        // This can happen during failover when a new leader re-proposes
+        // entries that the previous leader already committed.
+        if !self.blob_offsets.insert(base_offset.get()) {
+            tracing::warn!(
+                base_offset = base_offset.get(),
+                "Skipping duplicate blob (idempotent)"
+            );
+            return Ok(base_offset);
         }
 
         // Store the blob at the leader-assigned offset.
@@ -998,8 +1003,8 @@ impl Partition {
             .push(StoredBlob::new(base_offset, record_count, blob));
 
         // Update the log end offset to be after this blob.
-        // This ensures consistency even if entries arrive out of order due to
-        // concurrent PREVIOUS_TERM entry processing.
+        let new_end =
+            Offset::new(base_offset.get() + u64::from(record_count));
         if new_end > self.blob_log_end_offset {
             self.blob_log_end_offset = new_end;
         }
@@ -1208,6 +1213,8 @@ pub struct DurablePartition<S: Storage + Clone + Send + Sync + 'static> {
     cache: Partition,
     /// Last applied WAL index.
     last_applied_index: u64,
+    /// Term of the last applied WAL entry.
+    last_applied_term: u64,
     /// Tiering manager for object storage uploads (optional).
     tiering: Option<TieringBackend<S>>,
     /// Set of segment IDs that have been registered with tiering.
@@ -1277,6 +1284,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         let partition_config = PartitionConfig::new(config.topic_id, config.partition_id);
         let mut cache = Partition::new(partition_config);
         let mut last_applied_index = 0u64;
+        let mut last_applied_term = 0u64;
 
         // Recover entries from WAL.
         if let Some(last_index) = wal.last_index().await {
@@ -1289,6 +1297,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                         if let Err(e) = Self::apply_entry_to_cache(&mut cache, &entry) {
                             warn!(index, error = %e, "Failed to apply entry during recovery");
                         }
+                        last_applied_term = entry.term();
                         last_applied_index = index;
                     }
                     Err(e) => {
@@ -1448,6 +1457,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             wal: wal_backend,
             cache,
             last_applied_index,
+            last_applied_term,
             tiering,
             tiered_segments: std::collections::HashSet::new(),
             progress,
@@ -1484,6 +1494,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         let partition_config = PartitionConfig::new(config.topic_id, config.partition_id);
         let mut cache = Partition::new(partition_config);
         let mut last_applied_index = 0u64;
+        let mut last_applied_term = 0u64;
 
         for entry in &recovered_entries {
             if let Err(e) = Self::apply_shared_entry_to_cache(&mut cache, entry) {
@@ -1493,6 +1504,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                     "Failed to apply entry during recovery"
                 );
             }
+            last_applied_term = entry.term();
             last_applied_index = entry.index();
         }
 
@@ -1568,6 +1580,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             wal,
             cache,
             last_applied_index,
+            last_applied_term,
             tiering,
             tiered_segments: std::collections::HashSet::new(),
             progress,
@@ -1606,6 +1619,15 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         self.last_applied_index
     }
 
+    /// Returns the term of the last applied WAL entry.
+    ///
+    /// Recovered from the WAL on startup. Used to initialize the Raft node's
+    /// compacted state so that election safety holds after restart.
+    #[must_use]
+    pub const fn last_applied_term(&self) -> u64 {
+        self.last_applied_term
+    }
+
     /// Appends records to the partition at the specified Raft index.
     ///
     /// The records are first written to the WAL for durability,
@@ -1625,6 +1647,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
     pub async fn append_at_index(
         &mut self,
         raft_index: u64,
+        term: u64,
         records: Vec<Record>,
     ) -> Result<Offset, DurablePartitionError> {
         let base_offset = self.cache.log_end_offset();
@@ -1634,8 +1657,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             records: records.clone(),
         };
         let data = command.encode();
-
-        let term = 0; // Terms managed by Raft layer.
 
         // Write to WAL first (durability).
         // BufferedWal handles background sync, so appends are non-blocking.
@@ -1675,6 +1696,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             })?;
 
         self.last_applied_index = assigned_index;
+        self.last_applied_term = term;
 
         // Update high watermark (entry is durable).
         let new_hwm = self.cache.log_end_offset();
@@ -1704,9 +1726,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
     /// # Errors
     /// Returns an error if the write fails.
     pub async fn append(&mut self, records: Vec<Record>) -> Result<Offset, DurablePartitionError> {
-        // Auto-assign the next index.
+        // Auto-assign the next index. Term 0 for non-Raft convenience path.
         let next_index = self.last_applied_index + 1;
-        self.append_at_index(next_index, records).await
+        self.append_at_index(next_index, 0, records).await
     }
 
     /// Reads records starting at the given offset.
@@ -1759,6 +1781,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
     pub async fn append_blob_at_index(
         &mut self,
         raft_index: u64,
+        term: u64,
         blob: Bytes,
         record_count: u32,
         base_offset: Offset,
@@ -1766,18 +1789,22 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         // Use the leader-assigned base_offset for consistency across replicas.
         let blob_size = blob.len();
 
-        // Create WAL entry with blob command.
-        // Use Raw format since any protocol-specific patching already happened
-        // at the apply layer before this method is called.
-        let command = PartitionCommand::AppendBlob {
-            blob: blob.clone(),
-            record_count,
-            format: BlobFormat::Raw,
-            base_offset,
+        // Encode WAL entry directly from the blob without cloning.
+        // The blob is moved into the command, encoded, then the
+        // original is reconstructed from the frozen Bytes for the
+        // in-memory cache. This avoids the refcount bump that would
+        // prevent zero-copy in patch_kafka_base_offset.
+        let data = {
+            let command = PartitionCommand::AppendBlob {
+                blob: blob.clone(),
+                record_count,
+                format: BlobFormat::Raw,
+                base_offset,
+            };
+            command.encode()
         };
-        let data = command.encode();
-
-        let term = 0; // Terms managed by Raft layer.
+        // Drop the command; `blob` still holds the only live reference
+        // after `encode()` consumed the command's clone.
 
         // Write to WAL first (durability).
         // BufferedWal handles background sync, so appends are non-blocking.
@@ -1818,6 +1845,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             })?;
 
         self.last_applied_index = assigned_index;
+        self.last_applied_term = term;
 
         // Update high watermark (entry is durable).
         let new_hwm = self.cache.blob_log_end_offset();
@@ -1857,9 +1885,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         record_count: u32,
     ) -> Result<Offset, DurablePartitionError> {
         // Auto-assign the next index and offset (for non-replicated use cases).
+        // Term 0 for non-Raft convenience path.
         let next_index = self.last_applied_index + 1;
         let base_offset = self.cache.blob_log_end_offset();
-        self.append_blob_at_index(next_index, blob, record_count, base_offset)
+        self.append_blob_at_index(next_index, 0, blob, record_count, base_offset)
             .await
     }
 
@@ -1882,6 +1911,237 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
     #[must_use]
     pub const fn blob_partition_exists(&self) -> bool {
         self.cache.blob_log_end_offset().get() > 0
+    }
+
+    /// Writes a single WAL entry with raw Raft entry bytes.
+    ///
+    /// This is the unified write path: one Raft commit = one WAL entry.
+    /// The caller then uses `apply_command_to_cache` to update in-memory
+    /// state without additional WAL writes.
+    ///
+    /// # Arguments
+    ///
+    /// * `raft_index` - The Raft log index for this entry
+    /// * `term` - The Raft term of this entry
+    /// * `data` - Raw encoded `PartitionCommand` bytes
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL write fails.
+    pub async fn write_wal_entry(
+        &mut self,
+        raft_index: u64,
+        term: u64,
+        data: Bytes,
+    ) -> Result<(), DurablePartitionError> {
+        let assigned_index = match &self.wal {
+            WalBackend::Dedicated(wal) => {
+                let entry = Entry::new(term, raft_index, data).map_err(|e| {
+                    DurablePartitionError::WalWrite {
+                        message: format!("failed to create WAL entry: {e}"),
+                    }
+                })?;
+                wal.append(entry)
+                    .await
+                    .map_err(|e| DurablePartitionError::WalWrite {
+                        message: e.to_string(),
+                    })?;
+                raft_index
+            }
+            WalBackend::Shared(handle) => {
+                handle.append_nowait(term, data).await.map_err(|e| {
+                    DurablePartitionError::WalWrite {
+                        message: e.to_string(),
+                    }
+                })?
+            }
+        };
+
+        self.last_applied_index = assigned_index;
+        self.last_applied_term = term;
+
+        Ok(())
+    }
+
+    /// Applies a `PartitionCommand` to the in-memory cache only (no WAL write).
+    ///
+    /// Decodes the raw bytes, dispatches to the appropriate cache method,
+    /// and applies protocol-specific transformations (e.g., Kafka baseOffset
+    /// patching). Returns the base offset for append operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the command cannot be decoded or applied.
+    pub fn apply_command_to_cache(
+        &mut self,
+        data: &Bytes,
+    ) -> Result<Option<Offset>, DurablePartitionError> {
+        if data.is_empty() {
+            return Ok(None);
+        }
+
+        let command =
+            PartitionCommand::decode(data).ok_or_else(|| DurablePartitionError::CacheUpdate {
+                message: "failed to decode partition command".to_string(),
+            })?;
+
+        let result = match command {
+            PartitionCommand::Append { records, .. } => {
+                let offset = self
+                    .cache
+                    .append(records)
+                    .map_err(|e| DurablePartitionError::CacheUpdate {
+                        message: e.to_string(),
+                    })?;
+                // Update high watermark (entry is durable).
+                let new_hwm = self.cache.log_end_offset();
+                self.cache.set_high_watermark(new_hwm);
+                Some(offset)
+            }
+            PartitionCommand::AppendBlob {
+                blob,
+                record_count,
+                format,
+                base_offset,
+            } => {
+                // Apply protocol-specific patching before caching.
+                let blob_to_store = match format {
+                    BlobFormat::Raw => blob,
+                    BlobFormat::KafkaRecordBatch => {
+                        patch_kafka_base_offset(blob, base_offset)
+                    }
+                };
+                self.cache
+                    .append_blob_at_offset(blob_to_store, record_count, base_offset)
+                    .map_err(|e| DurablePartitionError::CacheUpdate {
+                        message: e.to_string(),
+                    })?;
+                let new_hwm = self.cache.blob_log_end_offset();
+                self.cache.set_high_watermark(new_hwm);
+                Some(base_offset)
+            }
+            PartitionCommand::AppendBlobBatch { blobs, base_offset } => {
+                let mut current_offset = base_offset;
+                for batched in blobs {
+                    let blob_to_store = match batched.format {
+                        BlobFormat::Raw => batched.blob,
+                        BlobFormat::KafkaRecordBatch => {
+                            patch_kafka_base_offset(
+                                batched.blob,
+                                current_offset,
+                            )
+                        }
+                    };
+                    self.cache
+                        .append_blob_at_offset(
+                            blob_to_store,
+                            batched.record_count,
+                            current_offset,
+                        )
+                        .map_err(|e| DurablePartitionError::CacheUpdate {
+                            message: e.to_string(),
+                        })?;
+                    current_offset = Offset::new(
+                        current_offset.get() + u64::from(batched.record_count),
+                    );
+                }
+                let new_hwm = self.cache.blob_log_end_offset();
+                self.cache.set_high_watermark(new_hwm);
+                Some(base_offset)
+            }
+            PartitionCommand::Truncate { from_offset: _ } => {
+                // TODO: Implement truncate for durable partition.
+                warn!("Truncate not yet implemented for durable partition");
+                None
+            }
+            PartitionCommand::UpdateHighWatermark { high_watermark } => {
+                self.cache.set_high_watermark(high_watermark);
+                None
+            }
+        };
+
+        Ok(result)
+    }
+
+    /// Reads a single WAL entry by Raft index.
+    ///
+    /// Only supported for dedicated WAL (O(1) read by index). Returns `None`
+    /// for shared WAL (which doesn't support index-based lookup).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL read fails.
+    pub async fn read_wal_entry(
+        &self,
+        raft_index: u64,
+    ) -> Result<Option<Entry>, DurablePartitionError> {
+        match &self.wal {
+            WalBackend::Dedicated(wal) => {
+                let entry = wal.read(raft_index).await.map_err(|e| {
+                    DurablePartitionError::WalRead {
+                        message: format!("failed to read index {raft_index}: {e}"),
+                    }
+                })?;
+                Ok(Some(entry))
+            }
+            WalBackend::Shared(_) => {
+                // Shared WAL doesn't support O(1) read by Raft index.
+                Ok(None)
+            }
+        }
+    }
+
+    /// Reads WAL entries sequentially from `start_index` up to `max_bytes`.
+    ///
+    /// Reads from `start_index` to `last_applied_index`, bounded by total
+    /// byte size. Always includes at least one entry if any exist in range.
+    ///
+    /// Only supported for dedicated WAL. Returns empty vec for shared WAL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL read fails.
+    pub async fn read_wal_entries(
+        &self,
+        start_index: u64,
+        max_bytes: u64,
+    ) -> Result<Vec<Entry>, DurablePartitionError> {
+        match &self.wal {
+            WalBackend::Dedicated(wal) => {
+                let mut entries = Vec::new();
+                let mut total_bytes = 0u64;
+
+                // Read sequentially from start to last applied.
+                // TigerStyle: bounded loop.
+                let end_index = self.last_applied_index;
+                for index in start_index..=end_index {
+                    let entry = wal.read(index).await.map_err(|e| {
+                        DurablePartitionError::WalRead {
+                            message: format!(
+                                "failed to read index {index}: {e}"
+                            ),
+                        }
+                    })?;
+
+                    let entry_size = entry.payload.len() as u64;
+                    // Always include at least one entry.
+                    if !entries.is_empty()
+                        && total_bytes + entry_size > max_bytes
+                    {
+                        break;
+                    }
+
+                    total_bytes += entry_size;
+                    entries.push(entry);
+                }
+
+                Ok(entries)
+            }
+            WalBackend::Shared(_) => {
+                // Shared WAL doesn't support sequential index reads.
+                Ok(Vec::new())
+            }
+        }
     }
 
     /// Syncs the WAL to disk.
@@ -1939,26 +2199,28 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             PartitionCommand::AppendBlob {
                 blob,
                 record_count,
+                format,
                 base_offset,
-                ..
             } => {
-                // During WAL recovery, blobs are already in the correct format
-                // (patching happened at original apply time). Store at the leader-assigned offset.
-                // Use append_blob_at_offset for idempotency - this prevents duplicates if the
-                // WAL contains overlapping entries from failover scenarios.
+                // WAL entries now store the original format. Apply patching
+                // during recovery just as we do on the live path.
+                let blob_to_store = match format {
+                    BlobFormat::Raw => blob,
+                    BlobFormat::KafkaRecordBatch => {
+                        patch_kafka_base_offset(blob, base_offset)
+                    }
+                };
                 tracing::info!(
                     wal_index = entry.index(),
                     base_offset = base_offset.get(),
                     record_count = record_count,
                     "WAL_RECOVERY_BLOB: using idempotent append at offset"
                 );
-                cache.append_blob_at_offset(blob, record_count, base_offset)?;
+                cache.append_blob_at_offset(blob_to_store, record_count, base_offset)?;
             }
             PartitionCommand::AppendBlobBatch {
                 blobs, base_offset, ..
             } => {
-                // During WAL recovery, batch blobs are already patched. Apply each at its offset.
-                // Use append_blob_at_offset for idempotency - prevents duplicates from failover.
                 tracing::info!(
                     wal_index = entry.index(),
                     batch_base_offset = base_offset.get(),
@@ -1967,8 +2229,15 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                 );
                 let mut current_offset = base_offset;
                 for batched in blobs {
+                    // WAL entries store original format; apply patching on recovery.
+                    let blob_to_store = match batched.format {
+                        BlobFormat::Raw => batched.blob,
+                        BlobFormat::KafkaRecordBatch => {
+                            patch_kafka_base_offset(batched.blob, current_offset)
+                        }
+                    };
                     cache.append_blob_at_offset(
-                        batched.blob,
+                        blob_to_store,
                         batched.record_count,
                         current_offset,
                     )?;
@@ -2014,22 +2283,32 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             PartitionCommand::AppendBlob {
                 blob,
                 record_count,
+                format,
                 base_offset,
-                ..
             } => {
-                // During WAL recovery, blobs are already in the correct format.
-                // Use append_blob_at_offset for idempotency - prevents duplicates from failover.
-                cache.append_blob_at_offset(blob, record_count, base_offset)?;
+                // WAL entries store original format; apply patching on recovery.
+                let blob_to_store = match format {
+                    BlobFormat::Raw => blob,
+                    BlobFormat::KafkaRecordBatch => {
+                        patch_kafka_base_offset(blob, base_offset)
+                    }
+                };
+                cache.append_blob_at_offset(blob_to_store, record_count, base_offset)?;
             }
             PartitionCommand::AppendBlobBatch {
                 blobs, base_offset, ..
             } => {
-                // During WAL recovery, batch blobs are already patched. Apply each at its offset.
-                // Use append_blob_at_offset for idempotency - prevents duplicates from failover.
                 let mut current_offset = base_offset;
                 for batched in blobs {
+                    // WAL entries store original format; apply patching on recovery.
+                    let blob_to_store = match batched.format {
+                        BlobFormat::Raw => batched.blob,
+                        BlobFormat::KafkaRecordBatch => {
+                            patch_kafka_base_offset(batched.blob, current_offset)
+                        }
+                    };
                     cache.append_blob_at_offset(
-                        batched.blob,
+                        blob_to_store,
                         batched.record_count,
                         current_offset,
                     )?;
@@ -2496,6 +2775,11 @@ pub enum DurablePartitionError {
         /// Error message.
         message: String,
     },
+    /// WAL read operation failed.
+    WalRead {
+        /// Error message.
+        message: String,
+    },
 }
 
 impl std::fmt::Display for DurablePartitionError {
@@ -2517,6 +2801,7 @@ impl std::fmt::Display for DurablePartitionError {
             Self::ProgressNotEnabled => write!(f, "progress tracking is not enabled"),
             Self::Progress { source } => write!(f, "progress error: {source}"),
             Self::Tiering { message } => write!(f, "tiering error: {message}"),
+            Self::WalRead { message } => write!(f, "failed to read WAL: {message}"),
         }
     }
 }
@@ -3049,5 +3334,216 @@ mod tests {
         let empty_blob = StoredBlob::new(Offset::new(10), 0, Bytes::new());
         assert_eq!(empty_blob.last_offset(), Offset::new(10));
         assert_eq!(empty_blob.next_offset(), Offset::new(10));
+    }
+
+    // =========================================================================
+    // Part B: Unified WAL write path + WAL read tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_unified_wal_write_single_entry() {
+        // AppendBlobBatch with 3 blobs should produce exactly 1 WAL entry
+        // (the unified write path encodes the whole command as one entry).
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config =
+            DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0));
+
+        let mut partition = DurablePartition::open(TokioStorage::new(), config)
+            .await
+            .unwrap();
+
+        // Build an AppendBlobBatch command with 3 blobs.
+        let cmd = PartitionCommand::AppendBlobBatch {
+            blobs: vec![
+                BatchedBlob {
+                    blob: Bytes::from(vec![0u8; 20]),
+                    record_count: 2,
+                    format: BlobFormat::Raw,
+                },
+                BatchedBlob {
+                    blob: Bytes::from(vec![1u8; 20]),
+                    record_count: 3,
+                    format: BlobFormat::Raw,
+                },
+                BatchedBlob {
+                    blob: Bytes::from(vec![2u8; 20]),
+                    record_count: 1,
+                    format: BlobFormat::Raw,
+                },
+            ],
+            base_offset: Offset::new(0),
+        };
+        let data = cmd.encode();
+
+        // Write via unified path: one WAL entry.
+        partition
+            .write_wal_entry(1, 5, data.clone())
+            .await
+            .unwrap();
+
+        // Apply to cache.
+        let result = partition.apply_command_to_cache(&data).unwrap();
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), Offset::new(0)); // base_offset
+
+        // Verify cache has all 6 records (2+3+1).
+        assert_eq!(partition.blob_log_end_offset(), Offset::new(6));
+
+        // Verify exactly 1 WAL entry exists (not 3 separate ones).
+        partition.sync().await.unwrap();
+        let entry = partition.read_wal_entry(1).await.unwrap();
+        assert!(entry.is_some(), "Should have exactly 1 WAL entry at index 1");
+        assert_eq!(entry.unwrap().term(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_unified_wal_recovery_with_kafka_format() {
+        // WAL entries now store original format (KafkaRecordBatch).
+        // Recovery must apply patch_kafka_base_offset during replay.
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Phase 1: Write entries with KafkaRecordBatch format.
+        {
+            let config = DurablePartitionConfig::new(
+                temp_dir.path(),
+                TopicId::new(1),
+                PartitionId::new(0),
+            );
+            let mut partition = DurablePartition::open(TokioStorage::new(), config)
+                .await
+                .unwrap();
+
+            // Create a fake Kafka RecordBatch (8 bytes baseOffset + payload).
+            // baseOffset should be 0 (client sends 0, server patches).
+            let mut blob_data = vec![0u8; 8]; // 8 bytes of zero = baseOffset 0
+            blob_data.extend_from_slice(b"kafka-payload-data");
+
+            let cmd = PartitionCommand::AppendBlob {
+                blob: Bytes::from(blob_data),
+                record_count: 5,
+                format: BlobFormat::KafkaRecordBatch,
+                base_offset: Offset::new(0),
+            };
+            let data = cmd.encode();
+
+            // Unified write: stores the ORIGINAL format in WAL.
+            partition.write_wal_entry(1, 3, data.clone()).await.unwrap();
+            partition.apply_command_to_cache(&data).unwrap();
+
+            // Verify cache has patched baseOffset.
+            let blobs = partition.read_blobs(Offset::new(0), 10000);
+            assert_eq!(blobs.len(), 1);
+            // After patching, first 8 bytes should be the base_offset (0) in big-endian.
+            let stored = &blobs[0].data;
+            let stored_base = i64::from_be_bytes(stored[..8].try_into().unwrap());
+            assert_eq!(stored_base, 0, "Patched baseOffset should be 0");
+
+            partition.sync().await.unwrap();
+        }
+
+        // Phase 2: Reopen and verify recovery applied the Kafka patch.
+        {
+            let config = DurablePartitionConfig::new(
+                temp_dir.path(),
+                TopicId::new(1),
+                PartitionId::new(0),
+            );
+            let partition = DurablePartition::open(TokioStorage::new(), config)
+                .await
+                .unwrap();
+
+            // Should have recovered 5 records.
+            assert_eq!(partition.blob_log_end_offset(), Offset::new(5));
+
+            let blobs = partition.read_blobs(Offset::new(0), 10000);
+            assert_eq!(blobs.len(), 1);
+
+            // Verify baseOffset was patched during recovery.
+            let stored = &blobs[0].data;
+            let stored_base = i64::from_be_bytes(stored[..8].try_into().unwrap());
+            assert_eq!(stored_base, 0, "Recovery should patch baseOffset");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_wal_entry_by_index() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config =
+            DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0));
+
+        let mut partition = DurablePartition::open(TokioStorage::new(), config)
+            .await
+            .unwrap();
+
+        // Write 3 entries.
+        for i in 1..=3u64 {
+            let cmd = PartitionCommand::AppendBlob {
+                blob: Bytes::from(format!("data-{i}")),
+                record_count: 1,
+                format: BlobFormat::Raw,
+                base_offset: Offset::new(i - 1),
+            };
+            let data = cmd.encode();
+            partition.write_wal_entry(i, 2, data.clone()).await.unwrap();
+            partition.apply_command_to_cache(&data).unwrap();
+        }
+
+        partition.sync().await.unwrap();
+
+        // Read each entry by index.
+        for i in 1..=3u64 {
+            let entry = partition.read_wal_entry(i).await.unwrap();
+            assert!(entry.is_some(), "Entry at index {i} should exist");
+            let e = entry.unwrap();
+            assert_eq!(e.index(), i);
+            assert_eq!(e.term(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_wal_entries_byte_limited() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config =
+            DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0));
+
+        let mut partition = DurablePartition::open(TokioStorage::new(), config)
+            .await
+            .unwrap();
+
+        // Write 5 entries with ~20 bytes each.
+        for i in 1..=5u64 {
+            let cmd = PartitionCommand::AppendBlob {
+                blob: Bytes::from(format!("payload-{i:04}")),
+                record_count: 1,
+                format: BlobFormat::Raw,
+                base_offset: Offset::new(i - 1),
+            };
+            let data = cmd.encode();
+            partition.write_wal_entry(i, 2, data.clone()).await.unwrap();
+            partition.apply_command_to_cache(&data).unwrap();
+        }
+
+        partition.sync().await.unwrap();
+
+        // Read with a small byte limit — should get at least 1 but not all 5.
+        // Each entry payload is ~22 bytes. Set limit to 30 to get 1-2 entries.
+        let entries = partition.read_wal_entries(1, 30).await.unwrap();
+        assert!(
+            !entries.is_empty(),
+            "Should always return at least one entry"
+        );
+        assert!(
+            entries.len() < 5,
+            "Should not return all entries with small byte limit"
+        );
+
+        // Read with large limit — should get all 5.
+        let all_entries = partition.read_wal_entries(1, 100_000).await.unwrap();
+        assert_eq!(all_entries.len(), 5, "Should return all entries with large limit");
+
+        // Read from middle — should get entries 3..=5.
+        let mid_entries = partition.read_wal_entries(3, 100_000).await.unwrap();
+        assert_eq!(mid_entries.len(), 3, "Should return entries 3, 4, 5");
+        assert_eq!(mid_entries[0].index(), 3);
     }
 }

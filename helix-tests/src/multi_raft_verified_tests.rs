@@ -713,6 +713,7 @@ impl VerifiedMultiRaftActor {
                     group_id,
                     index,
                     data,
+                    ..
                 } => {
                     self.record_applied(group_id, index, &data);
                 }
@@ -1085,6 +1086,7 @@ fn serialize_message_to(buf: &mut Vec<u8>, msg: &Message) {
             buf.extend_from_slice(&resp.to.get().to_le_bytes());
             buf.push(u8::from(resp.success));
             buf.extend_from_slice(&resp.match_index.get().to_le_bytes());
+            buf.extend_from_slice(&resp.persisted_commit_index.get().to_le_bytes());
         }
         Message::TimeoutNow(req) => {
             buf.push(7);
@@ -1319,6 +1321,15 @@ fn deserialize_message_with_len(payload: &[u8]) -> Option<(Message, usize)> {
                 payload[offset..offset + 8].try_into().ok()?,
             ));
             offset += 8;
+            let persisted_commit_index = if payload.len() >= offset + 8 {
+                let val = LogIndex::new(u64::from_le_bytes(
+                    payload[offset..offset + 8].try_into().ok()?,
+                ));
+                offset += 8;
+                val
+            } else {
+                LogIndex::new(0)
+            };
             Some((
                 Message::AppendEntriesResponse(AppendEntriesResponse::new(
                     term,
@@ -1326,6 +1337,7 @@ fn deserialize_message_with_len(payload: &[u8]) -> Option<(Message, usize)> {
                     to,
                     success,
                     match_index,
+                    persisted_commit_index,
                 )),
                 offset,
             ))

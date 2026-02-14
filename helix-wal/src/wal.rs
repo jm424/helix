@@ -55,6 +55,16 @@ pub struct WalConfig {
     /// Whether to sync after every write (vs batch syncs).
     /// When false, call `sync()` explicitly for durability.
     pub sync_on_write: bool,
+    /// Whether to fsync when rotating (sealing) a segment.
+    ///
+    /// When `true` (default), `rotate_segment` calls `sync()` on the
+    /// outgoing segment before sealing it. This ensures all data in the
+    /// segment is durable on disk.
+    ///
+    /// Set to `false` in `ReplicationOnly` durability mode where
+    /// durability is provided by Raft replication, not local fsync.
+    /// Skipping the sync avoids the ~1.3 ms fsync penalty per rotation.
+    pub sync_on_rotation: bool,
 }
 
 impl WalConfig {
@@ -65,6 +75,7 @@ impl WalConfig {
             dir: dir.into(),
             segment_config: SegmentConfig::new(),
             sync_on_write: false, // Default to batched syncs for performance.
+            sync_on_rotation: true, // Default to safe: sync before sealing.
         }
     }
 
@@ -79,6 +90,16 @@ impl WalConfig {
     #[must_use]
     pub const fn with_sync_on_write(mut self, sync: bool) -> Self {
         self.sync_on_write = sync;
+        self
+    }
+
+    /// Controls whether to fsync when rotating segments.
+    ///
+    /// Disable in `ReplicationOnly` mode to avoid the ~1.3 ms fsync
+    /// penalty per segment rotation.
+    #[must_use]
+    pub const fn with_sync_on_rotation(mut self, sync: bool) -> Self {
+        self.sync_on_rotation = sync;
         self
     }
 }
@@ -964,11 +985,13 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
     /// Rotates the current active segment to sealed.
     async fn rotate_segment(&mut self) -> WalResult<()> {
         if let Some(mut active) = self.active_segment.take() {
-            // Sync before sealing - this makes the segment's contents durable.
-            active.file.sync().await?;
-
-            // Update durable_index since we just synced.
-            self.durable_index = self.last_index;
+            // Sync before sealing to make the segment's contents durable.
+            // In ReplicationOnly mode, skip fsync — durability is provided
+            // by Raft replication across nodes, not local disk sync.
+            if self.config.sync_on_rotation {
+                active.file.sync().await?;
+                self.durable_index = self.last_index;
+            }
 
             active.segment.seal();
 

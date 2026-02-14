@@ -92,6 +92,8 @@ pub enum MultiRaftOutput {
         group_id: GroupId,
         /// Log index of the committed entry.
         index: LogIndex,
+        /// The Raft term of the committed entry.
+        term: TermId,
         /// The committed data.
         data: Bytes,
     },
@@ -116,6 +118,19 @@ pub enum MultiRaftOutput {
         term: TermId,
         /// Who we voted for in the new term (None if haven't voted).
         voted_for: Option<NodeId>,
+    },
+    /// Leader needs entries from the data WAL for a follower.
+    NeedEntries {
+        /// The Raft group.
+        group_id: GroupId,
+        /// The follower that needs entries.
+        follower_id: NodeId,
+        /// First entry index to read.
+        start_index: LogIndex,
+        /// Index before `start_index` (for `prev_log_term` lookup).
+        prev_log_index: LogIndex,
+        /// Maximum bytes to read.
+        max_bytes: u64,
     },
 }
 
@@ -643,10 +658,11 @@ impl MultiRaft {
                         result.push(MultiRaftOutput::SendMessages { to: dest, messages });
                     }
                 }
-                RaftOutput::CommitEntry { index, data } => {
+                RaftOutput::CommitEntry { index, term, data } => {
                     result.push(MultiRaftOutput::CommitEntry {
                         group_id,
                         index,
+                        term,
                         data,
                     });
                 }
@@ -661,6 +677,20 @@ impl MultiRaft {
                         group_id,
                         term,
                         voted_for,
+                    });
+                }
+                RaftOutput::NeedEntries {
+                    follower_id,
+                    start_index,
+                    prev_log_index,
+                    max_bytes,
+                } => {
+                    result.push(MultiRaftOutput::NeedEntries {
+                        group_id,
+                        follower_id,
+                        start_index,
+                        prev_log_index,
+                        max_bytes,
                     });
                 }
             }

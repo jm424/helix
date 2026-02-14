@@ -305,6 +305,13 @@ pub struct AppendEntriesResponse {
     pub success: bool,
     /// The follower's last log index (for fast backup).
     pub match_index: LogIndex,
+    /// The follower's last committed index persisted to the data WAL.
+    ///
+    /// Used by the leader for fast-forward on rejection: if the follower
+    /// has committed entries in its WAL that are not in the in-memory log,
+    /// the leader can skip directly to `persisted_commit_index + 1`
+    /// instead of backing up entry-by-entry.
+    pub persisted_commit_index: LogIndex,
 }
 
 impl AppendEntriesResponse {
@@ -316,6 +323,7 @@ impl AppendEntriesResponse {
         to: NodeId,
         success: bool,
         match_index: LogIndex,
+        persisted_commit_index: LogIndex,
     ) -> Self {
         Self {
             term,
@@ -323,6 +331,7 @@ impl AppendEntriesResponse {
             to,
             success,
             match_index,
+            persisted_commit_index,
         }
     }
 }

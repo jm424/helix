@@ -241,6 +241,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     if let MultiRaftOutput::CommitEntry {
                         group_id: gid,
                         index,
+                        term,
                         data: entry_data,
                     } = output
                     {
@@ -258,7 +259,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                             };
                             if let Some(ps_lock) = ps_lock {
                                 let mut ps = ps_lock.write().await;
-                                ps.apply_entry_async(*index, entry_data)
+                                ps.apply_entry_async(*index, *term, entry_data)
                                     .await
                                     .map_err(|e| ServerError::Internal {
                                         message: format!("failed to apply: {e}"),
@@ -638,6 +639,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     if let MultiRaftOutput::CommitEntry {
                         group_id: gid,
                         index,
+                        term,
                         data: entry_data,
                     } = output
                     {
@@ -648,7 +650,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                             };
                             if let Some(ps_lock) = ps_lock {
                                 let mut ps = ps_lock.write().await;
-                                ps.apply_entry_async(*index, entry_data)
+                                ps.apply_entry_async(*index, *term, entry_data)
                                     .await
                                     .map_err(|e| ServerError::Internal {
                                         message: format!("failed to apply: {e}"),

@@ -78,6 +78,13 @@ impl SharedWalConfig {
         self.wal_config = self.wal_config.with_segment_config(config);
         self
     }
+
+    /// Controls whether to fsync when rotating segments.
+    #[must_use]
+    pub const fn with_sync_on_rotation(mut self, sync: bool) -> Self {
+        self.wal_config.sync_on_rotation = sync;
+        self
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -1027,7 +1034,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
     ///
     /// Returns an error if the underlying WAL cannot be opened.
     pub async fn open(storage: S, config: CoordinatorConfig) -> WalResult<Self> {
-        let wal = SharedWal::open(storage, config.wal_config.clone()).await?;
+        // Propagate durability mode to the WAL layer so it knows
+        // whether to fsync on segment rotation.
+        let wal_config = config
+            .wal_config
+            .clone()
+            .with_sync_on_rotation(config.durability.requires_fsync());
+        let wal = SharedWal::open(storage, wal_config).await?;
 
         let inner = Arc::new(CoordinatorInner {
             wal: Mutex::new(wal),

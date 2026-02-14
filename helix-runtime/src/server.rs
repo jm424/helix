@@ -386,7 +386,7 @@ impl RaftServer {
                     message,
                 });
             }
-            RaftOutput::CommitEntry { index, data } => {
+            RaftOutput::CommitEntry { index, data, .. } => {
                 info!(index = index.get(), "Entry committed");
 
                 // Send event.
@@ -425,9 +425,9 @@ impl RaftServer {
 
                 let _ = self.events.send(ServerEvent::SteppedDown).await;
             }
-            RaftOutput::VoteStateChanged { .. } => {
-                // Vote state persistence is handled by the HelixService tick task.
-                // The single-node RaftServer doesn't persist vote state.
+            RaftOutput::VoteStateChanged { .. } | RaftOutput::NeedEntries { .. } => {
+                // VoteStateChanged: persistence handled by the HelixService tick task.
+                // NeedEntries: single-node server has no followers.
             }
         }
     }
@@ -438,7 +438,7 @@ impl RaftServer {
             RaftOutput::SendMessage(_message) => {
                 // Messages are handled separately.
             }
-            RaftOutput::CommitEntry { index, data } => {
+            RaftOutput::CommitEntry { index, data, .. } => {
                 let _ = events.send(ServerEvent::Committed { index, data }).await;
             }
             RaftOutput::BecameLeader => {
@@ -447,8 +447,9 @@ impl RaftServer {
             RaftOutput::SteppedDown => {
                 let _ = events.send(ServerEvent::SteppedDown).await;
             }
-            RaftOutput::VoteStateChanged { .. } => {
-                // Vote state persistence is handled by the HelixService tick task.
+            RaftOutput::VoteStateChanged { .. } | RaftOutput::NeedEntries { .. } => {
+                // VoteStateChanged: persistence handled by the HelixService tick task.
+                // NeedEntries: single-node server has no followers.
             }
         }
     }

@@ -304,6 +304,7 @@ fn serialize_message(msg: &Message) -> Vec<u8> {
             buf.extend_from_slice(&resp.to.get().to_le_bytes());
             buf.push(u8::from(resp.success));
             buf.extend_from_slice(&resp.match_index.get().to_le_bytes());
+            buf.extend_from_slice(&resp.persisted_commit_index.get().to_le_bytes());
         }
         Message::TimeoutNow(req) => {
             buf.push(message_tags::TIMEOUT_NOW);
@@ -469,12 +470,18 @@ fn deserialize_append_entries_response(data: &[u8]) -> Option<Message> {
     let to = NodeId::new(u64::from_le_bytes(data[16..24].try_into().ok()?));
     let success = data[24] != 0;
     let match_index = LogIndex::new(u64::from_le_bytes(data[25..33].try_into().ok()?));
+    let persisted_commit_index = if data.len() >= 41 {
+        LogIndex::new(u64::from_le_bytes(data[33..41].try_into().ok()?))
+    } else {
+        LogIndex::new(0)
+    };
     Some(Message::AppendEntriesResponse(AppendEntriesResponse::new(
         term,
         from,
         to,
         success,
         match_index,
+        persisted_commit_index,
     )))
 }
 
@@ -703,7 +710,7 @@ impl RaftActor {
                 RaftOutput::SendMessage(msg) => {
                     self.send_raft_message(&msg, ctx);
                 }
-                RaftOutput::CommitEntry { index, data } => {
+                RaftOutput::CommitEntry { index, data, .. } => {
                     // Record applied entry for StateMachineSafety verification.
                     self.record_applied_entry(index, &data);
                     tracing::debug!(
@@ -733,6 +740,14 @@ impl RaftActor {
                         term = term.get(),
                         voted_for = ?voted_for.map(NodeId::get),
                         "vote state changed"
+                    );
+                }
+                RaftOutput::NeedEntries { .. } => {
+                    // DST simulation doesn't have WAL-backed entries.
+                    // The in-memory log should always have entries.
+                    tracing::debug!(
+                        actor = %self.name,
+                        "NeedEntries (ignored in simulation)"
                     );
                 }
             }
@@ -1051,6 +1066,7 @@ mod tests {
             NodeId::new(1),
             true,
             LogIndex::new(7),
+            LogIndex::new(0),
         ));
         let serialized = serialize_message(&ae_resp);
         let deserialized = deserialize_message(&serialized).unwrap();

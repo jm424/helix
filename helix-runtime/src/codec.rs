@@ -365,17 +365,19 @@ fn encode_append_entries_response(buf: &mut BytesMut, resp: &AppendEntriesRespon
     buf.put_u64_le(resp.to.get());
     buf.put_u8(u8::from(resp.success));
     buf.put_u64_le(resp.match_index.get());
+    buf.put_u64_le(resp.persisted_commit_index.get());
 }
 
 /// Decodes an `AppendEntriesResponse`.
 fn decode_append_entries_response(buf: &mut &[u8]) -> CodecResult<AppendEntriesResponse> {
-    ensure_remaining(buf, 33)?;
+    ensure_remaining(buf, 41)?;
 
     let term = TermId::new(buf.get_u64_le());
     let from = NodeId::new(buf.get_u64_le());
     let to = NodeId::new(buf.get_u64_le());
     let success = buf.get_u8() != 0;
     let match_index = LogIndex::new(buf.get_u64_le());
+    let persisted_commit_index = LogIndex::new(buf.get_u64_le());
 
     Ok(AppendEntriesResponse::new(
         term,
@@ -383,6 +385,7 @@ fn decode_append_entries_response(buf: &mut &[u8]) -> CodecResult<AppendEntriesR
         to,
         success,
         match_index,
+        persisted_commit_index,
     ))
 }
 
@@ -1174,6 +1177,7 @@ mod tests {
             NodeId::new(1),
             true,
             LogIndex::new(12),
+            LogIndex::new(0),
         ))
     }
 

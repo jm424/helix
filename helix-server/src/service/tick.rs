@@ -376,6 +376,7 @@ pub async fn process_controller_outputs<
                 group_id,
                 index,
                 data,
+                ..
             } => {
                 // Only process controller partition commits.
                 if *group_id != CONTROLLER_GROUP_ID {
@@ -495,7 +496,8 @@ pub async fn process_controller_outputs<
                         }
 
                         // Create partition storage (durable if SharedWalPool available).
-                        {
+                        // Extract commit metadata for Raft recovery state.
+                        let (commit_index, commit_term) = {
                             let mut ps_map = partition_storage.write().await;
                             if let std::collections::hash_map::Entry::Vacant(e) =
                                 ps_map.entry(data_group_id)
@@ -509,9 +511,20 @@ pub async fn process_controller_outputs<
                                     storage,
                                 )
                                 .await;
+                                let ci = ps.last_applied();
+                                let ct = ps.last_applied_term();
                                 e.insert(Arc::new(RwLock::new(ps)));
+                                (ci, ct)
+                            } else {
+                                // Storage already exists (non-vacant entry), read from it.
+                                if let Some(ps_lock) = ps_map.get(&data_group_id) {
+                                    let ps = ps_lock.read().await;
+                                    (ps.last_applied(), ps.last_applied_term())
+                                } else {
+                                    (LogIndex::new(0), TermId::new(0))
+                                }
                             }
-                        }
+                        };
 
                         // Create the partition actor with restored vote state and add it to the router.
                         let partition_handle =
@@ -522,6 +535,8 @@ pub async fn process_controller_outputs<
                                 term,
                                 voted_for,
                                 observation_mode,
+                                commit_index,
+                                commit_term,
                                 output_tx.clone(),
                                 super::partition_actor::PartitionActorConfig::default(),
                             );
@@ -615,6 +630,10 @@ pub async fn process_controller_outputs<
                 }
                 // Ignore data partition vote changes - handled by OutputProcessor.
             }
+            MultiRaftOutput::NeedEntries { .. } => {
+                // NeedEntries is handled by the actor output processor path.
+                // The tick task only processes controller partition outputs.
+            }
         }
     }
 
@@ -626,6 +645,7 @@ pub async fn process_controller_outputs<
                 group_id,
                 index,
                 data,
+                ..
             } = output
             {
                 if *group_id != CONTROLLER_GROUP_ID {
@@ -667,7 +687,8 @@ pub async fn process_controller_outputs<
                         }
 
                         // Create partition storage (durable if SharedWalPool available).
-                        {
+                        // Extract commit metadata for Raft recovery state.
+                        let (commit_index, commit_term) = {
                             let mut ps_map = partition_storage.write().await;
                             if let std::collections::hash_map::Entry::Vacant(e) =
                                 ps_map.entry(data_group_id)
@@ -681,9 +702,20 @@ pub async fn process_controller_outputs<
                                     storage,
                                 )
                                 .await;
+                                let ci = ps.last_applied();
+                                let ct = ps.last_applied_term();
                                 e.insert(Arc::new(RwLock::new(ps)));
+                                (ci, ct)
+                            } else {
+                                // Storage already exists (non-vacant entry), read from it.
+                                if let Some(ps_lock) = ps_map.get(&data_group_id) {
+                                    let ps = ps_lock.read().await;
+                                    (ps.last_applied(), ps.last_applied_term())
+                                } else {
+                                    (LogIndex::new(0), TermId::new(0))
+                                }
                             }
-                        }
+                        };
 
                         // Create the partition actor and add to router.
                         let partition_handle =
@@ -694,6 +726,8 @@ pub async fn process_controller_outputs<
                                 TermId::new(0),
                                 None,
                                 false,
+                                commit_index,
+                                commit_term,
                                 output_tx.clone(),
                                 super::partition_actor::PartitionActorConfig::default(),
                             );
@@ -909,6 +943,7 @@ async fn process_outputs<S: Storage + Clone + Send + Sync + 'static>(
             MultiRaftOutput::CommitEntry {
                 group_id,
                 index,
+                term,
                 data,
             } => {
                 let key = {
@@ -937,7 +972,7 @@ async fn process_outputs<S: Storage + Clone + Send + Sync + 'static>(
                     };
                     if let Some(ps_lock) = ps_lock {
                         let mut ps = ps_lock.write().await;
-                        match ps.apply_entry_async(*index, data).await {
+                        match ps.apply_entry_async(*index, *term, data).await {
                             Ok(offset) => Ok(offset),
                             Err(e) => {
                                 warn!(
@@ -1053,6 +1088,9 @@ async fn process_outputs<S: Storage + Clone + Send + Sync + 'static>(
                 );
                 // Single-node mode doesn't persist vote state.
                 // Multi-node mode uses the VoteStore for persistence.
+            }
+            MultiRaftOutput::NeedEntries { .. } => {
+                // Single-node mode doesn't need WAL-backed AppendEntries.
             }
         }
     }

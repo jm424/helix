@@ -40,6 +40,10 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -306,6 +310,9 @@ fn parse_peer(s: &str) -> Result<ExtendedPeerInfo, String> {
 #[tokio::main]
 #[allow(clippy::too_many_lines)] // Main entry point with CLI handling.
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
+
     // Diagnostic: confirm process is actually running (before any initialization).
     eprintln!("[SERVER_START] pid={}", std::process::id());
 

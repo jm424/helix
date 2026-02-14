@@ -60,6 +60,7 @@ use helix_wal::Storage;
 
 use super::batcher::BackpressureState;
 use super::partition_actor::{BatchNotifyInfo, GroupedOutput, PartitionOutput};
+use super::router::PartitionRouter;
 use super::{BatchPendingProposal, BatcherStats};
 
 /// Configuration for the output processor.
@@ -122,6 +123,7 @@ pub async fn output_processor_task<
     batcher_stats: Option<Arc<BatcherStats>>,
     batcher_backpressure: Option<Arc<BackpressureState>>,
     vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
+    router: Option<Arc<PartitionRouter>>,
 ) {
     info!("Output processor started");
 
@@ -134,18 +136,21 @@ pub async fn output_processor_task<
             }
             PartitionOutput::EntryCommitted {
                 index,
+                term,
                 data,
                 batch_notify,
             } => {
                 info!(
                     group = group_id.get(),
                     index = index.get(),
+                    term = term.get(),
                     batch_notify_present = batch_notify.is_some(),
                     "Output processor received EntryCommitted"
                 );
                 handle_entry_committed(
                     group_id,
                     index,
+                    term,
                     &data,
                     batch_notify,
                     &partition_storage,
@@ -164,6 +169,23 @@ pub async fn output_processor_task<
             }
             PartitionOutput::VoteStateChanged { term, voted_for } => {
                 handle_vote_state_changed(group_id, term, voted_for, vote_store.as_ref());
+            }
+            PartitionOutput::NeedWalEntries {
+                follower_id,
+                start_index,
+                prev_log_index,
+                max_bytes,
+            } => {
+                handle_need_wal_entries(
+                    group_id,
+                    follower_id,
+                    start_index,
+                    prev_log_index,
+                    max_bytes,
+                    &partition_storage,
+                    router.as_ref(),
+                )
+                .await;
             }
         }
     }
@@ -202,6 +224,152 @@ async fn handle_send_messages<T: TransportService>(
     }
 }
 
+/// Handles `NeedWalEntries` by reading entries from the WAL and sending them
+/// back to the partition actor via `ProvideEntries`.
+#[allow(clippy::too_many_lines)]
+async fn handle_need_wal_entries<S: Storage + Clone + Send + Sync + 'static>(
+    group_id: GroupId,
+    follower_id: helix_core::NodeId,
+    start_index: LogIndex,
+    prev_log_index: LogIndex,
+    max_bytes: u64,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
+    router: Option<&Arc<PartitionRouter>>,
+) {
+    let Some(router) = router else {
+        warn!(
+            group = group_id.get(),
+            "NeedWalEntries but no router configured"
+        );
+        return;
+    };
+
+    // Read entries from the WAL.
+    let storage_map = partition_storage.read().await;
+    let Some(storage_lock) = storage_map.get(&group_id) else {
+        warn!(
+            group = group_id.get(),
+            "NeedWalEntries for unknown group"
+        );
+        return;
+    };
+
+    let storage = storage_lock.read().await;
+    let entries_result = storage
+        .read_wal_entries(start_index.get(), max_bytes)
+        .await;
+    drop(storage);
+    drop(storage_map);
+
+    let wal_entries = match entries_result {
+        Ok(Some(entries)) => entries,
+        Ok(None) => {
+            warn!(
+                group = group_id.get(),
+                "NeedWalEntries but no WAL available (in-memory storage)"
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(
+                group = group_id.get(),
+                error = %e,
+                "Failed to read WAL entries"
+            );
+            return;
+        }
+    };
+
+    if wal_entries.is_empty() {
+        warn!(
+            group = group_id.get(),
+            start = start_index.get(),
+            "No WAL entries found in range"
+        );
+        // Still send empty provide_entries to clear wal_read_pending.
+    }
+
+    // Look up prev_log_term from the WAL if prev_log_index > 0.
+    let prev_log_term = if prev_log_index.get() == 0 {
+        TermId::new(0)
+    } else {
+        let storage_map = partition_storage.read().await;
+        let prev_term = if let Some(sl) = storage_map.get(&group_id) {
+            let s = sl.read().await;
+            match s.read_wal_entry(prev_log_index.get()).await {
+                Ok(Some(entry)) => {
+                    let term = entry.term();
+                    if term == 0 {
+                        // Pre-Part-A WAL data with term=0; refuse to serve.
+                        warn!(
+                            group = group_id.get(),
+                            index = prev_log_index.get(),
+                            "Refusing to serve entries with term=0 (pre-recovery WAL data)"
+                        );
+                        return;
+                    }
+                    TermId::new(term)
+                }
+                Ok(None) => TermId::new(0),
+                Err(e) => {
+                    warn!(
+                        group = group_id.get(),
+                        error = %e,
+                        "Failed to read prev_log entry from WAL"
+                    );
+                    return;
+                }
+            }
+        } else {
+            TermId::new(0)
+        };
+        drop(storage_map);
+        prev_term
+    };
+
+    // Refuse to serve entries with term=0 (pre-Part-A WAL data).
+    for entry in &wal_entries {
+        if entry.term() == 0 {
+            warn!(
+                group = group_id.get(),
+                index = entry.index(),
+                "Refusing to serve WAL entry with term=0"
+            );
+            return;
+        }
+    }
+
+    // Convert WAL entries to LogEntry format.
+    let log_entries: Vec<helix_raft::LogEntry> = wal_entries
+        .into_iter()
+        .map(|e| helix_raft::LogEntry {
+            term: TermId::new(e.term()),
+            index: LogIndex::new(e.index()),
+            data: bytes::Bytes::copy_from_slice(&e.payload),
+        })
+        .collect();
+
+    // Send ProvideEntries back to the partition actor.
+    let Ok(handle) = router.partition(group_id).await else {
+        warn!(
+            group = group_id.get(),
+            "Cannot find partition actor for ProvideEntries"
+        );
+        return;
+    };
+
+    if let Err(e) = handle
+        .provide_entries(follower_id, prev_log_index, prev_log_term, log_entries)
+        .await
+    {
+        warn!(
+            group = group_id.get(),
+            error = %e,
+            "Failed to send ProvideEntries to partition actor"
+        );
+    }
+}
+
 /// Handles `EntryCommitted` output by applying to storage and notifying waiters.
 ///
 /// The `batch_notify` parameter is provided by the partition actor when it owns
@@ -215,6 +383,7 @@ async fn handle_send_messages<T: TransportService>(
 async fn handle_entry_committed<S: Storage + Clone + Send + Sync + 'static>(
     group_id: GroupId,
     index: LogIndex,
+    term: TermId,
     data: &bytes::Bytes,
     batch_notify: Option<BatchNotifyInfo>,
     partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
@@ -313,7 +482,7 @@ async fn handle_entry_committed<S: Storage + Clone + Send + Sync + 'static>(
             };
             if let Some(ps_lock) = ps_lock {
                 let mut ps = ps_lock.write().await;
-                ps.apply_entry_async(index, data).await
+                ps.apply_entry_async(index, term, data).await
             } else {
                 Err(ServerError::PartitionNotFound {
                     topic: topic_id.get().to_string(),
@@ -455,7 +624,7 @@ async fn handle_entry_committed<S: Storage + Clone + Send + Sync + 'static>(
 
         let apply_result = {
             let mut ps = ps_lock.write().await;
-            ps.apply_entry_async(index, data).await
+            ps.apply_entry_async(index, term, data).await
         };
 
         if let Err(e) = apply_result {
@@ -709,6 +878,7 @@ mod tests {
             None,
             None,
             None, // No vote persistence in tests.
+            None, // No router in tests.
         ));
 
         // Send BecameLeader output.
@@ -758,6 +928,7 @@ mod tests {
             None,
             None,
             None, // No vote persistence in tests.
+            None, // No router in tests.
         ));
 
         // Send EntryCommitted output (no batch proposal, so just applies).
@@ -765,6 +936,7 @@ mod tests {
             group_id: GroupId::new(1),
             output: PartitionOutput::EntryCommitted {
                 index: LogIndex::new(1),
+                term: TermId::new(1),
                 data: Bytes::from("test data"),
                 batch_notify: None,
             },
@@ -854,6 +1026,7 @@ mod tests {
             Some(Arc::clone(&batcher_stats)),
             Some(Arc::clone(&backpressure)),
             None, // No vote persistence in tests.
+            None, // No router in tests.
         ));
 
         // Create valid batch entry data.
@@ -874,6 +1047,7 @@ mod tests {
             group_id,
             output: PartitionOutput::EntryCommitted {
                 index,
+                term: TermId::new(1),
                 data,
                 batch_notify: None,
             },
