@@ -109,6 +109,17 @@ pub enum WalError {
         reason: &'static str,
     },
 
+    /// Sealed segment has been evicted from memory.
+    ///
+    /// The segment data is still on disk and can be read via
+    /// `read_entry_from_disk()`. This error signals the caller to
+    /// fall back to async disk I/O.
+    #[error("segment {segment_id} evicted from memory")]
+    SegmentEvicted {
+        /// The segment that was evicted.
+        segment_id: u64,
+    },
+
     /// Coordinator has been shut down.
     #[error("WAL coordinator has been shut down")]
     Shutdown,

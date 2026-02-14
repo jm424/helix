@@ -371,8 +371,16 @@ impl<S: Storage + Send + Sync + 'static> BufferedWal<S> {
             }
         }
 
-        // Fall back to WAL.
-        guard.wal.read(index).cloned()
+        // Fall back to WAL (in-memory).
+        match guard.wal.read(index) {
+            Ok(entry) => Ok(entry.clone()),
+            Err(WalError::SegmentEvicted { segment_id }) => {
+                // Segment evicted from memory — read from disk.
+                let segment_id = crate::SegmentId::new(segment_id);
+                guard.wal.read_entry_from_disk(segment_id, index).await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Returns the first index in the WAL.
@@ -448,7 +456,7 @@ impl<S: Storage + Send + Sync + 'static> BufferedWal<S> {
         segment_id: crate::SegmentId,
     ) -> WalResult<bytes::Bytes> {
         let guard = self.inner.lock().await;
-        guard.wal.read_segment_bytes(segment_id)
+        guard.wal.read_segment_bytes(segment_id).await
     }
 
     /// Explicitly syncs all buffered writes to disk.
@@ -461,6 +469,17 @@ impl<S: Storage + Send + Sync + 'static> BufferedWal<S> {
     /// Returns an error if the sync fails.
     pub async fn sync(&self) -> WalResult<()> {
         self.flush().await
+    }
+
+    /// Evicts all sealed segments from memory.
+    ///
+    /// Drops in-memory entries from sealed segments to free memory. Reads
+    /// will fall back to segment files on disk (OS page cache).
+    ///
+    /// Returns the number of segments evicted.
+    pub async fn evict_all_sealed_segments(&self) -> u32 {
+        let mut guard = self.inner.lock().await;
+        guard.wal.evict_all_sealed_segments()
     }
 
     /// Stops the background flush task and flushes remaining entries.

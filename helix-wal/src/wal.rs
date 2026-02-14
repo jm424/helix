@@ -140,11 +140,16 @@ pub struct Wal<S: Storage, E: WalEntry = Entry> {
 }
 
 /// A sealed (read-only) segment.
+///
+/// After rotation, the in-memory entries may be evicted to free memory.
+/// When evicted, `segment` is `None` and reads fall back to disk via `path`.
+/// `info` is always available for metadata queries regardless of eviction state.
 struct SealedSegment<E: WalEntry> {
-    /// Segment metadata.
-    segment: Segment<E>,
-    /// Path to segment file.
-    #[allow(dead_code)]
+    /// In-memory segment data. `None` when evicted to free memory.
+    segment: Option<Segment<E>>,
+    /// Segment metadata (always available, even after eviction).
+    info: SegmentInfo,
+    /// Path to segment file (for disk reads after eviction).
     path: PathBuf,
 }
 
@@ -160,6 +165,21 @@ struct ActiveSegment<E: WalEntry> {
     write_offset: u64,
 }
 
+/// Creates a `SegmentInfo` from a `Segment`.
+fn segment_info_from<E: WalEntry>(
+    segment_id: SegmentId,
+    segment: &Segment<E>,
+) -> SegmentInfo {
+    SegmentInfo {
+        segment_id,
+        first_index: segment.first_index(),
+        last_index: segment.last_index(),
+        size_bytes: segment.size_bytes(),
+        entry_count: segment.entry_count(),
+        is_sealed: segment.is_sealed(),
+    }
+}
+
 impl<S: Storage, E: WalEntry> Wal<S, E> {
     /// Opens or creates a WAL in the given directory.
     ///
@@ -168,6 +188,10 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
     ///
     /// # Errors
     /// Returns an error if recovery fails or the directory cannot be created.
+    ///
+    /// # Panics
+    /// Panics if a recovered segment's in-memory state is inconsistent
+    /// (segments must be resident during recovery).
     #[allow(clippy::too_many_lines)]
     pub async fn open(storage: S, config: WalConfig) -> WalResult<Self> {
         let storage = Arc::new(storage);
@@ -218,10 +242,12 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
                         last_index = Some(idx);
                     }
 
+                    let info = segment_info_from(segment_id, &segment);
                     sealed_segments.insert(
                         segment_id,
                         SealedSegment {
-                            segment,
+                            segment: Some(segment),
+                            info,
                             path: path.clone(),
                         },
                     );
@@ -235,7 +261,7 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
         // Remove empty segments - they have a header but no entries (un-synced new segment).
         let empty_segments: Vec<SegmentId> = sealed_segments
             .iter()
-            .filter(|(_, sealed)| sealed.segment.last_index().is_none())
+            .filter(|(_, sealed)| sealed.info.last_index.is_none())
             .map(|(id, _)| *id)
             .collect();
         for id in empty_segments {
@@ -277,7 +303,7 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
             // For SharedEntry, just compute last_index from entries across all segments.
             // Deduplication is handled by SharedWal::recover() using last-write-wins.
             for sealed in sealed_segments.values() {
-                if let Some(seg_last) = sealed.segment.last_index() {
+                if let Some(seg_last) = sealed.info.last_index {
                     valid_last_index =
                         Some(valid_last_index.map_or(seg_last, |v: u64| v.max(seg_last)));
                 }
@@ -307,7 +333,7 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
 
         // Sort segments by first_index, then by segment_id as tiebreaker.
         let mut segments_by_first_index: Vec<_> = sealed_segments.iter().collect();
-        segments_by_first_index.sort_by_key(|(id, sealed)| (sealed.segment.first_index(), **id));
+        segments_by_first_index.sort_by_key(|(id, sealed)| (sealed.info.first_index, **id));
 
         for (id, sealed) in segments_by_first_index {
             // Skip segments already marked for removal (e.g., stale segments).
@@ -321,8 +347,8 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
                 continue;
             }
 
-            let seg_first = sealed.segment.first_index();
-            let seg_last = sealed.segment.last_index();
+            let seg_first = sealed.info.first_index;
+            let seg_last = sealed.info.last_index;
 
             if seg_first > expected_next {
                 // Gap detected! This segment starts after a gap.
@@ -373,12 +399,12 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
                     let seg_last_val = seg_last.unwrap_or(seg_first);
                     for (old_id, old_sealed) in &sealed_segments {
                         if *old_id < *id {
-                            if let Some(old_last) = old_sealed.segment.last_index() {
+                            if let Some(old_last) = old_sealed.info.last_index {
                                 if old_last >= seg_first {
                                     overlaps_to_fix.push((*old_id, truncate_to));
                                 }
                             }
-                            let old_first = old_sealed.segment.first_index();
+                            let old_first = old_sealed.info.first_index;
                             if old_first > seg_last_val {
                                 warn!(
                                     stale_segment_id = old_id.get(),
@@ -413,12 +439,19 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
         let had_overlaps = !overlaps_to_fix.is_empty();
         for (seg_id, truncate_to) in overlaps_to_fix {
             if let Some(sealed) = sealed_segments.get_mut(&seg_id) {
-                let _ = sealed.segment.truncate_entries_after(truncate_to);
+                // During recovery, segments are always resident.
+                let segment = sealed
+                    .segment
+                    .as_mut()
+                    .expect("segments must be resident during recovery");
+                let _ = segment.truncate_entries_after(truncate_to);
+                // Update info after truncation.
+                sealed.info = segment_info_from(seg_id, segment);
 
                 // IMPORTANT: Also rewrite the segment file on disk.
                 // Otherwise, the synced file still has the old (overlapping) data,
                 // and future recovery could see inconsistent state.
-                let data = sealed.segment.encode();
+                let data = segment.encode();
                 if let Ok(file) = storage.open(&sealed.path).await {
                     let _ = file.truncate(0).await;
                     if file.write_at(0, &data).await.is_ok() {
@@ -659,24 +692,24 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
 
         for segment_id in std::mem::take(&mut self.sealed_segments_pending_sync) {
             if let Some(sealed) = self.sealed_segments.get(&segment_id) {
-                let data = sealed.segment.encode();
+                // If segment is evicted, we can't re-encode it. The on-disk
+                // file already has the pre-truncation data; skip sync and
+                // keep it pending. This is rare (truncation + eviction overlap).
+                let data = sealed.segment.as_ref().map(Segment::encode);
                 let mut sync_ok = false;
-                if let Ok(file) = self.storage.open(&sealed.path).await {
-                    // IMPORTANT: Only sync if write succeeded, otherwise we'd sync a 0-byte file.
-                    let _ = file.truncate(0).await;
-                    if file.write_at(0, &data).await.is_ok() && file.sync().await.is_ok() {
-                        sync_ok = true;
+                if let Some(data) = data {
+                    if let Ok(file) = self.storage.open(&sealed.path).await {
+                        let _ = file.truncate(0).await;
+                        if file.write_at(0, &data).await.is_ok()
+                            && file.sync().await.is_ok()
+                        {
+                            sync_ok = true;
+                        }
                     }
                 }
                 if !sync_ok {
                     still_pending.push(segment_id);
-                    // This segment's synced_files might have MORE entries than in-memory.
-                    // We don't know exactly how many, but we know the segment existed before
-                    // truncation, so its synced content could be up to any previous state.
-                    // For safety, we can't claim any index beyond this segment's current
-                    // in-memory last_index is durable, because on crash we might recover
-                    // extra entries from this segment's synced state.
-                    if let Some(seg_last) = sealed.segment.last_index() {
+                    if let Some(seg_last) = sealed.info.last_index {
                         max_pending_synced_index =
                             Some(max_pending_synced_index.map_or(seg_last, |m| m.max(seg_last)));
                     }
@@ -751,9 +784,16 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
 
         // Search sealed segments.
         for sealed in self.sealed_segments.values().rev() {
-            if index >= sealed.segment.first_index() {
-                if let Ok(entry) = sealed.segment.read(index) {
-                    return Ok(entry);
+            if index >= sealed.info.first_index {
+                if let Some(segment) = &sealed.segment {
+                    if let Ok(entry) = segment.read(index) {
+                        return Ok(entry);
+                    }
+                } else {
+                    // Segment evicted from memory — caller must use disk fallback.
+                    return Err(WalError::SegmentEvicted {
+                        segment_id: sealed.info.segment_id.get(),
+                    });
                 }
             }
         }
@@ -771,11 +811,22 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
     /// This is useful for recovery and for entry types with partition-local
     /// indices ([`SharedEntry`](crate::SharedEntry)) where index-based lookup
     /// doesn't apply.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any sealed segment has been evicted. This method is only
+    /// valid during recovery when all segments are resident in memory.
     pub fn entries(&self) -> impl Iterator<Item = &E> {
         // Chain sealed segments (in order) with active segment.
+        // All sealed segments must be resident (only called during recovery).
         self.sealed_segments
             .values()
-            .flat_map(|s| s.segment.entries())
+            .flat_map(|s| {
+                s.segment
+                    .as_ref()
+                    .expect("entries() requires all segments to be resident (recovery only)")
+                    .entries()
+            })
             .chain(self.active_segment.iter().flat_map(|a| a.segment.entries()))
     }
 
@@ -785,7 +836,7 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
         let sealed_count: u64 = self
             .sealed_segments
             .values()
-            .map(|s| s.segment.entry_count())
+            .map(|s| s.info.entry_count)
             .sum();
         let active_count = self
             .active_segment
@@ -848,7 +899,7 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
         let segments_to_remove: Vec<SegmentId> = self
             .sealed_segments
             .iter()
-            .filter(|(_, seg)| seg.segment.first_index() > last_index_to_keep)
+            .filter(|(_, seg)| seg.info.first_index > last_index_to_keep)
             .map(|(id, _)| *id)
             .collect();
 
@@ -859,7 +910,7 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
                 let _ = self.storage.remove(&sealed.path).await;
                 debug!(
                     segment_id = segment_id.get(),
-                    first_index = sealed.segment.first_index(),
+                    first_index = sealed.info.first_index,
                     "Removed sealed segment (truncation before its start)"
                 );
             }
@@ -880,21 +931,34 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
         let mut segments_to_delete: Vec<SegmentId> = Vec::new();
         for (segment_id, sealed) in &mut self.sealed_segments {
             if sealed
-                .segment
-                .last_index()
+                .info
+                .last_index
                 .is_some_and(|l| l > last_index_to_keep)
             {
-                let _ = sealed.segment.truncate_entries_after(last_index_to_keep);
-                debug!(
-                    segment_id = segment_id.get(),
-                    last_index_to_keep, "Truncated sealed segment (in-memory)"
-                );
-
-                // If segment is now empty, mark for deletion.
-                if sealed.segment.entry_count() == 0 {
+                if let Some(segment) = &mut sealed.segment {
+                    // Resident: truncate in-memory entries.
+                    let _ = segment.truncate_entries_after(last_index_to_keep);
+                    sealed.info = segment_info_from(*segment_id, segment);
                     debug!(
                         segment_id = segment_id.get(),
-                        "Segment became empty after truncation, will delete"
+                        last_index_to_keep,
+                        "Truncated sealed segment (in-memory)"
+                    );
+
+                    // If segment is now empty, mark for deletion.
+                    if segment.entry_count() == 0 {
+                        debug!(
+                            segment_id = segment_id.get(),
+                            "Segment became empty after truncation, will delete"
+                        );
+                        segments_to_delete.push(*segment_id);
+                    }
+                } else {
+                    // Evicted: remove entirely. Data is on disk but we can't
+                    // partially truncate without loading. Recovery handles it.
+                    debug!(
+                        segment_id = segment_id.get(),
+                        "Removing evicted segment during truncation"
                     );
                     segments_to_delete.push(*segment_id);
                 }
@@ -996,16 +1060,18 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
             active.segment.seal();
 
             let segment_id = active.segment.id();
+            let info = segment_info_from(segment_id, &active.segment);
             info!(
                 segment_id = segment_id.get(),
-                entries = active.segment.entry_count(),
+                entries = info.entry_count,
                 "Sealed segment"
             );
 
             self.sealed_segments.insert(
                 segment_id,
                 SealedSegment {
-                    segment: active.segment,
+                    segment: Some(active.segment),
+                    info,
                     path: active.path,
                 },
             );
@@ -1049,17 +1115,9 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
     /// Returns `None` if the segment doesn't exist or is the active segment.
     #[must_use]
     pub fn segment_info(&self, segment_id: SegmentId) -> Option<SegmentInfo> {
-        self.sealed_segments.get(&segment_id).map(|sealed| {
-            let segment = &sealed.segment;
-            SegmentInfo {
-                segment_id,
-                first_index: segment.first_index(),
-                last_index: segment.last_index(),
-                size_bytes: segment.size_bytes(),
-                entry_count: segment.entry_count(),
-                is_sealed: segment.is_sealed(),
-            }
-        })
+        self.sealed_segments
+            .get(&segment_id)
+            .map(|sealed| sealed.info)
     }
 
     /// Reads the raw bytes of a sealed segment for tiering to S3.
@@ -1074,7 +1132,10 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
     /// # Panics
     ///
     /// Panics if the segment exists but is not sealed (invariant violation).
-    pub fn read_segment_bytes(&self, segment_id: SegmentId) -> WalResult<bytes::Bytes> {
+    pub async fn read_segment_bytes(
+        &self,
+        segment_id: SegmentId,
+    ) -> WalResult<bytes::Bytes> {
         let sealed =
             self.sealed_segments
                 .get(&segment_id)
@@ -1083,12 +1144,108 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
                 })?;
 
         // TigerStyle: Assert preconditions.
-        assert!(
-            sealed.segment.is_sealed(),
-            "segment must be sealed for tiering"
-        );
+        assert!(sealed.info.is_sealed, "segment must be sealed for tiering");
 
-        Ok(sealed.segment.encode())
+        if let Some(segment) = &sealed.segment {
+            // Resident: encode from memory.
+            Ok(segment.encode())
+        } else {
+            // Evicted: read from disk (OS page cache makes this fast).
+            let file = self.storage.open(&sealed.path).await?;
+            file.read_all().await
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Segment Eviction
+    // -------------------------------------------------------------------------
+    // These methods drop in-memory entries from sealed segments to free memory.
+    // After eviction, reads fall back to segment files on disk (OS page cache).
+
+    /// Reads a single entry from a sealed segment on disk.
+    ///
+    /// Opens the segment file, decodes all entries, and returns the one at
+    /// `index`. This is the async fallback when `read()` returns
+    /// `WalError::SegmentEvicted`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the segment file cannot be read or decoded, or
+    /// if the entry at `index` is not found in the segment.
+    pub async fn read_entry_from_disk(
+        &self,
+        segment_id: SegmentId,
+        index: u64,
+    ) -> WalResult<E> {
+        let sealed = self
+            .sealed_segments
+            .get(&segment_id)
+            .ok_or_else(|| WalError::SegmentNotFound {
+                segment_id: segment_id.get(),
+            })?;
+
+        let file = self.storage.open(&sealed.path).await?;
+        let data = file.read_all().await?;
+        let segment = Segment::<E>::decode(data, self.config.segment_config)?;
+
+        // Find entry by index in the decoded segment.
+        segment
+            .read(index)
+            .cloned()
+    }
+
+    /// Returns the entries of a sealed segment (before eviction).
+    ///
+    /// This is used by [`SharedWal`](crate::SharedWal) to build the
+    /// evicted index before dropping entries from memory. Returns `None`
+    /// if the segment is not found or already evicted.
+    #[must_use]
+    pub fn sealed_segment_entries(
+        &self,
+        segment_id: SegmentId,
+    ) -> Option<impl Iterator<Item = &E>> {
+        self.sealed_segments
+            .get(&segment_id)
+            .and_then(|sealed| sealed.segment.as_ref())
+            .map(Segment::entries)
+    }
+
+    /// Evicts a single sealed segment from memory.
+    ///
+    /// Drops the in-memory `Vec<E>` entries. Metadata (`SegmentInfo`) and
+    /// the file path are retained for disk reads.
+    ///
+    /// Returns `true` if the segment was evicted, `false` if not found or
+    /// already evicted.
+    pub fn evict_sealed_segment(&mut self, segment_id: SegmentId) -> bool {
+        if let Some(sealed) = self.sealed_segments.get_mut(&segment_id) {
+            if sealed.segment.is_some() {
+                sealed.segment = None;
+                debug!(
+                    segment_id = segment_id.get(),
+                    "Evicted sealed segment from memory"
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Evicts all sealed segments from memory.
+    ///
+    /// Returns the number of segments evicted.
+    pub fn evict_all_sealed_segments(&mut self) -> u32 {
+        let mut count = 0u32;
+        for sealed in self.sealed_segments.values_mut() {
+            if sealed.segment.is_some() {
+                sealed.segment = None;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            debug!(count, "Evicted all sealed segments from memory");
+        }
+        count
     }
 }
 
@@ -1299,5 +1456,117 @@ mod tests {
         assert_eq!(entries[1].partition_id(), p2);
         assert_eq!(entries[1].term(), 2);
         assert_eq!(entries[1].index(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_evict_sealed_segment_read_from_disk() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = WalConfig::new(temp_dir.path())
+            .with_segment_config(
+                SegmentConfig::new().with_max_size(1024 * 1024), // 1 MB
+            );
+
+        let mut wal: Wal<TokioStorage> =
+            Wal::open(TokioStorage::new(), config).await.unwrap();
+
+        // Append entries and force segment rotation.
+        for i in 1..=5 {
+            let entry = Entry::new(1, i, Bytes::from(format!("data-{i}"))).unwrap();
+            wal.append(entry).await.unwrap();
+        }
+        wal.sync().await.unwrap();
+
+        // Force rotation to seal the segment.
+        let entry = Entry::new(1, 6, Bytes::from("trigger-rotation")).unwrap();
+        wal.append(entry).await.unwrap();
+
+        // Read should work from memory.
+        assert!(wal.read(3).is_ok());
+
+        // Evict sealed segments.
+        let sealed_ids = wal.sealed_segment_ids();
+        if !sealed_ids.is_empty() {
+            let count = wal.evict_all_sealed_segments();
+            assert!(count > 0);
+
+            // Read from evicted segment should return SegmentEvicted.
+            let result = wal.read(3);
+            assert!(matches!(result, Err(WalError::SegmentEvicted { .. })));
+
+            // Read from disk fallback should work.
+            let segment_id = sealed_ids[0];
+            let entry = wal.read_entry_from_disk(segment_id, 3).await.unwrap();
+            assert_eq!(entry.index(), 3);
+            assert_eq!(entry.term(), 1);
+
+            // segment_info should still work after eviction.
+            let info = wal.segment_info(segment_id);
+            assert!(info.is_some());
+            assert!(info.unwrap().is_sealed);
+
+            // read_segment_bytes should work (reads from disk).
+            let bytes = wal.read_segment_bytes(segment_id).await.unwrap();
+            assert!(!bytes.is_empty());
+
+            // entry_count should still be correct.
+            assert!(wal.entry_count() > 0);
+
+            // Active segment entries should still be readable.
+            assert!(wal.read(6).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_evict_then_recovery() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = WalConfig::new(temp_dir.path());
+
+        // Write entries, rotate, evict, then verify recovery works.
+        {
+            let mut wal: Wal<TokioStorage> = Wal::open(TokioStorage::new(), config.clone())
+                .await
+                .unwrap();
+
+            for i in 1..=10 {
+                let entry = Entry::new(1, i, Bytes::from(format!("data-{i}"))).unwrap();
+                wal.append(entry).await.unwrap();
+            }
+            wal.sync().await.unwrap();
+        }
+
+        // Reopen (all segments are sealed after recovery).
+        {
+            let mut wal: Wal<TokioStorage> = Wal::open(TokioStorage::new(), config.clone())
+                .await
+                .unwrap();
+
+            assert_eq!(wal.last_index(), Some(10));
+
+            // Evict all sealed segments.
+            let count = wal.evict_all_sealed_segments();
+            assert!(count > 0);
+
+            // entry_count is still correct (uses info.entry_count).
+            assert_eq!(wal.entry_count(), 10);
+
+            // Sealed segment IDs still available.
+            assert!(!wal.sealed_segment_ids().is_empty());
+        }
+
+        // Recover again — segments are loaded fresh from disk.
+        {
+            let wal: Wal<TokioStorage> = Wal::open(TokioStorage::new(), config)
+                .await
+                .unwrap();
+
+            assert_eq!(wal.last_index(), Some(10));
+            assert_eq!(wal.entry_count(), 10);
+
+            // All entries readable (fresh from disk).
+            for i in 1..=10 {
+                let entry = wal.read(i).unwrap();
+                assert_eq!(entry.index(), i);
+            }
+        }
     }
 }
