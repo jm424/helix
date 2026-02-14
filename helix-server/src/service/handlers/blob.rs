@@ -774,45 +774,24 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                 .collect(),
             PartitionStorageInner::Durable(p) => p
                 .read_blobs(Offset::new(start_offset), max_bytes)
+                .await
+                .map_err(|e| ServerError::Internal {
+                    message: e.to_string(),
+                })?
                 .into_iter()
                 .map(|b| b.data)
                 .collect(),
         };
 
         // Log result.
-        if blobs.is_empty() {
-            info!(
-                topic = %topic,
-                partition,
-                group_id = group_id.get(),
-                start_offset,
-                "read_blobs: returning EMPTY"
-            );
-        } else {
-            info!(
-                topic = %topic,
-                partition,
-                group_id = group_id.get(),
-                blobs_count = blobs.len(),
-                "read_blobs: returning blobs"
-            );
-            // Debug: log the baseOffset of each blob being returned.
-            for (i, blob) in blobs.iter().enumerate() {
-                if blob.len() >= 8 {
-                    let base_offset = i64::from_be_bytes([
-                        blob[0], blob[1], blob[2], blob[3], blob[4], blob[5], blob[6], blob[7],
-                    ]);
-                    info!(
-                        topic = %topic,
-                        partition,
-                        blob_index = i,
-                        blob_len = blob.len(),
-                        base_offset,
-                        "Returning blob"
-                    );
-                }
-            }
-        }
+        info!(
+            topic = %topic,
+            partition,
+            group_id = group_id.get(),
+            start_offset,
+            blobs_count = blobs.len(),
+            "read_blobs: returning"
+        );
 
         Ok(blobs)
     }

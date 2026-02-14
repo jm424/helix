@@ -772,8 +772,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                     })?;
 
                 // Decode and apply to cache only (no additional WAL writes).
+                // Pass wal_index for BlobIndex population. write_wal_entry
+                // already set last_applied_index to the assigned WAL index.
+                let wal_index = partition.last_applied_index();
                 partition
-                    .apply_command_to_cache(data)
+                    .apply_command_to_cache(wal_index, data)
                     .map_err(|e| ServerError::Internal {
                         message: format!("failed to apply to cache: {e}"),
                     })?
