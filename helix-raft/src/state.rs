@@ -1515,13 +1515,12 @@ impl RaftNode {
         let entries = self.log.entries_from_limited(next_idx, max_entries_bytes);
         let entries_count = entries.len();
 
-        // If the requested entries are below the in-memory log's range but
-        // exist in the data WAL, request a WAL read instead. This happens
-        // after restart when the in-memory log only has the no-op entry
-        // but the data WAL has committed entries at lower indices.
+        // If the requested entries are below the in-memory log's range,
+        // request a WAL read. This happens after restart (entries below
+        // persisted_commit_index) or after runtime log compaction
+        // (entries truncated from memory but present in WAL).
         let log_first = self.log.first_index();
-        let need_wal = next_idx <= self.persisted_commit_index
-            && (log_first.get() == 0 || next_idx < log_first);
+        let need_wal = log_first.get() > 0 && next_idx < log_first;
         if need_wal {
             outputs.push(RaftOutput::NeedEntries {
                 follower_id: peer,
@@ -1671,6 +1670,89 @@ impl RaftNode {
         debug_assert!(self.commit_index >= prev_commit);
 
         outputs
+    }
+
+    /// Compacts the Raft log by truncating committed entries (leader).
+    ///
+    /// Keeps a trailing window of entries for fast in-memory follower
+    /// catch-up. The window size is `config.log_trailing_entries`. A
+    /// hard cap based on `commit_index` prevents a lagging follower from
+    /// blocking compaction and causing OOM.
+    ///
+    /// Returns true if any entries were removed.
+    pub fn compact_log(&mut self) -> bool {
+        if self.state != RaftState::Leader {
+            return false;
+        }
+
+        let trailing = self.config.log_trailing_entries;
+        let log_len = self.log.len();
+
+        // Nothing to compact if the log is small enough.
+        if log_len <= trailing {
+            return false;
+        }
+
+        // Find the minimum match_index across all followers so we don't
+        // compact entries they still need from memory.
+        let min_match = self
+            .replication_state
+            .values()
+            .map(|s| s.match_index)
+            .min()
+            .unwrap_or(LogIndex::new(0));
+
+        // Hard cap: never keep more than trailing_window entries behind
+        // commit_index, even if a follower is lagging (WAL fallback).
+        let hard_cap = self
+            .commit_index
+            .get()
+            .saturating_sub(trailing);
+
+        // Compact to the max of (min_match, hard_cap) — keep entries
+        // that followers need, but enforce the hard cap.
+        let compact_to = hard_cap.max(min_match.get());
+
+        // Never compact past last_applied (entries not yet emitted as
+        // CommitEntry must stay in the log).
+        let compact_to = compact_to.min(self.last_applied.get());
+
+        // Nothing to compact if compact_to is below the log's start.
+        let log_first = self.log.first_index().get();
+        if log_first == 0 || compact_to < log_first {
+            return false;
+        }
+
+        self.log.truncate_prefix(LogIndex::new(compact_to));
+        true
+    }
+
+    /// Compacts the Raft log by truncating committed entries (follower).
+    ///
+    /// Followers don't have `replication_state` so they compact based on
+    /// `last_applied` minus the trailing window.
+    ///
+    /// Returns true if any entries were removed.
+    pub fn compact_log_follower(&mut self) -> bool {
+        let trailing = self.config.log_trailing_entries;
+        let log_len = self.log.len();
+
+        if log_len <= trailing {
+            return false;
+        }
+
+        let compact_to = self
+            .last_applied
+            .get()
+            .saturating_sub(trailing);
+
+        let log_first = self.log.first_index().get();
+        if log_first == 0 || compact_to < log_first {
+            return false;
+        }
+
+        self.log.truncate_prefix(LogIndex::new(compact_to));
+        true
     }
 
     /// Applies committed entries up to the given index.
@@ -2673,5 +2755,360 @@ mod tests {
             9,
             "Should fast-forward to persisted_commit_index + 1"
         );
+    }
+
+    // =========================================================================
+    // Log compaction tests
+    // =========================================================================
+
+    /// Helper: creates a leader with `n` committed entries and a small
+    /// trailing window for compaction tests.
+    fn make_leader_with_committed(
+        entry_count: u64,
+        trailing: u64,
+    ) -> RaftNode {
+        let config = make_config(1).with_log_trailing_entries(trailing);
+        let mut node = RaftNode::new(config);
+        make_leader(&mut node);
+
+        let peer = NodeId::new(2);
+
+        // Propose entries.
+        for i in 0..entry_count {
+            let data = Bytes::from(format!("entry-{i}"));
+            node.handle_client_request(ClientRequest::new(data));
+        }
+
+        // Ack from peer to commit (quorum = 2 in a 3-node cluster).
+        // last_index includes the leader's no-op entry at index 1,
+        // so entries are at indices 2..=entry_count+1.
+        let match_idx = node.log.last_index();
+        let resp = AppendEntriesResponse::new(
+            node.current_term(),
+            peer,
+            node.node_id(),
+            true,
+            match_idx,
+            LogIndex::new(0),
+        );
+        node.handle_message(Message::AppendEntriesResponse(resp));
+
+        // Postcondition: all entries committed and applied.
+        assert_eq!(node.commit_index().get(), match_idx.get());
+        assert_eq!(node.last_applied().get(), match_idx.get());
+        node
+    }
+
+    #[test]
+    fn test_compact_log_truncates_committed_entries() {
+        let mut node = make_leader_with_committed(20, 5);
+
+        let log_len_before = node.log.len();
+        assert!(log_len_before > 5, "should have >5 entries before compact");
+
+        let compacted = node.compact_log();
+        assert!(compacted, "compact_log should have removed entries");
+
+        // Log should be trimmed — at most trailing + a few entries.
+        assert!(
+            node.log.len() <= 10,
+            "log should be trimmed, got {}",
+            node.log.len()
+        );
+    }
+
+    #[test]
+    fn test_compact_log_respects_trailing_window() {
+        let mut node = make_leader_with_committed(30, 10);
+
+        node.compact_log();
+
+        // Should retain at least trailing_window entries.
+        assert!(
+            node.log.len() >= 10,
+            "should retain at least trailing entries, got {}",
+            node.log.len()
+        );
+
+        // The last entry should still be accessible.
+        let last = node.log.last_index();
+        assert!(node.log.get(last).is_some(), "last entry should exist");
+    }
+
+    #[test]
+    fn test_compact_log_respects_min_match_index() {
+        let config = make_config(1).with_log_trailing_entries(5);
+        let mut node = RaftNode::new(config);
+        make_leader(&mut node);
+
+        let peer2 = NodeId::new(2);
+        let peer3 = NodeId::new(3);
+
+        // Propose 20 entries.
+        for i in 0..20 {
+            let data = Bytes::from(format!("entry-{i}"));
+            node.handle_client_request(ClientRequest::new(data));
+        }
+
+        // Peer2 has caught up to index 21, peer3 only to index 10.
+        let resp2 = AppendEntriesResponse::new(
+            node.current_term(),
+            peer2,
+            node.node_id(),
+            true,
+            node.log.last_index(),
+            LogIndex::new(0),
+        );
+        node.handle_message(Message::AppendEntriesResponse(resp2));
+
+        let resp3 = AppendEntriesResponse::new(
+            node.current_term(),
+            peer3,
+            node.node_id(),
+            true,
+            LogIndex::new(10),
+            LogIndex::new(0),
+        );
+        node.handle_message(Message::AppendEntriesResponse(resp3));
+
+        // min(match_index) = 10. With trailing=5 and commit_index=21,
+        // hard_cap = 21-5 = 16. compact_to = max(10, 16) = 16.
+        // So entries up to 16 get removed.
+        node.compact_log();
+
+        let first = node.log.first_index();
+        assert!(
+            first.get() >= 10,
+            "first_index should be >= min_match (10), got {}",
+            first.get()
+        );
+    }
+
+    #[test]
+    fn test_compact_log_with_lagging_follower_enforces_cap() {
+        let config = make_config(1).with_log_trailing_entries(5);
+        let mut node = RaftNode::new(config);
+        make_leader(&mut node);
+
+        let peer2 = NodeId::new(2);
+        let peer3 = NodeId::new(3);
+
+        // Propose 30 entries.
+        for i in 0..30 {
+            let data = Bytes::from(format!("entry-{i}"));
+            node.handle_client_request(ClientRequest::new(data));
+        }
+
+        // Peer2 fully caught up, peer3 stuck at index 2 (very lagging).
+        let resp2 = AppendEntriesResponse::new(
+            node.current_term(),
+            peer2,
+            node.node_id(),
+            true,
+            node.log.last_index(),
+            LogIndex::new(0),
+        );
+        node.handle_message(Message::AppendEntriesResponse(resp2));
+
+        let resp3 = AppendEntriesResponse::new(
+            node.current_term(),
+            peer3,
+            node.node_id(),
+            true,
+            LogIndex::new(2),
+            LogIndex::new(0),
+        );
+        node.handle_message(Message::AppendEntriesResponse(resp3));
+
+        // commit_index = 31, trailing = 5, hard_cap = 26.
+        // min_match = 2. compact_to = max(2, 26) = 26.
+        // Hard cap overrides the lagging follower.
+        node.compact_log();
+
+        let first = node.log.first_index();
+        assert!(
+            first.get() > 2,
+            "hard cap should override lagging follower, got first={}",
+            first.get()
+        );
+    }
+
+    #[test]
+    fn test_compact_log_no_op_when_small() {
+        // With only a few entries and a large trailing window, nothing
+        // should be compacted.
+        let mut node = make_leader_with_committed(5, 100);
+        let compacted = node.compact_log();
+        assert!(!compacted, "should not compact when log is small");
+    }
+
+    #[test]
+    fn test_compact_log_follower_truncates() {
+        let config = make_config(1).with_log_trailing_entries(5);
+        let mut node = RaftNode::new(config);
+        // Node stays as follower — simulate receiving entries via
+        // AppendEntries from a leader.
+
+        let leader = NodeId::new(2);
+        let term = TermId::new(1);
+
+        // Build entries as if received from leader.
+        let mut entries = Vec::new();
+        for i in 1..=25u64 {
+            entries.push(LogEntry::new(
+                term,
+                LogIndex::new(i),
+                Bytes::from(format!("data-{i}")),
+            ));
+        }
+
+        let req = AppendEntriesRequest::new(
+            term,
+            leader,
+            node.node_id(),
+            LogIndex::new(0),
+            TermId::new(0),
+            entries,
+            LogIndex::new(25),
+        );
+        node.handle_message(Message::AppendEntries(req));
+
+        // Node is follower with last_applied=25, log len=25.
+        assert_eq!(node.last_applied().get(), 25);
+        assert_eq!(node.log.len(), 25);
+
+        let compacted = node.compact_log_follower();
+        assert!(compacted, "follower should compact");
+
+        // compact_to = 25 - 5 = 20. Entries 1..=20 removed.
+        assert_eq!(
+            node.log.first_index().get(),
+            21,
+            "first_index should be 21 after compaction"
+        );
+        assert_eq!(node.log.len(), 5, "should have 5 trailing entries");
+    }
+
+    #[test]
+    fn test_compact_log_follower_no_op_when_not_leader() {
+        // compact_log() (leader path) should be a no-op for followers.
+        let mut node = make_leader_with_committed(20, 5);
+
+        // Step down.
+        node.state = RaftState::Follower;
+        let compacted = node.compact_log();
+        assert!(!compacted, "compact_log should be no-op for follower");
+    }
+
+    #[test]
+    fn test_need_entries_after_truncation() {
+        let mut node = make_leader_with_committed(30, 5);
+
+        // Compact: commit_index=31, trailing=5, so entries 1..=26 removed.
+        node.compact_log();
+
+        let peer3 = NodeId::new(3);
+        // Simulate peer3 at next_index=10 (below compacted range).
+        if let Some(state) = node.replication_state.get_mut(&peer3) {
+            state.next_index = LogIndex::new(10);
+            state.inflight_count = 0;
+        }
+
+        let outputs = node.send_append_entries(peer3);
+
+        // Should emit NeedEntries because index 10 is below log's first_index.
+        let need = outputs.iter().any(|o| {
+            matches!(o, RaftOutput::NeedEntries { start_index, .. }
+                if start_index.get() == 10)
+        });
+        assert!(
+            need,
+            "should emit NeedEntries for truncated entries"
+        );
+    }
+
+    #[test]
+    fn test_compaction_then_provide_entries() {
+        let mut node = make_leader_with_committed(30, 5);
+
+        node.compact_log();
+
+        let peer3 = NodeId::new(3);
+        // Simulate peer3 needing entries at index 10.
+        if let Some(state) = node.replication_state.get_mut(&peer3) {
+            state.next_index = LogIndex::new(10);
+            state.inflight_count = 0;
+        }
+
+        let outputs = node.send_append_entries(peer3);
+
+        // Find the NeedEntries output.
+        let need_entries = outputs.iter().find_map(|o| {
+            if let RaftOutput::NeedEntries {
+                follower_id,
+                start_index,
+                prev_log_index,
+                max_bytes,
+            } = o
+            {
+                Some((*follower_id, *start_index, *prev_log_index, *max_bytes))
+            } else {
+                None
+            }
+        });
+        assert!(need_entries.is_some(), "should emit NeedEntries");
+
+        let (follower_id, start_index, prev_log_index, _max_bytes) =
+            need_entries.unwrap();
+
+        // Simulate WAL providing entries.
+        let wal_entries: Vec<LogEntry> = (start_index.get()..=15)
+            .map(|i| {
+                LogEntry::new(
+                    TermId::new(1),
+                    LogIndex::new(i),
+                    Bytes::from(format!("wal-{i}")),
+                )
+            })
+            .collect();
+
+        let prev_term = TermId::new(1);
+        let outputs = node.provide_entries(
+            follower_id,
+            prev_log_index,
+            prev_term,
+            wal_entries,
+        );
+
+        // Should produce an AppendEntries message.
+        let sent = outputs.iter().any(|o| {
+            matches!(o, RaftOutput::SendMessage(Message::AppendEntries(_)))
+        });
+        assert!(sent, "should send AppendEntries from WAL entries");
+    }
+
+    #[test]
+    fn test_compaction_preserves_term_at_boundary() {
+        // After compaction, term_at(compact_to) should still return
+        // the correct term for prev_log_term lookups.
+        let mut node = make_leader_with_committed(20, 5);
+
+        let last_before = node.log.last_index();
+        node.compact_log();
+
+        let first_after = node.log.first_index();
+        assert!(first_after.get() > 1, "should have compacted");
+
+        // The entry just below first_after should be at compacted_index.
+        let boundary = LogIndex::new(first_after.get() - 1);
+        let term = node.log.term_at(boundary);
+        assert!(
+            term.get() > 0,
+            "term_at boundary should return non-zero term, got {}",
+            term.get()
+        );
+
+        // Last entry should still be accessible.
+        assert!(node.log.get(last_before).is_some());
     }
 }

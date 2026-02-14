@@ -249,15 +249,20 @@ impl RaftLog {
 
     /// Truncates the log prefix up to and including the given index.
     ///
-    /// Removes entries with index <= `last_to_remove`. This is used during
-    /// snapshot installation to discard entries covered by the snapshot.
+    /// Removes entries with index <= `last_to_remove`. Updates compacted
+    /// state so `term_at(last_to_remove)` returns the correct term for
+    /// `prev_log_term` lookups in `send_append_entries`.
     pub fn truncate_prefix(&mut self, last_to_remove: LogIndex) {
         if self.entries.is_empty() {
             return;
         }
 
         if last_to_remove.get() >= self.last_index().get() {
-            // Remove everything.
+            // Save compacted state from the last entry before clearing.
+            if let Some(last) = self.entries.last() {
+                self.compacted_index = last.index.get();
+                self.compacted_term = last.term.get();
+            }
             self.entries.clear();
             self.first_index = last_to_remove.get() + 1;
             return;
@@ -272,6 +277,12 @@ impl RaftLog {
         // Safe cast: remove_count is bounded by entries.len() which fits in usize.
         #[allow(clippy::cast_possible_truncation)]
         let remove_count = (last_to_remove.get() - self.first_index + 1) as usize;
+
+        // Save compacted state from the last removed entry so that
+        // term_at(last_to_remove) returns correctly after truncation.
+        let last_removed = &self.entries[remove_count - 1];
+        self.compacted_index = last_removed.index.get();
+        self.compacted_term = last_removed.term.get();
 
         // Remove the prefix.
         self.entries.drain(..remove_count);

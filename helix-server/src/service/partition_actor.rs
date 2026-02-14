@@ -1387,6 +1387,13 @@ impl PartitionActorShared {
                 }
             }
         }
+
+        // Compact the Raft log after processing outputs to bound memory.
+        if self.raft_node.is_leader() {
+            self.raft_node.compact_log();
+        } else {
+            self.raft_node.compact_log_follower();
+        }
     }
 }
 
@@ -1608,6 +1615,13 @@ impl PartitionActor {
                         .await;
                 }
             }
+        }
+
+        // Compact the Raft log after processing outputs to bound memory.
+        if self.raft_node.is_leader() {
+            self.raft_node.compact_log();
+        } else {
+            self.raft_node.compact_log_follower();
         }
     }
 }

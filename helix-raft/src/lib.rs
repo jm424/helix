@@ -72,4 +72,10 @@ pub mod limits {
 
     /// Maximum election tick.
     pub const ELECTION_TICK_MAX: u32 = 100;
+
+    /// Default number of trailing log entries to retain after compaction.
+    ///
+    /// At ~1 KB per entry, 10K entries ≈ 10 MB — negligible memory but
+    /// enough for fast in-memory follower catch-up in normal operation.
+    pub const LOG_TRAILING_ENTRIES_DEFAULT: u64 = 10_000;
 }

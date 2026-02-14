@@ -4,7 +4,7 @@ use helix_core::NodeId;
 
 use crate::limits::{
     CLUSTER_SIZE_MAX, ELECTION_TICK_DEFAULT, ELECTION_TICK_MAX, ELECTION_TICK_MIN,
-    HEARTBEAT_TICK_DEFAULT,
+    HEARTBEAT_TICK_DEFAULT, LOG_TRAILING_ENTRIES_DEFAULT,
 };
 
 /// Configuration for a Raft node.
@@ -43,6 +43,13 @@ pub struct RaftConfig {
     /// Random seed for this node (used for election timeout randomization).
     /// Each node should have a different seed.
     pub random_seed: u64,
+
+    /// Number of trailing log entries to retain after compaction.
+    ///
+    /// After compaction, this many recent entries are kept in-memory for
+    /// fast follower catch-up. Entries older than the window are served
+    /// from the WAL. At ~1 KB per entry, 10K entries ≈ 10 MB.
+    pub log_trailing_entries: u64,
 }
 
 impl RaftConfig {
@@ -68,6 +75,7 @@ impl RaftConfig {
             heartbeat_tick: HEARTBEAT_TICK_DEFAULT,
             // Use node_id as seed by default for determinism.
             random_seed: node_id.get(),
+            log_trailing_entries: LOG_TRAILING_ENTRIES_DEFAULT,
         }
     }
 
@@ -122,6 +130,13 @@ impl RaftConfig {
     #[must_use]
     pub const fn with_random_seed(mut self, seed: u64) -> Self {
         self.random_seed = seed;
+        self
+    }
+
+    /// Sets the number of trailing log entries to retain after compaction.
+    #[must_use]
+    pub const fn with_log_trailing_entries(mut self, entries: u64) -> Self {
+        self.log_trailing_entries = entries;
         self
     }
 
