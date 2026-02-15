@@ -927,6 +927,7 @@ impl SegmentReader for TestSegmentReader {
     async fn read_segment_bytes(&self, segment_id: SegmentId) -> TierResult<Bytes> {
         let wal = self.wal.read().await;
         wal.read_segment_bytes(segment_id)
+            .await
             .map_err(|e| TierError::Io {
                 operation: "read_segment_bytes",
                 message: e.to_string(),
@@ -1105,7 +1106,7 @@ async fn test_real_segment_rotation_and_tiering() {
         );
 
         // The downloaded bytes should be the encoded segment.
-        let original = wal.read().await.read_segment_bytes(*segment_id).unwrap();
+        let original = wal.read().await.read_segment_bytes(*segment_id).await.unwrap();
         assert_eq!(
             downloaded, original,
             "Downloaded data should match original"
@@ -1244,7 +1245,7 @@ async fn test_real_tiering_corruption_detection() {
 
     // Download with corruption - data should be different.
     let corrupted = tiering_manager.download_segment(segment_id).await.unwrap();
-    let original = wal.read().await.read_segment_bytes(segment_id).unwrap();
+    let original = wal.read().await.read_segment_bytes(segment_id).await.unwrap();
     assert_ne!(
         corrupted, original,
         "Corrupted data should differ from original"
@@ -1335,7 +1336,7 @@ async fn test_real_multi_segment_tiering() {
 
         // Download and verify.
         let downloaded = tiering_manager.download_segment(*segment_id).await.unwrap();
-        let original = wal.read().await.read_segment_bytes(*segment_id).unwrap();
+        let original = wal.read().await.read_segment_bytes(*segment_id).await.unwrap();
         assert_eq!(downloaded, original);
     }
 }
@@ -1559,7 +1560,7 @@ async fn test_concurrent_tiering_different_segments() {
 
         // Verify data integrity.
         let downloaded = tiering_manager.download_segment(*segment_id).await.unwrap();
-        let original = wal.read().await.read_segment_bytes(*segment_id).unwrap();
+        let original = wal.read().await.read_segment_bytes(*segment_id).await.unwrap();
         assert_eq!(
             downloaded, original,
             "Data mismatch for segment {segment_id:?}"
@@ -1664,7 +1665,7 @@ async fn test_concurrent_tiering_same_segment_race() {
 
     // Verify data integrity.
     let downloaded = tiering_manager.download_segment(segment_id).await.unwrap();
-    let original = wal.read().await.read_segment_bytes(segment_id).unwrap();
+    let original = wal.read().await.read_segment_bytes(segment_id).await.unwrap();
     assert_eq!(downloaded, original);
 }
 
@@ -1794,7 +1795,7 @@ async fn test_manager_restart_recovery() {
 
             // Verify data integrity.
             let downloaded = new_manager.download_segment(*segment_id).await.unwrap();
-            let original = wal.read().await.read_segment_bytes(*segment_id).unwrap();
+            let original = wal.read().await.read_segment_bytes(*segment_id).await.unwrap();
             assert_eq!(downloaded, original);
         }
     }
@@ -1904,7 +1905,7 @@ async fn test_continuous_tiering_with_random_faults() {
 
         for segment_id in &successfully_tiered {
             let downloaded = tiering_manager.download_segment(*segment_id).await.unwrap();
-            let original = wal.read().await.read_segment_bytes(*segment_id).unwrap();
+            let original = wal.read().await.read_segment_bytes(*segment_id).await.unwrap();
             assert_eq!(
                 downloaded, original,
                 "seed {seed}: Data integrity violation for segment {segment_id:?}"
@@ -2050,7 +2051,7 @@ async fn test_restart_recovery_with_multiple_seeds() {
 
                 // Data integrity check.
                 let downloaded = new_manager.download_segment(*segment_id).await.unwrap();
-                let original = wal.read().await.read_segment_bytes(*segment_id).unwrap();
+                let original = wal.read().await.read_segment_bytes(*segment_id).await.unwrap();
                 assert_eq!(
                     downloaded, original,
                     "seed {seed}: Data integrity violation"
@@ -2191,7 +2192,7 @@ async fn test_interleaved_operations_with_faults() {
         );
 
         let downloaded = tiering_manager.download_segment(*segment_id).await.unwrap();
-        let original = wal.read().await.read_segment_bytes(*segment_id).unwrap();
+        let original = wal.read().await.read_segment_bytes(*segment_id).await.unwrap();
         assert_eq!(downloaded, original, "Data integrity check failed");
     }
 }
@@ -2267,7 +2268,7 @@ async fn test_diagnostic_tiering_pipeline() {
         let info = wal.read().await.segment_info(*segment_id).unwrap();
 
         // Read raw bytes from WAL.
-        let wal_bytes = wal.read().await.read_segment_bytes(*segment_id).unwrap();
+        let wal_bytes = wal.read().await.read_segment_bytes(*segment_id).await.unwrap();
         assert!(
             !wal_bytes.is_empty(),
             "DIAGNOSTIC: WAL segment {segment_id:?} bytes are empty!"
@@ -2313,7 +2314,7 @@ async fn test_diagnostic_tiering_pipeline() {
     // Final verification: download through the API and compare.
     for segment_id in &sealed_ids {
         let downloaded = tiering_manager.download_segment(*segment_id).await.unwrap();
-        let original = wal.read().await.read_segment_bytes(*segment_id).unwrap();
+        let original = wal.read().await.read_segment_bytes(*segment_id).await.unwrap();
         assert_eq!(
             downloaded, original,
             "DIAGNOSTIC: Downloaded bytes don't match original WAL bytes"
@@ -2600,7 +2601,7 @@ async fn test_buggify_data_integrity_after_crashes() {
 
             if matches!(location, Some(SegmentLocation::Both)) {
                 let downloaded = tiering_manager.download_segment(*segment_id).await.unwrap();
-                let original = wal.read().await.read_segment_bytes(*segment_id).unwrap();
+                let original = wal.read().await.read_segment_bytes(*segment_id).await.unwrap();
                 assert_eq!(
                     downloaded,
                     original,

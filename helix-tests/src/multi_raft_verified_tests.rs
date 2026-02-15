@@ -752,6 +752,9 @@ impl VerifiedMultiRaftActor {
                     self.persisted_vote_state
                         .insert(group_id, (term, voted_for));
                 }
+                MultiRaftOutput::NeedEntries { .. } => {
+                    // WAL-backed AppendEntries; not exercised in this test.
+                }
             }
         }
     }
