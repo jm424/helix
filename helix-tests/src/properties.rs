@@ -10,6 +10,8 @@ use bytes::Bytes;
 use helix_core::LogIndex;
 use helix_raft::RaftState;
 
+use tracing::warn;
+
 use crate::raft_actor::RaftActor;
 
 // ============================================================================
@@ -1169,7 +1171,7 @@ pub fn check_helix_properties(
                 term,
                 leaders: leaders.iter().copied().collect(),
             });
-            tracing::warn!(
+            warn!(
                 group_id,
                 term,
                 leaders = ?leaders,

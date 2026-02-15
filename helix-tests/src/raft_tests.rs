@@ -11,6 +11,8 @@ use bloodhound::simulation::discrete::event::ActorId;
 use helix_core::NodeId;
 use helix_raft::{RaftConfig, RaftState};
 
+use tracing::info;
+
 use crate::raft_actor::{create_raft_cluster, RaftActor};
 use crate::scenarios::seeds::REGRESSION_SEEDS;
 
@@ -168,11 +170,12 @@ fn run_leader_election_simulation(seed: u64) {
     );
 
     // Print stats for debugging.
-    println!(
-        "Seed {seed}: {} events in {}ns virtual time ({:.0}x speedup)",
-        result.stats.events_processed,
-        result.stats.final_time_ns,
-        result.stats.speedup()
+    info!(
+        seed,
+        events = result.stats.events_processed,
+        virtual_time_ns = result.stats.final_time_ns,
+        speedup = format_args!("{:.0}x", result.stats.speedup()),
+        "Simulation completed"
     );
 }
 
@@ -200,9 +203,10 @@ fn test_simulation_single_node_election() {
     let result = engine.run();
 
     assert!(result.success);
-    println!(
-        "Single node: {} events, final time {}ns",
-        result.stats.events_processed, result.stats.final_time_ns
+    info!(
+        events = result.stats.events_processed,
+        final_time_ns = result.stats.final_time_ns,
+        "Single node simulation completed"
     );
 }
 
@@ -233,11 +237,11 @@ fn test_simulation_five_node_cluster() {
     let result = engine.run();
 
     assert!(result.success);
-    println!(
-        "5-node cluster: {} events, {}ns virtual time, {:.0} events/sec",
-        result.stats.events_processed,
-        result.stats.final_time_ns,
-        result.stats.events_per_second()
+    info!(
+        events = result.stats.events_processed,
+        virtual_time_ns = result.stats.final_time_ns,
+        events_per_sec = format_args!("{:.0}", result.stats.events_per_second()),
+        "5-node cluster simulation completed"
     );
 }
 
@@ -275,5 +279,5 @@ fn test_simulation_regression_seeds() {
         );
     }
 
-    println!("All {} regression seeds passed", REGRESSION_SEEDS.len());
+    info!(count = REGRESSION_SEEDS.len(), "All regression seeds passed");
 }

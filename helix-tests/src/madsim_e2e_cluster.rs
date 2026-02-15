@@ -85,7 +85,7 @@ use helix_server::service::router::PartitionRouter;
 use helix_server::service::HelixService;
 use helix_wal::{FaultConfig, SimulatedStorage};
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{debug, error, info, trace};
 
 use crate::madsim_transport::{
     create_cluster_mailboxes, IncomingMessage as MadSimIncomingMessage, MadSimNetworkState,
@@ -579,7 +579,7 @@ impl E2ECluster {
                         return Ok(());
                     }
                     // Try another node.
-                    tracing::debug!(
+                    debug!(
                         node = node_id.get(),
                         error_code,
                         message = %message,
@@ -668,7 +668,7 @@ impl E2ECluster {
                 Ok(offset) => return Ok(Offset::new(offset)),
                 Err(KafkaError::Protocol { error_code, .. }) if error_code == 6 => {
                     // NOT_LEADER_OR_FOLLOWER (error code 6) - try another node.
-                    tracing::debug!(node = node_id.get(), "Not leader, trying another node");
+                    debug!(node = node_id.get(), "Not leader, trying another node");
                     current_node_id = available_nodes
                         .iter()
                         .find(|&&n| !tried_nodes.contains(&n))
@@ -689,7 +689,7 @@ impl E2ECluster {
                     ref message,
                 }) if error_code == 9 => {
                     // BROKER_NOT_AVAILABLE (error code 9) - server overloaded, try another node.
-                    tracing::debug!(
+                    debug!(
                         node = node_id.get(),
                         "Broker not available (overloaded), trying another node"
                     );
@@ -706,7 +706,7 @@ impl E2ECluster {
                     // UNKNOWN_TOPIC_OR_PARTITION (3), LEADER_NOT_AVAILABLE (5), or UNKNOWN (-1)
                     // These are retriable - the controller may not have replicated to this node yet,
                     // or there's a transient issue during partition setup.
-                    tracing::debug!(
+                    debug!(
                         node = node_id.get(),
                         error_code,
                         "Partition not ready on this node, trying another"
@@ -755,7 +755,7 @@ impl E2ECluster {
         #[allow(clippy::cast_sign_loss)]
         let partition_id = PartitionId::new(u64::from(partition));
 
-        eprintln!("=== Debug state for {topic}:{partition} ===");
+        debug!(topic, partition, "Debug partition state");
 
         for node in self.nodes.values() {
             let node_id = node.node_id;
@@ -767,9 +767,9 @@ impl E2ECluster {
             };
 
             let Some(topic_id) = topic_id else {
-                eprintln!(
-                    "  Node {}: topic not found in controller state",
-                    node_id.get()
+                debug!(
+                    node_id = node_id.get(),
+                    "Topic not found in controller state"
                 );
                 continue;
             };
@@ -781,7 +781,10 @@ impl E2ECluster {
             };
 
             let Some(group_id) = group_id else {
-                eprintln!("  Node {}: partition not found in group_map", node_id.get());
+                debug!(
+                    node_id = node_id.get(),
+                    "Partition not found in group_map"
+                );
                 continue;
             };
 
@@ -835,19 +838,18 @@ impl E2ECluster {
                 String::new()
             };
 
-            eprintln!(
-                "  Node {}: {} term={} leader={:?} commit={} log={} blobs={}{}",
-                node_id.get(),
-                state_str,
+            debug!(
+                node_id = node_id.get(),
+                state = state_str,
                 term,
-                leader_id,
+                ?leader_id,
                 commit_idx,
                 log_len,
                 blob_count,
-                repl_info
+                repl_info,
+                "Partition node state"
             );
         }
-        eprintln!("===========================================");
     }
 
     /// Debug helper: prints controller group state (group 0) for all nodes.
@@ -855,7 +857,7 @@ impl E2ECluster {
     pub async fn debug_controller_state(&self) {
         use helix_raft::RaftState;
 
-        eprintln!("=== Controller (group 0) state ===");
+        debug!("Controller (group 0) state");
 
         for node in self.nodes.values() {
             let node_id = node.node_id;
@@ -882,17 +884,16 @@ impl E2ECluster {
                 }
             };
 
-            eprintln!(
-                "  Node {}: {} term={} leader={:?} commit={} log={}",
-                node_id.get(),
-                state_str,
+            debug!(
+                node_id = node_id.get(),
+                state = state_str,
                 term,
-                leader_id,
+                ?leader_id,
                 commit_idx,
-                log_len
+                log_len,
+                "Controller node state"
             );
         }
-        eprintln!("=================================");
     }
 
     /// Checks if a specific node is available (not partitioned from all others, not crashed).
@@ -974,7 +975,7 @@ impl E2ECluster {
                 {
                     // Retriable: NOT_LEADER (6), LEADER_NOT_AVAILABLE (5),
                     // UNKNOWN_TOPIC (3), BROKER_NOT_AVAILABLE (9).
-                    tracing::debug!(
+                    debug!(
                         node = node_id.get(),
                         error_code,
                         "fetch: retriable error, trying next node"
@@ -982,7 +983,7 @@ impl E2ECluster {
                     continue;
                 }
                 Err(e) => {
-                    tracing::debug!(node = node_id.get(), error = %e, "fetch failed");
+                    debug!(node = node_id.get(), error = %e, "fetch failed");
                     continue;
                 }
             }
@@ -1118,7 +1119,7 @@ impl E2ECluster {
                 Some(all_batches)
             }
             Err(e) => {
-                tracing::debug!(
+                debug!(
                     node = node_id.get(),
                     error = %e,
                     "consume_from_node fetch failed"
@@ -1185,7 +1186,7 @@ impl E2ECluster {
             {
                 let state = self.network_state.lock().expect("lock poisoned");
                 if state.is_crashed(node_id) {
-                    tracing::debug!(
+                    debug!(
                         node = node_id.get(),
                         "Skipping crashed node in consistency check"
                     );
@@ -1197,7 +1198,7 @@ impl E2ECluster {
             let records = match self.consume_from_node(node_id, topic, partition, 0).await {
                 Some(r) => r,
                 None => {
-                    tracing::debug!(
+                    debug!(
                         node = node_id.get(),
                         topic,
                         partition,
@@ -1216,7 +1217,7 @@ impl E2ECluster {
 
         if replica_data.len() == 1 {
             // Only one replica available - can't verify cross-replica consistency.
-            tracing::debug!("Only one replica available, skipping cross-replica check");
+            debug!("Only one replica available, skipping cross-replica check");
             return Ok(());
         }
 
@@ -1261,7 +1262,7 @@ impl E2ECluster {
             }
         }
 
-        tracing::debug!(
+        debug!(
             topic,
             partition,
             replicas = replica_data.len(),
@@ -1607,7 +1608,7 @@ impl E2ECluster {
                     state.verify_payload_direct(topic_id, u64::from(partition), offset, &payload)
                 {
                     // Data corruption detected for acked data.
-                    tracing::error!(
+                    error!(
                         topic_id,
                         partition,
                         offset,
@@ -1617,7 +1618,7 @@ impl E2ECluster {
                     return Err(corruption_error);
                 }
             } else {
-                tracing::debug!(
+                debug!(
                     topic_id,
                     partition,
                     offset,
@@ -1632,7 +1633,7 @@ impl E2ECluster {
                 state.verify_offset_with_hash(topic_id, u64::from(partition), offset, actual_hash);
 
             verified_count += 1;
-            tracing::trace!(
+            trace!(
                 topic_id,
                 partition,
                 offset,
@@ -1650,7 +1651,7 @@ impl E2ECluster {
             ));
         }
 
-        tracing::debug!(
+        debug!(
             topic,
             partition,
             start_offset,
@@ -1932,11 +1933,11 @@ impl E2ECluster {
                 let count = router.partition_count().await;
                 let group_ids: Vec<u64> =
                     router.group_ids().await.iter().map(|g| g.get()).collect();
-                eprintln!(
-                    "[DEBUG] Node {}: router has {} partitions: {:?}",
-                    node_id.get(),
-                    count,
-                    group_ids
+                debug!(
+                    node_id = node_id.get(),
+                    partition_count = count,
+                    ?group_ids,
+                    "Router state"
                 );
 
                 // Query leader state for each partition.
@@ -1944,18 +1945,18 @@ impl E2ECluster {
                     if let Ok(handle) = router.partition(group_id).await {
                         let is_leader = handle.is_leader().await.unwrap_or(false);
                         let leader_id = handle.leader_id().await.unwrap_or(None);
-                        eprintln!(
-                            "[DEBUG]   Group {}: is_leader={}, leader_id={:?}",
-                            group_id.get(),
+                        debug!(
+                            group_id = group_id.get(),
                             is_leader,
-                            leader_id.map(|n| n.get())
+                            leader_id = ?leader_id.map(|n| n.get()),
+                            "Group state"
                         );
                     }
                 }
 
                 // Also check if the service's actor_router has the same partitions.
                 let service_has_router = node.service.actor_router().is_some();
-                eprintln!("[DEBUG]   Service has actor_router: {}", service_has_router);
+                debug!(service_has_router, "Service actor_router");
                 if let Some(service_router) = node.service.actor_router() {
                     let service_count = service_router.partition_count().await;
                     let service_groups: Vec<u64> = service_router
@@ -1964,13 +1965,14 @@ impl E2ECluster {
                         .iter()
                         .map(|g| g.get())
                         .collect();
-                    eprintln!(
-                        "[DEBUG]   Service router partitions: {} {:?}",
-                        service_count, service_groups
+                    debug!(
+                        partition_count = service_count,
+                        ?service_groups,
+                        "Service router partitions"
                     );
                 }
             } else {
-                eprintln!("[DEBUG] Node {}: no router", node_id.get());
+                debug!(node_id = node_id.get(), "No router");
             }
         }
     }
@@ -1994,7 +1996,7 @@ impl E2ECluster {
                     // Short wait for leader election / replication (10ms simulated).
                     self.sleep(Duration::from_millis(10)).await;
                     if attempt % 50 == 0 && attempt > 0 {
-                        tracing::debug!(attempt, "Produce retry, waiting for leader");
+                        debug!(attempt, "Produce retry, waiting for leader");
                     }
                 }
             }
@@ -2403,7 +2405,7 @@ mod tests {
                 }
             }
         }
-        eprintln!("[PASS] test_extract_payload_roundtrip: Parser correctly extracts payloads");
+        info!("test_extract_payload_roundtrip: parser correctly extracts payloads");
     }
 
     /// Verifies that `verify_payload_direct` catches data corruption.
@@ -2445,7 +2447,7 @@ mod tests {
             "Error should mention UNEXPECTED DATA: {err}"
         );
 
-        eprintln!("[PASS] test_verification_catches_corruption: Corruption detection works");
+        info!("test_verification_catches_corruption: corruption detection works");
     }
 
     /// Verifies that parse errors are caught explicitly, not silently skipped.
@@ -2465,7 +2467,7 @@ mod tests {
             "Error should explain the issue: {err}"
         );
 
-        eprintln!("[PASS] test_parse_error_not_silent: Parse errors are caught explicitly");
+        info!("test_parse_error_not_silent: parse errors are caught explicitly");
     }
 
     // ========================================================================
@@ -3113,7 +3115,7 @@ mod tests {
                         // Apply fault scenario based on tick count.
                         // Pass None for leader - scenarios that need leader will be skipped.
                         if let Some(action) = executor.tick(&cluster, None) {
-                            tracing::debug!(seed, tick, action, "Fault injected");
+                            debug!(seed, tick, action, "Fault injected");
                         }
 
                         // Small sleep to advance simulated time (reduced from 50ms).
@@ -3298,7 +3300,7 @@ mod tests {
 
                     // With fault injection, we may lose some records depending on scenario.
                     // Verify we got a reasonable number of records.
-                    tracing::debug!(
+                    debug!(
                         seed,
                         produced,
                         consumed,
@@ -3632,7 +3634,7 @@ mod tests {
                         }
                     }
 
-                    tracing::debug!(
+                    debug!(
                         seed,
                         total_acked,
                         total_failed,

@@ -17,6 +17,7 @@ use helix_raft::{
     PreVoteResponse, RaftConfig, RaftNode, RaftOutput, RaftState, RequestVoteRequest,
     RequestVoteResponse, TimeoutNowRequest,
 };
+use tracing::{debug, info, trace, warn};
 
 /// Timer IDs for Raft events.
 mod timer_ids {
@@ -713,7 +714,7 @@ impl RaftActor {
                 RaftOutput::CommitEntry { index, data, .. } => {
                     // Record applied entry for StateMachineSafety verification.
                     self.record_applied_entry(index, &data);
-                    tracing::debug!(
+                    debug!(
                         actor = %self.name,
                         index = index.get(),
                         data_len = data.len(),
@@ -721,21 +722,21 @@ impl RaftActor {
                     );
                 }
                 RaftOutput::BecameLeader => {
-                    tracing::info!(
+                    info!(
                         actor = %self.name,
                         term = self.node.current_term().get(),
                         "became leader"
                     );
                 }
                 RaftOutput::SteppedDown => {
-                    tracing::info!(
+                    info!(
                         actor = %self.name,
                         term = self.node.current_term().get(),
                         "stepped down"
                     );
                 }
                 RaftOutput::VoteStateChanged { term, voted_for } => {
-                    tracing::debug!(
+                    debug!(
                         actor = %self.name,
                         term = term.get(),
                         voted_for = ?voted_for.map(NodeId::get),
@@ -745,7 +746,7 @@ impl RaftActor {
                 RaftOutput::NeedEntries { .. } => {
                     // DST simulation doesn't have WAL-backed entries.
                     // The in-memory log should always have entries.
-                    tracing::debug!(
+                    debug!(
                         actor = %self.name,
                         "NeedEntries (ignored in simulation)"
                     );
@@ -773,7 +774,7 @@ impl RaftActor {
             if let Some(ref network_state) = self.network_state {
                 if let Ok(state) = network_state.lock() {
                     if state.is_partitioned(self.actor_id, to_actor) {
-                        tracing::trace!(
+                        trace!(
                             actor = %self.name,
                             to = %to_actor,
                             "message dropped due to partition"
@@ -811,7 +812,7 @@ impl RaftActor {
             return;
         }
         self.crashed = true;
-        tracing::info!(
+        info!(
             actor = %self.name,
             term = self.node.current_term().get(),
             state = ?self.node.state(),
@@ -827,7 +828,7 @@ impl RaftActor {
         }
         self.node = RaftNode::new(self.config.clone());
         self.crashed = false;
-        tracing::info!(actor = %self.name, "RECOVERED - starting fresh as follower");
+        info!(actor = %self.name, "RECOVERED - starting fresh as follower");
         self.schedule_tick(ctx);
     }
 
@@ -836,7 +837,7 @@ impl RaftActor {
         if let Some(ref network_state) = self.network_state {
             if let Ok(mut state) = network_state.lock() {
                 state.partition(nodes);
-                tracing::info!(actor = %self.name, ?nodes, "network partition active");
+                info!(actor = %self.name, ?nodes, "network partition active");
             }
         }
     }
@@ -846,7 +847,7 @@ impl RaftActor {
         if let Some(ref network_state) = self.network_state {
             if let Ok(mut state) = network_state.lock() {
                 state.heal(nodes);
-                tracing::info!(actor = %self.name, ?nodes, "network partition healed");
+                info!(actor = %self.name, ?nodes, "network partition healed");
             }
         }
     }
@@ -875,12 +876,12 @@ impl SimulatedActor for RaftActor {
 
             // All other events - skip if crashed.
             _ if self.crashed => {
-                tracing::trace!(actor = %self.name, "ignoring event while crashed");
+                trace!(actor = %self.name, "ignoring event while crashed");
             }
 
             EventKind::ActorStart { .. } => {
                 self.schedule_tick(ctx);
-                tracing::debug!(actor = %self.name, "started");
+                debug!(actor = %self.name, "started");
             }
 
             EventKind::TimerFired { timer_id, .. } => {
@@ -896,7 +897,7 @@ impl SimulatedActor for RaftActor {
 
             EventKind::PacketDelivery { payload, from, .. } => {
                 if self.is_packet_partitioned(from) {
-                    tracing::trace!(actor = %self.name, %from, "dropping partitioned packet");
+                    trace!(actor = %self.name, %from, "dropping partitioned packet");
                     return;
                 }
                 if let Some(msg) = deserialize_message(&payload) {
@@ -910,9 +911,9 @@ impl SimulatedActor for RaftActor {
                     let request = ClientRequest::new(Bytes::from(data));
                     if let Some(outputs) = self.node.handle_client_request(request) {
                         self.process_outputs(outputs, ctx);
-                        tracing::debug!(actor = %self.name, "accepted client request");
+                        debug!(actor = %self.name, "accepted client request");
                     } else {
-                        tracing::debug!(actor = %self.name, "rejected client request (not leader)");
+                        debug!(actor = %self.name, "rejected client request (not leader)");
                     }
                 }
             }
@@ -947,7 +948,7 @@ impl SimulatedActor for RaftActor {
     fn restore(&mut self, _state: Box<dyn Any + Send>) {
         // Full restore would require recreating RaftNode.
         // For now, this is a limitation.
-        tracing::warn!(actor = %self.name, "checkpoint restore not fully implemented");
+        warn!(actor = %self.name, "checkpoint restore not fully implemented");
     }
 
     fn on_start(&mut self, ctx: &mut SimulationContext) {

@@ -34,6 +34,7 @@ use helix_runtime::{
     BrokerHeartbeat, TransportResult, TransportService,
 };
 use tokio::sync::mpsc;
+use tracing::{trace, warn};
 
 // ============================================================================
 // Network State
@@ -303,7 +304,7 @@ impl TransportService for MadSimTransport {
         let encoded = match encode_group_batch(&messages) {
             Ok(bytes) => bytes,
             Err(e) => {
-                tracing::warn!(
+                warn!(
                     from = from.get(),
                     to = to.get(),
                     error = %e,
@@ -316,7 +317,7 @@ impl TransportService for MadSimTransport {
         let decoded_messages = match decode_group_batch(&encoded) {
             Ok((msgs, _consumed)) => msgs,
             Err(e) => {
-                tracing::warn!(
+                warn!(
                     from = from.get(),
                     to = to.get(),
                     error = %e,
@@ -344,7 +345,7 @@ impl TransportService for MadSimTransport {
             };
 
             if is_partitioned {
-                tracing::trace!(
+                trace!(
                     from = from.get(),
                     to = to.get(),
                     "Raft batch dropped due to partition"
@@ -375,7 +376,7 @@ impl TransportService for MadSimTransport {
         let encoded = match encode_broker_heartbeat(heartbeat) {
             Ok(bytes) => bytes,
             Err(e) => {
-                tracing::warn!(
+                warn!(
                     from = from.get(),
                     to = to.get(),
                     error = %e,
@@ -388,7 +389,7 @@ impl TransportService for MadSimTransport {
         let decoded_heartbeat = match decode_broker_heartbeat(&encoded) {
             Ok((hb, _consumed)) => hb,
             Err(e) => {
-                tracing::warn!(
+                warn!(
                     from = from.get(),
                     to = to.get(),
                     error = %e,
@@ -416,7 +417,7 @@ impl TransportService for MadSimTransport {
             };
 
             if is_partitioned {
-                tracing::trace!(
+                trace!(
                     from = from.get(),
                     to = to.get(),
                     "Heartbeat dropped due to partition"

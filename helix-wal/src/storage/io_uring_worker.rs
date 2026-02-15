@@ -33,6 +33,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
+use tracing::{debug, info, warn};
+
 use super::{Storage, StorageFile};
 use crate::error::{WalError, WalResult};
 
@@ -216,7 +218,7 @@ impl IoUringWorkerStorage {
             });
         }
 
-        tracing::info!(worker_count, "io_uring worker pool started");
+        info!(worker_count, "io_uring worker pool started");
 
         Ok(Self {
             state: Arc::new(WorkerPoolState {
@@ -288,7 +290,7 @@ impl Drop for WorkerPoolState {
             if let Ok(mut guard) = worker.worker_handle.lock() {
                 if let Some(handle) = guard.take() {
                     if handle.join().is_err() {
-                        tracing::warn!(worker = i, "io_uring worker thread panicked");
+                        warn!(worker = i, "io_uring worker thread panicked");
                     }
                 }
             }
@@ -474,7 +476,7 @@ async fn worker_loop(mut command_rx: mpsc::UnboundedReceiver<IoCommand>) {
 
         // Check for shutdown before batching.
         if matches!(first, IoCommand::Shutdown) {
-            tracing::debug!("io_uring worker shutting down");
+            debug!("io_uring worker shutting down");
             break;
         }
 
@@ -485,7 +487,7 @@ async fn worker_loop(mut command_rx: mpsc::UnboundedReceiver<IoCommand>) {
             match command_rx.try_recv() {
                 Ok(IoCommand::Shutdown) => {
                     // Process current batch, then shutdown.
-                    tracing::debug!("io_uring worker shutting down after batch");
+                    debug!("io_uring worker shutting down after batch");
                     process_batch(&storage, &mut files, &mut batch).await;
                     return;
                 }
@@ -506,7 +508,7 @@ async fn worker_loop(mut command_rx: mpsc::UnboundedReceiver<IoCommand>) {
     // Report batch efficiency stats (debug only).
     if total_batches > 0 {
         let avg_batch = total_io_ops as f64 / total_batches as f64;
-        tracing::debug!(
+        debug!(
             total_batches,
             total_io_ops,
             max_batch_size,
@@ -516,7 +518,7 @@ async fn worker_loop(mut command_rx: mpsc::UnboundedReceiver<IoCommand>) {
     }
 
     // Clean up: files are dropped when the HashMap goes out of scope.
-    tracing::debug!("io_uring worker stopped, closed {} files", files.len());
+    debug!("io_uring worker stopped, closed {} files", files.len());
 }
 
 /// Represents a pending I/O operation with its reply channel.

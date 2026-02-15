@@ -117,12 +117,6 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaServe
     /// Returns an error if the server fails to bind or accept connections.
     pub async fn run(&self) -> KafkaResult<()> {
         let listener = create_reusable_listener(self.config.bind_addr)?;
-        // Diagnostic: confirm server is accepting connections.
-        eprintln!(
-            "[SERVER_LISTENING] pid={} addr={}",
-            std::process::id(),
-            self.config.bind_addr
-        );
         info!(addr = %self.config.bind_addr, "Kafka server listening");
 
         loop {

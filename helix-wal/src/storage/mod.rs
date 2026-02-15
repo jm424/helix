@@ -40,6 +40,9 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use tracing::info;
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+use tracing::warn;
 
 use crate::error::WalResult;
 
@@ -76,16 +79,16 @@ pub fn create_storage() -> Box<dyn Storage> {
     {
         match IoUringWorkerStorage::try_new() {
             Ok(storage) => {
-                tracing::info!("using io_uring storage backend");
+                info!("using io_uring storage backend");
                 return Box::new(storage);
             }
             Err(e) => {
-                tracing::warn!("io_uring init failed ({e}), falling back to tokio::fs");
+                warn!("io_uring init failed ({e}), falling back to tokio::fs");
             }
         }
     }
 
-    tracing::info!("using tokio::fs storage backend");
+    info!("using tokio::fs storage backend");
     Box::new(TokioStorage::new())
 }
 

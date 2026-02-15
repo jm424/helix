@@ -740,7 +740,7 @@ pub fn patch_kafka_base_offset(blob: Bytes, base_offset: Offset) -> Bytes {
 
     if blob.len() < KAFKA_BASE_OFFSET_SIZE {
         // Blob too small to be a valid RecordBatch, return as-is.
-        tracing::warn!(
+        warn!(
             blob_len = blob.len(),
             "Blob too small for Kafka patching"
         );
@@ -764,7 +764,7 @@ pub fn patch_kafka_base_offset(blob: Bytes, base_offset: Offset) -> Bytes {
         .copy_from_slice(&base_offset_i64.to_be_bytes());
     let result = buf.freeze();
 
-    tracing::info!(
+    info!(
         blob_len = result.len(),
         original_base_offset,
         new_base_offset = base_offset.get(),
@@ -1078,7 +1078,7 @@ impl Partition {
 
         let base_offset = self.blob_log_end_offset;
 
-        tracing::debug!(
+        debug!(
             base_offset = base_offset.get(),
             record_count,
             "append_blob sequential"
@@ -1120,7 +1120,7 @@ impl Partition {
             return Err(PartitionError::Closed);
         }
 
-        tracing::debug!(
+        debug!(
             base_offset = base_offset.get(),
             record_count,
             "append_blob_at_offset"
@@ -1130,7 +1130,7 @@ impl Partition {
         // This can happen during failover when a new leader re-proposes
         // entries that the previous leader already committed.
         if !self.blob_offsets.insert(base_offset.get()) {
-            tracing::warn!(
+            warn!(
                 base_offset = base_offset.get(),
                 "Skipping duplicate blob (idempotent)"
             );
@@ -2452,7 +2452,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             })?;
 
         // Debug: log WAL recovery entries.
-        tracing::info!(
+        info!(
             wal_index = entry.index(),
             command_type = ?std::mem::discriminant(&command),
             "WAL_RECOVERY: applying entry"
@@ -2467,7 +2467,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                 base_offset,
                 ..
             } => {
-                tracing::info!(
+                info!(
                     wal_index = entry.index(),
                     base_offset = base_offset.get(),
                     record_count = record_count,
@@ -2479,7 +2479,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             PartitionCommand::AppendBlobBatch {
                 blobs, base_offset, ..
             } => {
-                tracing::info!(
+                info!(
                     wal_index = entry.index(),
                     batch_base_offset = base_offset.get(),
                     num_blobs = blobs.len(),

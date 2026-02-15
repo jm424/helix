@@ -313,19 +313,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
 
-    // Diagnostic: confirm process is actually running (before any initialization).
-    eprintln!("[SERVER_START] pid={}", std::process::id());
-
     let args = Args::parse();
-
-    // Diagnostic: confirm args parsed successfully.
-    eprintln!(
-        "[SERVER_ARGS] pid={} node_id={} listen_addr={} raft_addr={:?}",
-        std::process::id(),
-        args.node_id,
-        args.listen_addr,
-        args.raft_addr
-    );
 
     // Initialize logging to stderr (stdout may be suppressed by test harness).
     // FmtSpan::CLOSE logs when spans close with their duration - useful for profiling.

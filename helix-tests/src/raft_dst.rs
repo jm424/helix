@@ -27,6 +27,8 @@ use helix_raft::RaftConfig;
 
 use std::sync::{Arc, Mutex};
 
+use tracing::info;
+
 use crate::properties::{check_single_leader_per_term, has_leader, leader_count, PropertyChecker};
 use crate::raft_actor::{custom_events, NetworkState, RaftActor, SharedNetworkState};
 
@@ -121,7 +123,7 @@ fn run_simulation_test(config: &SimulationTestConfig) -> bool {
             EventKind::ProcessRecover { actor: crash_actor },
         );
 
-        tracing::info!(
+        info!(
             actor = %crash_actor,
             crash_time_ms = config.crash_time_ms,
             recover_time_ms = config.recover_time_ms,

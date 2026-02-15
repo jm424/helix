@@ -35,6 +35,7 @@ use std::collections::HashMap;
 
 use helix_core::{GroupId, NodeId};
 use tokio::sync::RwLock;
+use tracing::{debug, warn};
 
 use crate::service::partition_actor::PartitionActorHandle;
 use crate::service::wal_actor::WalActorHandle;
@@ -200,7 +201,11 @@ impl PartitionRouter {
             .into_iter()
             .map(|(group_id, handle)| async move {
                 if let Err(e) = handle.tick().await {
-                    tracing::warn!("failed to tick partition {group_id}: {e}");
+                    warn!(
+                        group_id = group_id.get(),
+                        error = %e,
+                        "Failed to tick partition"
+                    );
                 }
             })
             .collect();
@@ -247,7 +252,11 @@ impl PartitionRouter {
                 let group_id = group_msg.group_id;
                 async move {
                     if let Err(e) = self.route_message(group_id, from, group_msg.message).await {
-                        tracing::debug!("failed to route message to partition {group_id}: {e}");
+                        debug!(
+                            group_id = group_id.get(),
+                            error = %e,
+                            "Failed to route message to partition"
+                        );
                     }
                 }
             })

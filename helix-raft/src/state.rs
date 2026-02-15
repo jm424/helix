@@ -17,6 +17,8 @@ use std::collections::{HashMap, HashSet};
 use bytes::Bytes;
 use helix_core::{LogIndex, NodeId, TermId, MAX_RAFT_MESSAGE_BYTES};
 
+use tracing::{debug, info, warn};
+
 use crate::config::RaftConfig;
 use crate::limits;
 use crate::log::{LogEntry, RaftLog};
@@ -679,7 +681,7 @@ impl RaftNode {
         // Log inflight state before sending.
         for &peer in &peers {
             if let Some(state) = self.replication_state.get(&peer) {
-                tracing::debug!(
+                debug!(
                     index = index.get(),
                     peer = peer.get(),
                     inflight = state.inflight_count,
@@ -688,7 +690,7 @@ impl RaftNode {
                     "handle_client_request: peer state before send"
                 );
             } else {
-                tracing::warn!(
+                warn!(
                     index = index.get(),
                     peer = peer.get(),
                     "handle_client_request: NO replication state for peer"
@@ -705,7 +707,7 @@ impl RaftNode {
             .iter()
             .filter(|o| matches!(o, RaftOutput::SendMessage(_)))
             .count();
-        tracing::debug!(
+        debug!(
             index = index.get(),
             peer_count,
             msg_count,
@@ -1487,7 +1489,7 @@ impl RaftNode {
         }
 
         let Some(state) = self.replication_state.get_mut(&peer) else {
-            tracing::debug!(
+            debug!(
                 peer = peer.get(),
                 "send_append_entries: no replication state for peer"
             );
@@ -1496,7 +1498,7 @@ impl RaftNode {
 
         // Don't send if at inflight limit (pipelining bound).
         if state.inflight_count >= limits::MAX_INFLIGHT_APPEND_ENTRIES {
-            tracing::debug!(
+            debug!(
                 peer = peer.get(),
                 inflight = state.inflight_count,
                 limit = limits::MAX_INFLIGHT_APPEND_ENTRIES,
@@ -1782,7 +1784,7 @@ impl RaftNode {
         while self.last_applied < self.commit_index {
             let idx = LogIndex::new(self.last_applied.get() + 1);
             if let Some(entry) = self.log.get(idx) {
-                tracing::info!(
+                info!(
                     node_id = self.config.node_id.get(),
                     index = idx.get(),
                     entry_term = entry.term.get(),

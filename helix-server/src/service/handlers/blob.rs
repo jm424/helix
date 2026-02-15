@@ -452,7 +452,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                         message: "batch commit notification channel closed".to_string(),
                     })??;
 
-                tracing::info!(
+                info!(
                     topic = %topic,
                     partition,
                     group_id = group_id.get(),
