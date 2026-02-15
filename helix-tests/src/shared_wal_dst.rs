@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
-use helix_core::PartitionId;
+use helix_core::GroupId;
 use helix_wal::{FaultConfig, SharedEntry, SharedWal, SharedWalConfig, SimulatedStorage};
 
 /// Entry data tracked for verification.
@@ -35,11 +35,11 @@ struct TrackedEntry {
 #[derive(Debug, Default)]
 struct PropertyState {
     /// Entries appended (with full data for content verification).
-    appended: HashMap<PartitionId, Vec<TrackedEntry>>,
+    appended: HashMap<GroupId, Vec<TrackedEntry>>,
     /// Entries that were synced (durable) - indices only.
-    synced: HashMap<PartitionId, HashSet<u64>>,
+    synced: HashMap<GroupId, HashSet<u64>>,
     /// Entries recovered after "crash" - indices only.
-    recovered: HashMap<PartitionId, HashSet<u64>>,
+    recovered: HashMap<GroupId, HashSet<u64>>,
 }
 
 /// Property: All synced entries must be recovered after crash.
@@ -65,7 +65,7 @@ fn verify_durability(state: &PropertyState) -> Vec<String> {
 }
 
 /// Property: Recovered entries must be in sequential order per partition.
-fn verify_ordering(recovered: &HashMap<PartitionId, Vec<SharedEntry>>) -> Vec<String> {
+fn verify_ordering(recovered: &HashMap<GroupId, Vec<SharedEntry>>) -> Vec<String> {
     let mut violations = Vec::new();
 
     for (partition_id, entries) in recovered {
@@ -89,7 +89,7 @@ fn verify_ordering(recovered: &HashMap<PartitionId, Vec<SharedEntry>>) -> Vec<St
 /// Property: No phantom entries (entries that were never appended).
 fn verify_no_phantoms(
     state: &PropertyState,
-    recovered: &HashMap<PartitionId, Vec<SharedEntry>>,
+    recovered: &HashMap<GroupId, Vec<SharedEntry>>,
 ) -> Vec<String> {
     let mut violations = Vec::new();
 
@@ -119,7 +119,7 @@ fn verify_no_phantoms(
 /// This is THE critical verification - ensures data integrity, not just metadata.
 fn verify_content(
     state: &PropertyState,
-    recovered: &HashMap<PartitionId, Vec<SharedEntry>>,
+    recovered: &HashMap<GroupId, Vec<SharedEntry>>,
 ) -> Vec<String> {
     let mut violations = Vec::new();
 
@@ -162,7 +162,7 @@ fn verify_content(
 }
 
 /// Property: No duplicate entries (same index appearing twice).
-fn verify_no_duplicates(recovered: &HashMap<PartitionId, Vec<SharedEntry>>) -> Vec<String> {
+fn verify_no_duplicates(recovered: &HashMap<GroupId, Vec<SharedEntry>>) -> Vec<String> {
     let mut violations = Vec::new();
 
     for (partition_id, entries) in recovered {
@@ -187,7 +187,7 @@ fn verify_no_duplicates(recovered: &HashMap<PartitionId, Vec<SharedEntry>>) -> V
 /// must also be recovered. This catches "hole" bugs where middle entries are lost.
 fn verify_prefix_consistency(
     state: &PropertyState,
-    recovered: &HashMap<PartitionId, Vec<SharedEntry>>,
+    recovered: &HashMap<GroupId, Vec<SharedEntry>>,
 ) -> Vec<String> {
     let mut violations = Vec::new();
 
@@ -221,15 +221,15 @@ fn verify_prefix_consistency(
 }
 
 /// Property: Partition isolation - verify partition_id in entry matches key.
-fn verify_partition_isolation(recovered: &HashMap<PartitionId, Vec<SharedEntry>>) -> Vec<String> {
+fn verify_partition_isolation(recovered: &HashMap<GroupId, Vec<SharedEntry>>) -> Vec<String> {
     let mut violations = Vec::new();
 
     for (partition_id, entries) in recovered {
         for entry in entries {
-            if entry.partition_id() != *partition_id {
+            if entry.group_id() != *partition_id {
                 violations.push(format!(
                     "Isolation violation: entry claims partition {} but stored under partition {}",
-                    entry.partition_id(),
+                    entry.group_id(),
                     partition_id
                 ));
             }
@@ -246,8 +246,8 @@ async fn test_dst_shared_wal_basic_durability() {
     let config = SharedWalConfig::new("/test/shared-wal");
 
     let mut state = PropertyState::default();
-    let p1 = PartitionId::new(1);
-    let p2 = PartitionId::new(2);
+    let p1 = GroupId::new(1);
+    let p2 = GroupId::new(2);
 
     // Phase 1: Write and sync entries.
     {
@@ -341,7 +341,7 @@ async fn test_dst_shared_wal_unsynced_entries_may_be_lost() {
     let storage = SimulatedStorage::new(2);
     let config = SharedWalConfig::new("/test/shared-wal");
 
-    let p1 = PartitionId::new(1);
+    let p1 = GroupId::new(1);
 
     // Phase 1: Append entries, sync some, leave some unsynced.
     {
@@ -417,7 +417,7 @@ async fn test_dst_shared_wal_fsync_failure_rate_statistics() {
         let storage = SimulatedStorage::with_faults(seed, fault_config);
         let config = SharedWalConfig::new(format!("/test/fsync-rate-{seed}"));
 
-        let p1 = PartitionId::new(1);
+        let p1 = GroupId::new(1);
 
         let Ok(mut wal) = SharedWal::open(storage.clone(), config).await else {
             continue;
@@ -457,7 +457,7 @@ async fn test_dst_shared_wal_fsync_failure_no_durability_guarantee() {
     let storage = SimulatedStorage::with_faults(3, fault_config);
     let config = SharedWalConfig::new("/test/shared-wal");
 
-    let p1 = PartitionId::new(1);
+    let p1 = GroupId::new(1);
 
     let mut wal = SharedWal::open(storage.clone(), config.clone())
         .await
@@ -497,7 +497,7 @@ async fn test_dst_shared_wal_multi_partition_interleaved() {
 
         for i in 1..=entries_per_partition as u64 {
             for p in 1..=partition_count as u64 {
-                let partition_id = PartitionId::new(p);
+                let partition_id = GroupId::new(p);
                 let payload = Bytes::from(format!("p{p}-{i}"));
                 wal.append(partition_id, 1, i, payload.clone())
                     .await
@@ -518,7 +518,7 @@ async fn test_dst_shared_wal_multi_partition_interleaved() {
 
         // Mark all as synced.
         for p in 1..=partition_count as u64 {
-            let partition_id = PartitionId::new(p);
+            let partition_id = GroupId::new(p);
             for i in 1..=entries_per_partition as u64 {
                 state.synced.entry(partition_id).or_default().insert(i);
             }
@@ -563,7 +563,7 @@ async fn test_dst_shared_wal_multi_partition_interleaved() {
         // Verify counts.
         assert_eq!(recovered.len(), partition_count);
         for p in 1..=partition_count as u64 {
-            let partition_id = PartitionId::new(p);
+            let partition_id = GroupId::new(p);
             assert_eq!(
                 recovered.get(&partition_id).map(Vec::len),
                 Some(entries_per_partition),
@@ -581,7 +581,7 @@ async fn test_dst_shared_wal_multiple_crash_recover_cycles() {
     let storage = SimulatedStorage::new(5);
     let config = SharedWalConfig::new("/test/shared-wal");
 
-    let p1 = PartitionId::new(1);
+    let p1 = GroupId::new(1);
     let mut expected_count = 0u64;
 
     for cycle in 1..=5 {
@@ -649,7 +649,7 @@ async fn test_dst_shared_wal_torn_write_recovery() {
     let storage = SimulatedStorage::with_faults(6, fault_config);
     let config = SharedWalConfig::new("/test/shared-wal");
 
-    let p1 = PartitionId::new(1);
+    let p1 = GroupId::new(1);
 
     // Phase 1: Write entries with potential torn writes.
     {
@@ -703,7 +703,7 @@ async fn test_dst_shared_wal_torn_write_recovery() {
 fn test_verify_durability_catches_missing_entry() {
     // Simulate: we synced entry but it wasn't recovered (durability violation).
     let mut state = PropertyState::default();
-    let p1 = PartitionId::new(1);
+    let p1 = GroupId::new(1);
 
     // We appended and synced entries 1, 2, 3.
     state.appended.insert(
@@ -743,7 +743,7 @@ fn test_verify_durability_catches_missing_entry() {
 #[test]
 fn test_verify_ordering_catches_out_of_order() {
     // Simulate: recovered entries are out of order.
-    let p1 = PartitionId::new(1);
+    let p1 = GroupId::new(1);
 
     // Create entries with out-of-order indices.
     let entry1 = SharedEntry::new(p1, 1, 1, Bytes::from("e1")).unwrap();
@@ -767,7 +767,7 @@ fn test_verify_ordering_catches_out_of_order() {
 fn test_verify_no_phantoms_catches_phantom() {
     // Simulate: recovered entry that was never appended (phantom).
     let mut state = PropertyState::default();
-    let p1 = PartitionId::new(1);
+    let p1 = GroupId::new(1);
 
     // We only appended entries 1, 2.
     state.appended.insert(
@@ -807,7 +807,7 @@ fn test_verify_no_phantoms_catches_phantom() {
 fn test_verify_all_properties_pass_when_correct() {
     // Verify that correct state passes all property checks.
     let mut state = PropertyState::default();
-    let p1 = PartitionId::new(1);
+    let p1 = GroupId::new(1);
 
     // Append and sync 1, 2, 3.
     state.appended.insert(
@@ -852,7 +852,7 @@ fn test_verify_all_properties_pass_when_correct() {
 fn test_verify_content_catches_payload_mismatch() {
     // Simulate: recovered entry has wrong payload (content violation).
     let mut state = PropertyState::default();
-    let p1 = PartitionId::new(1);
+    let p1 = GroupId::new(1);
 
     // Append entries with specific payloads.
     state.appended.insert(
@@ -885,7 +885,7 @@ fn test_verify_content_catches_payload_mismatch() {
 fn test_verify_content_catches_term_mismatch() {
     // Simulate: recovered entry has wrong term (content violation).
     let mut state = PropertyState::default();
-    let p1 = PartitionId::new(1);
+    let p1 = GroupId::new(1);
 
     // Append entry with term 1.
     state.appended.insert(
@@ -916,7 +916,7 @@ fn test_verify_content_catches_term_mismatch() {
 
 #[test]
 fn test_verify_no_duplicates_catches_duplicate() {
-    let p1 = PartitionId::new(1);
+    let p1 = GroupId::new(1);
 
     // Create entries with duplicate index.
     let entry1 = SharedEntry::new(p1, 1, 1, Bytes::from("first")).unwrap();
@@ -938,7 +938,7 @@ fn test_verify_no_duplicates_catches_duplicate() {
 #[test]
 fn test_verify_prefix_consistency_catches_hole() {
     let mut state = PropertyState::default();
-    let p1 = PartitionId::new(1);
+    let p1 = GroupId::new(1);
 
     // Synced entries 1, 2, 3.
     state.synced.insert(p1, HashSet::from([1, 2, 3]));
@@ -961,8 +961,8 @@ fn test_verify_prefix_consistency_catches_hole() {
 
 #[test]
 fn test_verify_partition_isolation_catches_mismatch() {
-    let p1 = PartitionId::new(1);
-    let p2 = PartitionId::new(2);
+    let p1 = GroupId::new(1);
+    let p2 = GroupId::new(2);
 
     // Entry claims to be for partition 2 but stored under partition 1.
     let wrong_partition_entry = SharedEntry::new(p2, 1, 1, Bytes::from("data")).unwrap();
@@ -981,7 +981,7 @@ fn test_verify_partition_isolation_catches_mismatch() {
 
 #[test]
 fn test_verify_all_new_properties_pass_when_correct() {
-    let p1 = PartitionId::new(1);
+    let p1 = GroupId::new(1);
 
     // Create correctly ordered entries with no duplicates.
     let entry1 = SharedEntry::new(p1, 1, 1, Bytes::from("e1")).unwrap();
@@ -1012,7 +1012,7 @@ async fn test_dst_shared_wal_multi_seed_sync_durability() {
     for seed in 0..SEED_COUNT {
         let storage = SimulatedStorage::new(seed);
         let config = SharedWalConfig::new(format!("/test/sync-{seed}"));
-        let p1 = PartitionId::new(1);
+        let p1 = GroupId::new(1);
 
         // Write and sync.
         {
@@ -1071,7 +1071,7 @@ async fn test_dst_shared_wal_multi_seed_fsync_failures() {
         let fault_config = FaultConfig::default().with_fsync_fail_rate(0.3);
         let storage = SimulatedStorage::with_faults(seed, fault_config);
         let config = SharedWalConfig::new(format!("/test/fsync-{seed}"));
-        let p1 = PartitionId::new(1);
+        let p1 = GroupId::new(1);
 
         let sync_succeeded: bool;
 
@@ -1124,7 +1124,7 @@ async fn test_dst_shared_wal_multi_seed_torn_writes() {
         let fault_config = FaultConfig::default().with_torn_write_rate(0.2);
         let storage = SimulatedStorage::with_faults(seed, fault_config);
         let config = SharedWalConfig::new(format!("/test/torn-{seed}"));
-        let p1 = PartitionId::new(1);
+        let p1 = GroupId::new(1);
 
         let mut successful_appends = 0u64;
         let sync_succeeded: bool;
@@ -1237,7 +1237,7 @@ async fn test_dst_shared_wal_comprehensive_stress() {
 
             // Write all entries, tracking what succeeded with full content.
             for p in 1..=PARTITION_COUNT {
-                let partition_id = PartitionId::new(p);
+                let partition_id = GroupId::new(p);
 
                 for i in 1..=ENTRIES_PER_PARTITION {
                     let payload = Bytes::from(format!("p{p}-{i}"));
@@ -1409,7 +1409,7 @@ async fn test_dst_shared_wal_stress_with_truncation() {
         let storage = SimulatedStorage::new(seed);
         let config = SharedWalConfig::new(format!("/test/trunc-{seed}"));
 
-        let p1 = PartitionId::new(1);
+        let p1 = GroupId::new(1);
 
         // Phase 1: Write, truncate, write more.
         {
@@ -1490,7 +1490,7 @@ async fn test_dst_shared_wal_multi_crash_recovery_cycles() {
         let storage = SimulatedStorage::new(seed);
         let config = SharedWalConfig::new(format!("/test/cycles-{seed}"));
 
-        let p1 = PartitionId::new(1);
+        let p1 = GroupId::new(1);
         let mut expected_index = 0u64;
 
         for cycle in 1..=CYCLES {
@@ -1601,7 +1601,7 @@ async fn test_dst_shared_wal_last_write_wins_semantics() {
         let storage = SimulatedStorage::with_faults(seed, fault_config);
         let config = SharedWalConfig::new(format!("/test/lww-{seed}"));
 
-        let p1 = PartitionId::new(1);
+        let p1 = GroupId::new(1);
 
         // Phase 1: Write entries 1-10 at term 1, sync.
         let phase1_ok: bool;
@@ -1736,7 +1736,7 @@ async fn test_dst_shared_wal_partial_overwrite_stale_entries_reappear() {
     let storage = SimulatedStorage::new(42);
     let config = SharedWalConfig::new("/test/partial-overwrite");
 
-    let p1 = PartitionId::new(1);
+    let p1 = GroupId::new(1);
 
     // Phase 1: Write entries 1-10 at term 1.
     {
@@ -1828,7 +1828,7 @@ async fn test_dst_shared_wal_max_entry_size() {
     let storage = SimulatedStorage::new(42);
     let config = SharedWalConfig::new("/test/max-size");
 
-    let p1 = PartitionId::new(1);
+    let p1 = GroupId::new(1);
 
     let mut wal = SharedWal::open(storage.clone(), config.clone())
         .await
@@ -1871,7 +1871,7 @@ async fn test_dst_shared_wal_segment_rollover() {
     let config = SharedWalConfig::new("/test/rollover")
         .with_segment_config(helix_wal::SegmentConfig::new().with_max_size(SEGMENT_SIZE_BYTES_MIN));
 
-    let p1 = PartitionId::new(1);
+    let p1 = GroupId::new(1);
 
     let mut wal = SharedWal::open(storage.clone(), config.clone())
         .await
@@ -1946,7 +1946,7 @@ async fn test_dst_shared_wal_segment_rollover_with_faults() {
                 helix_wal::SegmentConfig::new().with_max_size(SEGMENT_SIZE_BYTES_MIN),
             );
 
-        let p1 = PartitionId::new(1);
+        let p1 = GroupId::new(1);
 
         let entries_written: u64;
         let sync_succeeded: bool;
@@ -2090,8 +2090,8 @@ async fn test_dst_shared_wal_high_fidelity_stress() {
         let storage = SimulatedStorage::with_faults(seed, fault_config);
         let config = SharedWalConfig::new(format!("/wal/hifi-{seed}"));
 
-        let p1 = PartitionId::new(1);
-        let p2 = PartitionId::new(2);
+        let p1 = GroupId::new(1);
+        let p2 = GroupId::new(2);
 
         let wal_result = SharedWal::open(storage.clone(), config.clone()).await;
         let Ok(mut wal) = wal_result else {
@@ -2167,8 +2167,8 @@ async fn test_dst_shared_wal_high_fidelity_stress() {
                     total_crashes += 1;
 
                     // Capture durable state before crash
-                    let p1_durable_before = wal.partition_durable_index(p1);
-                    let p2_durable_before = wal.partition_durable_index(p2);
+                    let p1_durable_before = wal.group_durable_index(p1);
+                    let p2_durable_before = wal.group_durable_index(p2);
 
                     drop(wal);
                     storage.simulate_crash();
@@ -2258,8 +2258,8 @@ async fn test_dst_shared_wal_high_fidelity_stress() {
         seeds_completed += 1;
 
         // Final crash/recovery check
-        let p1_final_durable = wal.partition_durable_index(p1);
-        let p2_final_durable = wal.partition_durable_index(p2);
+        let p1_final_durable = wal.group_durable_index(p1);
+        let p2_final_durable = wal.group_durable_index(p2);
         drop(wal);
         storage.simulate_crash();
 

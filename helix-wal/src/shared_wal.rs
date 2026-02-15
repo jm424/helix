@@ -6,40 +6,42 @@
 //!
 //! # Design
 //!
-//! - Entries are tagged with partition ID via [`SharedEntry`]
-//! - Partition-local indices are used (not WAL-global)
-//! - Recovery scans sequentially and groups entries by partition
-//! - Per-partition `BTreeMap` index for O(log n) entry lookups
+//! - Entries are tagged with group ID via [`SharedEntry`]
+//! - Group-local indices are used (not WAL-global)
+//! - Recovery scans sequentially and groups entries by group
+//! - Per-group `BTreeMap` index for O(log n) entry lookups
 //!
 //! # Example
 //!
 //! ```ignore
 //! use helix_wal::{SharedWal, SharedWalConfig, TokioStorage};
-//! use helix_core::PartitionId;
+//! use helix_core::GroupId;
 //! use bytes::Bytes;
 //!
 //! let config = SharedWalConfig::new("/tmp/shared-wal");
 //! let mut wal = SharedWal::open(TokioStorage::new(), config).await?;
 //!
-//! // Append entries from different partitions.
-//! let p1 = PartitionId::new(1);
-//! let p2 = PartitionId::new(2);
+//! // Append entries from different groups.
+//! let g1 = GroupId::new(1);
+//! let g2 = GroupId::new(2);
 //!
-//! wal.append(p1, 1, 1, Bytes::from("p1-data")).await?;
-//! wal.append(p2, 1, 1, Bytes::from("p2-data")).await?;
+//! wal.append(g1, 1, 1, Bytes::from("g1-data")).await?;
+//! wal.append(g2, 1, 1, Bytes::from("g2-data")).await?;
 //!
 //! // Single sync makes both entries durable.
 //! wal.sync().await?;
 //!
-//! // Recovery groups entries by partition.
-//! let by_partition = wal.recover()?;
+//! // Recovery groups entries by group.
+//! let by_group = wal.recover()?;
 //! ```
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use bytes::Bytes;
-use helix_core::{PartitionId, WriteDurability};
+use helix_core::{GroupId, WriteDurability};
+
+use tracing::warn;
 
 use crate::error::WalResult;
 use crate::shared_entry::SharedEntry;
@@ -109,33 +111,33 @@ impl SharedWalConfig {
 pub struct SharedWal<S: Storage> {
     /// Underlying WAL with `SharedEntry` format.
     wal: Wal<S, SharedEntry>,
-    /// Per-partition tracking for sequential index assertion.
-    partition_state: HashMap<PartitionId, PartitionState>,
-    /// Per-partition durable index (last synced index per partition).
-    partition_durable: HashMap<PartitionId, u64>,
-    /// Per-partition truncation point (entries with index > this are logically deleted).
-    /// None means no truncation has occurred for that partition.
-    partition_truncated_after: HashMap<PartitionId, u64>,
-    /// Per-partition index for O(log n) entry lookups.
+    /// Per-group tracking for sequential index assertion.
+    group_state: HashMap<GroupId, GroupState>,
+    /// Per-group durable index (last synced index per group).
+    group_durable: HashMap<GroupId, u64>,
+    /// Per-group truncation point (entries with index > this are logically deleted).
+    /// None means no truncation has occurred for that group.
+    group_truncated_after: HashMap<GroupId, u64>,
+    /// Per-group index for O(log n) entry lookups.
     ///
-    /// Maps `(partition_id, raft_index) → SharedEntry`. Maintained in sync with
+    /// Maps `(group_id, raft_index) → SharedEntry`. Maintained in sync with
     /// append/truncate/recover operations. `SharedEntry` payload is `Bytes`
     /// (Arc-backed), so clones share data cheaply (~56 bytes of header + pointer).
-    partition_index: HashMap<PartitionId, BTreeMap<u64, SharedEntry>>,
+    group_index: HashMap<GroupId, BTreeMap<u64, SharedEntry>>,
     /// Lightweight index for evicted entries.
     ///
-    /// Maps `(partition_id, raft_index) → segment_id`. Used to locate entries
-    /// on disk after their `SharedEntry` has been evicted from `partition_index`.
+    /// Maps `(group_id, raft_index) → segment_id`. Used to locate entries
+    /// on disk after their `SharedEntry` has been evicted from `group_index`.
     /// Each entry costs ~16 bytes (vs ~56 bytes for the full `SharedEntry`).
-    evicted_index: HashMap<PartitionId, BTreeMap<u64, crate::SegmentId>>,
+    evicted_index: HashMap<GroupId, BTreeMap<u64, crate::SegmentId>>,
 }
 
-/// Per-partition state for assertion checking.
+/// Per-group state for assertion checking.
 #[derive(Debug, Clone, Copy)]
-struct PartitionState {
-    /// Last appended index for this partition.
+struct GroupState {
+    /// Last appended index for this group.
     last_index: u64,
-    /// Last appended term for this partition.
+    /// Last appended term for this group.
     last_term: u64,
 }
 
@@ -150,10 +152,10 @@ impl<S: Storage> SharedWal<S> {
         let wal = Wal::open(storage, config.wal_config).await?;
         Ok(Self {
             wal,
-            partition_state: HashMap::new(),
-            partition_durable: HashMap::new(),
-            partition_truncated_after: HashMap::new(),
-            partition_index: HashMap::new(),
+            group_state: HashMap::new(),
+            group_durable: HashMap::new(),
+            group_truncated_after: HashMap::new(),
+            group_index: HashMap::new(),
             evicted_index: HashMap::new(),
         })
     }
@@ -170,71 +172,71 @@ impl<S: Storage> SharedWal<S> {
         self.wal.entry_count()
     }
 
-    /// Returns the last index for a specific partition from internal state.
+    /// Returns the last index for a specific group from internal state.
     ///
     /// This reflects entries that have been processed by `append_batch`,
     /// even if they haven't been synced yet.
     #[must_use]
-    pub fn partition_last_index(&self, partition_id: PartitionId) -> Option<u64> {
-        self.partition_state
-            .get(&partition_id)
+    pub fn group_last_index(&self, group_id: GroupId) -> Option<u64> {
+        self.group_state
+            .get(&group_id)
             .map(|s| s.last_index)
     }
 
-    /// Appends an entry for a partition.
+    /// Appends an entry for a group.
     ///
     /// # Panics
     ///
     /// Panics if `TigerStyle` assertions fail:
-    /// - Partition-local indices must be sequential (1, 2, 3...)
-    /// - Term must be monotonically non-decreasing per partition
+    /// - Group-local indices must be sequential (1, 2, 3...)
+    /// - Term must be monotonically non-decreasing per group
     ///
     /// # Errors
     /// Returns an error if the append fails.
     pub async fn append(
         &mut self,
-        partition_id: PartitionId,
+        group_id: GroupId,
         term: u64,
         index: u64,
         payload: Bytes,
     ) -> WalResult<()> {
-        // TigerStyle: Assert per-partition indices are strictly increasing.
+        // TigerStyle: Assert per-group indices are strictly increasing.
         // Gaps are allowed to support cases where NOOP entries are skipped.
-        if let Some(state) = self.partition_state.get(&partition_id) {
+        if let Some(state) = self.group_state.get(&group_id) {
             assert!(
                 index > state.last_index,
-                "partition {} index must be greater than last: last {}, got {}",
-                partition_id,
+                "group {} index must be greater than last: last {}, got {}",
+                group_id,
                 state.last_index,
                 index
             );
             assert!(
                 term >= state.last_term,
-                "partition {} term must be non-decreasing: last {}, got {}",
-                partition_id,
+                "group {} term must be non-decreasing: last {}, got {}",
+                group_id,
                 state.last_term,
                 term
             );
         } else {
-            // First entry for this partition - index should be 1 or explicitly set.
+            // First entry for this group - index should be 1 or explicitly set.
             // We allow any starting index to support recovery scenarios.
         }
 
-        let entry = SharedEntry::new(partition_id, term, index, payload)?;
+        let entry = SharedEntry::new(group_id, term, index, payload)?;
         self.wal.append(entry.clone()).await?;
 
-        // Update partition state.
-        self.partition_state.insert(
-            partition_id,
-            PartitionState {
+        // Update group state.
+        self.group_state.insert(
+            group_id,
+            GroupState {
                 last_index: index,
                 last_term: term,
             },
         );
 
-        // Update partition index.
-        self.partition_index
-            .entry(partition_id)
+        // Update group index.
+        self.group_index
+            .entry(group_id)
             .or_default()
             .insert(index, entry);
 
@@ -247,8 +249,8 @@ impl<S: Storage> SharedWal<S> {
     /// all entries are written in a single syscall.
     ///
     /// Each entry must satisfy the same `TigerStyle` invariants as `append`:
-    /// - Per-partition indices must be sequential
-    /// - Terms must be monotonically non-decreasing per partition
+    /// - Per-group indices must be sequential
+    /// - Terms must be monotonically non-decreasing per group
     ///
     /// # Errors
     ///
@@ -264,31 +266,31 @@ impl<S: Storage> SharedWal<S> {
 
         // Validate all entries before writing.
         for entry in entries {
-            let partition_id = entry.partition_id();
+            let group_id = entry.group_id();
             let index = entry.index();
             let term = entry.term();
 
-            if let Some(state) = self.partition_state.get(&partition_id) {
+            if let Some(state) = self.group_state.get(&group_id) {
                 assert!(
                     index > state.last_index,
-                    "partition {} index must be greater than last: last {}, got {}",
-                    partition_id,
+                    "group {} index must be greater than last: last {}, got {}",
+                    group_id,
                     state.last_index,
                     index
                 );
                 assert!(
                     term >= state.last_term,
-                    "partition {} term must be non-decreasing: last {}, got {}",
-                    partition_id,
+                    "group {} term must be non-decreasing: last {}, got {}",
+                    group_id,
                     state.last_term,
                     term
                 );
             }
 
-            // Update partition state for subsequent entries in this batch.
-            self.partition_state.insert(
-                partition_id,
-                PartitionState {
+            // Update group state for subsequent entries in this batch.
+            self.group_state.insert(
+                group_id,
+                GroupState {
                     last_index: index,
                     last_term: term,
                 },
@@ -298,10 +300,10 @@ impl<S: Storage> SharedWal<S> {
         // Single batched write.
         self.wal.append_batch(entries).await?;
 
-        // Update partition index.
+        // Update group index.
         for entry in entries {
-            self.partition_index
-                .entry(entry.partition_id())
+            self.group_index
+                .entry(entry.group_id())
                 .or_default()
                 .insert(entry.index(), entry.clone());
         }
@@ -318,7 +320,7 @@ impl<S: Storage> SharedWal<S> {
     /// Returns an error if the sync fails.
     pub async fn sync(&mut self) -> WalResult<()> {
         self.wal.sync().await?;
-        self.update_partition_durable_indices();
+        self.update_group_durable_indices();
         Ok(())
     }
 
@@ -331,10 +333,10 @@ impl<S: Storage> SharedWal<S> {
     ///
     /// In `Fsync` mode, use `sync()` instead which both fsyncs and updates
     /// the durable indices.
-    pub fn update_partition_durable_indices(&mut self) {
-        for (partition_id, state) in &self.partition_state {
-            self.partition_durable
-                .insert(*partition_id, state.last_index);
+    pub fn update_group_durable_indices(&mut self) {
+        for (group_id, state) in &self.group_state {
+            self.group_durable
+                .insert(*group_id, state.last_index);
         }
     }
 
@@ -346,12 +348,12 @@ impl<S: Storage> SharedWal<S> {
         self.wal.durable_index()
     }
 
-    /// Returns the durable index for a specific partition.
+    /// Returns the durable index for a specific group.
     ///
-    /// Returns `None` if no entries have been synced for this partition.
+    /// Returns `None` if no entries have been synced for this group.
     #[must_use]
-    pub fn partition_durable_index(&self, partition_id: PartitionId) -> Option<u64> {
-        self.partition_durable.get(&partition_id).copied()
+    pub fn group_durable_index(&self, group_id: GroupId) -> Option<u64> {
+        self.group_durable.get(&group_id).copied()
     }
 
     /// Truncates entries after the given index for a partition.
@@ -371,50 +373,50 @@ impl<S: Storage> SharedWal<S> {
     ///
     /// Panics if `after_index` is greater than the last appended index for this partition
     /// (cannot truncate entries that don't exist).
-    pub fn truncate_after(&mut self, partition_id: PartitionId, after_index: u64) {
-        if let Some(state) = self.partition_state.get(&partition_id) {
+    pub fn truncate_after(&mut self, group_id: GroupId, after_index: u64) {
+        if let Some(state) = self.group_state.get(&group_id) {
             assert!(
                 after_index <= state.last_index,
-                "cannot truncate partition {} after index {} (last appended: {})",
-                partition_id,
+                "cannot truncate group {} after index {} (last appended: {})",
+                group_id,
                 after_index,
                 state.last_index
             );
         }
-        // else: no entries for this partition yet, truncation is a no-op
+        // else: no entries for this group yet, truncation is a no-op
 
         // Record truncation point for filtering during reads.
-        self.partition_truncated_after
-            .insert(partition_id, after_index);
+        self.group_truncated_after
+            .insert(group_id, after_index);
 
-        // Update partition state so next append expects after_index + 1.
+        // Update group state so next append expects after_index + 1.
         // We preserve the term from the entry at after_index (or allow any term for new entries).
-        if let Some(state) = self.partition_state.get_mut(&partition_id) {
+        if let Some(state) = self.group_state.get_mut(&group_id) {
             state.last_index = after_index;
             // Note: We don't reset last_term because the new leader may use a higher term.
             // The term monotonicity check will still work correctly.
         }
 
         // Update durable index if it was beyond the truncation point.
-        if let Some(durable) = self.partition_durable.get_mut(&partition_id) {
+        if let Some(durable) = self.group_durable.get_mut(&group_id) {
             if *durable > after_index {
                 *durable = after_index;
             }
         }
 
-        // Trim partition index: remove entries with index > after_index.
-        if let Some(btree) = self.partition_index.get_mut(&partition_id) {
+        // Trim group index: remove entries with index > after_index.
+        if let Some(btree) = self.group_index.get_mut(&group_id) {
             // split_off returns entries >= key, so split at after_index + 1.
             let _ = btree.split_off(&(after_index + 1));
         }
     }
 
-    /// Returns the truncation point for a partition, if any.
+    /// Returns the truncation point for a group, if any.
     ///
-    /// Returns `None` if no truncation has occurred for this partition.
+    /// Returns `None` if no truncation has occurred for this group.
     #[must_use]
-    pub fn partition_truncated_after(&self, partition_id: PartitionId) -> Option<u64> {
-        self.partition_truncated_after.get(&partition_id).copied()
+    pub fn group_truncated_after(&self, group_id: GroupId) -> Option<u64> {
+        self.group_truncated_after.get(&group_id).copied()
     }
 
     /// Returns an iterator over all entries in the WAL.
@@ -424,111 +426,111 @@ impl<S: Storage> SharedWal<S> {
         self.wal.entries()
     }
 
-    /// Recovers entries from the WAL, grouped by partition.
+    /// Recovers entries from the WAL, grouped by group.
     ///
-    /// This is typically called during node startup to restore partition state.
-    /// Each partition then rebuilds its in-memory Raft log from its entries.
+    /// This is typically called during node startup to restore group state.
+    /// Each group then rebuilds its in-memory Raft log from its entries.
     ///
     /// # Last-Write-Wins Semantics
     ///
-    /// If multiple entries exist with the same partition and index (due to truncation
+    /// If multiple entries exist with the same group and index (due to truncation
     /// and re-append), the last entry in WAL order wins. This ensures that after
     /// truncation and new appends, recovery returns the correct (new) entries.
     ///
-    /// Also rebuilds internal partition state and durable tracking for assertion checking.
+    /// Also rebuilds internal group state and durable tracking for assertion checking.
     ///
     /// # Errors
     /// Currently infallible, but returns `Result` for future extensibility.
-    pub fn recover(&mut self) -> WalResult<HashMap<PartitionId, Vec<SharedEntry>>> {
-        // Use HashMap to deduplicate: last-write-wins for same (partition, index).
-        let mut by_partition_map: HashMap<PartitionId, HashMap<u64, SharedEntry>> = HashMap::new();
+    pub fn recover(&mut self) -> WalResult<HashMap<GroupId, Vec<SharedEntry>>> {
+        // Use HashMap to deduplicate: last-write-wins for same (group, index).
+        let mut by_group_map: HashMap<GroupId, HashMap<u64, SharedEntry>> = HashMap::new();
 
         for entry in self.wal.entries() {
-            let partition_id = entry.partition_id();
+            let group_id = entry.group_id();
             let index = entry.index();
 
             // Last-write-wins: later entries with same index overwrite earlier ones.
-            by_partition_map
-                .entry(partition_id)
+            by_group_map
+                .entry(group_id)
                 .or_default()
                 .insert(index, entry.clone());
         }
 
-        // Convert to sorted Vec and update partition state.
-        let mut by_partition: HashMap<PartitionId, Vec<SharedEntry>> = HashMap::new();
+        // Convert to sorted Vec and update group state.
+        let mut by_group: HashMap<GroupId, Vec<SharedEntry>> = HashMap::new();
 
-        for (partition_id, index_map) in by_partition_map {
+        for (group_id, index_map) in by_group_map {
             // Sort by index.
             let mut entries: Vec<SharedEntry> = index_map.into_values().collect();
             entries.sort_by_key(SharedEntry::index);
 
-            // Update partition state from the last (highest index) entry.
+            // Update group state from the last (highest index) entry.
             if let Some(last_entry) = entries.last() {
-                self.partition_state.insert(
-                    partition_id,
-                    PartitionState {
+                self.group_state.insert(
+                    group_id,
+                    GroupState {
                         last_index: last_entry.index(),
                         last_term: last_entry.term(),
                     },
                 );
             }
 
-            by_partition.insert(partition_id, entries);
+            by_group.insert(group_id, entries);
         }
 
-        // Recovered entries are durable - update per-partition durable indices.
-        for (partition_id, state) in &self.partition_state {
-            self.partition_durable
-                .insert(*partition_id, state.last_index);
+        // Recovered entries are durable - update per-group durable indices.
+        for (group_id, state) in &self.group_state {
+            self.group_durable
+                .insert(*group_id, state.last_index);
         }
 
-        // Populate partition index from recovered entries.
-        self.partition_index.clear();
-        for (partition_id, entries) in &by_partition {
+        // Populate group index from recovered entries.
+        self.group_index.clear();
+        for (group_id, entries) in &by_group {
             let btree: BTreeMap<u64, SharedEntry> =
                 entries.iter().map(|e| (e.index(), e.clone())).collect();
-            self.partition_index.insert(*partition_id, btree);
+            self.group_index.insert(*group_id, btree);
         }
 
         // Clear truncation tracking since we've recovered to a consistent state.
-        self.partition_truncated_after.clear();
+        self.group_truncated_after.clear();
 
-        Ok(by_partition)
+        Ok(by_group)
     }
 
-    /// Returns entries for a specific partition.
+    /// Returns entries for a specific group.
     ///
-    /// Uses the per-partition `BTreeMap` index, which returns entries in sorted
+    /// Uses the per-group `BTreeMap` index, which returns entries in sorted
     /// order. The index is kept in sync with truncation, so no filtering needed.
     #[must_use]
-    pub fn entries_for_partition(&self, partition_id: PartitionId) -> Vec<SharedEntry> {
-        self.partition_index
-            .get(&partition_id)
+    pub fn entries_for_group(&self, group_id: GroupId) -> Vec<SharedEntry> {
+        self.group_index
+            .get(&group_id)
             .map(|btree| btree.values().cloned().collect())
             .unwrap_or_default()
     }
 
-    /// Reads a specific entry by partition ID and index.
+    /// Reads a specific entry by group ID and index.
     ///
-    /// Returns `None` if no entry exists for the given partition and index,
+    /// Returns `None` if no entry exists for the given group and index,
     /// or if the index is beyond the current valid range (after truncation).
     ///
-    /// Uses the per-partition `BTreeMap` index for O(log n) lookup.
+    /// Uses the per-group `BTreeMap` index for O(log n) lookup.
     #[must_use]
-    pub fn read(&self, partition_id: PartitionId, index: u64) -> Option<SharedEntry> {
+    pub fn read(&self, group_id: GroupId, index: u64) -> Option<SharedEntry> {
         // Check if index is beyond current valid range.
-        if let Some(state) = self.partition_state.get(&partition_id) {
+        if let Some(state) = self.group_state.get(&group_id) {
             if index > state.last_index {
                 return None;
             }
         }
 
-        self.partition_index
-            .get(&partition_id)
+        self.group_index
+            .get(&group_id)
             .and_then(|btree| btree.get(&index).cloned())
     }
 
-    /// Reads a range of entries for a partition, bounded by byte size.
+    /// Reads a range of entries for a group, bounded by byte size.
     ///
     /// Returns entries from `start_index` to `end_index` (inclusive), stopping
     /// when adding the next entry would exceed `max_bytes`. Always includes at
@@ -536,12 +538,12 @@ impl<S: Storage> SharedWal<S> {
     #[must_use]
     pub fn read_entries_range(
         &self,
-        partition_id: PartitionId,
+        group_id: GroupId,
         start_index: u64,
         end_index: u64,
         max_bytes: u64,
     ) -> Vec<SharedEntry> {
-        let Some(btree) = self.partition_index.get(&partition_id) else {
+        let Some(btree) = self.group_index.get(&group_id) else {
             return Vec::new();
         };
 
@@ -559,9 +561,9 @@ impl<S: Storage> SharedWal<S> {
         result
     }
 
-    /// Returns the set of partition IDs that have entries in this WAL.
-    pub fn partition_ids(&self) -> impl Iterator<Item = PartitionId> + '_ {
-        self.partition_state.keys().copied()
+    /// Returns the set of group IDs that have entries in this WAL.
+    pub fn group_ids(&self) -> impl Iterator<Item = GroupId> + '_ {
+        self.group_state.keys().copied()
     }
 
     /// Returns the list of sealed segment IDs.
@@ -602,8 +604,8 @@ impl<S: Storage> SharedWal<S> {
     /// Evicts a sealed segment from memory.
     ///
     /// This performs dual eviction:
-    /// 1. Removes `SharedEntry` values from `partition_index` (frees payload data)
-    /// 2. Records `(partition_id, index) → segment_id` in `evicted_index`
+    /// 1. Removes `SharedEntry` values from `group_index` (frees payload data)
+    /// 2. Records `(group_id, index) → segment_id` in `evicted_index`
     /// 3. Drops the in-memory `Segment` in the underlying WAL
     ///
     /// After eviction, reads fall back to `read_or_load()` which reads from disk.
@@ -611,25 +613,25 @@ impl<S: Storage> SharedWal<S> {
     /// Returns `true` if the segment was evicted.
     pub fn evict_sealed_segment(&mut self, segment_id: crate::SegmentId) -> bool {
         // Step 1: Read entries from the WAL segment before eviction.
-        // This gives us the (partition_id, index) pairs to build evicted_index.
-        let entry_mappings: Vec<(PartitionId, u64)> =
+        // This gives us the (group_id, index) pairs to build evicted_index.
+        let entry_mappings: Vec<(GroupId, u64)> =
             if let Some(entries) = self.wal.sealed_segment_entries(segment_id) {
                 entries
-                    .map(|e| (e.partition_id(), e.index()))
+                    .map(|e| (e.group_id(), e.index()))
                     .collect()
             } else {
                 return false; // Segment not found or already evicted.
             };
 
-        // Step 2: Move entries from partition_index to evicted_index.
-        for &(partition_id, index) in &entry_mappings {
-            // Remove from partition_index.
-            if let Some(btree) = self.partition_index.get_mut(&partition_id) {
+        // Step 2: Move entries from group_index to evicted_index.
+        for &(group_id, index) in &entry_mappings {
+            // Remove from group_index.
+            if let Some(btree) = self.group_index.get_mut(&group_id) {
                 btree.remove(&index);
             }
             // Add to evicted_index.
             self.evicted_index
-                .entry(partition_id)
+                .entry(group_id)
                 .or_default()
                 .insert(index, segment_id);
         }
@@ -663,20 +665,20 @@ impl<S: Storage> SharedWal<S> {
     /// Returns an error if the disk read fails.
     pub async fn read_or_load(
         &self,
-        partition_id: PartitionId,
+        group_id: GroupId,
         index: u64,
     ) -> WalResult<Option<SharedEntry>> {
         // Check if index is beyond current valid range.
-        if let Some(state) = self.partition_state.get(&partition_id) {
+        if let Some(state) = self.group_state.get(&group_id) {
             if index > state.last_index {
                 return Ok(None);
             }
         }
 
-        // Fast path: check partition_index (in-memory).
+        // Fast path: check group_index (in-memory).
         if let Some(entry) = self
-            .partition_index
-            .get(&partition_id)
+            .group_index
+            .get(&group_id)
             .and_then(|btree| btree.get(&index).cloned())
         {
             return Ok(Some(entry));
@@ -685,12 +687,12 @@ impl<S: Storage> SharedWal<S> {
         // Slow path: check evicted_index → read from disk.
         if let Some(segment_id) = self
             .evicted_index
-            .get(&partition_id)
+            .get(&group_id)
             .and_then(|btree| btree.get(&index).copied())
         {
             let entry = self.wal.read_entry_from_disk(segment_id, index).await?;
-            // Verify the entry belongs to the right partition.
-            if entry.partition_id() == partition_id {
+            // Verify the entry belongs to the right group.
+            if entry.group_id() == group_id {
                 return Ok(Some(entry));
             }
         }
@@ -707,7 +709,7 @@ impl<S: Storage> SharedWal<S> {
     /// Returns an error if a disk read fails.
     pub async fn read_entries_range_or_load(
         &self,
-        partition_id: PartitionId,
+        group_id: GroupId,
         start_index: u64,
         end_index: u64,
         max_bytes: u64,
@@ -716,7 +718,7 @@ impl<S: Storage> SharedWal<S> {
         let mut total_bytes = 0u64;
 
         for index in start_index..=end_index {
-            if let Some(entry) = self.read_or_load(partition_id, index).await? {
+            if let Some(entry) = self.read_or_load(group_id, index).await? {
                 let entry_size = entry.payload.len() as u64;
                 // Always include at least one entry.
                 if !result.is_empty() && total_bytes + entry_size > max_bytes {
@@ -836,21 +838,21 @@ impl CoordinatorConfig {
 /// Acknowledgment that an entry is durable.
 #[derive(Debug, Clone, Copy)]
 pub struct DurableAck {
-    /// The partition ID.
-    pub partition_id: PartitionId,
-    /// The partition's local index that was made durable.
+    /// The group ID.
+    pub group_id: GroupId,
+    /// The group's local index that was made durable.
     pub index: u64,
     /// The term of the entry.
     pub term: u64,
 }
 
-/// A partition's handle to a coordinated shared WAL.
+/// A group's handle to a coordinated shared WAL.
 ///
 /// This handle is `Clone + Send + Sync` and can be used from multiple tasks.
 /// Writes are buffered internally and flushed by a background task.
 #[derive(Clone)]
 pub struct SharedWalHandle<S: Storage> {
-    partition_id: PartitionId,
+    group_id: GroupId,
     inner: Arc<CoordinatorInner<S>>,
 }
 
@@ -891,7 +893,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
             return Err(crate::WalError::Shutdown);
         }
 
-        let entry = SharedEntry::new(self.partition_id, term, index, payload.clone())?;
+        let entry = SharedEntry::new(self.group_id, term, index, payload.clone())?;
         let (tx, rx) = oneshot::channel();
 
         let pending = PendingWrite {
@@ -959,26 +961,26 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
             let mut buffer = self.inner.buffer.lock().await;
 
             // Determine the next index atomically while holding buffer lock.
-            let last_index = if let Some(idx) = buffer.last_index_for(self.partition_id) {
+            let last_index = if let Some(idx) = buffer.last_index_for(self.group_id) {
                 idx
             } else {
                 // First append for this partition - check WAL state for initialization.
                 // This only happens once per partition per coordinator lifetime.
                 let wal = self.inner.wal.lock().await;
-                let wal_last = wal.partition_last_index(self.partition_id).unwrap_or(0);
+                let wal_last = wal.group_last_index(self.group_id).unwrap_or(0);
                 drop(wal);
                 // Initialize buffer tracking.
-                buffer.update_last_index(self.partition_id, wal_last);
+                buffer.update_last_index(self.group_id, wal_last);
                 wal_last
             };
 
             let next_index = last_index + 1;
 
             // Create entry with assigned index.
-            let entry = SharedEntry::new(self.partition_id, term, next_index, payload.clone())?;
+            let entry = SharedEntry::new(self.group_id, term, next_index, payload.clone())?;
 
             // Update buffer tracking BEFORE adding entry (atomic with lock).
-            buffer.update_last_index(self.partition_id, next_index);
+            buffer.update_last_index(self.group_id, next_index);
 
             let pending = PendingWrite {
                 entry,
@@ -1037,11 +1039,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
     pub async fn read_entry(&self, index: u64) -> Option<SharedEntry> {
         let wal = self.inner.wal.lock().await;
         // Use read_or_load for transparent disk fallback.
-        match wal.read_or_load(self.partition_id, index).await {
+        match wal.read_or_load(self.group_id, index).await {
             Ok(entry) => entry,
             Err(e) => {
-                tracing::warn!(
-                    partition_id = %self.partition_id,
+                warn!(
+                    group_id = %self.group_id,
                     index,
                     error = %e,
                     "Failed to read entry from disk"
@@ -1067,7 +1069,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
         let wal = self.inner.wal.lock().await;
         // Try in-memory first; if all entries are resident this is fast.
         let result = wal.read_entries_range(
-            self.partition_id,
+            self.group_id,
             start_index,
             end_index,
             max_bytes,
@@ -1079,7 +1081,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
         // In-memory returned nothing — try disk fallback.
         match wal
             .read_entries_range_or_load(
-                self.partition_id,
+                self.group_id,
                 start_index,
                 end_index,
                 max_bytes,
@@ -1088,8 +1090,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
         {
             Ok(entries) => entries,
             Err(e) => {
-                tracing::warn!(
-                    partition_id = %self.partition_id,
+                warn!(
+                    group_id = %self.group_id,
                     start_index,
                     end_index,
                     error = %e,
@@ -1100,10 +1102,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
         }
     }
 
-    /// Returns the partition ID for this handle.
+    /// Returns the group ID for this handle.
     #[must_use]
-    pub const fn partition_id(&self) -> PartitionId {
-        self.partition_id
+    pub const fn group_id(&self) -> GroupId {
+        self.group_id
     }
 
     /// Returns the list of sealed segment IDs.
@@ -1150,16 +1152,16 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
     /// This is useful for initializing a `DurablePartition` to continue
     /// from the correct index after recovery.
     pub async fn last_index(&self) -> Option<u64> {
-        // Check WAL's partition_state (source of truth for in-progress batches).
+        // Check WAL's group_state (source of truth for in-progress batches).
         let wal_state_index = {
             let wal = self.inner.wal.lock().await;
-            wal.partition_last_index(self.partition_id)
+            wal.group_last_index(self.group_id)
         };
 
         // Check durable index (synced entries).
         let durable_index = {
-            let last_index = self.inner.partition_last_index.read().await;
-            last_index.get(&self.partition_id).copied()
+            let last_index = self.inner.group_last_index.read().await;
+            last_index.get(&self.group_id).copied()
         };
 
         // Check buffer for pending entries.
@@ -1168,7 +1170,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
             buffer
                 .entries
                 .iter()
-                .filter(|pw| pw.entry.partition_id() == self.partition_id)
+                .filter(|pw| pw.entry.group_id() == self.group_id)
                 .map(|pw| pw.entry.index())
                 .max()
         };
@@ -1192,9 +1194,9 @@ struct PendingWrite {
 struct WriteBuffer {
     entries: VecDeque<PendingWrite>,
     bytes: usize,
-    /// Per-partition last buffered index (for tracking expected next index).
+    /// Per-group last buffered index (for tracking expected next index).
     /// This is updated atomically with adding entries to prevent TOCTOU races.
-    partition_last_buffered: HashMap<PartitionId, u64>,
+    group_last_buffered: HashMap<GroupId, u64>,
 }
 
 impl WriteBuffer {
@@ -1203,13 +1205,13 @@ impl WriteBuffer {
         Self {
             entries: VecDeque::new(),
             bytes: 0,
-            partition_last_buffered: HashMap::new(),
+            group_last_buffered: HashMap::new(),
         }
     }
 
     fn drain(&mut self) -> Vec<PendingWrite> {
         self.bytes = 0;
-        // Don't clear partition_last_buffered - it tracks cumulative state.
+        // Don't clear group_last_buffered - it tracks cumulative state.
         std::mem::take(&mut self.entries).into()
     }
 
@@ -1217,14 +1219,14 @@ impl WriteBuffer {
         self.entries.is_empty()
     }
 
-    /// Returns the last buffered index for a partition.
-    fn last_index_for(&self, partition_id: PartitionId) -> Option<u64> {
-        self.partition_last_buffered.get(&partition_id).copied()
+    /// Returns the last buffered index for a group.
+    fn last_index_for(&self, group_id: GroupId) -> Option<u64> {
+        self.group_last_buffered.get(&group_id).copied()
     }
 
-    /// Updates the last buffered index for a partition.
-    fn update_last_index(&mut self, partition_id: PartitionId, index: u64) {
-        self.partition_last_buffered.insert(partition_id, index);
+    /// Updates the last buffered index for a group.
+    fn update_last_index(&mut self, group_id: GroupId, index: u64) {
+        self.group_last_buffered.insert(group_id, index);
     }
 }
 
@@ -1240,8 +1242,8 @@ struct CoordinatorInner<S: Storage> {
     config: CoordinatorConfig,
     /// Shutdown flag.
     shutdown: AtomicBool,
-    /// Per-partition last index (for assertion without locking WAL).
-    partition_last_index: RwLock<HashMap<PartitionId, u64>>,
+    /// Per-group last index (for assertion without locking WAL).
+    group_last_index: RwLock<HashMap<GroupId, u64>>,
 }
 
 /// Coordinated shared WAL with concurrent handles and automatic batching.
@@ -1255,15 +1257,15 @@ struct CoordinatorInner<S: Storage> {
 ///
 /// ```ignore
 /// use helix_wal::{SharedWalCoordinator, CoordinatorConfig, TokioStorage};
-/// use helix_core::PartitionId;
+/// use helix_core::GroupId;
 /// use bytes::Bytes;
 ///
 /// let config = CoordinatorConfig::new("/tmp/shared-wal");
 /// let coordinator = SharedWalCoordinator::open(TokioStorage::new(), config).await?;
 ///
-/// // Get handles for partitions.
-/// let h1 = coordinator.handle(PartitionId::new(1));
-/// let h2 = coordinator.handle(PartitionId::new(2));
+/// // Get handles for groups.
+/// let h1 = coordinator.handle(GroupId::new(1));
+/// let h2 = coordinator.handle(GroupId::new(2));
 ///
 /// // Concurrent writes - each returns when durable.
 /// let (r1, r2) = tokio::join!(
@@ -1303,7 +1305,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
             flush_notify: Notify::new(),
             config,
             shutdown: AtomicBool::new(false),
-            partition_last_index: RwLock::new(HashMap::new()),
+            group_last_index: RwLock::new(HashMap::new()),
         });
 
         // Spawn flush task.
@@ -1318,14 +1320,14 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
         })
     }
 
-    /// Gets a handle for a partition.
+    /// Gets a handle for a group.
     ///
-    /// Each partition should call this once and clone the handle as needed.
+    /// Each group should call this once and clone the handle as needed.
     /// The handle is `Clone + Send + Sync`.
     #[must_use]
-    pub fn handle(&self, partition_id: PartitionId) -> SharedWalHandle<S> {
+    pub fn handle(&self, group_id: GroupId) -> SharedWalHandle<S> {
         SharedWalHandle {
-            partition_id,
+            group_id,
             inner: self.inner.clone(),
         }
     }
@@ -1364,18 +1366,18 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
     /// # Errors
     ///
     /// Returns an error if recovery fails.
-    pub async fn recover(&self) -> WalResult<HashMap<PartitionId, Vec<SharedEntry>>> {
+    pub async fn recover(&self) -> WalResult<HashMap<GroupId, Vec<SharedEntry>>> {
         let result = {
             let mut wal = self.inner.wal.lock().await;
             wal.recover()?
         };
 
-        // Update partition_last_index from recovered state.
+        // Update group_last_index from recovered state.
         {
-            let mut last_index = self.inner.partition_last_index.write().await;
-            for (partition_id, entries) in &result {
+            let mut last_index = self.inner.group_last_index.write().await;
+            for (group_id, entries) in &result {
                 if let Some(last) = entries.last() {
-                    last_index.insert(*partition_id, last.index());
+                    last_index.insert(*group_id, last.index());
                 }
             }
         }
@@ -1383,12 +1385,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
         Ok(result)
     }
 
-    /// Returns the durable index for a specific partition.
+    /// Returns the durable index for a specific group.
     ///
-    /// Returns `None` if no entries have been synced for this partition.
-    pub async fn partition_durable_index(&self, partition_id: PartitionId) -> Option<u64> {
+    /// Returns `None` if no entries have been synced for this group.
+    pub async fn group_durable_index(&self, group_id: GroupId) -> Option<u64> {
         let wal = self.inner.wal.lock().await;
-        wal.partition_durable_index(partition_id)
+        wal.group_durable_index(group_id)
     }
 
     /// Shuts down the coordinator gracefully.
@@ -1489,7 +1491,7 @@ async fn flush_loop<S: Storage + Clone + Send + Sync + 'static>(inner: Arc<Coord
             .into_iter()
             .map(|pw| {
                 let ack = DurableAck {
-                    partition_id: pw.entry.partition_id(),
+                    group_id: pw.entry.group_id(),
                     index: pw.entry.index(),
                     term: pw.entry.term(),
                 };
@@ -1526,7 +1528,7 @@ async fn flush_loop<S: Storage + Clone + Send + Sync + 'static>(inner: Arc<Coord
         } else {
             // ReplicationOnly: skip fsync, but still update partition_durable indices
             // since entries are now written and "durable enough" for replication tracking.
-            wal.update_partition_durable_indices();
+            wal.update_group_durable_indices();
             Ok(())
         };
 
@@ -1540,11 +1542,11 @@ async fn flush_loop<S: Storage + Clone + Send + Sync + 'static>(inner: Arc<Coord
         // Notify all waiters.
         match sync_result {
             Ok(()) => {
-                // Update partition_last_index for successful writes.
+                // Update group_last_index for successful writes.
                 {
-                    let mut last_index = inner.partition_last_index.write().await;
+                    let mut last_index = inner.group_last_index.write().await;
                     for (_, ack) in &channels {
-                        last_index.insert(ack.partition_id, ack.index);
+                        last_index.insert(ack.group_id, ack.index);
                     }
                 }
 
@@ -1667,14 +1669,14 @@ impl PoolConfig {
 /// - K parallel write streams (reduced lock contention)
 /// - NUMA-aware placement (1 WAL per NUMA node)
 ///
-/// # Partition Assignment
+/// # Group Assignment
 ///
-/// Partitions are assigned to WALs by hashing: `partition_id % wal_count`. This ensures:
-/// - Deterministic assignment (same partition always goes to same WAL)
-/// - Even distribution (assuming partition IDs are well-distributed)
-/// - No coordination needed (each partition knows its WAL)
+/// Groups are assigned to WALs by hashing: `group_id % wal_count`. This ensures:
+/// - Deterministic assignment (same group always goes to same WAL)
+/// - Even distribution (assuming group IDs are well-distributed)
+/// - No coordination needed (each group knows its WAL)
 pub struct SharedWalPool<S: Storage> {
-    /// The WALs in this pool, indexed by `partition_id % wal_count`.
+    /// The WALs in this pool, indexed by `group_id % wal_count`.
     coordinators: Vec<SharedWalCoordinator<S>>,
     /// Number of WALs (stored separately to avoid Vec length lookup in hot path).
     wal_count: u32,
@@ -1719,26 +1721,26 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalPool<S> {
         })
     }
 
-    /// Gets a handle for a partition.
+    /// Gets a handle for a group.
     ///
-    /// The partition is assigned to a WAL by hashing: `partition_id % wal_count`.
+    /// The group is assigned to a WAL by hashing: `group_id % wal_count`.
     /// This assignment is deterministic and stable.
     ///
     /// # Panics
     ///
     /// Panics if the internal state is inconsistent (should never happen).
     #[must_use]
-    pub fn handle(&self, partition_id: PartitionId) -> SharedWalHandle<S> {
+    pub fn handle(&self, group_id: GroupId) -> SharedWalHandle<S> {
         // TigerStyle: Explicit cast with bounds check via assert.
         // Safe: wal_count <= POOL_WAL_COUNT_MAX (16), so result fits in usize on any platform.
         #[allow(clippy::cast_possible_truncation)]
-        let wal_index = (partition_id.get() % u64::from(self.wal_count)) as usize;
+        let wal_index = (group_id.get() % u64::from(self.wal_count)) as usize;
         assert!(wal_index < self.coordinators.len());
 
-        self.coordinators[wal_index].handle(partition_id)
+        self.coordinators[wal_index].handle(group_id)
     }
 
-    /// Returns which WAL index a partition is assigned to.
+    /// Returns which WAL index a group is assigned to.
     ///
     /// Useful for debugging and metrics.
     ///
@@ -1746,9 +1748,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalPool<S> {
     ///
     /// Panics if the internal state is inconsistent (should never happen).
     #[must_use]
-    pub fn wal_index_for_partition(&self, partition_id: PartitionId) -> u32 {
+    pub fn wal_index_for_group(&self, group_id: GroupId) -> u32 {
         #[allow(clippy::cast_possible_truncation)] // Bounded by wal_count.
-        let index = (partition_id.get() % u64::from(self.wal_count)) as u32;
+        let index = (group_id.get() % u64::from(self.wal_count)) as u32;
         assert!(index < self.wal_count);
         index
     }
@@ -1770,13 +1772,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalPool<S> {
     /// # Panics
     ///
     /// Panics if recovered entries are not sorted by index (indicates WAL corruption).
-    pub async fn recover(&self) -> WalResult<HashMap<PartitionId, Vec<SharedEntry>>> {
-        let mut all_entries: HashMap<PartitionId, Vec<SharedEntry>> = HashMap::new();
+    pub async fn recover(&self) -> WalResult<HashMap<GroupId, Vec<SharedEntry>>> {
+        let mut all_entries: HashMap<GroupId, Vec<SharedEntry>> = HashMap::new();
 
         for coordinator in &self.coordinators {
             let wal_entries = coordinator.recover().await?;
-            for (partition_id, entries) in wal_entries {
-                all_entries.entry(partition_id).or_default().extend(entries);
+            for (group_id, entries) in wal_entries {
+                all_entries.entry(group_id).or_default().extend(entries);
             }
         }
 
@@ -1858,8 +1860,8 @@ mod tests {
         let mut wal = SharedWal::open(TokioStorage::new(), config).await.unwrap();
         assert!(wal.is_empty());
 
-        let p1 = PartitionId::new(1);
-        let p2 = PartitionId::new(2);
+        let p1 = GroupId::new(1);
+        let p2 = GroupId::new(2);
 
         // Append entries from two partitions.
         wal.append(p1, 1, 1, Bytes::from("p1-1")).await.unwrap();
@@ -1877,9 +1879,9 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let config = SharedWalConfig::new(temp_dir.path());
 
-        let p1 = PartitionId::new(1);
-        let p2 = PartitionId::new(2);
-        let p3 = PartitionId::new(3);
+        let p1 = GroupId::new(1);
+        let p2 = GroupId::new(2);
+        let p3 = GroupId::new(3);
 
         // Write entries.
         {
@@ -1929,14 +1931,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_shared_wal_entries_for_partition() {
+    async fn test_shared_wal_entries_for_group() {
         let temp_dir = tempfile::tempdir().unwrap();
         let config = SharedWalConfig::new(temp_dir.path());
 
         let mut wal = SharedWal::open(TokioStorage::new(), config).await.unwrap();
 
-        let p1 = PartitionId::new(1);
-        let p2 = PartitionId::new(2);
+        let p1 = GroupId::new(1);
+        let p2 = GroupId::new(2);
 
         wal.append(p1, 1, 1, Bytes::from("p1-1")).await.unwrap();
         wal.append(p2, 1, 1, Bytes::from("p2-1")).await.unwrap();
@@ -1944,13 +1946,13 @@ mod tests {
         wal.append(p1, 1, 3, Bytes::from("p1-3")).await.unwrap();
         wal.sync().await.unwrap();
 
-        let p1_entries = wal.entries_for_partition(p1);
+        let p1_entries = wal.entries_for_group(p1);
         assert_eq!(p1_entries.len(), 3);
 
-        let p2_entries = wal.entries_for_partition(p2);
+        let p2_entries = wal.entries_for_group(p2);
         assert_eq!(p2_entries.len(), 1);
 
-        let p3_entries = wal.entries_for_partition(PartitionId::new(3));
+        let p3_entries = wal.entries_for_group(GroupId::new(3));
         assert_eq!(p3_entries.len(), 0);
     }
 
@@ -1963,14 +1965,14 @@ mod tests {
 
         let mut wal = SharedWal::open(TokioStorage::new(), config).await.unwrap();
 
-        let p1 = PartitionId::new(1);
+        let p1 = GroupId::new(1);
 
         wal.append(p1, 1, 1, Bytes::from("p1-1")).await.unwrap();
         // Skip index 2 - gaps are allowed.
         wal.append(p1, 1, 3, Bytes::from("p1-3")).await.unwrap();
         wal.sync().await.unwrap();
 
-        let entries = wal.entries_for_partition(p1);
+        let entries = wal.entries_for_group(p1);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].index(), 1);
         assert_eq!(entries[1].index(), 3);
@@ -1985,7 +1987,7 @@ mod tests {
 
         let mut wal = SharedWal::open(TokioStorage::new(), config).await.unwrap();
 
-        let p1 = PartitionId::new(1);
+        let p1 = GroupId::new(1);
 
         wal.append(p1, 1, 5, Bytes::from("p1-5")).await.unwrap();
         // Going backwards - should panic.
@@ -2000,7 +2002,7 @@ mod tests {
 
         let mut wal = SharedWal::open(TokioStorage::new(), config).await.unwrap();
 
-        let p1 = PartitionId::new(1);
+        let p1 = GroupId::new(1);
 
         wal.append(p1, 5, 1, Bytes::from("p1-1")).await.unwrap();
         // Term goes backwards - should panic.
@@ -2014,8 +2016,8 @@ mod tests {
 
         let mut wal = SharedWal::open(TokioStorage::new(), config).await.unwrap();
 
-        let p1 = PartitionId::new(1);
-        let p2 = PartitionId::new(2);
+        let p1 = GroupId::new(1);
+        let p2 = GroupId::new(2);
 
         // Both partitions can have index 1, 2, 3...
         wal.append(p1, 1, 1, Bytes::from("p1-1")).await.unwrap();
@@ -2026,11 +2028,11 @@ mod tests {
         wal.sync().await.unwrap();
 
         // Verify both partitions have their own index sequences.
-        let p1_entries = wal.entries_for_partition(p1);
+        let p1_entries = wal.entries_for_group(p1);
         assert_eq!(p1_entries[0].index(), 1);
         assert_eq!(p1_entries[1].index(), 2);
 
-        let p2_entries = wal.entries_for_partition(p2);
+        let p2_entries = wal.entries_for_group(p2);
         assert_eq!(p2_entries[0].index(), 1);
         assert_eq!(p2_entries[1].index(), 2);
     }
@@ -2042,7 +2044,7 @@ mod tests {
 
         let mut wal = SharedWal::open(TokioStorage::new(), config).await.unwrap();
 
-        let p1 = PartitionId::new(1);
+        let p1 = GroupId::new(1);
 
         // Append entries 1-5.
         for i in 1..=5u64 {
@@ -2056,7 +2058,7 @@ mod tests {
         wal.truncate_after(p1, 3);
 
         // Entries 4, 5 should no longer be visible.
-        let entries = wal.entries_for_partition(p1);
+        let entries = wal.entries_for_group(p1);
         assert_eq!(entries.len(), 3);
         assert_eq!(entries.last().unwrap().index(), 3);
 
@@ -2071,7 +2073,7 @@ mod tests {
         wal.sync().await.unwrap();
 
         // Now we should have 5 entries: 1, 2, 3, 4-new, 5-new.
-        let entries = wal.entries_for_partition(p1);
+        let entries = wal.entries_for_group(p1);
         assert_eq!(entries.len(), 5);
 
         // The new entries should have term 2.
@@ -2084,7 +2086,7 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let config = SharedWalConfig::new(temp_dir.path());
 
-        let p1 = PartitionId::new(1);
+        let p1 = GroupId::new(1);
 
         // Phase 1: Write, truncate, write new entries.
         {
@@ -2139,14 +2141,14 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "cannot truncate partition")]
+    #[should_panic(expected = "cannot truncate group")]
     async fn test_shared_wal_truncate_beyond_last_panics() {
         let temp_dir = tempfile::tempdir().unwrap();
         let config = SharedWalConfig::new(temp_dir.path());
 
         let mut wal = SharedWal::open(TokioStorage::new(), config).await.unwrap();
 
-        let p1 = PartitionId::new(1);
+        let p1 = GroupId::new(1);
 
         // Append entries 1-3.
         for i in 1..=3u64 {
@@ -2166,8 +2168,8 @@ mod tests {
 
         let mut wal = SharedWal::open(TokioStorage::new(), config).await.unwrap();
 
-        let p1 = PartitionId::new(1);
-        let p2 = PartitionId::new(2);
+        let p1 = GroupId::new(1);
+        let p2 = GroupId::new(2);
 
         // Append entries for both partitions.
         for i in 1..=5u64 {
@@ -2184,15 +2186,15 @@ mod tests {
         wal.truncate_after(p1, 2);
 
         // p1 should have 2 entries, p2 should have 5.
-        assert_eq!(wal.entries_for_partition(p1).len(), 2);
-        assert_eq!(wal.entries_for_partition(p2).len(), 5);
+        assert_eq!(wal.entries_for_group(p1).len(), 2);
+        assert_eq!(wal.entries_for_group(p2).len(), 5);
 
         // Append new entries to p1.
         wal.append(p1, 2, 3, Bytes::from("p1-3-new")).await.unwrap();
         wal.sync().await.unwrap();
 
-        assert_eq!(wal.entries_for_partition(p1).len(), 3);
-        assert_eq!(wal.entries_for_partition(p2).len(), 5);
+        assert_eq!(wal.entries_for_group(p1).len(), 3);
+        assert_eq!(wal.entries_for_group(p2).len(), 5);
     }
 
     #[tokio::test]
@@ -2202,8 +2204,8 @@ mod tests {
 
         let mut wal = SharedWal::open(TokioStorage::new(), config).await.unwrap();
 
-        let p1 = PartitionId::new(1);
-        let p2 = PartitionId::new(2);
+        let p1 = GroupId::new(1);
+        let p2 = GroupId::new(2);
 
         // Append entries.
         for i in 1..=5u64 {
@@ -2242,7 +2244,7 @@ mod tests {
         let entry = wal.read_or_load(p1, 3).await.unwrap();
         assert!(entry.is_some());
         let entry = entry.unwrap();
-        assert_eq!(entry.partition_id(), p1);
+        assert_eq!(entry.group_id(), p1);
         assert_eq!(entry.index(), 3);
         assert_eq!(entry.payload.as_ref(), b"p1-3");
 
@@ -2250,7 +2252,7 @@ mod tests {
         let entry = wal.read_or_load(p2, 2).await.unwrap();
         assert!(entry.is_some());
         let entry = entry.unwrap();
-        assert_eq!(entry.partition_id(), p2);
+        assert_eq!(entry.group_id(), p2);
         assert_eq!(entry.index(), 2);
 
         // read_entries_range_or_load should work.
@@ -2271,7 +2273,7 @@ mod tests {
 
         let mut wal = SharedWal::open(TokioStorage::new(), config).await.unwrap();
 
-        let p1 = PartitionId::new(1);
+        let p1 = GroupId::new(1);
 
         for i in 1..=3u64 {
             wal.append(p1, 1, i, Bytes::from(format!("data-{i}")))
@@ -2304,7 +2306,7 @@ mod tests {
         assert!(wal.entry_count() > 0);
 
         // partition_last_index still correct.
-        assert_eq!(wal.partition_last_index(p1), Some(4));
+        assert_eq!(wal.group_last_index(p1), Some(4));
     }
 }
 
@@ -2333,8 +2335,8 @@ mod coordinator_tests {
             .await
             .unwrap();
 
-        let p1 = PartitionId::new(1);
-        let p2 = PartitionId::new(2);
+        let p1 = GroupId::new(1);
+        let p2 = GroupId::new(2);
 
         let h1 = coordinator.handle(p1);
         let h2 = coordinator.handle(p2);
@@ -2351,9 +2353,9 @@ mod coordinator_tests {
         let ack1 = r1.unwrap();
         let ack2 = r2.unwrap();
 
-        assert_eq!(ack1.partition_id, p1);
+        assert_eq!(ack1.group_id, p1);
         assert_eq!(ack1.index, 1);
-        assert_eq!(ack2.partition_id, p2);
+        assert_eq!(ack2.group_id, p2);
         assert_eq!(ack2.index, 1);
 
         coordinator.shutdown().await.unwrap();
@@ -2369,7 +2371,7 @@ mod coordinator_tests {
             .await
             .unwrap();
 
-        let p1 = PartitionId::new(1);
+        let p1 = GroupId::new(1);
         let h1 = coordinator.handle(p1);
 
         // Sequential writes.
@@ -2401,7 +2403,7 @@ mod coordinator_tests {
 
         // Create handles for all partitions.
         let handles: Vec<_> = (1..=partition_count)
-            .map(|p| coordinator.handle(PartitionId::new(p)))
+            .map(|p| coordinator.handle(GroupId::new(p)))
             .collect();
 
         // Spawn concurrent writers.
@@ -2436,8 +2438,8 @@ mod coordinator_tests {
         let config =
             CoordinatorConfig::new(temp_dir.path()).with_flush_interval(Duration::from_millis(5));
 
-        let p1 = PartitionId::new(1);
-        let p2 = PartitionId::new(2);
+        let p1 = GroupId::new(1);
+        let p2 = GroupId::new(2);
 
         // Phase 1: Write entries.
         {
@@ -2492,7 +2494,7 @@ mod coordinator_tests {
             .await
             .unwrap();
 
-        let p1 = PartitionId::new(1);
+        let p1 = GroupId::new(1);
         let h1 = coordinator.handle(p1);
         let h1_clone = h1.clone();
 
@@ -2518,7 +2520,7 @@ mod coordinator_tests {
             .await
             .unwrap();
 
-        let p1 = PartitionId::new(1);
+        let p1 = GroupId::new(1);
         let h1 = coordinator.handle(p1);
 
         // Write without waiting for automatic flush.
@@ -2540,7 +2542,7 @@ mod coordinator_tests {
         let config =
             CoordinatorConfig::new(temp_dir.path()).with_flush_interval(Duration::from_secs(60)); // Long interval
 
-        let p1 = PartitionId::new(1);
+        let p1 = GroupId::new(1);
 
         // Phase 1: Write using append_async and shutdown (should flush).
         {
@@ -2579,18 +2581,18 @@ mod coordinator_tests {
             .await
             .unwrap();
 
-        let p1 = PartitionId::new(1);
+        let p1 = GroupId::new(1);
         let h1 = coordinator.handle(p1);
 
         // Initially no durable index.
-        assert_eq!(coordinator.partition_durable_index(p1).await, None);
+        assert_eq!(coordinator.group_durable_index(p1).await, None);
 
         // Write and wait for durability.
         h1.append(1, 1, Bytes::from("entry-1")).await.unwrap();
         h1.append(1, 2, Bytes::from("entry-2")).await.unwrap();
 
         // Now durable index should be 2.
-        assert_eq!(coordinator.partition_durable_index(p1).await, Some(2));
+        assert_eq!(coordinator.group_durable_index(p1).await, Some(2));
 
         coordinator.shutdown().await.unwrap();
     }
@@ -2610,7 +2612,7 @@ mod coordinator_tests {
             .await
             .unwrap();
 
-        let p1 = PartitionId::new(1);
+        let p1 = GroupId::new(1);
         let h1 = coordinator.handle(p1);
 
         // Write enough entries to trigger segment rotation.
@@ -2661,14 +2663,14 @@ mod pool_tests {
         assert!(pool.is_empty().await);
 
         // Partitions should be distributed across WALs.
-        let p1 = PartitionId::new(1);
-        let p2 = PartitionId::new(2);
-        let p3 = PartitionId::new(3);
+        let p1 = GroupId::new(1);
+        let p2 = GroupId::new(2);
+        let p3 = GroupId::new(3);
 
         // With 2 WALs: p1 -> wal 1, p2 -> wal 0, p3 -> wal 1.
-        assert_eq!(pool.wal_index_for_partition(p1), 1);
-        assert_eq!(pool.wal_index_for_partition(p2), 0);
-        assert_eq!(pool.wal_index_for_partition(p3), 1);
+        assert_eq!(pool.wal_index_for_group(p1), 1);
+        assert_eq!(pool.wal_index_for_group(p2), 0);
+        assert_eq!(pool.wal_index_for_group(p3), 1);
 
         // Get handles and write.
         let h1 = pool.handle(p1);
@@ -2688,8 +2690,8 @@ mod pool_tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let base_path = temp_dir.path().to_path_buf();
 
-        let p1 = PartitionId::new(10);
-        let p2 = PartitionId::new(11);
+        let p1 = GroupId::new(10);
+        let p2 = GroupId::new(11);
 
         // Write entries.
         {
@@ -2749,8 +2751,8 @@ mod pool_tests {
         // Track which WAL each partition goes to.
         let mut wal_counts = [0u32; 4];
         for i in 0..100 {
-            let partition = PartitionId::new(i);
-            let wal_idx = pool.wal_index_for_partition(partition);
+            let partition = GroupId::new(i);
+            let wal_idx = pool.wal_index_for_group(partition);
             wal_counts[wal_idx as usize] += 1;
         }
 

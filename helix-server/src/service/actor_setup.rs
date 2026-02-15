@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use helix_core::{GroupId, LogIndex, NodeId, PartitionId};
+use helix_core::{GroupId, LogIndex, NodeId};
 use helix_raft::{RaftConfig, RaftNode};
 use helix_runtime::{IncomingMessage, TransportService};
 use tokio::sync::{mpsc, RwLock};
@@ -242,7 +242,7 @@ pub async fn setup_multi_partition<
     vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
     shared_wal_pool: Option<Arc<SharedWalPool<S>>>,
     data_dir: Option<PathBuf>,
-    recovered_entries: Arc<RwLock<HashMap<PartitionId, Vec<SharedEntry>>>>,
+    recovered_entries: Arc<RwLock<HashMap<GroupId, Vec<SharedEntry>>>>,
     storage: S,
 ) -> ActorSetupHandles {
     let group_count = initial_groups.len();

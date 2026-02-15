@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use helix_core::{
-    GroupId, LogIndex, NodeId, Offset, PartitionId, TermId, TopicId, WriteDurability,
+    GroupId, LogIndex, NodeId, Offset, TermId, TopicId, WriteDurability,
 };
 use helix_progress::{ProgressConfig, ProgressManager, SimulatedProgressStore};
 use helix_raft::multi::MultiRaft;
@@ -37,7 +37,7 @@ use helix_runtime::{PeerInfo, TransportConfig, TransportError, TransportHandle, 
 use helix_tier::SimulatedObjectStorage;
 use helix_wal::{PoolConfig, SharedEntry, SharedWalPool, Storage, TokioStorage};
 use tokio::sync::{mpsc, oneshot, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::controller::{ControllerState, BROKER_HEARTBEAT_TIMEOUT_MS, CONTROLLER_GROUP_ID};
 use crate::group_map::GroupMap;
@@ -424,10 +424,10 @@ pub struct HelixService<
     pub(crate) local_broker_heartbeats: Arc<RwLock<HashMap<NodeId, u64>>>,
     /// Shared WAL pool for fsync amortization. Present when `data_dir` is set.
     pub(crate) shared_wal_pool: Option<Arc<SharedWalPool<S>>>,
-    /// Recovered entries from shared WAL, indexed by `PartitionId`.
+    /// Recovered entries from shared WAL, indexed by `GroupId`.
     /// Used during partition creation to restore state (Phase 3).
     #[allow(dead_code)] // Used in Phase 3 of SharedWAL integration.
-    pub(crate) recovered_entries: Arc<RwLock<HashMap<PartitionId, Vec<SharedEntry>>>>,
+    pub(crate) recovered_entries: Arc<RwLock<HashMap<GroupId, Vec<SharedEntry>>>>,
     /// Pending batched proposals waiting for Raft commit (multi-node mode only).
     /// Indexed by (`GroupId`, `LogIndex`) for O(1) lookup on commit.
     /// Note: This field is shared via Arc with the tick task, not read directly here.
@@ -1160,7 +1160,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                 let snapshot = stats.snapshot();
                 let json = snapshot.to_json(node_id, timestamp_ms);
                 if let Err(e) = tokio::fs::write(&report_path, json).await {
-                    tracing::warn!(
+                    warn!(
                         path = %report_path.display(),
                         error = %e,
                         "Failed to write bench report"
@@ -1398,7 +1398,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
 
     /// Returns access to recovered entries for DST.
     #[must_use]
-    pub const fn recovered_entries(&self) -> &Arc<RwLock<HashMap<PartitionId, Vec<SharedEntry>>>> {
+    pub const fn recovered_entries(&self) -> &Arc<RwLock<HashMap<GroupId, Vec<SharedEntry>>>> {
         &self.recovered_entries
     }
 
@@ -1503,7 +1503,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
         for output in outputs {
             if let helix_raft::multi::MultiRaftOutput::SendMessages { to, messages } = output {
                 if let Err(e) = transport.send_batch(*to, messages.clone()).await {
-                    tracing::debug!(
+                    debug!(
                         to = to.get(),
                         count = messages.len(),
                         error = %e,

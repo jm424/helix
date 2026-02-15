@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 
 use bytes::Bytes;
-use helix_core::PartitionId;
+use helix_core::GroupId;
 use helix_wal::{DurableAck, SharedWalHandle, SharedWalPool, Storage, WalResult};
 use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
@@ -30,8 +30,8 @@ use tracing::debug;
 pub enum WalCommand {
     /// Append an entry to the WAL for a partition.
     Append {
-        /// Partition ID for the entry.
-        partition_id: PartitionId,
+        /// Group ID for the entry.
+        group_id: GroupId,
         /// Raft term.
         term: u64,
         /// Log index (partition-local).
@@ -84,7 +84,7 @@ impl WalActorHandle {
     /// Returns an error if the actor has shut down or the WAL write fails.
     pub async fn append(
         &self,
-        partition_id: PartitionId,
+        group_id: GroupId,
         term: u64,
         index: u64,
         payload: Bytes,
@@ -93,7 +93,7 @@ impl WalActorHandle {
 
         self.tx
             .send(WalCommand::Append {
-                partition_id,
+                group_id,
                 term,
                 index,
                 payload,
@@ -117,8 +117,8 @@ impl WalActorHandle {
 struct WalActor<S: Storage> {
     /// Command receiver.
     cmd_rx: mpsc::Receiver<WalCommand>,
-    /// Per-partition handles to the shared WAL pool.
-    handles: HashMap<PartitionId, SharedWalHandle<S>>,
+    /// Per-group handles to the shared WAL pool.
+    handles: HashMap<GroupId, SharedWalHandle<S>>,
     /// The pool (for creating new handles).
     pool: SharedWalPool<S>,
 }
@@ -133,11 +133,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> WalActor<S> {
         }
     }
 
-    /// Gets or creates a handle for a partition.
-    fn handle_for(&mut self, partition_id: PartitionId) -> &SharedWalHandle<S> {
+    /// Gets or creates a handle for a group.
+    fn handle_for(&mut self, group_id: GroupId) -> &SharedWalHandle<S> {
         self.handles
-            .entry(partition_id)
-            .or_insert_with(|| self.pool.handle(partition_id))
+            .entry(group_id)
+            .or_insert_with(|| self.pool.handle(group_id))
     }
 
     /// Runs the actor message loop.
@@ -147,13 +147,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> WalActor<S> {
         while let Some(cmd) = self.cmd_rx.recv().await {
             match cmd {
                 WalCommand::Append {
-                    partition_id,
+                    group_id,
                     term,
                     index,
                     payload,
                     reply,
                 } => {
-                    let handle = self.handle_for(partition_id).clone();
+                    let handle = self.handle_for(group_id).clone();
                     // Spawn the append to not block the actor loop.
                     // The handle's append already does batching via the coordinator.
                     tokio::spawn(async move {
@@ -217,14 +217,14 @@ mod tests {
         let (_temp_dir, pool) = setup_pool().await;
         let handle = spawn_wal_actor(pool, WalActorConfig::default());
 
-        let partition = PartitionId::new(1);
+        let partition = GroupId::new(1);
         let result = handle
             .append(partition, 1, 1, Bytes::from("test data"))
             .await;
 
         assert!(result.is_ok());
         let ack = result.unwrap();
-        assert_eq!(ack.partition_id, partition);
+        assert_eq!(ack.group_id, partition);
         assert_eq!(ack.index, 1);
 
         handle.shutdown().await;
@@ -235,8 +235,8 @@ mod tests {
         let (_temp_dir, pool) = setup_pool().await;
         let handle = spawn_wal_actor(pool, WalActorConfig::default());
 
-        let p1 = PartitionId::new(1);
-        let p2 = PartitionId::new(2);
+        let p1 = GroupId::new(1);
+        let p2 = GroupId::new(2);
 
         // Append to both partitions.
         let r1 = handle.append(p1, 1, 1, Bytes::from("p1 data")).await;
@@ -244,8 +244,8 @@ mod tests {
 
         assert!(r1.is_ok());
         assert!(r2.is_ok());
-        assert_eq!(r1.unwrap().partition_id, p1);
-        assert_eq!(r2.unwrap().partition_id, p2);
+        assert_eq!(r1.unwrap().group_id, p1);
+        assert_eq!(r2.unwrap().group_id, p2);
 
         handle.shutdown().await;
     }
@@ -255,7 +255,7 @@ mod tests {
         let (_temp_dir, pool) = setup_pool().await;
         let handle = spawn_wal_actor(pool, WalActorConfig::default());
 
-        let partition = PartitionId::new(1);
+        let partition = GroupId::new(1);
 
         // Append multiple entries sequentially.
         for i in 1..=5 {
@@ -279,7 +279,7 @@ mod tests {
         let mut join_handles = Vec::new();
         for i in 1..=10_u64 {
             let h = handle.clone();
-            let partition = PartitionId::new(i);
+            let partition = GroupId::new(i);
             join_handles.push(tokio::spawn(async move {
                 h.append(partition, 1, 1, Bytes::from(format!("data {i}")))
                     .await
@@ -301,7 +301,7 @@ mod tests {
         let handle1 = spawn_wal_actor(pool, WalActorConfig::default());
         let handle2 = handle1.clone();
 
-        let partition = PartitionId::new(1);
+        let partition = GroupId::new(1);
 
         // Both handles should work.
         let r1 = handle1.append(partition, 1, 1, Bytes::from("data1")).await;

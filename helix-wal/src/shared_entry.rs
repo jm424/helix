@@ -9,9 +9,9 @@
 //! +----------+----------+----------+----------+----------+----------+
 //! ```
 //!
-//! - CRC32: Checksum of Length + `PartitionId` + Term + Index + Payload
+//! - CRC32: Checksum of Length + `GroupId` + Term + Index + Payload
 //! - Length: Payload length in bytes (not including header)
-//! - PID: Partition ID that owns this entry
+//! - PID: Group ID that owns this entry
 //! - Term: Raft term when entry was created
 //! - Index: Log index of this entry (partition-local)
 //! - Payload: Application data
@@ -19,7 +19,7 @@
 //! All integers are stored in little-endian format.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use helix_core::PartitionId;
+use helix_core::GroupId;
 
 use crate::entry::WalEntry;
 use crate::error::{WalError, WalResult};
@@ -48,8 +48,8 @@ pub struct SharedEntryHeader {
     pub crc: u32,
     /// Length of the payload in bytes.
     pub length: u32,
-    /// Partition ID that owns this entry.
-    pub partition_id: PartitionId,
+    /// Group ID that owns this entry.
+    pub group_id: GroupId,
     /// Raft term when this entry was created.
     pub term: u64,
     /// Log index of this entry (partition-local).
@@ -64,7 +64,7 @@ impl SharedEntryHeader {
     /// # Errors
     /// Returns an error if the payload is too large.
     pub fn new(
-        partition_id: PartitionId,
+        group_id: GroupId,
         term: u64,
         index: u64,
         payload: &[u8],
@@ -84,13 +84,13 @@ impl SharedEntryHeader {
         #[allow(clippy::cast_possible_truncation)]
         let length = length as u32;
 
-        // Compute CRC over length + partition_id + term + index + payload.
-        let crc = Self::compute_crc(length, partition_id, term, index, payload);
+        // Compute CRC over length + group_id + term + index + payload.
+        let crc = Self::compute_crc(length, group_id, term, index, payload);
 
         Ok(Self {
             crc,
             length,
-            partition_id,
+            group_id,
             term,
             index,
         })
@@ -99,14 +99,14 @@ impl SharedEntryHeader {
     /// Computes the CRC32 checksum for an entry.
     fn compute_crc(
         length: u32,
-        partition_id: PartitionId,
+        group_id: GroupId,
         term: u64,
         index: u64,
         payload: &[u8],
     ) -> u32 {
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&length.to_le_bytes());
-        hasher.update(&partition_id.get().to_le_bytes());
+        hasher.update(&group_id.get().to_le_bytes());
         hasher.update(&term.to_le_bytes());
         hasher.update(&index.to_le_bytes());
         hasher.update(payload);
@@ -120,7 +120,7 @@ impl SharedEntryHeader {
     pub fn verify(&self, payload: &[u8], offset: u64) -> WalResult<()> {
         let expected = Self::compute_crc(
             self.length,
-            self.partition_id,
+            self.group_id,
             self.term,
             self.index,
             payload,
@@ -139,7 +139,7 @@ impl SharedEntryHeader {
     pub fn encode(&self, buf: &mut BytesMut) {
         buf.put_u32_le(self.crc);
         buf.put_u32_le(self.length);
-        buf.put_u64_le(self.partition_id.get());
+        buf.put_u64_le(self.group_id.get());
         buf.put_u64_le(self.term);
         buf.put_u64_le(self.index);
     }
@@ -158,7 +158,7 @@ impl SharedEntryHeader {
 
         let crc = buf.get_u32_le();
         let length = buf.get_u32_le();
-        let partition_id = PartitionId::new(buf.get_u64_le());
+        let group_id = GroupId::new(buf.get_u64_le());
         let term = buf.get_u64_le();
         let index = buf.get_u64_le();
 
@@ -173,7 +173,7 @@ impl SharedEntryHeader {
         Ok(Self {
             crc,
             length,
-            partition_id,
+            group_id,
             term,
             index,
         })
@@ -208,19 +208,19 @@ impl SharedEntry {
     /// # Errors
     /// Returns an error if the payload is too large.
     pub fn new(
-        partition_id: PartitionId,
+        group_id: GroupId,
         term: u64,
         index: u64,
         payload: Bytes,
     ) -> WalResult<Self> {
-        let header = SharedEntryHeader::new(partition_id, term, index, &payload)?;
+        let header = SharedEntryHeader::new(group_id, term, index, &payload)?;
         Ok(Self { header, payload })
     }
 
-    /// Returns the partition ID.
+    /// Returns the group ID.
     #[must_use]
-    pub const fn partition_id(&self) -> PartitionId {
-        self.header.partition_id
+    pub const fn group_id(&self) -> GroupId {
+        self.header.group_id
     }
 
     /// Returns the Raft term.
@@ -329,11 +329,11 @@ mod tests {
 
     #[test]
     fn test_shared_entry_roundtrip() {
-        let partition_id = PartitionId::new(42);
+        let group_id = GroupId::new(42);
         let payload = Bytes::from("hello, shared world!");
-        let entry = SharedEntry::new(partition_id, 1, 100, payload.clone()).unwrap();
+        let entry = SharedEntry::new(group_id, 1, 100, payload.clone()).unwrap();
 
-        assert_eq!(entry.partition_id(), partition_id);
+        assert_eq!(entry.group_id(), group_id);
         assert_eq!(entry.term(), 1);
         assert_eq!(entry.index(), 100);
         assert_eq!(entry.payload, payload);
@@ -352,7 +352,7 @@ mod tests {
 
     #[test]
     fn test_shared_entry_checksum_detects_corruption() {
-        let entry = SharedEntry::new(PartitionId::new(1), 1, 1, Bytes::from("test")).unwrap();
+        let entry = SharedEntry::new(GroupId::new(1), 1, 1, Bytes::from("test")).unwrap();
 
         let mut buf = BytesMut::new();
         entry.encode(&mut buf);
@@ -369,14 +369,14 @@ mod tests {
     #[test]
     fn test_shared_entry_too_large() {
         let payload = Bytes::from(vec![0u8; ENTRY_PAYLOAD_SIZE_BYTES_MAX as usize + 1]);
-        let result = SharedEntry::new(PartitionId::new(1), 1, 1, payload);
+        let result = SharedEntry::new(GroupId::new(1), 1, 1, payload);
         assert!(matches!(result, Err(WalError::EntryTooLarge { .. })));
     }
 
     #[test]
     fn test_shared_entry_header_size() {
         // Verify our constant matches actual encoded size.
-        let header = SharedEntryHeader::new(PartitionId::new(1), 1, 1, &[]).unwrap();
+        let header = SharedEntryHeader::new(GroupId::new(1), 1, 1, &[]).unwrap();
         let mut buf = BytesMut::new();
         header.encode(&mut buf);
         assert_eq!(buf.len(), SHARED_ENTRY_HEADER_SIZE);
@@ -384,7 +384,7 @@ mod tests {
 
     #[test]
     fn test_truncated_shared_entry() {
-        let entry = SharedEntry::new(PartitionId::new(1), 1, 1, Bytes::from("hello")).unwrap();
+        let entry = SharedEntry::new(GroupId::new(1), 1, 1, Bytes::from("hello")).unwrap();
         let mut buf = BytesMut::new();
         entry.encode(&mut buf);
 
@@ -398,7 +398,7 @@ mod tests {
     #[test]
     fn test_shared_entry_walentry_trait() {
         // Verify SharedEntry implements WalEntry correctly.
-        let entry = SharedEntry::new(PartitionId::new(99), 5, 42, Bytes::from("data")).unwrap();
+        let entry = SharedEntry::new(GroupId::new(99), 5, 42, Bytes::from("data")).unwrap();
 
         // Check trait constants and methods.
         assert_eq!(SharedEntry::HEADER_SIZE, SHARED_ENTRY_HEADER_SIZE);
@@ -421,12 +421,12 @@ mod tests {
     #[test]
     fn test_shared_entry_multiple_partitions() {
         // Test entries from different partitions can be distinguished.
-        let entry1 = SharedEntry::new(PartitionId::new(1), 1, 1, Bytes::from("p1")).unwrap();
-        let entry2 = SharedEntry::new(PartitionId::new(2), 1, 1, Bytes::from("p2")).unwrap();
-        let entry3 = SharedEntry::new(PartitionId::new(1), 1, 2, Bytes::from("p1-2")).unwrap();
+        let entry1 = SharedEntry::new(GroupId::new(1), 1, 1, Bytes::from("p1")).unwrap();
+        let entry2 = SharedEntry::new(GroupId::new(2), 1, 1, Bytes::from("p2")).unwrap();
+        let entry3 = SharedEntry::new(GroupId::new(1), 1, 2, Bytes::from("p1-2")).unwrap();
 
-        assert_ne!(entry1.partition_id(), entry2.partition_id());
-        assert_eq!(entry1.partition_id(), entry3.partition_id());
+        assert_ne!(entry1.group_id(), entry2.group_id());
+        assert_eq!(entry1.group_id(), entry3.group_id());
         assert_eq!(entry1.index(), entry2.index());
         assert_ne!(entry1.index(), entry3.index());
     }

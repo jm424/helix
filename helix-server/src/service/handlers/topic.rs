@@ -64,12 +64,12 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     .data_dir
                     .as_ref()
                     .expect("data_dir must be set with shared_wal_pool");
-                let wal_handle = pool.handle(partition_id);
+                let wal_handle = pool.handle(group_id);
                 let recovered = self
                     .recovered_entries
                     .write()
                     .await
-                    .remove(&partition_id)
+                    .remove(&group_id)
                     .unwrap_or_default();
 
                 #[cfg(feature = "s3")]

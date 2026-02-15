@@ -122,7 +122,7 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
     vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
     shared_wal_pool: Option<Arc<SharedWalPool<S>>>,
     data_dir: Option<PathBuf>,
-    recovered_entries: Arc<RwLock<HashMap<PartitionId, Vec<SharedEntry>>>>,
+    recovered_entries: Arc<RwLock<HashMap<GroupId, Vec<SharedEntry>>>>,
     storage: S,
     mut incoming_rx: mpsc::Receiver<IncomingMessage>,
     mut shutdown_rx: mpsc::Receiver<()>,
@@ -275,7 +275,7 @@ pub async fn tick_task_controller<
     vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
     shared_wal_pool: Option<Arc<SharedWalPool<S>>>,
     data_dir: Option<PathBuf>,
-    recovered_entries: Arc<RwLock<HashMap<PartitionId, Vec<SharedEntry>>>>,
+    recovered_entries: Arc<RwLock<HashMap<GroupId, Vec<SharedEntry>>>>,
     storage: S,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
@@ -362,7 +362,7 @@ pub async fn process_controller_outputs<
     vote_store: Option<&Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
     shared_wal_pool: Option<&Arc<SharedWalPool<S>>>,
     data_dir: Option<&PathBuf>,
-    recovered_entries: Option<&Arc<RwLock<HashMap<PartitionId, Vec<SharedEntry>>>>>,
+    recovered_entries: Option<&Arc<RwLock<HashMap<GroupId, Vec<SharedEntry>>>>>,
     storage: Option<&S>,
 ) {
     // Collect follow-up outputs for single-node processing.
@@ -505,6 +505,7 @@ pub async fn process_controller_outputs<
                                 let ps = create_partition_storage(
                                     topic_id,
                                     partition_id,
+                                    data_group_id,
                                     shared_wal_pool,
                                     data_dir,
                                     recovered_entries,
@@ -696,6 +697,7 @@ pub async fn process_controller_outputs<
                                 let ps = create_partition_storage(
                                     topic_id,
                                     partition_id,
+                                    data_group_id,
                                     shared_wal_pool,
                                     data_dir,
                                     recovered_entries,
@@ -762,19 +764,20 @@ pub async fn process_controller_outputs<
 async fn create_partition_storage<S: Storage + Clone + Send + Sync + 'static>(
     topic_id: helix_core::TopicId,
     partition_id: PartitionId,
+    data_group_id: GroupId,
     shared_wal_pool: Option<&Arc<SharedWalPool<S>>>,
     data_dir: Option<&PathBuf>,
-    recovered_entries: Option<&Arc<RwLock<HashMap<PartitionId, Vec<SharedEntry>>>>>,
+    recovered_entries: Option<&Arc<RwLock<HashMap<GroupId, Vec<SharedEntry>>>>>,
     storage: Option<&S>,
 ) -> PartitionStorage<S> {
     // Mode 1: Shared WAL pool.
     if let (Some(pool), Some(dir)) = (shared_wal_pool, data_dir) {
-        let wal_handle = pool.handle(partition_id);
+        let wal_handle = pool.handle(data_group_id);
         let recovered = if let Some(entries) = recovered_entries {
             entries
                 .write()
                 .await
-                .remove(&partition_id)
+                .remove(&data_group_id)
                 .unwrap_or_default()
         } else {
             Vec::new()

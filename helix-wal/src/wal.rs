@@ -1385,7 +1385,7 @@ mod tests {
     #[tokio::test]
     async fn test_wal_with_shared_entry() {
         use crate::shared_entry::SharedEntry;
-        use helix_core::PartitionId;
+        use helix_core::GroupId;
 
         let temp_dir = tempfile::tempdir().unwrap();
         let config = WalConfig::new(temp_dir.path());
@@ -1399,8 +1399,8 @@ mod tests {
 
         // Append entries from multiple partitions with partition-local indices.
         // Each partition has its own sequential index space (1, 2, 3...).
-        let p1 = PartitionId::new(1);
-        let p2 = PartitionId::new(2);
+        let p1 = GroupId::new(1);
+        let p2 = GroupId::new(2);
 
         // Interleave entries from two partitions.
         // P1: indices 1, 2, 3, 4, 5 with term=1
@@ -1426,11 +1426,11 @@ mod tests {
         for (i, chunk) in entries.chunks(2).enumerate() {
             let local_idx = (i + 1) as u64;
 
-            assert_eq!(chunk[0].partition_id(), p1);
+            assert_eq!(chunk[0].group_id(), p1);
             assert_eq!(chunk[0].term(), 1);
             assert_eq!(chunk[0].index(), local_idx);
 
-            assert_eq!(chunk[1].partition_id(), p2);
+            assert_eq!(chunk[1].group_id(), p2);
             assert_eq!(chunk[1].term(), 2);
             assert_eq!(chunk[1].index(), local_idx);
         }
@@ -1448,12 +1448,12 @@ mod tests {
         assert_eq!(entries.len(), 10);
 
         // First entry should be P1 with index 1.
-        assert_eq!(entries[0].partition_id(), p1);
+        assert_eq!(entries[0].group_id(), p1);
         assert_eq!(entries[0].term(), 1);
         assert_eq!(entries[0].index(), 1);
 
         // Second entry should be P2 with index 1.
-        assert_eq!(entries[1].partition_id(), p2);
+        assert_eq!(entries[1].group_id(), p2);
         assert_eq!(entries[1].term(), 2);
         assert_eq!(entries[1].index(), 1);
     }
