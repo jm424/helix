@@ -137,6 +137,11 @@ pub struct Wal<S: Storage, E: WalEntry = Entry> {
     /// When non-empty, `sync()` cannot update `durable_index` because the sealed
     /// segments' synced state may have more entries than in-memory state.
     sealed_segments_pending_sync: Vec<SegmentId>,
+    /// Last decoded segment cache for `read_entry_from_disk`.
+    /// Single-entry cache — consecutive reads from the same segment
+    /// (the common case for sequential offset iteration) avoid re-reading
+    /// and re-decoding the entire segment file.
+    cached_segment: Option<(SegmentId, Segment<E>)>,
 }
 
 /// A sealed (read-only) segment.
@@ -328,6 +333,7 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
                 durable_index: last_index, // Recovered state is durable (survived crash)
                 bytes_since_sync: 0,
                 sealed_segments_pending_sync: Vec::new(),
+                cached_segment: None,
             });
         }
 
@@ -506,6 +512,7 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
             durable_index: last_index, // Recovered state is durable (survived crash)
             bytes_since_sync: 0,
             sealed_segments_pending_sync: Vec::new(),
+            cached_segment: None,
         })
     }
 
@@ -991,6 +998,9 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
             }
         }
 
+        // Invalidate read cache — truncation may change segment contents.
+        self.cached_segment = None;
+
         debug!(last_index_to_keep, "Truncated WAL");
         Ok(())
     }
@@ -1168,15 +1178,28 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
     /// `index`. This is the async fallback when `read()` returns
     /// `WalError::SegmentEvicted`.
     ///
+    /// Uses a single-entry cache to avoid re-reading and re-decoding the
+    /// same segment for consecutive entries. Sequential offset iteration
+    /// (the common case) hits the cache for every entry in the same segment.
+    ///
     /// # Errors
     ///
     /// Returns an error if the segment file cannot be read or decoded, or
     /// if the entry at `index` is not found in the segment.
     pub async fn read_entry_from_disk(
-        &self,
+        &mut self,
         segment_id: SegmentId,
         index: u64,
     ) -> WalResult<E> {
+        // Check cache first — consecutive reads from the same segment
+        // (the common case) avoid re-reading and re-decoding.
+        if let Some((cached_id, ref cached_seg)) = self.cached_segment {
+            if cached_id == segment_id {
+                return cached_seg.read(index).cloned();
+            }
+        }
+
+        // Cache miss — verify segment exists, read from disk, and cache.
         let sealed = self
             .sealed_segments
             .get(&segment_id)
@@ -1187,11 +1210,9 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
         let file = self.storage.open(&sealed.path).await?;
         let data = file.read_all().await?;
         let segment = Segment::<E>::decode(data, self.config.segment_config)?;
-
-        // Find entry by index in the decoded segment.
-        segment
-            .read(index)
-            .cloned()
+        let entry = segment.read(index).cloned();
+        self.cached_segment = Some((segment_id, segment));
+        entry
     }
 
     /// Returns the entries of a sealed segment (before eviction).
@@ -1221,6 +1242,14 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
         if let Some(sealed) = self.sealed_segments.get_mut(&segment_id) {
             if sealed.segment.is_some() {
                 sealed.segment = None;
+                // Invalidate read cache if it holds this segment.
+                if self
+                    .cached_segment
+                    .as_ref()
+                    .is_some_and(|(id, _)| *id == segment_id)
+                {
+                    self.cached_segment = None;
+                }
                 debug!(
                     segment_id = segment_id.get(),
                     "Evicted sealed segment from memory"

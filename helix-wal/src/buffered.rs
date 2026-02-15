@@ -362,7 +362,7 @@ impl<S: Storage + Send + Sync + 'static> BufferedWal<S> {
     /// # Errors
     /// Returns an error if the index is out of bounds.
     pub async fn read(&self, index: u64) -> WalResult<Entry> {
-        let guard = self.inner.lock().await;
+        let mut guard = self.inner.lock().await;
 
         // Check buffer first (entries not yet flushed).
         for entry in &guard.buffer {

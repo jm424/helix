@@ -664,7 +664,7 @@ impl<S: Storage> SharedWal<S> {
     ///
     /// Returns an error if the disk read fails.
     pub async fn read_or_load(
-        &self,
+        &mut self,
         group_id: GroupId,
         index: u64,
     ) -> WalResult<Option<SharedEntry>> {
@@ -708,7 +708,7 @@ impl<S: Storage> SharedWal<S> {
     ///
     /// Returns an error if a disk read fails.
     pub async fn read_entries_range_or_load(
-        &self,
+        &mut self,
         group_id: GroupId,
         start_index: u64,
         end_index: u64,
@@ -1037,7 +1037,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
     ///
     /// Returns an error if the disk fallback read fails (I/O or decode).
     pub async fn read_entry(&self, index: u64) -> Option<SharedEntry> {
-        let wal = self.inner.wal.lock().await;
+        let mut wal = self.inner.wal.lock().await;
         // Use read_or_load for transparent disk fallback.
         match wal.read_or_load(self.group_id, index).await {
             Ok(entry) => entry,
@@ -1066,7 +1066,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
         end_index: u64,
         max_bytes: u64,
     ) -> Vec<SharedEntry> {
-        let wal = self.inner.wal.lock().await;
+        let mut wal = self.inner.wal.lock().await;
         // Try in-memory first; if all entries are resident this is fast.
         let result = wal.read_entries_range(
             self.group_id,
