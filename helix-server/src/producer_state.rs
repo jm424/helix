@@ -6,7 +6,9 @@
 //!
 //! # Design
 //!
-//! - Deduplication check happens BEFORE Raft proposal to prevent duplicate log entries.
+//! - Sequence checks run inside the partition actor, after the `offset_seeded`
+//!   gate ensures producer state is fully rebuilt from committed entries.
+//! - All access is serialized by the actor — no atomics or locks needed.
 //! - Each partition maintains a map of producer states.
 //! - Bounded memory: LRU eviction when exceeding `PRODUCERS_PER_PARTITION_MAX`.
 //! - Kafka-compatible 5-batch deduplication window for out-of-order retries.
@@ -56,12 +58,20 @@ struct DedupEntry {
 }
 
 /// State for a single producer on a partition.
+///
+/// All access is serialized through the partition actor or output processor,
+/// so no atomics are needed.
 #[derive(Debug, Clone)]
 pub struct ProducerPartitionState {
     /// Producer epoch (for fencing).
     pub epoch: ProducerEpoch,
     /// Last committed sequence number.
     last_sequence: SequenceNum,
+    /// High water mark: next expected sequence considering in-flight proposals.
+    ///
+    /// Updated on accept (before Raft commit) within the serialized actor,
+    /// so concurrent access is impossible.
+    next_expected: i32,
     /// Recent batches for deduplication (circular buffer).
     /// Handles out-of-order retries within the window.
     dedup_window: Vec<DedupEntry>,
@@ -76,6 +86,7 @@ impl ProducerPartitionState {
         Self {
             epoch,
             last_sequence: initial_sequence,
+            next_expected: initial_sequence.next().get(),
             dedup_window: Vec::with_capacity(DEDUP_WINDOW_SIZE),
             last_activity_us: current_time_us,
         }
@@ -155,15 +166,23 @@ impl PartitionProducerState {
     /// - `ProducerFenced` if the epoch is stale
     #[must_use]
     pub fn check_sequence(
-        &self,
+        &mut self,
         producer_id: ProducerId,
         epoch: ProducerEpoch,
         sequence: SequenceNum,
     ) -> SequenceCheckResult {
-        let Some(state) = self.producers.get(&producer_id) else {
-            // New producer - this is their first batch, always valid.
-            return SequenceCheckResult::Valid;
-        };
+        // Create state on first sight so we can reserve sequences for
+        // concurrent in-flight proposals. Without this, multiple batches
+        // from a new producer all take the "no state" fast path, then the
+        // first commit creates state with a low next_expected and rejects
+        // the rest.
+        let state = self.producers.entry(producer_id).or_insert_with(|| {
+            ProducerPartitionState::new(
+                epoch,
+                SequenceNum::new(sequence.get().saturating_sub(1)),
+                0, // Timestamp updated on commit.
+            )
+        });
 
         // Check epoch - reject if stale.
         if epoch < state.epoch {
@@ -182,16 +201,21 @@ impl PartitionProducerState {
             return SequenceCheckResult::Duplicate { cached_offset };
         }
 
-        // Check for out-of-order (gap in sequence).
-        // Note: Kafka allows some slack for in-flight requests, but we're strict for now.
-        let expected_next = state.last_sequence.next();
+        // Gap check against the high water mark (accepted sequences, not
+        // just committed). All access is serialized by the partition actor.
+        let expected = state.next_expected;
         // Safe cast: DEDUP_WINDOW_SIZE is a small constant (5).
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        if sequence.get() > expected_next.get() + (DEDUP_WINDOW_SIZE as i32) {
+        if sequence.get() > expected + (DEDUP_WINDOW_SIZE as i32) {
             return SequenceCheckResult::OutOfSequence {
-                expected: expected_next.get(),
+                expected,
                 received: sequence.get(),
             };
+        }
+
+        // Reserve this sequence: advance high water mark.
+        if sequence.get() + 1 > state.next_expected {
+            state.next_expected = sequence.get() + 1;
         }
 
         SequenceCheckResult::Valid
@@ -228,9 +252,15 @@ impl PartitionProducerState {
             state.epoch = epoch;
             state.dedup_window.clear();
             state.last_sequence = SequenceNum::new(sequence.get().saturating_sub(1));
+            state.next_expected = sequence.get();
         }
 
         state.record_committed(sequence, base_offset);
+        // Advance high water mark to account for batches accepted via the
+        // "new producer" fast path before state existed.
+        if sequence.get() + 1 > state.next_expected {
+            state.next_expected = sequence.get() + 1;
+        }
         state.touch(current_time_us);
 
         // LRU eviction if over limit.
@@ -269,7 +299,7 @@ mod tests {
 
     #[test]
     fn test_new_producer_is_valid() {
-        let state = PartitionProducerState::new();
+        let mut state = PartitionProducerState::new();
         let result = state.check_sequence(
             ProducerId::new(1),
             ProducerEpoch::new(0),

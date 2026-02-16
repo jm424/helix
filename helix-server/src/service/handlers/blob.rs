@@ -1,7 +1,7 @@
 //! Blob storage handlers for the Helix service (Kafka zero-copy support).
 
 use bytes::Bytes;
-use helix_core::{NodeId, Offset, PartitionId, ProducerEpoch, ProducerId, SequenceNum};
+use helix_core::{NodeId, Offset, PartitionId};
 use helix_raft::multi::MultiRaftOutput;
 use helix_raft::RaftState;
 use helix_wal::Storage;
@@ -12,21 +12,9 @@ use helix_runtime::TransportService;
 
 use crate::error::{ServerError, ServerResult};
 use crate::partition_storage::PartitionStorageInner;
-use crate::producer_state::SequenceCheckResult;
 use crate::storage::{BlobFormat, PartitionCommand};
 
 use super::super::{HelixService, PendingProposal};
-
-/// Producer info for idempotent produce requests.
-#[derive(Debug, Clone, Copy)]
-pub struct IdempotentProducerInfo {
-    /// Producer ID (must be >= 0 for idempotent).
-    pub producer_id: ProducerId,
-    /// Producer epoch.
-    pub epoch: ProducerEpoch,
-    /// Base sequence number for this batch.
-    pub base_sequence: SequenceNum,
-}
 
 impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixService<S, T> {
     /// Checks if this node is the leader for the given group.
@@ -304,9 +292,10 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
 
     /// Appends a blob with idempotent producer support.
     ///
-    /// This method checks for duplicate sequences before proposing to Raft,
-    /// preventing duplicate log entries. If a duplicate is detected, the
-    /// cached offset is returned without re-proposing.
+    /// Idempotent sequence checks happen inside the partition actor (after
+    /// the `offset_seeded` gate) to avoid stale state on leader changes.
+    /// Producer state is recorded by the output processor on commit via
+    /// `extract_and_record_producer_state`.
     ///
     /// # Arguments
     ///
@@ -314,7 +303,6 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
     /// * `partition` - Partition index
     /// * `record_count` - Number of records in the batch
     /// * `data` - Raw `RecordBatch` bytes
-    /// * `producer_info` - Optional producer info for idempotent deduplication
     ///
     /// # Errors
     ///
@@ -331,7 +319,6 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
         partition: i32,
         record_count: u32,
         data: Bytes,
-        producer_info: Option<IdempotentProducerInfo>,
     ) -> ServerResult<u64> {
         // Get topic metadata.
         let topic_meta = self
@@ -374,72 +361,6 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             });
         }
 
-        // Check producer sequence for idempotent deduplication BEFORE proposing.
-        if let Some(ref info) = producer_info {
-            let ps_lock = {
-                let storage = self.partition_storage.read().await;
-                storage.get(&group_id).cloned()
-            };
-            if let Some(ps_lock) = ps_lock {
-                let ps = ps_lock.read().await;
-                match ps.check_producer_sequence(info.producer_id, info.epoch, info.base_sequence) {
-                    SequenceCheckResult::Valid => {
-                        // Continue with the proposal.
-                        debug!(
-                            topic = %topic,
-                            partition,
-                            producer_id = info.producer_id.get(),
-                            sequence = info.base_sequence.get(),
-                            "Idempotent sequence check passed"
-                        );
-                    }
-                    SequenceCheckResult::Duplicate { cached_offset } => {
-                        // Return cached offset without re-proposing.
-                        info!(
-                            topic = %topic,
-                            partition,
-                            producer_id = info.producer_id.get(),
-                            sequence = info.base_sequence.get(),
-                            cached_offset = cached_offset.get(),
-                            "Duplicate produce detected, returning cached offset"
-                        );
-                        return Ok(cached_offset.get());
-                    }
-                    SequenceCheckResult::OutOfSequence { expected, received } => {
-                        warn!(
-                            topic = %topic,
-                            partition,
-                            producer_id = info.producer_id.get(),
-                            expected,
-                            received,
-                            "Out of sequence produce rejected"
-                        );
-                        return Err(ServerError::OutOfOrderSequence {
-                            topic: topic.to_string(),
-                            partition,
-                            expected,
-                            received,
-                        });
-                    }
-                    SequenceCheckResult::ProducerFenced { current_epoch } => {
-                        warn!(
-                            topic = %topic,
-                            partition,
-                            producer_id = info.producer_id.get(),
-                            stale_epoch = info.epoch.get(),
-                            current_epoch = current_epoch.get(),
-                            "Producer fenced"
-                        );
-                        return Err(ServerError::ProducerFenced {
-                            topic: topic.to_string(),
-                            partition,
-                            producer_id: info.producer_id.get(),
-                        });
-                    }
-                }
-            }
-        }
-
         // In multi-node mode, we need to wait for the commit to happen asynchronously.
         // In single-node mode, the commit happens synchronously.
         let is_multi_node = self.is_multi_node_generic();
@@ -473,29 +394,11 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     "BLOB_HANDLER: received offset from commit notification"
                 );
 
-                // Record producer sequence after successful commit.
-                if let Some(ref info) = producer_info {
-                    let ps_lock = {
-                        let storage = self.partition_storage.read().await;
-                        storage.get(&group_id).cloned()
-                    };
-                    if let Some(ps_lock) = ps_lock {
-                        let mut ps = ps_lock.write().await;
-                        ps.record_producer_sequence(
-                            info.producer_id,
-                            info.epoch,
-                            info.base_sequence,
-                            offset,
-                        );
-                    }
-                }
-
                 debug!(
                     topic = %topic,
                     partition,
                     base_offset = offset.get(),
                     record_count,
-                    idempotent = producer_info.is_some(),
                     "Appended blob via batcher"
                 );
 
@@ -587,29 +490,11 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     message: "commit notification channel closed".to_string(),
                 })??;
 
-            // Record producer sequence after successful commit.
-            if let Some(ref info) = producer_info {
-                let ps_lock = {
-                    let storage = self.partition_storage.read().await;
-                    storage.get(&group_id).cloned()
-                };
-                if let Some(ps_lock) = ps_lock {
-                    let mut ps = ps_lock.write().await;
-                    ps.record_producer_sequence(
-                        info.producer_id,
-                        info.epoch,
-                        info.base_sequence,
-                        offset,
-                    );
-                }
-            }
-
             debug!(
                 topic = %topic,
                 partition,
                 base_offset = offset.get(),
                 record_count,
-                idempotent = producer_info.is_some(),
                 "Appended blob (idempotent)"
             );
 
@@ -679,16 +564,6 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                                     .map_err(|e| ServerError::Internal {
                                         message: format!("failed to apply: {e}"),
                                     })?;
-
-                                // Record producer sequence after successful commit.
-                                if let Some(ref info) = producer_info {
-                                    ps.record_producer_sequence(
-                                        info.producer_id,
-                                        info.epoch,
-                                        info.base_sequence,
-                                        base_offset,
-                                    );
-                                }
                             }
                         }
                     }
@@ -700,8 +575,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                 partition,
                 base_offset = base_offset.get(),
                 record_count,
-                idempotent = producer_info.is_some(),
-                "Appended blob (idempotent)"
+                "Appended blob (single-node)"
             );
 
             Ok(base_offset.get())

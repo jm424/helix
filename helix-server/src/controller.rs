@@ -531,6 +531,13 @@ impl ControllerState {
             .map(|((_, pid), assignment)| (*pid, assignment))
     }
 
+    /// Returns all partition assignments across all topics.
+    pub fn all_assignments(
+        &self,
+    ) -> impl Iterator<Item = ((TopicId, PartitionId), &PartitionAssignment)> {
+        self.assignments.iter().map(|(k, v)| (*k, v))
+    }
+
     /// Checks if a topic exists.
     #[must_use]
     pub fn topic_exists(&self, name: &str) -> bool {

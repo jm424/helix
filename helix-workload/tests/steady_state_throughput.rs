@@ -39,6 +39,7 @@ use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use helix_workload::profiles::{self, BenchmarkProfile};
 use helix_workload::{ProducerMode, RealCluster, RealExecutor, WorkloadExecutor};
+use hdrhistogram::Histogram;
 use rand::RngCore;
 
 fn binary_path() -> PathBuf {
@@ -674,4 +675,511 @@ async fn test_multi_partition_throughput() {
             "Throughput {throughput_mb:.1} MB/s below target {target_throughput_mb:.0} MB/s"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Partition scaling curve infrastructure
+// ---------------------------------------------------------------------------
+
+/// Outcome of measuring a single partition-count data point.
+struct ScalingResult {
+    partition_count: u32,
+    producer_count: usize,
+    message_size: usize,
+    success_count: u64,
+    error_count: u64,
+    duration_secs: f64,
+    throughput_ops: f64,
+    throughput_mb: f64,
+    latency_p50_us: u64,
+    latency_p99_us: u64,
+    latency_p999_us: u64,
+    latency_max_us: u64,
+}
+
+/// Per-producer measurement collected during a benchmark run.
+struct ProducerMeasurement {
+    success: u64,
+    errors: u64,
+    histogram: Histogram<u64>,
+    partition_ops: Vec<u64>,
+}
+
+/// Load profile for scaling curve (defaults to discovery-throughput).
+fn load_scaling_profile() -> BenchmarkProfile {
+    if let Ok(path) = std::env::var("HELIX_PROFILE_FILE") {
+        return BenchmarkProfile::from_file(&path)
+            .unwrap_or_else(|e| panic!("failed to load profile from {path}: {e}"));
+    }
+    let name = std::env::var("HELIX_PROFILE")
+        .unwrap_or_else(|_| "discovery-throughput".to_string());
+    profiles::load_profile(&name).unwrap_or_else(|_| {
+        let available = profiles::list_profiles().join(", ");
+        panic!("unknown profile '{name}'. Available: {available}");
+    })
+}
+
+/// Parse partition counts from `HELIX_PARTITION_COUNTS` env var.
+fn parse_partition_counts() -> Vec<u32> {
+    std::env::var("HELIX_PARTITION_COUNTS")
+        .unwrap_or_else(|_| "1,4,8,16,32,64,128,256".to_string())
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<u32>()
+                .expect("invalid partition count in HELIX_PARTITION_COUNTS")
+        })
+        .collect()
+}
+
+/// Warmup phase: send messages without recording metrics.
+#[allow(clippy::too_many_arguments)]
+async fn warmup_producer(
+    executor: &Arc<RealExecutor>,
+    topic: &Arc<String>,
+    payload: &Bytes,
+    partition_count: i32,
+    producer_id: usize,
+    inflight: usize,
+    duration: Duration,
+) {
+    let end = std::time::Instant::now() + duration;
+    let mut futures: FuturesUnordered<tokio::task::JoinHandle<()>> =
+        FuturesUnordered::new();
+    let mut seq = 0u64;
+
+    while std::time::Instant::now() < end || !futures.is_empty() {
+        while futures.len() < inflight && std::time::Instant::now() < end {
+            let exec = Arc::clone(executor);
+            let p = payload.clone();
+            let t = Arc::clone(topic);
+            let partition =
+                ((producer_id as i32 * 1000) + (seq as i32)) % partition_count;
+            seq += 1;
+            futures.push(tokio::spawn(async move {
+                let _ = exec.send(&t, partition, p).await;
+            }));
+        }
+        if futures.next().await.is_none() {
+            break;
+        }
+    }
+}
+
+/// Measurement phase: send messages and record latency + per-partition counts.
+#[allow(clippy::too_many_arguments)]
+async fn measure_producer(
+    executor: &Arc<RealExecutor>,
+    topic: &Arc<String>,
+    payload: &Bytes,
+    partition_count: i32,
+    producer_id: usize,
+    inflight: usize,
+    duration: Duration,
+) -> ProducerMeasurement {
+    // 1 us to 120 s range, 3 significant figures.
+    let mut histogram =
+        Histogram::<u64>::new_with_bounds(1, 120_000_000, 3)
+            .expect("histogram creation failed");
+    let mut success = 0u64;
+    let mut errors = 0u64;
+    let mut partition_ops = vec![0u64; partition_count as usize];
+
+    type SendResult = (
+        i32,
+        Result<u64, helix_workload::ExecutorError>,
+        u64,
+    );
+    let end = std::time::Instant::now() + duration;
+    let mut futures: FuturesUnordered<tokio::task::JoinHandle<SendResult>> =
+        FuturesUnordered::new();
+    let mut seq = 0u64;
+
+    while std::time::Instant::now() < end || !futures.is_empty() {
+        while futures.len() < inflight && std::time::Instant::now() < end {
+            let exec = Arc::clone(executor);
+            let p = payload.clone();
+            let t = Arc::clone(topic);
+            let partition =
+                ((producer_id as i32 * 1000) + (seq as i32)) % partition_count;
+            seq += 1;
+            futures.push(tokio::spawn(async move {
+                let start = std::time::Instant::now();
+                let result = exec.send(&t, partition, p).await;
+                let latency_us = start.elapsed().as_micros() as u64;
+                (partition, result, latency_us)
+            }));
+        }
+
+        if let Some(join_result) = futures.next().await {
+            match join_result {
+                Ok((partition, Ok(_), latency_us)) => {
+                    success += 1;
+                    partition_ops[partition as usize] += 1;
+                    histogram.record(latency_us.min(120_000_000)).ok();
+                }
+                Ok((_, Err(_), _)) | Err(_) => {
+                    errors += 1;
+                }
+            }
+        }
+    }
+
+    ProducerMeasurement {
+        success,
+        errors,
+        histogram,
+        partition_ops,
+    }
+}
+
+/// Spawn all producers, run warmup + measurement, return merged results.
+async fn run_scaling_producers(
+    bootstrap_servers: &str,
+    profile: &BenchmarkProfile,
+    partition_count: u32,
+    producer_mode: ProducerMode,
+) -> (Duration, Histogram<u64>, u64, u64, Vec<u64>) {
+    let producer_count = profile.producer.threads;
+    let inflight = profile.producer.inflight;
+    let warmup_dur = Duration::from_secs(profile.execution.warmup_secs);
+    let measure_dur = Duration::from_secs(profile.execution.duration_secs);
+    let topic_name = Arc::new("scaling-curve".to_string());
+
+    let mut payload_data = vec![0u8; profile.producer.message_size];
+    rand::thread_rng().fill_bytes(&mut payload_data);
+    let payload = Bytes::from(payload_data);
+
+    let ready_barrier =
+        Arc::new(tokio::sync::Barrier::new(producer_count + 1));
+    let start_barrier =
+        Arc::new(tokio::sync::Barrier::new(producer_count + 1));
+    let mut handles = Vec::with_capacity(producer_count);
+
+    for producer_id in 0..producer_count {
+        let bootstrap = bootstrap_servers.to_string();
+        let p = payload.clone();
+        let ready_b = Arc::clone(&ready_barrier);
+        let start_b = Arc::clone(&start_barrier);
+        let topic = Arc::clone(&topic_name);
+        let pc = partition_count as i32;
+
+        handles.push(tokio::spawn(async move {
+            let executor = Arc::new(
+                RealExecutor::with_mode(&bootstrap, producer_mode)
+                    .expect("failed to create producer executor"),
+            );
+            warmup_producer(
+                &executor, &topic, &p, pc, producer_id, inflight,
+                warmup_dur,
+            )
+            .await;
+
+            ready_b.wait().await;
+            start_b.wait().await;
+
+            measure_producer(
+                &executor, &topic, &p, pc, producer_id, inflight,
+                measure_dur,
+            )
+            .await
+        }));
+    }
+
+    ready_barrier.wait().await;
+    let measure_start = std::time::Instant::now();
+    start_barrier.wait().await;
+
+    let mut merged =
+        Histogram::<u64>::new_with_bounds(1, 120_000_000, 3)
+            .expect("histogram creation failed");
+    let mut total_success = 0u64;
+    let mut total_errors = 0u64;
+    let mut partition_ops = vec![0u64; partition_count as usize];
+
+    for handle in handles {
+        let m = handle.await.expect("producer task panicked");
+        total_success += m.success;
+        total_errors += m.errors;
+        merged.add(&m.histogram).expect("histogram merge failed");
+        for (i, &ops) in m.partition_ops.iter().enumerate() {
+            partition_ops[i] += ops;
+        }
+    }
+
+    let elapsed = measure_start.elapsed();
+    (elapsed, merged, total_success, total_errors, partition_ops)
+}
+
+/// Build a `ScalingResult` from raw measurements.
+fn build_scaling_result(
+    profile: &BenchmarkProfile,
+    partition_count: u32,
+    elapsed: Duration,
+    histogram: &Histogram<u64>,
+    total_success: u64,
+    total_errors: u64,
+) -> ScalingResult {
+    let secs = elapsed.as_secs_f64();
+    let throughput_ops = total_success as f64 / secs;
+    let throughput_mb = (total_success as f64
+        * profile.producer.message_size as f64)
+        / secs
+        / 1_000_000.0;
+
+    ScalingResult {
+        partition_count,
+        producer_count: profile.producer.threads,
+        message_size: profile.producer.message_size,
+        success_count: total_success,
+        error_count: total_errors,
+        duration_secs: secs,
+        throughput_ops,
+        throughput_mb,
+        latency_p50_us: histogram.value_at_percentile(50.0),
+        latency_p99_us: histogram.value_at_percentile(99.0),
+        latency_p999_us: histogram.value_at_percentile(99.9),
+        latency_max_us: histogram.max(),
+    }
+}
+
+/// Print per-partition distribution and summary for one data point.
+fn print_point_summary(result: &ScalingResult, partition_ops: &[u64]) {
+    let active = partition_ops.iter().filter(|&&x| x > 0).count();
+
+    if active <= 16 {
+        for (i, &ops) in partition_ops.iter().enumerate() {
+            if ops > 0 {
+                let pct =
+                    ops as f64 / result.success_count.max(1) as f64 * 100.0;
+                let mb = (ops as f64 * result.message_size as f64)
+                    / result.duration_secs
+                    / 1_000_000.0;
+                println!("    P{i}: {ops} ({pct:.1}%), {mb:.1} MB/s");
+            }
+        }
+    } else {
+        let ops: Vec<u64> =
+            partition_ops.iter().copied().filter(|&x| x > 0).collect();
+        let min = ops.iter().copied().min().unwrap_or(0);
+        let max = ops.iter().copied().max().unwrap_or(0);
+        let mean = ops.iter().sum::<u64>() as f64 / ops.len().max(1) as f64;
+        println!(
+            "  Partitions: {active} active, \
+             ops/partition min={min} max={max} mean={mean:.0}"
+        );
+    }
+
+    println!(
+        "  Throughput: {:.0} ops/s, {:.1} MB/s",
+        result.throughput_ops, result.throughput_mb
+    );
+    println!(
+        "  Latency: p50={:.2}ms p99={:.2}ms p999={:.2}ms max={:.1}ms",
+        result.latency_p50_us as f64 / 1000.0,
+        result.latency_p99_us as f64 / 1000.0,
+        result.latency_p999_us as f64 / 1000.0,
+        result.latency_max_us as f64 / 1000.0,
+    );
+    if result.error_count > 0 {
+        println!("  Errors: {}", result.error_count);
+    }
+}
+
+/// Run a single partition-count data point.
+async fn run_scaling_point(
+    profile: &BenchmarkProfile,
+    partition_count: u32,
+) -> ScalingResult {
+    println!();
+    println!("{}", "=".repeat(60));
+    println!("=== Partitions: {partition_count} ===");
+
+    let node_count = profile.cluster.nodes as u16;
+    let base_port = find_available_base_port(23000, node_count);
+    let raft_base_port = find_available_base_port(33000, node_count);
+    let dir_name = format!("scaling_curve_p{partition_count}");
+
+    let cluster = RealCluster::builder()
+        .nodes(u32::from(node_count))
+        .base_port(base_port)
+        .raft_base_port(raft_base_port)
+        .binary_path(binary_path())
+        .data_dir(test_data_dir(&dir_name))
+        .auto_create_topics(true)
+        .default_replication_factor(profile.cluster.replication_factor)
+        .topic("scaling-curve", partition_count)
+        .log_level("warn")
+        .build()
+        .expect("failed to start cluster");
+
+    let producer_mode = if profile.producer.linger_ms == 0 {
+        ProducerMode::LowLatency
+    } else {
+        ProducerMode::HighThroughput
+    };
+
+    let wait_exec =
+        RealExecutor::with_mode(cluster.bootstrap_servers(), producer_mode)
+            .expect("executor creation failed");
+    // Extra time for high partition counts.
+    let timeout =
+        Duration::from_secs(60 + u64::from(partition_count / 10));
+    wait_exec
+        .wait_ready(timeout)
+        .await
+        .expect("cluster not ready");
+
+    let (elapsed, histogram, success, errors, partition_ops) =
+        run_scaling_producers(
+            cluster.bootstrap_servers(),
+            profile,
+            partition_count,
+            producer_mode,
+        )
+        .await;
+
+    let result = build_scaling_result(
+        profile,
+        partition_count,
+        elapsed,
+        &histogram,
+        success,
+        errors,
+    );
+    print_point_summary(&result, &partition_ops);
+    result
+}
+
+/// Print formatted results table to stdout.
+fn print_results_table(results: &[ScalingResult]) {
+    println!();
+    println!("=== Partition Scaling Results ===");
+    println!(
+        "{:>10}  {:>12}  {:>8}  {:>9}  {:>9}  {:>10}  {:>9}  {:>7}",
+        "Partitions",
+        "Ops/s",
+        "MB/s",
+        "p50(ms)",
+        "p99(ms)",
+        "p999(ms)",
+        "max(ms)",
+        "Errors"
+    );
+    println!("{}", "-".repeat(86));
+    for r in results {
+        println!(
+            "{:>10}  {:>12.0}  {:>8.1}  {:>9.2}  {:>9.2}  \
+             {:>10.2}  {:>9.1}  {:>7}",
+            r.partition_count,
+            r.throughput_ops,
+            r.throughput_mb,
+            r.latency_p50_us as f64 / 1000.0,
+            r.latency_p99_us as f64 / 1000.0,
+            r.latency_p999_us as f64 / 1000.0,
+            r.latency_max_us as f64 / 1000.0,
+            r.error_count,
+        );
+    }
+}
+
+/// Write results to CSV file if `HELIX_RESULTS_FILE` is set.
+fn write_results_csv(results: &[ScalingResult]) {
+    let path = match std::env::var("HELIX_RESULTS_FILE") {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let mut csv = String::from(
+        "partitions,producers,message_bytes,success,errors,\
+         duration_s,throughput_ops,throughput_mb,\
+         p50_ms,p99_ms,p999_ms,max_ms\n",
+    );
+    for r in results {
+        csv.push_str(&format!(
+            "{},{},{},{},{},{:.2},{:.1},{:.1},\
+             {:.2},{:.2},{:.2},{:.1}\n",
+            r.partition_count,
+            r.producer_count,
+            r.message_size,
+            r.success_count,
+            r.error_count,
+            r.duration_secs,
+            r.throughput_ops,
+            r.throughput_mb,
+            r.latency_p50_us as f64 / 1000.0,
+            r.latency_p99_us as f64 / 1000.0,
+            r.latency_p999_us as f64 / 1000.0,
+            r.latency_max_us as f64 / 1000.0,
+        ));
+    }
+    std::fs::write(&path, &csv).unwrap_or_else(|e| {
+        eprintln!("Failed to write results to {path}: {e}");
+    });
+    println!();
+    println!("CSV results written to: {path}");
+}
+
+/// Partition scaling curve test.
+///
+/// Sweeps across partition counts to measure throughput and latency
+/// scaling. Starts a fresh 3-node cluster for each partition count,
+/// runs warmup + measurement, and produces a summary table + optional
+/// CSV report.
+///
+/// # Usage
+///
+/// ```bash
+/// # Build server binary first
+/// cargo build --release --bin helix-server
+///
+/// # Run with defaults (discovery-throughput, 1..256 partitions)
+/// cargo test -p helix-workload --release \
+///   --test steady_state_throughput \
+///   test_partition_scaling_curve -- --ignored --nocapture
+///
+/// # Custom partition counts and profile
+/// HELIX_PARTITION_COUNTS=1,8,32,128 \
+///   HELIX_PROFILE=discovery-latency \
+///   cargo test -p helix-workload --release \
+///   --test steady_state_throughput \
+///   test_partition_scaling_curve -- --ignored --nocapture
+///
+/// # Save results to CSV
+/// HELIX_RESULTS_FILE=results.csv cargo test ...
+/// ```
+///
+/// # Environment Variables
+///
+/// - `HELIX_PROFILE` - profile name (default: discovery-throughput)
+/// - `HELIX_PROFILE_FILE` - custom TOML profile (overrides above)
+/// - `HELIX_PARTITION_COUNTS` - comma-separated (default: 1..256)
+/// - `HELIX_RESULTS_FILE` - path to write CSV results (optional)
+#[tokio::test]
+#[ignore]
+async fn test_partition_scaling_curve() {
+    let profile = load_scaling_profile();
+    let partition_counts = parse_partition_counts();
+
+    println!("=== Partition Scaling Curve ===");
+    println!("Profile: {} - {}", profile.name, profile.description);
+    println!("Partition counts: {:?}", partition_counts);
+    println!(
+        "Producers: {}, Inflight: {}, Message: {} bytes",
+        profile.producer.threads,
+        profile.producer.inflight,
+        profile.producer.message_size
+    );
+    println!(
+        "Warmup: {}s, Duration: {}s per data point",
+        profile.execution.warmup_secs, profile.execution.duration_secs
+    );
+
+    let mut results = Vec::with_capacity(partition_counts.len());
+    for &count in &partition_counts {
+        let result = run_scaling_point(&profile, count).await;
+        results.push(result);
+    }
+
+    print_results_table(&results);
+    write_results_csv(&results);
 }

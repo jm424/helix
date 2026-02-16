@@ -32,13 +32,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
-use helix_core::{GroupId, LogIndex, NodeId, Offset};
+use helix_core::{GroupId, LogIndex, NodeId, Offset, ProducerEpoch, ProducerId, SequenceNum};
 use helix_raft::multi::GroupMessage;
 use helix_raft::{ClientRequest, Message, RaftNode};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, instrument, warn};
 
 use crate::error::{ServerError, ServerResult};
+use crate::kafka::extract_producer_info;
+use crate::producer_state::{PartitionProducerState, SequenceCheckResult};
 use crate::storage::{
     BatchedBlob, BlobFormat,
     PartitionCommand as StoragePartitionCommand,
@@ -107,6 +109,12 @@ pub enum PartitionCommand {
         result_tx: oneshot::Sender<ServerResult<Offset>>,
         /// Size of the blob in bytes (for backpressure tracking).
         blob_size_bytes: u32,
+    },
+
+    /// Transfer leadership to a target node (preferred leader rebalancing).
+    TransferLeadership {
+        /// The target node to transfer leadership to.
+        target: NodeId,
     },
 
     /// Seed the actor's offset tracking after leadership change.
@@ -408,6 +416,24 @@ impl PartitionActorHandle {
             .map_err(|_| PartitionError::ActorShutdown)
     }
 
+    /// Transfers leadership to the target node.
+    ///
+    /// Used by the leader rebalancer to move leadership to the preferred
+    /// replica (`replicas[0]`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor has shut down.
+    pub async fn transfer_leadership(
+        &self,
+        target: NodeId,
+    ) -> Result<(), PartitionError> {
+        self.tx
+            .send(PartitionCommand::TransferLeadership { target })
+            .await
+            .map_err(|_| PartitionError::ActorShutdown)
+    }
+
     /// Sends a tick to the partition actor.
     ///
     /// # Errors
@@ -702,6 +728,7 @@ pub fn spawn_partition_actor_shared_with_batch_config(
         is_leader_cache,
         batcher_stats,
         global_backpressure,
+        producer_state: PartitionProducerState::new(),
     };
     tokio::spawn(actor.run());
 
@@ -819,6 +846,12 @@ struct PartitionActorShared {
     #[allow(dead_code)]
     global_backpressure:
         Option<Arc<super::batcher::BackpressureState>>,
+    /// Idempotent producer state maintained by the actor.
+    ///
+    /// Rebuilt from committed entries (including `PREVIOUS_TERM`) on
+    /// leadership changes. Sequence checks run after the `offset_seeded`
+    /// gate, guaranteeing fully-rebuilt state.
+    producer_state: PartitionProducerState,
 }
 
 impl PartitionActorShared {
@@ -911,6 +944,11 @@ impl PartitionActorShared {
                     blob_size_bytes,
                 )
                 .await;
+            }
+            PartitionCommand::TransferLeadership { target } => {
+                if let Some(outputs) = self.raft_node.transfer_leadership(target) {
+                    self.process_raft_outputs(outputs).await;
+                }
             }
             PartitionCommand::SeedOffset { offset } => {
                 self.handle_seed_offset(offset);
@@ -1260,9 +1298,41 @@ impl PartitionActorShared {
             return;
         }
 
+        // Check idempotent producer sequences for each blob.
+        // Filter out duplicates/fenced/out-of-order, respond to their
+        // result_txs immediately, and only propose the valid ones.
+        let (blobs, record_counts, result_txs, filtered_bytes) =
+            self.filter_batch_by_sequence(
+                batch.blobs,
+                batch.record_counts,
+                batch.result_txs,
+            );
+
+        if filtered_bytes > 0 {
+            #[allow(clippy::cast_possible_truncation)]
+            let filtered_count =
+                batch_size - blobs.len() as u32;
+            self.backpressure
+                .subtract_batch(filtered_bytes, filtered_count);
+        }
+
+        if blobs.is_empty() {
+            // All blobs were duplicates or rejected.
+            return;
+        }
+
+        // Recompute batch metrics after filtering.
+        #[allow(clippy::cast_possible_truncation)]
+        let batch_size = blobs.len() as u32;
+        let batch_bytes = batch_bytes - filtered_bytes;
+        let batch_records: u64 = record_counts
+            .iter()
+            .map(|c| u64::from(*c))
+            .sum();
+
         let base_offset = self.next_base_offset;
         let command = StoragePartitionCommand::AppendBlobBatch {
-            blobs: batch.blobs,
+            blobs,
             base_offset,
         };
         let command_data = command.encode();
@@ -1273,8 +1343,8 @@ impl PartitionActorShared {
             let err = ServerError::Internal {
                 message: "Raft rejected proposal".to_string(),
             };
-            for result_tx in batch.result_txs {
-                let _ = result_tx.send(Err(err.clone()));
+            for tx in result_txs {
+                let _ = tx.send(Err(err.clone()));
             }
             self.backpressure
                 .subtract_batch(batch_bytes, batch_size);
@@ -1292,8 +1362,8 @@ impl PartitionActorShared {
             batch_size,
             batch_bytes,
             total_records: batch_records,
-            record_counts: batch.record_counts,
-            result_txs: batch.result_txs,
+            record_counts,
+            result_txs,
         };
         self.batch_pending_proposals
             .insert(log_index, pending_info);
@@ -1308,6 +1378,124 @@ impl PartitionActorShared {
             "Batch proposed (per-partition batching)"
         );
         self.process_raft_outputs(outputs).await;
+    }
+
+    /// Filters a batch through idempotent sequence checks.
+    ///
+    /// Returns `(valid_blobs, valid_record_counts, valid_result_txs,
+    /// filtered_bytes)`. Rejected blobs get immediate responses.
+    #[allow(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        clippy::type_complexity,
+        clippy::too_many_lines
+    )]
+    fn filter_batch_by_sequence(
+        &mut self,
+        blobs: Vec<BatchedBlob>,
+        record_counts: Vec<u32>,
+        result_txs: Vec<oneshot::Sender<ServerResult<Offset>>>,
+    ) -> (
+        Vec<BatchedBlob>,
+        Vec<u32>,
+        Vec<oneshot::Sender<ServerResult<Offset>>>,
+        u32,
+    ) {
+        let cap = blobs.len();
+        let mut valid_blobs = Vec::with_capacity(cap);
+        let mut valid_rcs = Vec::with_capacity(cap);
+        let mut valid_txs = Vec::with_capacity(cap);
+        let mut filtered_bytes: u32 = 0;
+
+        for ((batched, rc), tx) in blobs
+            .into_iter()
+            .zip(record_counts)
+            .zip(result_txs)
+        {
+            // Skip check for non-Kafka or non-idempotent blobs.
+            let check = (batched.format
+                == BlobFormat::KafkaRecordBatch)
+                .then(|| extract_producer_info(&batched.blob))
+                .flatten()
+                .filter(
+                    crate::kafka::ProducerInfo::is_idempotent,
+                );
+
+            let Some(info) = check else {
+                valid_blobs.push(batched);
+                valid_rcs.push(rc);
+                valid_txs.push(tx);
+                continue;
+            };
+
+            let result = self.producer_state.check_sequence(
+                ProducerId::new(info.producer_id as u64),
+                ProducerEpoch::new(info.epoch as u16),
+                SequenceNum::new(info.base_sequence),
+            );
+            match result {
+                SequenceCheckResult::Valid => {
+                    valid_blobs.push(batched);
+                    valid_rcs.push(rc);
+                    valid_txs.push(tx);
+                }
+                SequenceCheckResult::Duplicate {
+                    cached_offset,
+                } => {
+                    debug!(
+                        group_id = self.group_id.get(),
+                        producer_id = info.producer_id,
+                        sequence = info.base_sequence,
+                        "Duplicate produce in actor"
+                    );
+                    filtered_bytes +=
+                        batched.blob.len() as u32;
+                    let _ = tx.send(Ok(cached_offset));
+                }
+                SequenceCheckResult::OutOfSequence {
+                    expected,
+                    received,
+                } => {
+                    warn!(
+                        group_id = self.group_id.get(),
+                        producer_id = info.producer_id,
+                        expected,
+                        received,
+                        "Out-of-sequence produce in actor"
+                    );
+                    filtered_bytes +=
+                        batched.blob.len() as u32;
+                    let _ = tx.send(Err(
+                        ServerError::OutOfOrderSequence {
+                            topic: String::new(),
+                            partition: 0,
+                            expected,
+                            received,
+                        },
+                    ));
+                }
+                SequenceCheckResult::ProducerFenced {
+                    ..
+                } => {
+                    warn!(
+                        group_id = self.group_id.get(),
+                        producer_id = info.producer_id,
+                        epoch = info.epoch,
+                        "Producer fenced in actor"
+                    );
+                    filtered_bytes +=
+                        batched.blob.len() as u32;
+                    let _ = tx.send(Err(
+                        ServerError::ProducerFenced {
+                            topic: String::new(),
+                            partition: 0,
+                            producer_id: info.producer_id as u64,
+                        },
+                    ));
+                }
+            }
+        }
+        (valid_blobs, valid_rcs, valid_txs, filtered_bytes)
     }
 
     fn handle_seed_offset(&mut self, offset: Offset) {
@@ -1360,6 +1548,83 @@ impl PartitionActorShared {
         }
     }
 
+    /// Records producer state from a committed entry's data.
+    ///
+    /// Called for every committed entry (including `PREVIOUS_TERM`) to
+    /// rebuild the actor's `PartitionProducerState`. This ensures the
+    /// dedup window and `next_expected` are fully populated before any
+    /// new sequence checks run (gated by `offset_seeded`).
+    #[allow(clippy::cast_sign_loss)]
+    fn record_producer_state_from_committed(&mut self, data: &Bytes) {
+        if data.is_empty() {
+            return;
+        }
+        let Some(cmd) = StoragePartitionCommand::decode(data) else {
+            return;
+        };
+        match cmd {
+            StoragePartitionCommand::AppendBlob {
+                blob,
+                base_offset,
+                format,
+                ..
+            } => {
+                if format == BlobFormat::KafkaRecordBatch {
+                    if let Some(info) = extract_producer_info(&blob) {
+                        if info.is_idempotent() {
+                            self.producer_state.record_produce(
+                                ProducerId::new(
+                                    info.producer_id as u64,
+                                ),
+                                ProducerEpoch::new(
+                                    info.epoch as u16,
+                                ),
+                                SequenceNum::new(info.base_sequence),
+                                base_offset,
+                                base_offset.get(),
+                            );
+                        }
+                    }
+                }
+            }
+            StoragePartitionCommand::AppendBlobBatch {
+                blobs,
+                base_offset,
+            } => {
+                let mut offset = base_offset;
+                for batched in &blobs {
+                    if batched.format == BlobFormat::KafkaRecordBatch
+                    {
+                        if let Some(info) =
+                            extract_producer_info(&batched.blob)
+                        {
+                            if info.is_idempotent() {
+                                self.producer_state.record_produce(
+                                    ProducerId::new(
+                                        info.producer_id as u64,
+                                    ),
+                                    ProducerEpoch::new(
+                                        info.epoch as u16,
+                                    ),
+                                    SequenceNum::new(
+                                        info.base_sequence,
+                                    ),
+                                    offset,
+                                    offset.get(),
+                                );
+                            }
+                        }
+                    }
+                    offset = Offset::new(
+                        offset.get()
+                            + u64::from(batched.record_count),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn process_raft_outputs(
         &mut self,
@@ -1386,7 +1651,8 @@ impl PartitionActorShared {
                     }
                 }
                 RaftOutput::CommitEntry { index, term, metadata, payload } => {
-                    // Advance next_base_offset from committed entries.
+                    // Advance next_base_offset and record producer state
+                    // from committed entries (including PREVIOUS_TERM).
                     // Reconstitute full data for decode (encode_split
                     // metadata alone is incomplete).
                     {
@@ -1401,6 +1667,9 @@ impl PartitionActorShared {
                             buf.freeze()
                         };
                         self.advance_offset_from_committed(&data);
+                        self.record_producer_state_from_committed(
+                            &data,
+                        );
                     }
 
                     if let Some(reply) =
@@ -1454,6 +1723,11 @@ impl PartitionActorShared {
                     self.is_leader_cache
                         .store(true, Ordering::Relaxed);
                     self.offset_seeded = false;
+                    // Reset producer state — will be rebuilt from
+                    // PREVIOUS_TERM CommitEntry events before
+                    // offset_seeded is set.
+                    self.producer_state =
+                        PartitionProducerState::new();
                     let grouped = GroupedOutput {
                         group_id: self.group_id,
                         output: PartitionOutput::BecameLeader,
@@ -1592,6 +1866,11 @@ impl PartitionActor {
                         message: "ProduceRequest not supported"
                             .to_string(),
                     }));
+                }
+                PartitionCommand::TransferLeadership { target } => {
+                    if let Some(outputs) = self.raft_node.transfer_leadership(target) {
+                        self.process_raft_outputs(outputs).await;
+                    }
                 }
                 PartitionCommand::SeedOffset { .. } => {}
                 PartitionCommand::Tick => {
@@ -1917,6 +2196,7 @@ mod tests {
             is_leader_cache: Arc::new(AtomicBool::new(false)),
             batcher_stats: None,
             global_backpressure: None,
+            producer_state: PartitionProducerState::new(),
         };
         (actor, output_rx, cmd_tx)
     }

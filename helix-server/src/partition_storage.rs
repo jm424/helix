@@ -355,7 +355,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     #[allow(dead_code)] // Will be used in append_blob integration.
     #[must_use]
     pub fn check_producer_sequence(
-        &self,
+        &mut self,
         producer_id: ProducerId,
         epoch: ProducerEpoch,
         sequence: SequenceNum,

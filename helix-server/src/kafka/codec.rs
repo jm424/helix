@@ -57,14 +57,16 @@ pub const fn request_header_version(api_key: i16, api_version: i16) -> i16 {
 #[allow(clippy::match_same_arms)] // Explicit for documentation clarity.
 const fn flexible_version_threshold(api_key: i16) -> Option<i16> {
     match api_key {
-        0 => Some(9),  // Produce
-        1 => Some(12), // Fetch
-        2 => Some(6),  // ListOffsets
-        3 => Some(9),  // Metadata
-        8 => Some(8),  // OffsetCommit
-        9 => Some(6),  // OffsetFetch
-        10 => Some(3), // FindCoordinator
-        18 => None,    // ApiVersions: always v0
+        0 => Some(9),   // Produce
+        1 => Some(12),  // Fetch
+        2 => Some(6),   // ListOffsets
+        3 => Some(9),   // Metadata
+        8 => Some(8),   // OffsetCommit
+        9 => Some(6),   // OffsetFetch
+        10 => Some(3),  // FindCoordinator
+        18 => None,     // ApiVersions: always v0
+        19 => Some(5),  // CreateTopics
+        22 => Some(2),  // InitProducerId
         _ => None,
     }
 }

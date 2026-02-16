@@ -45,6 +45,22 @@ pub const HEARTBEAT_INTERVAL_MS: u64 = 1_000; // 1 second.
 /// - Uploading eligible segments to object storage (S3/filesystem)
 pub const TIERING_INTERVAL_MS: u64 = 5_000; // 5 seconds.
 
+/// Interval for leader rebalancing (in milliseconds).
+///
+/// The controller leader periodically checks whether partition leaders match
+/// their preferred replicas (`replicas[0]`) and issues `TransferLeadership`
+/// for any imbalanced partitions. Set to 10 seconds for fast convergence
+/// after topic creation or node restarts.
+pub const LEADER_REBALANCE_INTERVAL_MS: u64 = 10_000; // 10 seconds.
+
+/// Maximum leadership transfers per rebalance cycle.
+///
+/// Rate-limits transfers to avoid disrupting in-flight requests. At 10s
+/// intervals with 10 transfers per cycle, 1000 imbalanced partitions
+/// converge in ~17 minutes. For typical workloads (128-512 partitions),
+/// convergence is 1-2 cycles.
+pub const MAX_TRANSFERS_PER_CYCLE: usize = 10;
+
 /// Background task to handle Raft ticks for all groups (single-node).
 #[allow(clippy::significant_drop_tightening, clippy::implicit_hasher)]
 pub async fn tick_task<S: Storage + Clone + Send + Sync + 'static>(
@@ -281,6 +297,8 @@ pub async fn tick_task_controller<
 ) {
     let mut tick_interval =
         tokio::time::interval(tokio::time::Duration::from_millis(TICK_INTERVAL_MS));
+    let mut rebalance_interval =
+        tokio::time::interval(tokio::time::Duration::from_millis(LEADER_REBALANCE_INTERVAL_MS));
 
     let node_id = {
         let mr = multi_raft.read().await;
@@ -325,10 +343,115 @@ pub async fn tick_task_controller<
                     Some(&storage),
                 ).await;
             }
+            _ = rebalance_interval.tick() => {
+                // Leader rebalancing: move partition leaders to their preferred
+                // replicas (replicas[0]). Only runs on the controller leader.
+                rebalance_partition_leaders(
+                    &multi_raft,
+                    &controller_state,
+                    &cluster_nodes,
+                    &router,
+                ).await;
+            }
         }
     }
 
     info!("Controller tick task stopped");
+}
+
+/// Rebalances partition leaders to their preferred replicas.
+///
+/// Iterates all partition assignments. For each partition where the current
+/// leader differs from the preferred leader (`replicas[0]`), sends a
+/// `TransferLeadership` command to the partition actor. Rate-limited to
+/// `MAX_TRANSFERS_PER_CYCLE` per invocation.
+///
+/// Only runs when this node is the controller leader. Follows the Kafka
+/// `auto.leader.rebalance` pattern.
+async fn rebalance_partition_leaders(
+    multi_raft: &Arc<RwLock<MultiRaft>>,
+    controller_state: &Arc<RwLock<ControllerState>>,
+    cluster_nodes: &[NodeId],
+    router: &Arc<super::router::PartitionRouter>,
+) {
+    // Only the controller leader should rebalance.
+    let is_controller_leader = {
+        let mr = multi_raft.read().await;
+        mr.group_state(CONTROLLER_GROUP_ID)
+            .is_some_and(|s| s.state == RaftState::Leader)
+    };
+    if !is_controller_leader {
+        return;
+    }
+
+    // Get current time for broker liveness checks.
+    #[allow(clippy::cast_possible_truncation)]
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+
+    // Collect imbalanced partitions: preferred leader != actual leader.
+    let imbalanced: Vec<(GroupId, NodeId)> = {
+        let state = controller_state.read().await;
+        state
+            .all_assignments()
+            .filter_map(|(_, assignment)| {
+                let preferred = *assignment.replicas.first()?;
+                // Skip if already the leader.
+                if assignment.leader == Some(preferred) {
+                    return None;
+                }
+                // Skip if preferred leader is not alive.
+                if !state.is_broker_live(preferred, now_ms) {
+                    return None;
+                }
+                Some((assignment.group_id, preferred))
+            })
+            .take(MAX_TRANSFERS_PER_CYCLE)
+            .collect()
+    };
+
+    if imbalanced.is_empty() {
+        return;
+    }
+
+    info!(
+        count = imbalanced.len(),
+        total_partitions = cluster_nodes.len(),
+        "Rebalancing partition leaders"
+    );
+
+    for (group_id, preferred) in &imbalanced {
+        // Skip the controller partition (group 0).
+        if *group_id == CONTROLLER_GROUP_ID {
+            continue;
+        }
+
+        match router.partition(*group_id).await {
+            Ok(handle) => {
+                if let Err(e) = handle.transfer_leadership(*preferred).await {
+                    warn!(
+                        group = group_id.get(),
+                        target = preferred.get(),
+                        error = %e,
+                        "Failed to send transfer leadership to partition actor"
+                    );
+                } else {
+                    debug!(
+                        group = group_id.get(),
+                        target = preferred.get(),
+                        "Initiated leadership transfer to preferred replica"
+                    );
+                }
+            }
+            Err(_) => {
+                debug!(
+                    group = group_id.get(),
+                    "Partition actor not found for rebalance (may still be starting)"
+                );
+            }
+        }
+    }
 }
 
 /// Processes outputs for controller partition only (actor mode).

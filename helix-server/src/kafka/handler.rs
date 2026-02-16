@@ -641,28 +641,9 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
         record_count: u32,
         data: Bytes,
     ) -> (u64, i16) {
-        use crate::service::handlers::blob::IdempotentProducerInfo;
-        use helix_core::{ProducerEpoch, ProducerId, SequenceNum};
-
-        // Extract producer info for idempotent deduplication.
-        let producer_info = extract_producer_info(&data).and_then(|info| {
-            // Only use idempotent path if producer_id is valid.
-            if info.is_idempotent() {
-                // Safe casts: Kafka protocol uses i64/i16/i32 for these fields.
-                #[allow(clippy::cast_sign_loss)]
-                Some(IdempotentProducerInfo {
-                    producer_id: ProducerId::new(info.producer_id as u64),
-                    epoch: ProducerEpoch::new(info.epoch as u16),
-                    base_sequence: SequenceNum::new(info.base_sequence),
-                })
-            } else {
-                None
-            }
-        });
-
         match self
             .service
-            .append_blob_idempotent(topic, partition, record_count, data, producer_info)
+            .append_blob_idempotent(topic, partition, record_count, data)
             .await
         {
             Ok(offset) => {
@@ -671,7 +652,6 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
                     partition,
                     base_offset = offset,
                     record_count,
-                    idempotent = producer_info.is_some(),
                     "Produced records"
                 );
                 (offset, 0)
@@ -976,12 +956,8 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
         #[allow(clippy::cast_possible_truncation)]
         let node_id = self.service.node_id().get() as i32;
 
-        response.error_code = 0;
-        response.node_id = BrokerId(node_id);
-        response.host = StrBytes::from_string(self.host.clone());
-        response.port = self.port;
-
         if request.api_version >= 3 {
+            // v3+ uses the coordinators array; legacy fields are removed.
             let mut coordinator = Coordinator::default();
             coordinator.key = find_coordinator_request.key;
             coordinator.node_id = BrokerId(node_id);
@@ -989,6 +965,12 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
             coordinator.port = self.port;
             coordinator.error_code = 0;
             response.coordinators.push(coordinator);
+        } else {
+            // v0-v2 uses top-level fields.
+            response.error_code = 0;
+            response.node_id = BrokerId(node_id);
+            response.host = StrBytes::from_string(self.host.clone());
+            response.port = self.port;
         }
 
         codec::encode_response(
@@ -1517,7 +1499,9 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
             .with_validate_only(false);
 
         // Encode request with Kafka framing.
-        let api_version: i16 = 5; // Use a common version.
+        // Use version 4 (below flexible version threshold of 5) so the
+        // receiving codec parses a v0 header without tagged fields.
+        let api_version: i16 = 4;
         let correlation_id: i32 = 1;
 
         let mut body = BytesMut::new();

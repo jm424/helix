@@ -305,6 +305,54 @@ pub fn builtin_profiles() -> HashMap<&'static str, BenchmarkProfile> {
                 10,
             ),
         ),
+        (
+            "discovery-throughput",
+            profile(
+                "discovery-throughput",
+                "Partition scaling: throughput (4 producers, 5ms linger, 60s)",
+                4,
+                1000,
+                5,
+                524_288,
+                "none",
+                5,
+                60,
+                1,
+                0,
+            ),
+        ),
+        (
+            "discovery-latency",
+            profile(
+                "discovery-latency",
+                "Partition scaling: latency (1 producer, 0ms linger, 60s)",
+                1,
+                100,
+                0,
+                16_384,
+                "none",
+                5,
+                60,
+                1,
+                0,
+            ),
+        ),
+        (
+            "discovery-stress",
+            profile(
+                "discovery-stress",
+                "Partition scaling: stress (8 producers, 100ms linger, 120s)",
+                8,
+                2000,
+                100,
+                1_048_576,
+                "none",
+                5,
+                120,
+                1,
+                0,
+            ),
+        ),
     ])
 }
 
@@ -348,6 +396,9 @@ mod tests {
         assert!(profiles.contains_key("latency"));
         assert!(profiles.contains_key("stress"));
         assert!(profiles.contains_key("sustained"));
+        assert!(profiles.contains_key("discovery-throughput"));
+        assert!(profiles.contains_key("discovery-latency"));
+        assert!(profiles.contains_key("discovery-stress"));
     }
 
     #[test]

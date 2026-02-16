@@ -183,12 +183,14 @@ fn create_reusable_listener(addr: SocketAddr) -> KafkaResult<TcpListener> {
     Ok(listener)
 }
 
-/// Handle a single client connection with concurrent request processing.
+/// Handle a single client connection with pipelined request processing.
 ///
-/// Requests are processed concurrently using:
-/// - A reader loop that spawns handler tasks for each request
-/// - A writer loop that sends responses as they complete
-/// - A bounded channel to coordinate between handlers and writer
+/// Requests are processed concurrently but responses are sent in request
+/// order (required by the Kafka wire protocol). This uses an ordered
+/// response slot pattern:
+/// - Each request gets a sequence number and a oneshot channel
+/// - Handler tasks run concurrently and send results via their slot
+/// - The writer task drains slots in order, blocking until the next one is ready
 ///
 /// This allows multiple in-flight requests on a single connection,
 /// significantly improving throughput when requests have latency (e.g., Raft consensus).
@@ -197,32 +199,47 @@ async fn handle_connection<S: Storage + Clone + Send + Sync + 'static, T: Transp
     peer_addr: SocketAddr,
     handler: Arc<KafkaHandler<S, T>>,
 ) -> KafkaResult<()> {
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, oneshot};
 
     // Split stream into read and write halves for concurrent access.
     let (mut read_half, mut write_half) = stream.into_split();
 
-    // Channel for sending responses from handler tasks to writer.
-    // Bounded to prevent unbounded memory growth with slow writes.
-    let (response_tx, mut response_rx) = mpsc::channel::<BytesMut>(100);
+    // Channel for sending ordered response slots to the writer task.
+    // Each slot is a oneshot receiver that will deliver the response
+    // in the order requests were received.
+    let (slot_tx, mut slot_rx) = mpsc::channel::<oneshot::Receiver<BytesMut>>(100);
 
-    // Spawn writer task that sends responses as they arrive.
+    // Writer task: drain response slots in order.
+    // Blocks on each slot until the handler task completes, ensuring
+    // responses are written to the socket in request order.
     let writer_peer_addr = peer_addr;
     let writer_task = tokio::spawn(async move {
-        while let Some(response_frame) = response_rx.recv().await {
-            if let Err(e) = write_half.write_all(&response_frame).await {
-                error!(
-                    peer = %writer_peer_addr,
-                    error = %e,
-                    "Failed to write response"
-                );
-                return Err(KafkaError::Io(e));
+        while let Some(slot_rx) = slot_rx.recv().await {
+            match slot_rx.await {
+                Ok(response_frame) => {
+                    if let Err(e) = write_half.write_all(&response_frame).await {
+                        error!(
+                            peer = %writer_peer_addr,
+                            error = %e,
+                            "Failed to write response"
+                        );
+                        return Err(KafkaError::Io(e));
+                    }
+                }
+                Err(_) => {
+                    // Handler task dropped without sending — connection is
+                    // likely closing or handler panicked. Skip this slot.
+                    error!(
+                        peer = %writer_peer_addr,
+                        "Response slot dropped without value"
+                    );
+                }
             }
         }
         Ok(())
     });
 
-    // Reader loop: read frames and spawn handler tasks.
+    // Reader loop: read frames and spawn handler tasks with ordered slots.
     let mut read_buf = BytesMut::with_capacity(64 * 1024);
     let reader_result: KafkaResult<()> = async {
         loop {
@@ -247,9 +264,16 @@ async fn handle_connection<S: Storage + Clone + Send + Sync + 'static, T: Transp
                     "Received Kafka request"
                 );
 
+                // Create an ordered response slot. The writer task holds
+                // the receiver and waits on it in FIFO order.
+                let (slot_tx_oneshot, slot_rx_oneshot) = oneshot::channel();
+                if slot_tx.send(slot_rx_oneshot).await.is_err() {
+                    // Writer task has exited — stop reading.
+                    return Ok(());
+                }
+
                 // Spawn handler task for concurrent processing.
                 let handler_clone = Arc::clone(&handler);
-                let response_tx_clone = response_tx.clone();
                 let handler_peer_addr = peer_addr;
 
                 tokio::spawn(async move {
@@ -270,8 +294,8 @@ async fn handle_connection<S: Storage + Clone + Send + Sync + 'static, T: Transp
                                 "Sending response"
                             );
 
-                            // Send to writer task (ignore send errors - connection closing).
-                            let _ = response_tx_clone.send(response_frame).await;
+                            // Send to writer via this request's ordered slot.
+                            let _ = slot_tx_oneshot.send(response_frame);
                         }
                         Err(e) => {
                             error!(
@@ -281,7 +305,7 @@ async fn handle_connection<S: Storage + Clone + Send + Sync + 'static, T: Transp
                                 error = %e,
                                 "Handler error"
                             );
-                            // Don't close connection for individual request errors.
+                            // Drop the slot sender — writer will skip this slot.
                             // The client will handle timeout/retry.
                         }
                     }
@@ -292,7 +316,7 @@ async fn handle_connection<S: Storage + Clone + Send + Sync + 'static, T: Transp
     .await;
 
     // Drop the sender to signal writer task to exit.
-    drop(response_tx);
+    drop(slot_tx);
 
     // Wait for writer task to complete.
     let writer_result = writer_task.await.unwrap_or_else(|e| {

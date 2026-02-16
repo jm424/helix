@@ -26,15 +26,23 @@
 //! ```bash
 //! # Node 1 (Kafka protocol)
 //! helix-server --protocol kafka --node-id 1 --raft-addr 0.0.0.0:9001 \
-//!     --peer 2:node2:9002 --peer 3:node3:9003
+//!     --peer 2:node2:9092:9002 --peer 3:node3:9092:9003
 //!
 //! # Node 2
 //! helix-server --protocol kafka --node-id 2 --raft-addr 0.0.0.0:9002 \
-//!     --peer 1:node1:9001 --peer 3:node3:9003
+//!     --peer 1:node1:9092:9001 --peer 3:node3:9092:9003
 //!
 //! # Node 3
 //! helix-server --protocol kafka --node-id 3 --raft-addr 0.0.0.0:9003 \
-//!     --peer 1:node1:9001 --peer 2:node2:9002
+//!     --peer 1:node1:9092:9001 --peer 2:node2:9092:9002
+//! ```
+//!
+//! In Docker/K8s, use `--kafka-advertise-addr` so Metadata responses
+//! return the container hostname instead of `0.0.0.0`:
+//!
+//! ```bash
+//! helix-server --protocol kafka --listen-addr 0.0.0.0:9092 \
+//!     --kafka-advertise-addr helix-node1:9092 ...
 //! ```
 
 #![deny(unsafe_code)]
@@ -192,6 +200,14 @@ struct Args {
     #[arg(long, default_value = "1")]
     auto_create_partitions: u32,
 
+    /// Advertised Kafka address for this node (`host:port`).
+    /// Used in Metadata API responses so clients can connect.
+    /// Defaults to `--listen-addr` if not specified.
+    /// Required for Docker/K8s where the bind address differs from
+    /// the externally reachable address.
+    #[arg(long)]
+    kafka_advertise_addr: Option<String>,
+
     /// Pre-create a topic at startup in format `name:partitions` (e.g., `test-topic:1`).
     /// Can be specified multiple times for multiple topics.
     /// All nodes should use the same topics for consistent Raft group allocation.
@@ -307,6 +323,20 @@ fn parse_peer(s: &str) -> Result<ExtendedPeerInfo, String> {
     })
 }
 
+/// Parses an advertise address in format `host:port` into `(String, i32)`.
+///
+/// Splits on the last `:` to handle IPv6 addresses.
+fn parse_advertise_addr(s: &str) -> (String, i32) {
+    let last_colon = s
+        .rfind(':')
+        .unwrap_or_else(|| panic!("invalid advertise address '{s}', expected 'host:port'"));
+    let host = s[..last_colon].to_string();
+    let port: i32 = s[last_colon + 1..]
+        .parse()
+        .unwrap_or_else(|_| panic!("invalid port in advertise address '{s}'"));
+    (host, port)
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)] // Main entry point with CLI handling.
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -359,8 +389,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(|p| (p.node_id, p.kafka_addr()))
             .collect();
 
-        // This node's Kafka address (from listen_addr).
-        let kafka_addr = args.listen_addr.to_string();
+        // This node's Kafka address for metadata responses.
+        // Use --kafka-advertise-addr if set, otherwise fall back to --listen-addr.
+        let kafka_addr = args
+            .kafka_advertise_addr
+            .clone()
+            .unwrap_or_else(|| args.listen_addr.to_string());
 
         // Build S3 config if bucket is specified.
         #[cfg(feature = "s3")]
@@ -545,9 +579,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let service = Arc::new(service);
 
             // Configure Kafka server.
-            let kafka_config = KafkaServerConfig::new(args.listen_addr)
+            let mut kafka_config = KafkaServerConfig::new(args.listen_addr)
                 .with_auto_create_topics(args.auto_create_topics)
                 .with_auto_create_partitions(args.auto_create_partitions);
+
+            // Apply advertised listener override for Docker/K8s environments.
+            if let Some(ref advertise) = args.kafka_advertise_addr {
+                let (host, port) = parse_advertise_addr(advertise);
+                kafka_config = kafka_config
+                    .with_advertised_listener(host, port);
+            }
 
             let kafka_server = KafkaServer::new(service, kafka_config);
 
