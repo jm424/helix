@@ -44,7 +44,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use helix_core::{GroupId, LogIndex, Offset, ProducerEpoch, ProducerId, SequenceNum, TermId};
+use helix_core::{GroupId, LogIndex, NodeId, Offset, ProducerEpoch, ProducerId, SequenceNum, TermId};
 use helix_runtime::TransportService;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
@@ -61,7 +61,7 @@ use helix_wal::Storage;
 use super::batcher::BackpressureState;
 use super::partition_actor::{BatchNotifyInfo, GroupedOutput, PartitionOutput};
 use super::router::PartitionRouter;
-use super::{BatchPendingProposal, BatcherStats};
+use super::{BatchPendingProposal, BatcherStats, OutputProcessorStats};
 
 /// Configuration for the output processor.
 #[derive(Debug, Clone, Copy)]
@@ -124,78 +124,301 @@ pub async fn output_processor_task<
     batcher_backpressure: Option<Arc<BackpressureState>>,
     vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
     router: Option<Arc<PartitionRouter>>,
+    stats: Option<Arc<OutputProcessorStats>>,
 ) {
+    const DRAIN_BATCH_LIMIT: usize = 256;
+
     info!("Output processor started");
 
-    while let Some(grouped) = output_rx.recv().await {
-        let GroupedOutput { group_id, output } = grouped;
+    let mut msg_buf: Vec<GroupedOutput> = Vec::with_capacity(DRAIN_BATCH_LIMIT);
+    let mut sends: Vec<(NodeId, Vec<helix_raft::multi::GroupMessage>)> = Vec::new();
+    let mut non_sends: Vec<GroupedOutput> = Vec::new();
 
-        match output {
-            PartitionOutput::SendMessages { to, messages } => {
-                handle_send_messages(to, &messages, transport_handle.as_ref()).await;
-            }
-            PartitionOutput::EntryCommitted {
-                index,
-                term,
-                metadata,
-                payload,
-                batch_notify,
-            } => {
-                // Reconstitute data from metadata+payload for downstream.
-                let data = if payload.is_empty() {
-                    metadata
-                } else {
-                    let mut buf = bytes::BytesMut::with_capacity(
-                        metadata.len() + payload.len(),
-                    );
-                    buf.extend_from_slice(&metadata);
-                    buf.extend_from_slice(&payload);
-                    buf.freeze()
-                };
-                handle_entry_committed(
-                    group_id,
-                    index,
-                    term,
-                    &data,
-                    batch_notify,
-                    &partition_storage,
-                    &group_map,
-                    &batch_pending_proposals,
-                    batcher_stats.as_ref(),
-                    batcher_backpressure.as_ref(),
-                )
-                .await;
-            }
-            PartitionOutput::BecameLeader => {
-                handle_became_leader(group_id, &group_map).await;
-            }
-            PartitionOutput::SteppedDown => {
-                handle_stepped_down(group_id, &group_map).await;
-            }
-            PartitionOutput::VoteStateChanged { term, voted_for } => {
-                handle_vote_state_changed(group_id, term, voted_for, vote_store.as_ref());
-            }
-            PartitionOutput::NeedWalEntries {
-                follower_id,
-                start_index,
-                prev_log_index,
-                max_bytes,
-            } => {
-                handle_need_wal_entries(
-                    group_id,
-                    follower_id,
-                    start_index,
-                    prev_log_index,
-                    max_bytes,
-                    &partition_storage,
-                    router.as_ref(),
-                )
-                .await;
-            }
+    let report_interval = std::time::Duration::from_secs(10);
+    let mut last_report = std::time::Instant::now();
+    let mut recv_start = std::time::Instant::now();
+
+    loop {
+        let n = output_rx.recv_many(&mut msg_buf, DRAIN_BATCH_LIMIT).await;
+        if n == 0 {
+            break;
         }
+
+        // Track idle time (how long we waited for messages).
+        if let Some(ref s) = stats {
+            #[allow(clippy::cast_possible_truncation)]
+            s.recv_idle_us.fetch_add(
+                recv_start.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+
+        process_message_batch(
+            &mut msg_buf,
+            &mut sends,
+            &mut non_sends,
+            transport_handle.as_ref(),
+            &partition_storage,
+            &group_map,
+            &batch_pending_proposals,
+            batcher_stats.as_ref(),
+            batcher_backpressure.as_ref(),
+            vote_store.as_ref(),
+            router.as_ref(),
+            stats.as_ref(),
+        )
+        .await;
+
+        // Track batch-level stats.
+        if let Some(ref s) = stats {
+            s.batch_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            #[allow(clippy::cast_possible_truncation)]
+            s.total_messages
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // Periodic stats report.
+        if stats.is_some() && last_report.elapsed() >= report_interval {
+            if let Some(ref s) = stats {
+                report_output_processor_stats(s, batcher_backpressure.as_ref(), false);
+            }
+            last_report = std::time::Instant::now();
+        }
+
+        recv_start = std::time::Instant::now();
+    }
+
+    // Final stats report on shutdown.
+    if let Some(ref s) = stats {
+        report_output_processor_stats(s, batcher_backpressure.as_ref(), true);
     }
 
     info!("Output processor stopped");
+}
+
+/// Processes a batch of messages in two phases: sends first, then non-sends.
+///
+/// Phase 1 processes all send messages (cheap, ~72μs each, unblocks followers).
+/// Phase 2 processes commits, leadership changes, and other outputs in order.
+/// Buffers are drained and reused across calls to avoid allocation.
+#[allow(clippy::too_many_arguments)]
+async fn process_message_batch<
+    S: Storage + Clone + Send + Sync + 'static,
+    T: TransportService,
+>(
+    msg_buf: &mut Vec<GroupedOutput>,
+    sends: &mut Vec<(NodeId, Vec<helix_raft::multi::GroupMessage>)>,
+    non_sends: &mut Vec<GroupedOutput>,
+    transport_handle: Option<&T>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
+    group_map: &Arc<RwLock<GroupMap>>,
+    batch_pending_proposals: &Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
+    >,
+    batcher_stats: Option<&Arc<BatcherStats>>,
+    batcher_backpressure: Option<&Arc<BackpressureState>>,
+    vote_store: Option<&Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
+    router: Option<&Arc<PartitionRouter>>,
+    stats: Option<&Arc<OutputProcessorStats>>,
+) {
+    // Separate sends from everything else.
+    for grouped in msg_buf.drain(..) {
+        let GroupedOutput { group_id, output } = grouped;
+        match output {
+            PartitionOutput::SendMessages { to, messages } => sends.push((to, messages)),
+            other => non_sends.push(GroupedOutput {
+                group_id,
+                output: other,
+            }),
+        }
+    }
+
+    // Phase 1: Process all sends (cheap, unblocks followers).
+    let send_phase_start = std::time::Instant::now();
+    let send_count = sends.len();
+    for (to, messages) in sends.drain(..) {
+        handle_send_messages(to, &messages, transport_handle).await;
+    }
+    if let Some(s) = stats {
+        #[allow(clippy::cast_possible_truncation)]
+        s.send_messages_us.fetch_add(
+            send_phase_start.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        s.send_messages_count
+            .fetch_add(send_count as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Phase 2: Process non-sends in order (commits, leadership, votes, WAL entries).
+    for grouped in non_sends.drain(..) {
+        let msg_start = std::time::Instant::now();
+        let GroupedOutput { group_id, output } = grouped;
+        let msg_kind = process_output(
+            group_id,
+            output,
+            transport_handle,
+            partition_storage,
+            group_map,
+            batch_pending_proposals,
+            batcher_stats,
+            batcher_backpressure,
+            vote_store,
+            router,
+        )
+        .await;
+
+        if let Some(s) = stats {
+            #[allow(clippy::cast_possible_truncation)]
+            let elapsed_us = msg_start.elapsed().as_micros() as u64;
+            let (count, time) = match msg_kind {
+                1 => (&s.entry_committed_count, &s.entry_committed_us),
+                _ => (&s.other_count, &s.other_us),
+            };
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            time.fetch_add(elapsed_us, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Processes a single output message. Returns message kind:
+/// 0 = `SendMessages`, 1 = `EntryCommitted`, 2 = other.
+#[allow(clippy::too_many_arguments)]
+async fn process_output<
+    S: Storage + Clone + Send + Sync + 'static,
+    T: TransportService,
+>(
+    group_id: GroupId,
+    output: PartitionOutput,
+    transport_handle: Option<&T>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
+    group_map: &Arc<RwLock<GroupMap>>,
+    batch_pending_proposals: &Arc<
+        RwLock<HashMap<GroupId, Arc<RwLock<HashMap<LogIndex, BatchPendingProposal>>>>>,
+    >,
+    batcher_stats: Option<&Arc<BatcherStats>>,
+    batcher_backpressure: Option<&Arc<BackpressureState>>,
+    vote_store: Option<&Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
+    router: Option<&Arc<PartitionRouter>>,
+) -> u8 {
+    match output {
+        PartitionOutput::SendMessages { to, messages } => {
+            handle_send_messages(to, &messages, transport_handle).await;
+            0
+        }
+        PartitionOutput::EntryCommitted {
+            index, term, metadata, payload, batch_notify,
+        } => {
+            let data = if payload.is_empty() {
+                metadata
+            } else {
+                let mut buf =
+                    bytes::BytesMut::with_capacity(metadata.len() + payload.len());
+                buf.extend_from_slice(&metadata);
+                buf.extend_from_slice(&payload);
+                buf.freeze()
+            };
+            handle_entry_committed(
+                group_id, index, term, &data, batch_notify,
+                partition_storage, group_map, batch_pending_proposals,
+                batcher_stats, batcher_backpressure, router,
+            )
+            .await;
+            1
+        }
+        PartitionOutput::BecameLeader => {
+            handle_became_leader(group_id, group_map).await;
+            2
+        }
+        PartitionOutput::SteppedDown => {
+            handle_stepped_down(group_id, group_map).await;
+            2
+        }
+        PartitionOutput::VoteStateChanged { term, voted_for } => {
+            handle_vote_state_changed(group_id, term, voted_for, vote_store);
+            2
+        }
+        PartitionOutput::NeedWalEntries {
+            follower_id, start_index, prev_log_index, max_bytes,
+        } => {
+            handle_need_wal_entries(
+                group_id, follower_id, start_index, prev_log_index,
+                max_bytes, partition_storage, router,
+            )
+            .await;
+            2
+        }
+    }
+}
+
+/// Reports output processor stats to the log.
+fn report_output_processor_stats(
+    stats: &OutputProcessorStats,
+    backpressure: Option<&Arc<BackpressureState>>,
+    is_final: bool,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let snap = stats.snapshot();
+    let total_busy_us = snap.send_messages_us + snap.entry_committed_us + snap.other_us;
+    let total_us = total_busy_us + snap.recv_idle_us;
+    let utilization_pct = if total_us > 0 {
+        (total_busy_us * 100) / total_us
+    } else {
+        0
+    };
+    let avg_send_us = if snap.send_messages_count > 0 {
+        snap.send_messages_us / snap.send_messages_count
+    } else {
+        0
+    };
+    let avg_commit_us = if snap.entry_committed_count > 0 {
+        snap.entry_committed_us / snap.entry_committed_count
+    } else {
+        0
+    };
+    let avg_batch_size = if snap.batch_count > 0 {
+        snap.total_messages / snap.batch_count
+    } else {
+        0
+    };
+
+    let (bp_peak_reqs, bp_peak_bytes, bp_rejected) = backpressure.map_or(
+        (0, 0, 0),
+        |bp| {
+            (
+                bp.peak_pending_requests.load(Relaxed),
+                bp.peak_pending_bytes.load(Relaxed),
+                bp.rejected_requests.load(Relaxed),
+            )
+        },
+    );
+
+    let label = if is_final {
+        "OUTPUT_PROCESSOR_STATS_FINAL"
+    } else {
+        "OUTPUT_PROCESSOR_STATS"
+    };
+
+    // Use warn level so stats are visible even with --log-level warn
+    // (the default for benchmarks). This fires once per 10s — not noisy.
+    warn!(
+        send_msgs = snap.send_messages_count,
+        send_us = snap.send_messages_us,
+        avg_send_us,
+        commits = snap.entry_committed_count,
+        commit_us = snap.entry_committed_us,
+        avg_commit_us,
+        other = snap.other_count,
+        idle_us = snap.recv_idle_us,
+        utilization_pct,
+        batches = snap.batch_count,
+        avg_batch_size,
+        bp_peak_reqs,
+        bp_peak_bytes_mb = bp_peak_bytes / (1024 * 1024),
+        bp_rejected,
+        "{label}"
+    );
 }
 
 /// Handles `SendMessages` output by sending via transport.
@@ -401,6 +624,7 @@ async fn handle_entry_committed<S: Storage + Clone + Send + Sync + 'static>(
     >,
     batcher_stats: Option<&Arc<BatcherStats>>,
     batcher_backpressure: Option<&Arc<BackpressureState>>,
+    router: Option<&Arc<super::router::PartitionRouter>>,
 ) {
     // Get topic/partition info for logging.
     let key = {
@@ -475,7 +699,7 @@ async fn handle_entry_committed<S: Storage + Clone + Send + Sync + 'static>(
             }
         };
 
-        info!(
+        debug!(
             group = group_id.get(),
             index = index.get(),
             base_offset = base_offset.get(),
@@ -547,10 +771,35 @@ async fn handle_entry_committed<S: Storage + Clone + Send + Sync + 'static>(
                     );
                 }
 
+                // Update the cached blob end offset on the partition
+                // actor handle so the batcher can read it lock-free.
+                let new_end = base_offset.get()
+                    + batch_proposal.total_records;
+                if let Some(r) = router {
+                    if let Ok(handle) = r.partition(group_id).await {
+                        let cache = handle.blob_end_offset_arc();
+                        // Monotonic update: only advance, never go back.
+                        let mut current = cache.load(
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        while new_end > current {
+                            match cache.compare_exchange_weak(
+                                current,
+                                new_end,
+                                std::sync::atomic::Ordering::Release,
+                                std::sync::atomic::Ordering::Relaxed,
+                            ) {
+                                Ok(_) => break,
+                                Err(actual) => current = actual,
+                            }
+                        }
+                    }
+                }
+
                 // Safety: durations will never exceed u64::MAX microseconds.
                 #[allow(clippy::cast_possible_truncation)]
                 {
-                    info!(
+                    debug!(
                         group = group_id.get(),
                         index = index.get(),
                         batch_size = batch_proposal.batch_size,
@@ -645,9 +894,34 @@ async fn handle_entry_committed<S: Storage + Clone + Send + Sync + 'static>(
             );
         } else {
             // Extract and record producer state from the entry data.
-            // This ensures idempotent deduplication works correctly even for
-            // entries committed by a new leader (PREVIOUS_TERM entries).
             extract_and_record_producer_state(data, base_offset, group_id, partition_storage).await;
+
+            // Update cached blob end offset for batcher lock-free reads.
+            if let Some(r) = router {
+                // Read new end offset from storage (already under no lock contention
+                // since we just released the write lock).
+                let new_end = {
+                    let ps = ps_lock.read().await;
+                    ps.blob_log_end_offset().get()
+                };
+                if let Ok(handle) = r.partition(group_id).await {
+                    let cache = handle.blob_end_offset_arc();
+                    let mut current = cache.load(
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    while new_end > current {
+                        match cache.compare_exchange_weak(
+                            current,
+                            new_end,
+                            std::sync::atomic::Ordering::Release,
+                            std::sync::atomic::Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(actual) => current = actual,
+                        }
+                    }
+                }
+            }
 
             debug!(
                 topic = topic_id.get(),
@@ -887,6 +1161,7 @@ mod tests {
             None,
             None, // No vote persistence in tests.
             None, // No router in tests.
+            None, // No stats in tests.
         ));
 
         // Send BecameLeader output.
@@ -937,6 +1212,7 @@ mod tests {
             None,
             None, // No vote persistence in tests.
             None, // No router in tests.
+            None, // No stats in tests.
         ));
 
         // Send EntryCommitted output (no batch proposal, so just applies).
@@ -1036,6 +1312,7 @@ mod tests {
             Some(Arc::clone(&backpressure)),
             None, // No vote persistence in tests.
             None, // No router in tests.
+            None, // No stats in tests.
         ));
 
         // Create valid batch entry data.

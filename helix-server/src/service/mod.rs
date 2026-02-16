@@ -169,6 +169,35 @@ pub struct BatcherStats {
     not_leader_count: std::sync::atomic::AtomicU64,
     /// Number of batch apply errors on commit.
     apply_error_count: std::sync::atomic::AtomicU64,
+
+    // --- Batcher loop instrumentation ---
+
+    /// Number of select! loop iterations.
+    pub loop_iterations: std::sync::atomic::AtomicU64,
+    /// Microseconds spent waiting in recv/select (idle time).
+    pub loop_idle_us: std::sync::atomic::AtomicU64,
+    /// Microseconds spent in handle_submit_actor (recv arm).
+    pub loop_submit_us: std::sync::atomic::AtomicU64,
+    /// Number of submit messages received.
+    pub loop_submit_count: std::sync::atomic::AtomicU64,
+    /// Microseconds spent in linger flush arm (all flushes).
+    pub loop_linger_flush_us: std::sync::atomic::AtomicU64,
+    /// Number of linger flush cycles (each may flush N groups).
+    pub loop_linger_flush_cycles: std::sync::atomic::AtomicU64,
+    /// Total groups flushed via linger.
+    pub loop_linger_flush_groups: std::sync::atomic::AtomicU64,
+    /// Microseconds in flush: router.partition() lookup.
+    pub flush_router_us: std::sync::atomic::AtomicU64,
+    /// Microseconds in flush: partition_storage read locks.
+    pub flush_storage_lock_us: std::sync::atomic::AtomicU64,
+    /// Microseconds in flush: encode_split.
+    pub flush_encode_us: std::sync::atomic::AtomicU64,
+    /// Microseconds in flush: propose_batch channel send.
+    pub flush_propose_us: std::sync::atomic::AtomicU64,
+    /// Number of inline flushes (triggered by size limit in submit).
+    pub inline_flush_count: std::sync::atomic::AtomicU64,
+    /// Microseconds spent in inline flushes.
+    pub inline_flush_us: std::sync::atomic::AtomicU64,
 }
 
 impl BatcherStats {
@@ -248,79 +277,72 @@ impl BatcherStats {
 
     /// Takes a snapshot of the current counters.
     pub fn snapshot(&self) -> BatcherStatsSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
         BatcherStatsSnapshot {
-            flush_count: self.flush_count.load(std::sync::atomic::Ordering::Relaxed),
-            flush_linger_count: self
-                .flush_linger_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-            flush_size_count: self
-                .flush_size_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-            flush_shutdown_count: self
-                .flush_shutdown_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-            total_batch_requests: self
-                .total_batch_requests
-                .load(std::sync::atomic::Ordering::Relaxed),
-            total_batch_bytes: self
-                .total_batch_bytes
-                .load(std::sync::atomic::Ordering::Relaxed),
-            total_batch_records: self
-                .total_batch_records
-                .load(std::sync::atomic::Ordering::Relaxed),
-            total_batch_age_us: self
-                .total_batch_age_us
-                .load(std::sync::atomic::Ordering::Relaxed),
-            commit_count: self.commit_count.load(std::sync::atomic::Ordering::Relaxed),
-            total_commit_latency_us: self
-                .total_commit_latency_us
-                .load(std::sync::atomic::Ordering::Relaxed),
-            total_batch_wait_us: self
-                .total_batch_wait_us
-                .load(std::sync::atomic::Ordering::Relaxed),
-            total_total_age_us: self
-                .total_total_age_us
-                .load(std::sync::atomic::Ordering::Relaxed),
-            not_leader_count: self
-                .not_leader_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-            apply_error_count: self
-                .apply_error_count
-                .load(std::sync::atomic::Ordering::Relaxed),
+            flush_count: self.flush_count.load(Relaxed),
+            flush_linger_count: self.flush_linger_count.load(Relaxed),
+            flush_size_count: self.flush_size_count.load(Relaxed),
+            flush_shutdown_count: self.flush_shutdown_count.load(Relaxed),
+            total_batch_requests: self.total_batch_requests.load(Relaxed),
+            total_batch_bytes: self.total_batch_bytes.load(Relaxed),
+            total_batch_records: self.total_batch_records.load(Relaxed),
+            total_batch_age_us: self.total_batch_age_us.load(Relaxed),
+            commit_count: self.commit_count.load(Relaxed),
+            total_commit_latency_us: self.total_commit_latency_us.load(Relaxed),
+            total_batch_wait_us: self.total_batch_wait_us.load(Relaxed),
+            total_total_age_us: self.total_total_age_us.load(Relaxed),
+            not_leader_count: self.not_leader_count.load(Relaxed),
+            apply_error_count: self.apply_error_count.load(Relaxed),
+            loop_iterations: self.loop_iterations.load(Relaxed),
+            loop_idle_us: self.loop_idle_us.load(Relaxed),
+            loop_submit_us: self.loop_submit_us.load(Relaxed),
+            loop_submit_count: self.loop_submit_count.load(Relaxed),
+            loop_linger_flush_us: self.loop_linger_flush_us.load(Relaxed),
+            loop_linger_flush_cycles: self
+                .loop_linger_flush_cycles.load(Relaxed),
+            loop_linger_flush_groups: self
+                .loop_linger_flush_groups.load(Relaxed),
+            flush_router_us: self.flush_router_us.load(Relaxed),
+            flush_storage_lock_us: self.flush_storage_lock_us.load(Relaxed),
+            flush_encode_us: self.flush_encode_us.load(Relaxed),
+            flush_propose_us: self.flush_propose_us.load(Relaxed),
+            inline_flush_count: self.inline_flush_count.load(Relaxed),
+            inline_flush_us: self.inline_flush_us.load(Relaxed),
         }
     }
 }
 
 /// Snapshot of batcher stats for reporting.
+#[allow(missing_docs)]
 pub struct BatcherStatsSnapshot {
-    /// Total number of batch flushes.
     pub flush_count: u64,
-    /// Flushes triggered by linger timeout.
     pub flush_linger_count: u64,
-    /// Flushes triggered by batch size limits.
     pub flush_size_count: u64,
-    /// Flushes triggered by shutdown.
     pub flush_shutdown_count: u64,
-    /// Total requests observed across all batches.
     pub total_batch_requests: u64,
-    /// Total bytes observed across all batches.
     pub total_batch_bytes: u64,
-    /// Total records observed across all batches.
     pub total_batch_records: u64,
-    /// Total batch age at flush time (microseconds).
     pub total_batch_age_us: u64,
-    /// Total number of committed batches.
     pub commit_count: u64,
-    /// Total commit latency after proposal (microseconds).
     pub total_commit_latency_us: u64,
-    /// Total batch wait time before proposal (microseconds).
     pub total_batch_wait_us: u64,
-    /// Total time from first request to commit (microseconds).
     pub total_total_age_us: u64,
-    /// Number of batch flushes rejected due to not being leader.
     pub not_leader_count: u64,
-    /// Number of batch apply errors on commit.
     pub apply_error_count: u64,
+    // Batcher loop instrumentation.
+    pub loop_iterations: u64,
+    pub loop_idle_us: u64,
+    pub loop_submit_us: u64,
+    pub loop_submit_count: u64,
+    pub loop_linger_flush_us: u64,
+    pub loop_linger_flush_cycles: u64,
+    pub loop_linger_flush_groups: u64,
+    pub flush_router_us: u64,
+    pub flush_storage_lock_us: u64,
+    pub flush_encode_us: u64,
+    pub flush_propose_us: u64,
+    pub inline_flush_count: u64,
+    pub inline_flush_us: u64,
 }
 
 impl BatcherStatsSnapshot {
@@ -347,6 +369,64 @@ impl BatcherStatsSnapshot {
             apply_error_count = self.apply_error_count,
         )
     }
+}
+
+/// Output processor performance stats for bottleneck analysis.
+///
+/// Tracks per-message-type processing times and idle time to determine
+/// whether the output processor is the throughput bottleneck.
+#[derive(Default)]
+pub struct OutputProcessorStats {
+    /// Number of `SendMessages` processed.
+    pub send_messages_count: std::sync::atomic::AtomicU64,
+    /// Cumulative microseconds spent on `SendMessages` (encode + transport send).
+    pub send_messages_us: std::sync::atomic::AtomicU64,
+    /// Number of `EntryCommitted` processed.
+    pub entry_committed_count: std::sync::atomic::AtomicU64,
+    /// Cumulative microseconds spent on `EntryCommitted` (decode + apply + notify).
+    pub entry_committed_us: std::sync::atomic::AtomicU64,
+    /// Number of other outputs processed (`BecameLeader`, `SteppedDown`, etc.).
+    pub other_count: std::sync::atomic::AtomicU64,
+    /// Cumulative microseconds spent on other outputs.
+    pub other_us: std::sync::atomic::AtomicU64,
+    /// Cumulative microseconds spent idle (waiting in `recv_many()`).
+    pub recv_idle_us: std::sync::atomic::AtomicU64,
+    /// Number of `recv_many` batches processed.
+    pub batch_count: std::sync::atomic::AtomicU64,
+    /// Total messages processed across all batches.
+    pub total_messages: std::sync::atomic::AtomicU64,
+}
+
+impl OutputProcessorStats {
+    /// Takes a snapshot for reporting.
+    pub fn snapshot(&self) -> OutputProcessorStatsSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        OutputProcessorStatsSnapshot {
+            send_messages_count: self.send_messages_count.load(Relaxed),
+            send_messages_us: self.send_messages_us.load(Relaxed),
+            entry_committed_count: self.entry_committed_count.load(Relaxed),
+            entry_committed_us: self.entry_committed_us.load(Relaxed),
+            other_count: self.other_count.load(Relaxed),
+            other_us: self.other_us.load(Relaxed),
+            recv_idle_us: self.recv_idle_us.load(Relaxed),
+            batch_count: self.batch_count.load(Relaxed),
+            total_messages: self.total_messages.load(Relaxed),
+        }
+    }
+}
+
+/// Snapshot of output processor stats for reporting.
+#[allow(missing_docs)]
+pub struct OutputProcessorStatsSnapshot {
+    pub send_messages_count: u64,
+    pub send_messages_us: u64,
+    pub entry_committed_count: u64,
+    pub entry_committed_us: u64,
+    pub other_count: u64,
+    pub other_us: u64,
+    pub recv_idle_us: u64,
+    pub batch_count: u64,
+    pub total_messages: u64,
 }
 
 /// Topic metadata.

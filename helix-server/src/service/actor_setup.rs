@@ -76,6 +76,8 @@ pub struct ActorSetupHandles {
     pub batcher_stats: Arc<BatcherStats>,
     /// Backpressure state.
     pub backpressure: Arc<BackpressureState>,
+    /// Output processor performance stats.
+    pub output_processor_stats: Arc<super::OutputProcessorStats>,
     /// Shutdown sender for the tick task.
     pub shutdown_tx: mpsc::Sender<()>,
     /// Map of partition handles by group ID (for direct access if needed).
@@ -158,6 +160,9 @@ pub async fn setup_single_partition<
         Arc::clone(&partition_storage),
     ));
 
+    // Create output processor stats for bottleneck analysis.
+    let output_processor_stats = Arc::new(super::OutputProcessorStats::default());
+
     // Spawn the output processor.
     tokio::spawn(output_processor::output_processor_task(
         output_rx,
@@ -169,6 +174,7 @@ pub async fn setup_single_partition<
         Some(Arc::clone(&backpressure)),
         vote_store,
         Some(Arc::clone(&router)),
+        Some(Arc::clone(&output_processor_stats)),
     ));
 
     info!(
@@ -187,6 +193,7 @@ pub async fn setup_single_partition<
         batcher_handle,
         batcher_stats,
         backpressure,
+        output_processor_stats,
         shutdown_tx,
         partition_handles,
         output_tx,
@@ -289,6 +296,9 @@ pub async fn setup_multi_partition<
         Arc::clone(&partition_storage),
     ));
 
+    // Create output processor stats for bottleneck analysis.
+    let output_processor_stats = Arc::new(super::OutputProcessorStats::default());
+
     // Spawn the output processor.
     tokio::spawn(output_processor::output_processor_task(
         output_rx,
@@ -300,6 +310,7 @@ pub async fn setup_multi_partition<
         Some(Arc::clone(&backpressure)),
         vote_store.clone(),
         Some(Arc::clone(&router)),
+        Some(Arc::clone(&output_processor_stats)),
     ));
 
     // Create shutdown channel for tick task.
@@ -339,6 +350,7 @@ pub async fn setup_multi_partition<
         batcher_handle,
         batcher_stats,
         backpressure,
+        output_processor_stats,
         shutdown_tx,
         partition_handles,
         output_tx,

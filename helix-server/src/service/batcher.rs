@@ -151,6 +151,10 @@ pub struct BackpressureState {
     pub rejected_requests: AtomicU64,
     /// Total bytes rejected due to backpressure.
     pub rejected_bytes: AtomicU64,
+    /// Peak pending requests (high-water mark).
+    pub peak_pending_requests: AtomicU64,
+    /// Peak pending bytes (high-water mark).
+    pub peak_pending_bytes: AtomicU64,
 }
 
 /// Handle for submitting requests to the batcher.
@@ -207,12 +211,23 @@ impl BatcherHandle {
         }
 
         // Increment counters before sending (will be decremented on flush).
-        self.backpressure
+        let new_requests = self
+            .backpressure
             .pending_requests
-            .fetch_add(1, Ordering::Relaxed);
-        self.backpressure
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        let new_bytes = self
+            .backpressure
             .pending_bytes
-            .fetch_add(blob_size, Ordering::Relaxed);
+            .fetch_add(blob_size, Ordering::Relaxed)
+            + blob_size;
+        // Track high-water marks for bottleneck analysis.
+        self.backpressure
+            .peak_pending_requests
+            .fetch_max(new_requests, Ordering::Relaxed);
+        self.backpressure
+            .peak_pending_bytes
+            .fetch_max(new_bytes, Ordering::Relaxed);
 
         let (result_tx, result_rx) = oneshot::channel();
 
@@ -937,6 +952,10 @@ pub async fn batcher_task_actor<S: Storage + Clone + Send + Sync + 'static>(
         "Batcher task (actor mode) started"
     );
 
+    let report_interval = Duration::from_secs(10);
+    let mut last_report = std::time::Instant::now();
+    let mut iter_start = std::time::Instant::now();
+
     loop {
         // Calculate next flush deadline based on oldest batch.
         let next_flush_deadline = batches
@@ -951,11 +970,23 @@ pub async fn batcher_task_actor<S: Storage + Clone + Send + Sync + 'static>(
                 .unwrap_or(Duration::ZERO)
         });
 
+        let select_start = std::time::Instant::now();
+
         tokio::select! {
             // Receive new request or shutdown.
             msg = rx.recv() => {
+                #[allow(clippy::cast_possible_truncation)]
+                let idle_us =
+                    select_start.elapsed().as_micros() as u64;
+                batcher_stats.loop_idle_us.fetch_add(
+                    idle_us,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+
                 match msg {
                     Some(BatcherMessage::Submit(request)) => {
+                        let submit_start =
+                            std::time::Instant::now();
                         handle_submit_actor(
                             request,
                             &mut batches,
@@ -966,9 +997,19 @@ pub async fn batcher_task_actor<S: Storage + Clone + Send + Sync + 'static>(
                             &backpressure,
                             &partition_storage,
                         ).await;
+                        #[allow(clippy::cast_possible_truncation)]
+                        let submit_us =
+                            submit_start.elapsed().as_micros() as u64;
+                        batcher_stats.loop_submit_us.fetch_add(
+                            submit_us,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        batcher_stats.loop_submit_count.fetch_add(
+                            1,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                     }
                     Some(BatcherMessage::Shutdown) | None => {
-                        // Flush any remaining batches before shutdown.
                         for (group_id, batch) in batches.drain() {
                             if !batch.is_empty() {
                                 flush_batch_actor(
@@ -993,23 +1034,38 @@ pub async fn batcher_task_actor<S: Storage + Clone + Send + Sync + 'static>(
                 if let Some(duration) = timeout {
                     tokio::time::sleep(duration).await;
                 } else {
-                    // No batches, wait forever for next message.
                     std::future::pending::<()>().await;
                 }
             } => {
+                #[allow(clippy::cast_possible_truncation)]
+                let idle_us =
+                    select_start.elapsed().as_micros() as u64;
+                batcher_stats.loop_idle_us.fetch_add(
+                    idle_us,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+
+                let flush_cycle_start =
+                    std::time::Instant::now();
                 let now = std::time::Instant::now();
                 let mut groups_to_flush = Vec::new();
 
                 for (group_id, batch) in &batches {
                     if !batch.is_empty()
-                        && now.duration_since(batch.first_request_time) >= linger_duration
+                        && now.duration_since(
+                            batch.first_request_time,
+                        ) >= linger_duration
                     {
                         groups_to_flush.push(*group_id);
                     }
                 }
 
+                let flush_group_count =
+                    groups_to_flush.len() as u64;
                 for group_id in groups_to_flush {
-                    if let Some(batch) = batches.remove(&group_id) {
+                    if let Some(batch) =
+                        batches.remove(&group_id)
+                    {
                         flush_batch_actor(
                             group_id,
                             batch,
@@ -1022,9 +1078,110 @@ pub async fn batcher_task_actor<S: Storage + Clone + Send + Sync + 'static>(
                         ).await;
                     }
                 }
+
+                #[allow(clippy::cast_possible_truncation)]
+                let flush_cycle_us = flush_cycle_start
+                    .elapsed()
+                    .as_micros() as u64;
+                batcher_stats.loop_linger_flush_us.fetch_add(
+                    flush_cycle_us,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                batcher_stats
+                    .loop_linger_flush_cycles
+                    .fetch_add(
+                        1,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                batcher_stats
+                    .loop_linger_flush_groups
+                    .fetch_add(
+                        flush_group_count,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
             }
         }
+
+        batcher_stats.loop_iterations.fetch_add(
+            1,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        // Periodic batcher utilization report.
+        if last_report.elapsed() >= report_interval {
+            report_batcher_loop_stats(&batcher_stats, &iter_start);
+            last_report = std::time::Instant::now();
+            iter_start = std::time::Instant::now();
+        }
     }
+}
+
+/// Reports batcher loop utilization stats.
+fn report_batcher_loop_stats(
+    stats: &super::BatcherStats,
+    window_start: &std::time::Instant,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    #[allow(clippy::cast_possible_truncation)]
+    let wall_us = window_start.elapsed().as_micros() as u64;
+    if wall_us == 0 {
+        return;
+    }
+
+    let idle = stats.loop_idle_us.load(Relaxed);
+    let submit = stats.loop_submit_us.load(Relaxed);
+    let submit_n = stats.loop_submit_count.load(Relaxed);
+    let linger_flush = stats.loop_linger_flush_us.load(Relaxed);
+    let linger_cycles = stats.loop_linger_flush_cycles.load(Relaxed);
+    let linger_groups = stats.loop_linger_flush_groups.load(Relaxed);
+    let iters = stats.loop_iterations.load(Relaxed);
+    let router = stats.flush_router_us.load(Relaxed);
+    let storage = stats.flush_storage_lock_us.load(Relaxed);
+    let encode = stats.flush_encode_us.load(Relaxed);
+    let propose = stats.flush_propose_us.load(Relaxed);
+    let inline_n = stats.inline_flush_count.load(Relaxed);
+    let inline = stats.inline_flush_us.load(Relaxed);
+
+    let busy = submit + linger_flush + inline;
+    let utilization = if wall_us > 0 {
+        (busy * 100) / wall_us
+    } else {
+        0
+    };
+
+    let avg_submit = if submit_n > 0 {
+        submit / submit_n
+    } else {
+        0
+    };
+    let avg_linger = if linger_cycles > 0 {
+        linger_flush / linger_cycles
+    } else {
+        0
+    };
+
+    // Use warn level so stats are visible with --log-level warn
+    // (the default for benchmarks). Fires once per 10s — not noisy.
+    warn!(
+        wall_ms = wall_us / 1000,
+        utilization_pct = utilization,
+        idle_ms = idle / 1000,
+        submit_ms = submit / 1000,
+        submit_count = submit_n,
+        avg_submit_us = avg_submit,
+        linger_flush_ms = linger_flush / 1000,
+        linger_cycles,
+        linger_groups,
+        avg_linger_us = avg_linger,
+        inline_flush_count = inline_n,
+        inline_flush_ms = inline / 1000,
+        loop_iterations = iters,
+        flush_router_ms = router / 1000,
+        flush_storage_ms = storage / 1000,
+        flush_encode_ms = encode / 1000,
+        flush_propose_ms = propose / 1000,
+        "BATCHER_LOOP_STATS"
+    );
 }
 
 /// Handles a submit request (actor mode).
@@ -1055,8 +1212,9 @@ async fn handle_submit_actor<S: Storage + Clone + Send + Sync + 'static>(
     #[allow(clippy::cast_possible_truncation)]
     let would_exceed_requests = batch.request_count() as u32 >= config.max_batch_requests;
 
-    // If batch would exceed limits, flush first.
+    // If batch would exceed limits, flush first (inline flush).
     if !batch.is_empty() && (would_exceed_bytes || would_exceed_requests) {
+        let inline_start = std::time::Instant::now();
         let old_batch = std::mem::replace(batch, AccumulatedBatch::new());
         flush_batch_actor(
             group_id,
@@ -1069,6 +1227,15 @@ async fn handle_submit_actor<S: Storage + Clone + Send + Sync + 'static>(
             partition_storage,
         )
         .await;
+        #[allow(clippy::cast_possible_truncation)]
+        batcher_stats.inline_flush_us.fetch_add(
+            inline_start.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        batcher_stats.inline_flush_count.fetch_add(
+            1,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     // Update first_request_time if this is the first request in the batch.
@@ -1104,7 +1271,7 @@ async fn flush_batch_actor<S: Storage + Clone + Send + Sync + 'static>(
     batcher_stats: &Arc<BatcherStats>,
     reason: FlushReason,
     backpressure: &Arc<BackpressureState>,
-    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
+    _partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
 ) {
     let batch_size = batch.request_count();
     let batch_bytes = batch.total_bytes;
@@ -1127,7 +1294,7 @@ async fn flush_batch_actor<S: Storage + Clone + Send + Sync + 'static>(
 
     #[allow(clippy::cast_possible_truncation)]
     {
-        info!(
+        debug!(
             group_id = group_id.get(),
             reason = reason.as_str(),
             batch_size,
@@ -1137,6 +1304,9 @@ async fn flush_batch_actor<S: Storage + Clone + Send + Sync + 'static>(
             "Batch flush (actor mode)"
         );
     }
+
+    // --- Instrumented flush path ---
+    let t0 = std::time::Instant::now();
 
     // Get the partition actor handle.
     let Ok(partition_handle) = router.partition(group_id).await else {
@@ -1159,28 +1329,17 @@ async fn flush_batch_actor<S: Storage + Clone + Send + Sync + 'static>(
     };
 
     // Check if we're the leader before proposing.
-    let Ok(is_leader) = partition_handle.is_leader().await else {
-        // Actor not responding - notify all waiters with error.
-        #[allow(clippy::cast_possible_truncation)]
-        backpressure
-            .pending_requests
-            .fetch_sub(batch_size as u64, Ordering::Relaxed);
-        backpressure
-            .pending_bytes
-            .fetch_sub(u64::from(batch_bytes), Ordering::Relaxed);
+    // Use the cached atomic flag (~1ns) instead of async round-trip (~300μs)
+    // through the partition actor command channel. Staleness is bounded by
+    // tick interval and is safe — propose_batch handles not-leader errors.
+    #[allow(clippy::cast_possible_truncation)]
+    batcher_stats.flush_router_us.fetch_add(
+        t0.elapsed().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
-        let err = ServerError::Internal {
-            message: "partition actor not responding".to_string(),
-        };
-        for result_tx in batch.result_txs {
-            let _ = result_tx.send(Err(err.clone()));
-        }
-        return;
-    };
-
-    if !is_leader {
+    if !partition_handle.is_leader_cached() {
         batcher_stats.record_not_leader();
-        // Not leader - notify all waiters with error.
         #[allow(clippy::cast_possible_truncation)]
         backpressure
             .pending_requests
@@ -1200,37 +1359,32 @@ async fn flush_batch_actor<S: Storage + Clone + Send + Sync + 'static>(
         return;
     }
 
-    // Capture base_offset from storage BEFORE proposing to Raft.
-    // This offset is encoded in the command and used by ALL replicas during apply.
-    // This ensures consistency across the cluster, even during leadership changes.
-    let base_offset = {
-        let ps_lock = {
-            let storage = partition_storage.read().await;
-            storage.get(&group_id).cloned()
-        };
-        if let Some(ps_lock) = ps_lock {
-            let ps = ps_lock.read().await;
-            ps.blob_log_end_offset()
-        } else {
-            Offset::new(0)
-        }
-    };
+    // Read base_offset from the partition actor's cached atomic (~1 ns)
+    // instead of acquiring partition_storage RwLock reads (was ~813 us
+    // avg due to contention with output processor write locks).
+    // The partition actor's patch_batch_base_offset() will override
+    // this with its own next_base_offset tracker if stale.
+    let t1 = std::time::Instant::now();
+    let base_offset = partition_handle.blob_end_offset_cached();
+    #[allow(clippy::cast_possible_truncation)]
+    batcher_stats.flush_storage_lock_us.fetch_add(
+        t1.elapsed().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
-    // Encode the batch command with split metadata/payload to avoid
-    // copying ~1 MB of blob data on the propose path.
+    // Encode the batch command with split metadata/payload.
+    let t2 = std::time::Instant::now();
     let command = PartitionCommand::AppendBlobBatch {
         blobs: batch.blobs,
         base_offset,
     };
     let (command_metadata, command_payload) = command.encode_split();
+    #[allow(clippy::cast_possible_truncation)]
+    batcher_stats.flush_encode_us.fetch_add(
+        t2.elapsed().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
-    // Build batch proposal info for the partition actor.
-    // The partition actor owns the full proposal lifecycle:
-    // - It stores the batch info BEFORE processing Raft outputs
-    // - When the entry commits, it passes the info through EntryCommitted
-    // - The output processor applies to storage and notifies clients
-    // This eliminates the race condition where EntryCommitted arrived before
-    // the pending proposal was registered in the shared map.
     #[allow(clippy::cast_possible_truncation)]
     let batch_info = BatchProposalInfo {
         first_request_at: batch.first_request_time,
@@ -1241,25 +1395,23 @@ async fn flush_batch_actor<S: Storage + Clone + Send + Sync + 'static>(
         result_txs: batch.result_txs,
     };
 
-    // Propose batch to the partition actor (lock-free!).
-    // The partition actor stores the batch info internally, so no race condition.
+    // Propose batch to the partition actor.
+    let t3 = std::time::Instant::now();
     let propose_result = partition_handle
         .propose_batch(command_metadata, command_payload, batch_info)
         .await;
+    #[allow(clippy::cast_possible_truncation)]
+    batcher_stats.flush_propose_us.fetch_add(
+        t3.elapsed().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     if let Err(e) = propose_result {
-        // Propose failed (channel closed).
         warn!(
             group_id = group_id.get(),
             error = %e,
             "Failed to send batch to partition actor"
         );
-        // Note: The batch_info (including result_txs) was moved to propose_batch,
-        // so the partition actor is responsible for notifying clients on error.
-        // We just decrement backpressure counters here.
-        // Actually, if propose_batch fails because the channel is closed,
-        // the batch_info is dropped. We should handle this by keeping result_txs.
-        // For now, backpressure is decremented - clients will timeout.
         #[allow(clippy::cast_possible_truncation)]
         backpressure
             .pending_requests

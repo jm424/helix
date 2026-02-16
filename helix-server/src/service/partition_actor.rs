@@ -27,7 +27,7 @@
 //! 4. `ProduceRequest`: Direct produce for per-partition batching
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -266,6 +266,10 @@ pub struct PartitionActorHandle {
     group_id: GroupId,
     /// Cached leadership state updated by the actor.
     is_leader_cache: Arc<AtomicBool>,
+    /// Cached blob end offset updated by the output processor on
+    /// commit. Allows the batcher to read the offset without
+    /// acquiring `partition_storage` locks.
+    blob_end_offset_cache: Arc<AtomicU64>,
 }
 
 impl PartitionActorHandle {
@@ -279,6 +283,7 @@ impl PartitionActorHandle {
             tx,
             group_id,
             is_leader_cache: Arc::new(AtomicBool::new(false)),
+            blob_end_offset_cache: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -292,6 +297,21 @@ impl PartitionActorHandle {
     #[must_use]
     pub fn is_leader_cached(&self) -> bool {
         self.is_leader_cache.load(Ordering::Relaxed)
+    }
+
+    /// Returns the cached blob end offset (~1 ns, no lock).
+    #[must_use]
+    pub fn blob_end_offset_cached(&self) -> Offset {
+        Offset::new(
+            self.blob_end_offset_cache.load(Ordering::Acquire),
+        )
+    }
+
+    /// Returns the shared blob end offset cache for the output
+    /// processor to update after applying committed entries.
+    #[must_use]
+    pub fn blob_end_offset_arc(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.blob_end_offset_cache)
     }
 
     /// Returns the group ID for this partition.
@@ -1303,10 +1323,10 @@ impl PartitionActorShared {
 
     /// Advances `next_base_offset` from a committed entry's data.
     ///
-    /// After a leadership change, PREVIOUS_TERM entries are committed
+    /// After a leadership change, `PREVIOUS_TERM` entries are committed
     /// before any new proposals arrive. Without tracking their offsets,
-    /// the first new proposal would reuse base_offset=0, violating
-    /// BlobIndex monotonicity.
+    /// the first new proposal would reuse `base_offset=0`, violating
+    /// `BlobIndex` monotonicity.
     fn advance_offset_from_committed(&mut self, data: &Bytes) {
         if data.is_empty() {
             return;

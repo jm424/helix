@@ -73,8 +73,9 @@ pub use wal::{SegmentInfo, Wal, WalConfig};
 
 /// WAL configuration limits.
 pub mod limits {
-    /// Maximum size of a single entry payload in bytes (1 MB).
-    pub const ENTRY_PAYLOAD_SIZE_BYTES_MAX: u32 = 1024 * 1024;
+    /// Maximum size of a single entry payload in bytes (5 MB).
+    /// Must exceed the batcher's `max_batch_bytes` (4 MB) plus encoding overhead.
+    pub const ENTRY_PAYLOAD_SIZE_BYTES_MAX: u32 = 5 * 1024 * 1024;
 
     /// Maximum size of a segment in bytes (1 GB).
     pub const SEGMENT_SIZE_BYTES_MAX: u64 = 1024 * 1024 * 1024;

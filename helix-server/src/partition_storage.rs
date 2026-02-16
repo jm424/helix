@@ -661,7 +661,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                     let new_hwm = partition.blob_log_end_offset();
                     partition.set_high_watermark(new_hwm);
 
-                    info!(
+                    debug!(
                         topic = %self.topic_id,
                         partition = %self.partition_id,
                         index = %index,
