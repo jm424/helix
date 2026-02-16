@@ -4,30 +4,44 @@ use bytes::Bytes;
 use helix_core::{LogIndex, TermId};
 
 /// A single entry in the Raft log.
+///
+/// Split into `metadata` (command header: type, offsets, counts, per-blob
+/// headers) and `payload` (blob data). For non-blob commands the payload
+/// is empty. This split eliminates a ~1 MB memcpy on the propose path
+/// because the large blob payload is carried by reference instead of
+/// being serialized into a contiguous buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogEntry {
     /// The term when this entry was created.
     pub term: TermId,
     /// The log index of this entry.
     pub index: LogIndex,
-    /// The command/data payload.
-    pub data: Bytes,
+    /// Command header (type, offsets, counts, per-blob headers).
+    pub metadata: Bytes,
+    /// Blob data (empty for non-blob commands).
+    pub payload: Bytes,
 }
 
 impl LogEntry {
-    /// Creates a new log entry.
+    /// Creates a new log entry with separate metadata and payload.
     #[must_use]
-    pub const fn new(term: TermId, index: LogIndex, data: Bytes) -> Self {
-        Self { term, index, data }
+    pub const fn new(term: TermId, index: LogIndex, metadata: Bytes, payload: Bytes) -> Self {
+        Self {
+            term,
+            index,
+            metadata,
+            payload,
+        }
     }
 
     /// Returns the wire size of this entry when encoded.
     ///
-    /// Wire format: 8 (term) + 8 (index) + 4 (data length prefix) + `data.len()`.
+    /// Wire format: 8 (term) + 8 (index) + 4 (metadata length) + metadata
+    /// + 4 (payload length) + payload.
     #[must_use]
     pub const fn wire_size(&self) -> u64 {
-        // 8 (term) + 8 (index) + 4 (data_len prefix) + data.len()
-        20 + self.data.len() as u64
+        // 8 (term) + 8 (index) + 4 (meta_len) + meta + 4 (payload_len) + payload
+        24 + self.metadata.len() as u64 + self.payload.len() as u64
     }
 }
 
@@ -379,6 +393,7 @@ mod tests {
             TermId::new(term),
             LogIndex::new(index),
             Bytes::from(format!("entry-{index}")),
+            Bytes::new(),
         )
     }
 
@@ -437,8 +452,8 @@ mod tests {
 
         // New entries with conflict at index 2 (different term).
         let new_entries = vec![
-            LogEntry::new(TermId::new(2), LogIndex::new(2), Bytes::from("new")),
-            LogEntry::new(TermId::new(2), LogIndex::new(3), Bytes::from("new")),
+            LogEntry::new(TermId::new(2), LogIndex::new(2), Bytes::from("new"), Bytes::new()),
+            LogEntry::new(TermId::new(2), LogIndex::new(3), Bytes::from("new"), Bytes::new()),
         ];
 
         log.append_entries(new_entries);
@@ -488,22 +503,33 @@ mod tests {
 
     #[test]
     fn test_wire_size() {
-        // Wire format: 8 (term) + 8 (index) + 4 (data length) + data.len()
-        let entry = LogEntry::new(TermId::new(1), LogIndex::new(1), Bytes::from("hello"));
-        // 20 + 5 = 25
-        assert_eq!(entry.wire_size(), 25);
-
-        let empty_entry = LogEntry::new(TermId::new(1), LogIndex::new(1), Bytes::new());
-        // 20 + 0 = 20
-        assert_eq!(empty_entry.wire_size(), 20);
-
-        let large_entry = LogEntry::new(
+        // Wire format: 8 (term) + 8 (index) + 4 (meta_len) + meta + 4 (payload_len) + payload
+        let entry = LogEntry::new(
             TermId::new(1),
             LogIndex::new(1),
+            Bytes::from("hello"),
+            Bytes::new(),
+        );
+        // 24 + 5 + 0 = 29
+        assert_eq!(entry.wire_size(), 29);
+
+        let empty_entry = LogEntry::new(
+            TermId::new(1),
+            LogIndex::new(1),
+            Bytes::new(),
+            Bytes::new(),
+        );
+        // 24 + 0 + 0 = 24
+        assert_eq!(empty_entry.wire_size(), 24);
+
+        let split_entry = LogEntry::new(
+            TermId::new(1),
+            LogIndex::new(1),
+            Bytes::from(vec![0u8; 18]),
             Bytes::from(vec![0u8; 1000]),
         );
-        // 20 + 1000 = 1020
-        assert_eq!(large_entry.wire_size(), 1020);
+        // 24 + 18 + 1000 = 1042
+        assert_eq!(split_entry.wire_size(), 1042);
     }
 
     #[test]
@@ -521,13 +547,13 @@ mod tests {
     #[test]
     fn test_entries_from_limited_partial() {
         let mut log = RaftLog::new();
-        // Each entry: 20 (header) + ~7 bytes data = ~27 bytes.
+        // Each entry: 24 (header) + ~7 bytes metadata + 0 payload = ~31 bytes.
         log.append(make_entry(1, 1));
         log.append(make_entry(1, 2));
         log.append(make_entry(2, 3));
 
-        // Limit to fit only 2 entries (54 bytes).
-        let entries = log.entries_from_limited(LogIndex::new(1), 55);
+        // Limit to fit only 2 entries (62 bytes).
+        let entries = log.entries_from_limited(LogIndex::new(1), 63);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].index.get(), 1);
         assert_eq!(entries[1].index.get(), 2);
@@ -542,6 +568,7 @@ mod tests {
             TermId::new(1),
             LogIndex::new(1),
             Bytes::from(large_data),
+            Bytes::new(),
         ));
         log.append(make_entry(1, 2));
 

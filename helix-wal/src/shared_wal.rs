@@ -668,20 +668,23 @@ impl<S: Storage> SharedWal<S> {
         group_id: GroupId,
         index: u64,
     ) -> WalResult<Option<SharedEntry>> {
-        // Check if index is beyond current valid range.
-        if let Some(state) = self.group_state.get(&group_id) {
-            if index > state.last_index {
-                return Ok(None);
-            }
-        }
-
-        // Fast path: check group_index (in-memory).
+        // Fast path: check group_index (in-memory) first. Entries are
+        // pre-registered here on append, before flush_loop writes them
+        // to disk. Checking this before group_state ensures buffered
+        // entries are readable immediately.
         if let Some(entry) = self
             .group_index
             .get(&group_id)
             .and_then(|btree| btree.get(&index).cloned())
         {
             return Ok(Some(entry));
+        }
+
+        // Check if index is beyond current valid range (flushed entries).
+        if let Some(state) = self.group_state.get(&group_id) {
+            if index > state.last_index {
+                return Ok(None);
+            }
         }
 
         // Slow path: check evicted_index → read from disk.
@@ -957,7 +960,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
         let (tx, rx) = oneshot::channel();
 
         // Add to buffer with atomically assigned index.
-        let next_index = {
+        let (next_index, entry_for_index) = {
             let mut buffer = self.inner.buffer.lock().await;
 
             // Determine the next index atomically while holding buffer lock.
@@ -978,6 +981,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
 
             // Create entry with assigned index.
             let entry = SharedEntry::new(self.group_id, term, next_index, payload.clone())?;
+
+            // Clone for group_index pre-registration (O(1), Bytes refcount).
+            let entry_for_index = entry.clone();
 
             // Update buffer tracking BEFORE adding entry (atomic with lock).
             buffer.update_last_index(self.group_id, next_index);
@@ -1002,8 +1008,20 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
                 self.inner.flush_notify.notify_one();
             }
 
-            next_index
+            (next_index, entry_for_index)
         };
+
+        // Pre-register entry in group_index so reads find it immediately,
+        // before flush_loop writes it to disk. Without this, read_or_load()
+        // returns None for buffered-but-unflushed entries, causing
+        // "BlobIndex references missing WAL entry" on the read path.
+        {
+            let mut wal = self.inner.wal.lock().await;
+            wal.group_index
+                .entry(self.group_id)
+                .or_default()
+                .insert(next_index, entry_for_index);
+        }
 
         Ok((next_index, rx))
     }

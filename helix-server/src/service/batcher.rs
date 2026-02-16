@@ -1216,12 +1216,13 @@ async fn flush_batch_actor<S: Storage + Clone + Send + Sync + 'static>(
         }
     };
 
-    // Encode the batch command with the leader-assigned base_offset.
+    // Encode the batch command with split metadata/payload to avoid
+    // copying ~1 MB of blob data on the propose path.
     let command = PartitionCommand::AppendBlobBatch {
         blobs: batch.blobs,
         base_offset,
     };
-    let command_data = command.encode();
+    let (command_metadata, command_payload) = command.encode_split();
 
     // Build batch proposal info for the partition actor.
     // The partition actor owns the full proposal lifecycle:
@@ -1243,7 +1244,7 @@ async fn flush_batch_actor<S: Storage + Clone + Send + Sync + 'static>(
     // Propose batch to the partition actor (lock-free!).
     // The partition actor stores the batch info internally, so no race condition.
     let propose_result = partition_handle
-        .propose_batch(command_data, batch_info)
+        .propose_batch(command_metadata, command_payload, batch_info)
         .await;
 
     if let Err(e) = propose_result {

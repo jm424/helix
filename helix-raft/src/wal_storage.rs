@@ -15,7 +15,7 @@
 //! This implementation is designed for single-threaded use within
 //! a Raft node. External synchronization is required for concurrent access.
 
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use helix_core::{LogIndex, TermId};
 use helix_wal::{Entry, Segment, SegmentConfig, SegmentId};
 
@@ -149,8 +149,21 @@ impl WalStorage {
     }
 
     /// Converts a Raft `LogEntry` to a WAL Entry.
+    ///
+    /// Frames metadata + payload as `[meta_len:u32_le][metadata][payload]`
+    /// so the WAL stores a single contiguous payload.
     fn log_to_wal_entry(entry: &LogEntry) -> StorageResult<Entry> {
-        Entry::new(entry.term.get(), entry.index.get(), entry.data.clone()).map_err(|e| {
+        // Frame: [meta_len:u32_le][metadata][payload]
+        let framed_len = 4 + entry.metadata.len() + entry.payload.len();
+        let mut buf = BytesMut::with_capacity(framed_len);
+        #[allow(clippy::cast_possible_truncation)]
+        let meta_len = entry.metadata.len() as u32;
+        buf.put_u32_le(meta_len);
+        buf.put_slice(&entry.metadata);
+        buf.put_slice(&entry.payload);
+        let framed = buf.freeze();
+
+        Entry::new(entry.term.get(), entry.index.get(), framed).map_err(|e| {
             StorageError::Io {
                 operation: "encode",
                 message: format!("failed to create WAL entry: {e}"),
@@ -159,11 +172,36 @@ impl WalStorage {
     }
 
     /// Converts a WAL Entry to a Raft `LogEntry`.
+    ///
+    /// Unframes `[meta_len:u32_le][metadata][payload]` back into split fields.
     fn wal_to_log_entry(entry: &helix_wal::Entry) -> LogEntry {
+        let data = entry.payload.clone();
+        if data.len() < 4 {
+            // Fallback for empty or legacy entries.
+            return LogEntry::new(
+                TermId::new(entry.term()),
+                LogIndex::new(entry.index()),
+                data,
+                Bytes::new(),
+            );
+        }
+        let meta_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        if data.len() < 4 + meta_len {
+            // Malformed - treat entire payload as metadata.
+            return LogEntry::new(
+                TermId::new(entry.term()),
+                LogIndex::new(entry.index()),
+                data,
+                Bytes::new(),
+            );
+        }
+        let metadata = data.slice(4..4 + meta_len);
+        let payload = data.slice(4 + meta_len..);
         LogEntry::new(
             TermId::new(entry.term()),
             LogIndex::new(entry.index()),
-            entry.payload.clone(),
+            metadata,
+            payload,
         )
     }
 
@@ -365,6 +403,7 @@ mod tests {
             TermId::new(term),
             LogIndex::new(index),
             Bytes::from(format!("entry-{index}")),
+            Bytes::new(),
         )
     }
 

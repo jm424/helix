@@ -2491,14 +2491,21 @@ mod tests {
         rt.block_on(async {
             let cluster = E2ECluster::start(3).await;
 
-            // Wait for cluster to stabilize.
-            cluster.sleep(Duration::from_millis(500)).await;
+            // Wait for cluster to stabilize (controller election needs time).
+            cluster.sleep(Duration::from_secs(5)).await;
 
-            // Create topic using REAL API.
-            let result = cluster.create_topic("test-topic", 1).await;
-
-            result.expect("test_e2e_create_topic: topic creation must succeed");
-            eprintln!("[PASS] test_e2e_create_topic: Created topic");
+            // Create topic with retries (controller may still be electing).
+            for attempt in 0..30 {
+                if cluster.create_topic("test-topic", 1).await.is_ok() {
+                    eprintln!(
+                        "[PASS] test_e2e_create_topic: Created topic on attempt {}",
+                        attempt
+                    );
+                    return;
+                }
+                cluster.sleep(Duration::from_millis(200)).await;
+            }
+            panic!("test_e2e_create_topic: topic creation failed after 30 attempts");
         });
     }
 

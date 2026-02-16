@@ -61,8 +61,10 @@ pub enum PartitionCommand {
 
     /// Propose a batch of records with reply channels for commit notification.
     ProposeBatch {
-        /// The batch data to propose.
-        data: Bytes,
+        /// Command header (type, offsets, counts, per-blob headers).
+        metadata: Bytes,
+        /// Blob data (zero-copy reference from producer).
+        payload: Bytes,
         /// Information needed to notify clients on commit.
         batch_info: BatchProposalInfo,
     },
@@ -325,11 +327,12 @@ impl PartitionActorHandle {
     /// Returns an error if the actor has shut down.
     pub async fn propose_batch(
         &self,
-        data: Bytes,
+        metadata: Bytes,
+        payload: Bytes,
         batch_info: BatchProposalInfo,
     ) -> Result<(), PartitionError> {
         self.tx
-            .send(PartitionCommand::ProposeBatch { data, batch_info })
+            .send(PartitionCommand::ProposeBatch { metadata, payload, batch_info })
             .await
             .map_err(|_| PartitionError::ActorShutdown)
     }
@@ -507,8 +510,10 @@ pub enum PartitionOutput {
         index: LogIndex,
         /// Raft term of the committed entry.
         term: helix_core::TermId,
-        /// Data payload.
-        data: Bytes,
+        /// Command header.
+        metadata: Bytes,
+        /// Blob payload (empty for non-blob commands).
+        payload: Bytes,
         /// Optional batch notification info.
         batch_notify: Option<BatchNotifyInfo>,
     },
@@ -868,8 +873,8 @@ impl PartitionActorShared {
             PartitionCommand::Propose { data, reply } => {
                 self.handle_propose(data, reply).await;
             }
-            PartitionCommand::ProposeBatch { data, batch_info } => {
-                self.handle_propose_batch(data, batch_info).await;
+            PartitionCommand::ProposeBatch { metadata, payload, batch_info } => {
+                self.handle_propose_batch(metadata, payload, batch_info).await;
             }
             PartitionCommand::ProduceRequest {
                 blob,
@@ -951,7 +956,8 @@ impl PartitionActorShared {
 
     async fn handle_propose_batch(
         &mut self,
-        data: Bytes,
+        metadata: Bytes,
+        payload: Bytes,
         batch_info: BatchProposalInfo,
     ) {
         if !self.raft_node.is_leader() {
@@ -969,13 +975,13 @@ impl PartitionActorShared {
             return;
         }
 
-        // Patch base_offset to ensure monotonicity. The batcher
+        // Patch base_offset in metadata to ensure monotonicity. The batcher
         // reads blob_log_end_offset (committed only), so concurrent
         // batches can get the same stale offset. The actor's
         // next_base_offset accounts for uncommitted proposals.
-        let data = self.patch_batch_base_offset(data, &batch_info);
+        let metadata = self.patch_batch_base_offset(metadata, &batch_info);
 
-        let request = ClientRequest::new(data);
+        let request = ClientRequest::new(metadata, payload);
         if let Some(outputs) =
             self.raft_node.handle_client_request(request)
         {
@@ -1040,8 +1046,13 @@ impl PartitionActorShared {
         ));
 
         // Seed from batcher on first propose after leadership change.
+        // Use max to avoid overwriting a higher next_base_offset that
+        // was advanced by committed PREVIOUS_TERM entries.
         if !self.offset_seeded {
-            self.next_base_offset = batcher_offset;
+            self.next_base_offset = std::cmp::max(
+                self.next_base_offset,
+                batcher_offset,
+            );
             self.offset_seeded = true;
         }
 
@@ -1080,7 +1091,7 @@ impl PartitionActorShared {
             }));
             return;
         }
-        let request = ClientRequest::new(data);
+        let request = ClientRequest::new(data, Bytes::new());
         match self.raft_node.handle_client_request(request) {
             Some(outputs) => {
                 let log_index = LogIndex::new(
@@ -1235,7 +1246,7 @@ impl PartitionActorShared {
             base_offset,
         };
         let command_data = command.encode();
-        let request = ClientRequest::new(command_data);
+        let request = ClientRequest::new(command_data, Bytes::new());
         let Some(outputs) =
             self.raft_node.handle_client_request(request)
         else {
@@ -1290,6 +1301,45 @@ impl PartitionActorShared {
         self.offset_seeded = true;
     }
 
+    /// Advances `next_base_offset` from a committed entry's data.
+    ///
+    /// After a leadership change, PREVIOUS_TERM entries are committed
+    /// before any new proposals arrive. Without tracking their offsets,
+    /// the first new proposal would reuse base_offset=0, violating
+    /// BlobIndex monotonicity.
+    fn advance_offset_from_committed(&mut self, data: &Bytes) {
+        if data.is_empty() {
+            return;
+        }
+        // Use the canonical decoder to handle all encode formats.
+        let Some(cmd) = StoragePartitionCommand::decode(data) else {
+            return;
+        };
+        let end_offset = match &cmd {
+            StoragePartitionCommand::AppendBlob {
+                base_offset,
+                record_count,
+                ..
+            } => Offset::new(
+                base_offset.get() + u64::from(*record_count),
+            ),
+            StoragePartitionCommand::AppendBlobBatch {
+                blobs,
+                base_offset,
+            } => {
+                let total: u64 = blobs
+                    .iter()
+                    .map(|b| u64::from(b.record_count))
+                    .sum();
+                Offset::new(base_offset.get() + total)
+            }
+            _ => return,
+        };
+        if end_offset > self.next_base_offset {
+            self.next_base_offset = end_offset;
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn process_raft_outputs(
         &mut self,
@@ -1315,7 +1365,24 @@ impl PartitionActorShared {
                         warn!("Failed to send message output");
                     }
                 }
-                RaftOutput::CommitEntry { index, term, data } => {
+                RaftOutput::CommitEntry { index, term, metadata, payload } => {
+                    // Advance next_base_offset from committed entries.
+                    // Reconstitute full data for decode (encode_split
+                    // metadata alone is incomplete).
+                    {
+                        let data = if payload.is_empty() {
+                            metadata.clone()
+                        } else {
+                            let mut buf = BytesMut::with_capacity(
+                                metadata.len() + payload.len(),
+                            );
+                            buf.extend_from_slice(&metadata);
+                            buf.extend_from_slice(&payload);
+                            buf.freeze()
+                        };
+                        self.advance_offset_from_committed(&data);
+                    }
+
                     if let Some(reply) =
                         self.pending_proposals.remove(&index)
                     {
@@ -1350,7 +1417,8 @@ impl PartitionActorShared {
                         output: PartitionOutput::EntryCommitted {
                             index,
                             term,
-                            data,
+                            metadata,
+                            payload,
                             batch_notify,
                         },
                     };
@@ -1555,7 +1623,7 @@ impl PartitionActor {
             }));
             return;
         }
-        let request = ClientRequest::new(data);
+        let request = ClientRequest::new(data, Bytes::new());
         match self.raft_node.handle_client_request(request) {
             Some(outputs) => {
                 let log_index = LogIndex::new(
@@ -1609,7 +1677,7 @@ impl PartitionActor {
                         })
                         .await;
                 }
-                RaftOutput::CommitEntry { index, term, data } => {
+                RaftOutput::CommitEntry { index, term, metadata, payload } => {
                     if let Some(reply) =
                         self.pending_proposals.remove(&index)
                     {
@@ -1622,7 +1690,8 @@ impl PartitionActor {
                         .send(PartitionOutput::EntryCommitted {
                             index,
                             term,
-                            data,
+                            metadata,
+                            payload,
                             batch_notify: None,
                         })
                         .await;

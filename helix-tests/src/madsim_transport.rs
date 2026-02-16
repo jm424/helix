@@ -636,11 +636,13 @@ mod tests {
                 TermId::new(5),
                 LogIndex::new(10),
                 Bytes::from("hello world"),
+                Bytes::new(),
             );
             let entry2 = LogEntry::new(
                 TermId::new(5),
                 LogIndex::new(11),
                 Bytes::from("test data 123"),
+                Bytes::new(),
             );
             let append_req = AppendEntriesRequest::new(
                 TermId::new(5),
@@ -692,8 +694,8 @@ mod tests {
                     assert_eq!(req.term.get(), 5);
                     assert_eq!(req.leader_id.get(), 1);
                     assert_eq!(req.entries.len(), 2);
-                    assert_eq!(req.entries[0].data.as_ref(), b"hello world");
-                    assert_eq!(req.entries[1].data.as_ref(), b"test data 123");
+                    assert_eq!(req.entries[0].metadata.as_ref(), b"hello world");
+                    assert_eq!(req.entries[1].metadata.as_ref(), b"test data 123");
                 } else {
                     panic!("Expected AppendEntries message");
                 }

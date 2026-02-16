@@ -481,29 +481,44 @@ fn decode_install_snapshot_response(buf: &mut &[u8]) -> CodecResult<InstallSnaps
 }
 
 /// Encodes a log entry.
+///
+/// Wire format: `[term:8][index:8][meta_len:4][metadata:N][payload_len:4][payload:M]`
 fn encode_log_entry(buf: &mut BytesMut, entry: &LogEntry) {
     buf.put_u64_le(entry.term.get());
     buf.put_u64_le(entry.index.get());
-    // Safe cast: entry data size is bounded by message limits which fit in u32.
+    // Safe cast: metadata size is bounded by message limits which fit in u32.
     #[allow(clippy::cast_possible_truncation)]
-    let data_len = entry.data.len() as u32;
-    buf.put_u32_le(data_len);
-    buf.put_slice(&entry.data);
+    let meta_len = entry.metadata.len() as u32;
+    buf.put_u32_le(meta_len);
+    buf.put_slice(&entry.metadata);
+    // Safe cast: payload size is bounded by message limits which fit in u32.
+    #[allow(clippy::cast_possible_truncation)]
+    let payload_len = entry.payload.len() as u32;
+    buf.put_u32_le(payload_len);
+    buf.put_slice(&entry.payload);
 }
 
 /// Decodes a log entry.
+///
+/// Wire format: `[term:8][index:8][meta_len:4][metadata:N][payload_len:4][payload:M]`
 fn decode_log_entry(buf: &mut &[u8]) -> CodecResult<LogEntry> {
-    ensure_remaining(buf, 20)?;
+    ensure_remaining(buf, 24)?;
 
     let term = TermId::new(buf.get_u64_le());
     let index = LogIndex::new(buf.get_u64_le());
-    let data_len = buf.get_u32_le() as usize;
 
-    ensure_remaining(buf, data_len)?;
-    let data = Bytes::copy_from_slice(&buf[..data_len]);
-    buf.advance(data_len);
+    let meta_len = buf.get_u32_le() as usize;
+    ensure_remaining(buf, meta_len)?;
+    let metadata = Bytes::copy_from_slice(&buf[..meta_len]);
+    buf.advance(meta_len);
 
-    Ok(LogEntry::new(term, index, data))
+    ensure_remaining(buf, 4)?;
+    let payload_len = buf.get_u32_le() as usize;
+    ensure_remaining(buf, payload_len)?;
+    let payload = Bytes::copy_from_slice(&buf[..payload_len]);
+    buf.advance(payload_len);
+
+    Ok(LogEntry::new(term, index, metadata, payload))
 }
 
 /// Ensures the buffer has at least `need` bytes remaining.
@@ -1156,8 +1171,8 @@ mod tests {
 
     fn make_append_entries_with_data() -> Message {
         let entries = vec![
-            LogEntry::new(TermId::new(5), LogIndex::new(11), Bytes::from("hello")),
-            LogEntry::new(TermId::new(5), LogIndex::new(12), Bytes::from("world")),
+            LogEntry::new(TermId::new(5), LogIndex::new(11), Bytes::from("hello"), Bytes::new()),
+            LogEntry::new(TermId::new(5), LogIndex::new(12), Bytes::from("world"), Bytes::new()),
         ];
         Message::AppendEntries(AppendEntriesRequest::new(
             TermId::new(5),

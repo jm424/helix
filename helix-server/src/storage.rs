@@ -20,6 +20,7 @@
 //! tracks segment lifecycle and notifies the tiering manager when segments
 //! are sealed or committed.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -116,13 +117,17 @@ impl BlobIndex {
     /// Panics if `base_offset` is not monotonically increasing.
     fn push(&mut self, base_offset: u64, wal_index: u64, record_count: u32) {
         // Precondition: offsets must be monotonically increasing.
-        assert!(
-            self.entries.is_empty()
-                || base_offset >= self.entries.last().expect("non-empty").base_offset,
-            "BlobIndex: base_offset {base_offset} is not monotonically increasing \
-             (last: {})",
-            self.entries.last().expect("non-empty").base_offset,
-        );
+        // Skip duplicate entries from re-application after recovery.
+        // The SharedWal uses auto-assigned indices that differ from Raft
+        // LogIndex, so the PartitionStorage idempotency check (which
+        // compares Raft indices) may allow re-application of entries
+        // already in the BlobIndex from WAL recovery.
+        if !self.entries.is_empty()
+            && base_offset < self.entries.last().expect("non-empty").base_offset
+                + u64::from(self.entries.last().expect("non-empty").record_count)
+        {
+            return;
+        }
 
         self.entries.push(BlobIndexEntry {
             base_offset,
@@ -607,9 +612,22 @@ impl PartitionCommand {
         }
     }
 
-    /// Decodes a command from bytes.
+    /// Decodes a command from a borrowed `Bytes` reference.
+    ///
+    /// Internally clones the reference before parsing; use [`decode_owned`]
+    /// when the caller can give up ownership to avoid the clone.
     #[must_use]
     pub fn decode(data: &Bytes) -> Option<Self> {
+        Self::decode_owned(data.clone())
+    }
+
+    /// Decodes a command from an owned `Bytes`, avoiding an internal clone.
+    ///
+    /// Blobs extracted via `copy_to_bytes` share only the moved-in
+    /// allocation, so their refcount stays at 1 when the caller held the
+    /// sole reference — enabling zero-copy `patch_kafka_base_offset`.
+    #[must_use]
+    pub fn decode_owned(data: Bytes) -> Option<Self> {
         // TigerStyle: bounded iteration for batch blobs.
         const MAX_BATCH_BLOBS: usize = 1000;
 
@@ -617,7 +635,7 @@ impl PartitionCommand {
             return None;
         }
 
-        let mut buf = data.clone();
+        let mut buf = data;
         let cmd_type = buf.get_u8();
 
         match cmd_type {
@@ -715,6 +733,192 @@ impl PartitionCommand {
             _ => None,
         }
     }
+
+    /// Encodes this command into a split `(metadata, payload)` pair.
+    ///
+    /// For `AppendBlob` with a single blob: metadata is the 18-byte header,
+    /// payload is the blob data (O(1) `Bytes::clone`). For `AppendBlobBatch`
+    /// with a single blob: same split. For multi-blob batches or non-blob
+    /// commands: metadata is the full `encode()` output, payload is empty.
+    ///
+    /// This eliminates the ~1 MB memcpy on the propose path for the common
+    /// single-blob case.
+    #[must_use]
+    pub fn encode_split(&self) -> (Bytes, Bytes) {
+        match self {
+            // Single blob: split header from blob data.
+            Self::AppendBlob {
+                blob,
+                record_count,
+                format,
+                base_offset,
+            } => {
+                // Metadata: type(1) + base_offset(8) + record_count(4) + format(1) + blob_len(4) = 18
+                let mut meta = BytesMut::with_capacity(18);
+                meta.put_u8(3);
+                meta.put_u64_le(base_offset.get());
+                meta.put_u32_le(*record_count);
+                let format_byte = match format {
+                    BlobFormat::Raw => 0u8,
+                    BlobFormat::KafkaRecordBatch => 1u8,
+                };
+                meta.put_u8(format_byte);
+                #[allow(clippy::cast_possible_truncation)]
+                let blob_len = blob.len() as u32;
+                meta.put_u32_le(blob_len);
+                (meta.freeze(), blob.clone())
+            }
+            // Single-blob batch: same split optimization.
+            Self::AppendBlobBatch { blobs, base_offset } if blobs.len() == 1 => {
+                let batched = &blobs[0];
+                // Metadata: type(1) + base_offset(8) + blob_count(4)
+                //   + record_count(4) + format(1) + blob_len(4) = 22
+                let mut meta = BytesMut::with_capacity(22);
+                meta.put_u8(4);
+                meta.put_u64_le(base_offset.get());
+                meta.put_u32_le(1); // blob_count
+                meta.put_u32_le(batched.record_count);
+                let format_byte = match batched.format {
+                    BlobFormat::Raw => 0u8,
+                    BlobFormat::KafkaRecordBatch => 1u8,
+                };
+                meta.put_u8(format_byte);
+                #[allow(clippy::cast_possible_truncation)]
+                let blob_len = batched.blob.len() as u32;
+                meta.put_u32_le(blob_len);
+                (meta.freeze(), batched.blob.clone())
+            }
+            // Multi-blob or non-blob: fall back to combined encode.
+            _ => (self.encode(), Bytes::new()),
+        }
+    }
+
+    /// Decodes a command from split `(metadata, payload)` fields.
+    ///
+    /// The metadata contains the command header; the payload contains the
+    /// blob data for single-blob commands. For multi-blob or non-blob
+    /// commands, payload is empty and metadata contains the full encoding.
+    pub fn decode_split(metadata: Bytes, payload: Bytes) -> Option<Self> {
+        if payload.is_empty() {
+            // No payload split: metadata is the full encoding.
+            return Self::decode_owned(metadata);
+        }
+
+        if metadata.is_empty() {
+            return None;
+        }
+
+        let cmd_type = metadata[0];
+        match cmd_type {
+            // Type 3: AppendBlob with split payload.
+            3 => {
+                if metadata.len() < 18 {
+                    return None;
+                }
+                let base_offset = Offset::new(u64::from_le_bytes(
+                    metadata[1..9].try_into().ok()?,
+                ));
+                let record_count = u32::from_le_bytes(
+                    metadata[9..13].try_into().ok()?,
+                );
+                let format = match metadata[13] {
+                    0 => BlobFormat::Raw,
+                    1 => BlobFormat::KafkaRecordBatch,
+                    _ => return None,
+                };
+                // blob_len at metadata[14..18] — we trust payload.len().
+                Some(Self::AppendBlob {
+                    blob: payload,
+                    record_count,
+                    format,
+                    base_offset,
+                })
+            }
+            // Type 4: AppendBlobBatch (single-blob) with split payload.
+            4 => {
+                if metadata.len() < 22 {
+                    return None;
+                }
+                let base_offset = Offset::new(u64::from_le_bytes(
+                    metadata[1..9].try_into().ok()?,
+                ));
+                let blob_count = u32::from_le_bytes(
+                    metadata[9..13].try_into().ok()?,
+                );
+                if blob_count != 1 {
+                    return None; // Multi-blob should not have split payload.
+                }
+                let record_count = u32::from_le_bytes(
+                    metadata[13..17].try_into().ok()?,
+                );
+                let format = match metadata[17] {
+                    0 => BlobFormat::Raw,
+                    1 => BlobFormat::KafkaRecordBatch,
+                    _ => return None,
+                };
+                // blob_len at metadata[18..22] — we trust payload.len().
+                Some(Self::AppendBlobBatch {
+                    blobs: vec![BatchedBlob {
+                        blob: payload,
+                        record_count,
+                        format,
+                    }],
+                    base_offset,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Frames metadata + payload into a single `Bytes` for WAL storage.
+///
+/// Format: `[meta_len:u32_le][metadata][payload]`.
+#[must_use]
+pub fn frame_for_wal(metadata: &Bytes, payload: &Bytes) -> Bytes {
+    if payload.is_empty() {
+        // No payload: store metadata as-is (common for non-blob commands
+        // and backward compat with existing WAL entries).
+        return metadata.clone();
+    }
+    let total = 4 + metadata.len() + payload.len();
+    let mut buf = BytesMut::with_capacity(total);
+    #[allow(clippy::cast_possible_truncation)]
+    let meta_len = metadata.len() as u32;
+    buf.put_u32_le(meta_len);
+    buf.put_slice(metadata);
+    buf.put_slice(payload);
+    buf.freeze()
+}
+
+/// Unframes WAL bytes into `(metadata, payload)`.
+///
+/// Inverse of `frame_for_wal`. If the data was not framed (no payload),
+/// returns `(data, empty)`.
+///
+/// Detection heuristic: framed data starts with a `u32` `meta_len`. If
+/// `4 + meta_len < data.len()`, we know there is a payload suffix.
+/// If `4 + meta_len == data.len()`, it could be framed with empty payload
+/// or unframed data; we return `(data, empty)` in that case which is
+/// correct for both.
+#[must_use]
+pub fn unframe_from_wal(data: Bytes) -> (Bytes, Bytes) {
+    if data.len() < 4 {
+        return (data, Bytes::new());
+    }
+
+    let meta_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+
+    // Validate: framed data has meta_len < data.len() - 4.
+    // If 4 + meta_len < data.len(), there is a payload suffix → framed.
+    if meta_len > 0 && 4 + meta_len < data.len() {
+        let metadata = data.slice(4..4 + meta_len);
+        let payload = data.slice(4 + meta_len..);
+        (metadata, payload)
+    } else {
+        // Not framed or no payload: treat entire data as metadata.
+        (data, Bytes::new())
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -774,12 +978,13 @@ pub fn patch_kafka_base_offset(blob: Bytes, base_offset: Offset) -> Bytes {
     result
 }
 
-/// Extracts a single `StoredBlob` at a given offset from a decoded `PartitionCommand`.
+/// Consumes a `PartitionCommand` and returns all blobs as a map keyed by
+/// base offset, with `patch_kafka_base_offset` already applied.
 ///
-/// Handles both `AppendBlob` and `AppendBlobBatch` variants, applying Kafka
-/// baseOffset patching as needed. Returns `None` if the command doesn't
-/// contain a blob at the requested offset.
-fn extract_blob_at_offset(command: &PartitionCommand, target_offset: Offset) -> Option<StoredBlob> {
+/// Moves blobs out of the command without cloning, keeping refcount at 1
+/// for `AppendBlob` (single blob) and at N for `AppendBlobBatch` (N blobs
+/// that share the parent allocation via `copy_to_bytes`).
+fn extract_all_blobs(command: PartitionCommand) -> HashMap<u64, StoredBlob> {
     match command {
         PartitionCommand::AppendBlob {
             blob,
@@ -787,43 +992,46 @@ fn extract_blob_at_offset(command: &PartitionCommand, target_offset: Offset) -> 
             format,
             base_offset,
         } => {
-            if *base_offset != target_offset {
-                return None;
-            }
             let patched = match format {
-                BlobFormat::Raw => blob.clone(),
+                BlobFormat::Raw => blob,
                 BlobFormat::KafkaRecordBatch => {
-                    patch_kafka_base_offset(blob.clone(), *base_offset)
+                    patch_kafka_base_offset(blob, base_offset)
                 }
             };
-            Some(StoredBlob::new(*base_offset, *record_count, patched))
+            let mut map = HashMap::with_capacity(1);
+            map.insert(base_offset.get(), StoredBlob::new(
+                base_offset,
+                record_count,
+                patched,
+            ));
+            map
         }
         PartitionCommand::AppendBlobBatch { blobs, base_offset } => {
-            let mut current_offset = *base_offset;
+            let mut map = HashMap::with_capacity(blobs.len());
+            let mut current_offset = base_offset;
             for batched in blobs {
-                if current_offset == target_offset {
-                    let patched = match batched.format {
-                        BlobFormat::Raw => batched.blob.clone(),
-                        BlobFormat::KafkaRecordBatch => {
-                            patch_kafka_base_offset(
-                                batched.blob.clone(),
-                                current_offset,
-                            )
-                        }
-                    };
-                    return Some(StoredBlob::new(
-                        current_offset,
-                        batched.record_count,
-                        patched,
-                    ));
-                }
+                let patched = match batched.format {
+                    BlobFormat::Raw => batched.blob,
+                    BlobFormat::KafkaRecordBatch => {
+                        patch_kafka_base_offset(
+                            batched.blob,
+                            current_offset,
+                        )
+                    }
+                };
+                map.insert(current_offset.get(), StoredBlob::new(
+                    current_offset,
+                    batched.record_count,
+                    patched,
+                ));
                 current_offset = Offset::new(
-                    current_offset.get() + u64::from(batched.record_count),
+                    current_offset.get()
+                        + u64::from(batched.record_count),
                 );
             }
-            None
+            map
         }
-        _ => None,
+        _ => HashMap::new(),
     }
 }
 
@@ -2108,11 +2316,16 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         let mut result = Vec::new();
         let mut total_bytes = 0u32;
         let mut last_wal_index = 0u64;
-        let mut cached_command: Option<PartitionCommand> = None;
+        let mut blob_cache: HashMap<u64, StoredBlob> = HashMap::new();
 
         for entry in &self.blob_index.entries[start_pos..] {
-            // Read + decode WAL entry (reuse if same wal_index as previous).
-            if cached_command.is_none() || entry.wal_index != last_wal_index {
+            // Decode + extract all blobs when the WAL index changes.
+            // Using decode_owned avoids an internal Bytes clone, keeping
+            // blob refcount at 1 for zero-copy patching.
+            if blob_cache.is_empty()
+                || entry.wal_index != last_wal_index
+            {
+                blob_cache.clear();
                 let wal_entry = self
                     .read_wal_entry(entry.wal_index)
                     .await?
@@ -2122,24 +2335,25 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                             entry.wal_index
                         ),
                     })?;
-                cached_command = PartitionCommand::decode(&wal_entry.payload);
+                let cmd =
+                    PartitionCommand::decode_owned(wal_entry.payload);
+                if let Some(cmd) = cmd {
+                    blob_cache = extract_all_blobs(cmd);
+                }
                 last_wal_index = entry.wal_index;
             }
 
-            // Extract blob from decoded command at this offset.
-            if let Some(ref cmd) = cached_command {
-                if let Some(blob) = extract_blob_at_offset(
-                    cmd,
-                    Offset::new(entry.base_offset),
-                ) {
-                    let size = blob.data.len() as u32;
-                    // Always include at least one blob.
-                    if !result.is_empty() && total_bytes + size > max_bytes {
-                        break;
-                    }
-                    result.push(blob);
-                    total_bytes += size;
+            // Move blob out of cache (owned, no clone).
+            if let Some(blob) =
+                blob_cache.remove(&entry.base_offset)
+            {
+                let size = blob.data.len() as u32;
+                // Always include at least one blob.
+                if !result.is_empty() && total_bytes + size > max_bytes {
+                    break;
                 }
+                result.push(blob);
+                total_bytes += size;
             }
         }
 

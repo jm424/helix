@@ -186,8 +186,11 @@ fn encode_raft_message(msg: &Message) -> Vec<u8> {
             for entry in &req.entries {
                 buf.extend(&entry.index.get().to_le_bytes());
                 buf.extend(&entry.term.get().to_le_bytes());
-                buf.extend(&(entry.data.len() as u32).to_le_bytes());
-                buf.extend(&entry.data);
+                // Combine metadata+payload for test wire format.
+                let combined_len = entry.metadata.len() + entry.payload.len();
+                buf.extend(&(combined_len as u32).to_le_bytes());
+                buf.extend(&entry.metadata);
+                buf.extend(&entry.payload);
             }
         }
         Message::AppendEntriesResponse(resp) => {
@@ -350,7 +353,7 @@ fn decode_raft_message(payload: &[u8]) -> Option<(Message, usize)> {
                 }
                 let data = Bytes::copy_from_slice(&payload[offset..offset + data_len]);
                 offset += data_len;
-                entries.push(LogEntry::new(entry_term, index, data));
+                entries.push(LogEntry::new(entry_term, index, data, Bytes::new()));
             }
             Some((
                 Message::AppendEntries(AppendEntriesRequest::new(

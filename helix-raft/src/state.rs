@@ -90,8 +90,10 @@ pub enum RaftOutput {
         index: LogIndex,
         /// The Raft term of the committed entry.
         term: TermId,
-        /// The data payload of the committed entry.
-        data: Bytes,
+        /// Command header of the committed entry.
+        metadata: Bytes,
+        /// Blob payload of the committed entry (empty for non-blob commands).
+        payload: Bytes,
     },
     /// This node became leader.
     BecameLeader,
@@ -665,7 +667,7 @@ impl RaftNode {
 
         // Append entry to our log.
         let index = LogIndex::new(self.log.last_index().get() + 1);
-        let entry = LogEntry::new(self.current_term, index, request.data);
+        let entry = LogEntry::new(self.current_term, index, request.metadata, request.payload);
         self.log.append(entry);
 
         // Postcondition: log grew by exactly one entry.
@@ -997,7 +999,7 @@ impl RaftNode {
         // This is a standard Raft optimization implemented by Kafka KRaft
         // (LeaderChangeMessage) and Redpanda (replicate_config_as_new_leader).
         let noop_index = LogIndex::new(self.log.last_index().get() + 1);
-        let noop_entry = LogEntry::new(self.current_term, noop_index, Bytes::new());
+        let noop_entry = LogEntry::new(self.current_term, noop_index, Bytes::new(), Bytes::new());
         self.log.append(noop_entry);
 
         // Send AppendEntries (with no-op) to all peers.
@@ -1789,13 +1791,15 @@ impl RaftNode {
                     index = idx.get(),
                     entry_term = entry.term.get(),
                     current_term = self.current_term.get(),
-                    data_len = entry.data.len(),
+                    metadata_len = entry.metadata.len(),
+                    payload_len = entry.payload.len(),
                     "RAFT_COMMIT_EMIT: emitting CommitEntry"
                 );
                 outputs.push(RaftOutput::CommitEntry {
                     index: idx,
                     term: entry.term,
-                    data: entry.data.clone(),
+                    metadata: entry.metadata.clone(),
+                    payload: entry.payload.clone(),
                 });
             }
             self.last_applied = idx;
@@ -2060,7 +2064,7 @@ mod tests {
 
         // Send client request.
         // Note: log already has 1 entry (no-op from leader election).
-        let request = ClientRequest::new(Bytes::from("test command"));
+        let request = ClientRequest::new(Bytes::from("test command"), Bytes::new());
         let outputs = node.handle_client_request(request);
 
         assert!(outputs.is_some());
@@ -2105,7 +2109,7 @@ mod tests {
 
         // Client request should commit immediately.
         // Note: no-op at index 1 is already committed, client request at index 2.
-        let request = ClientRequest::new(Bytes::from("test"));
+        let request = ClientRequest::new(Bytes::from("test"), Bytes::new());
         let outputs = node.handle_client_request(request).unwrap();
 
         assert!(outputs
@@ -2152,7 +2156,7 @@ mod tests {
 
         // Add many entries to the log.
         for i in 0..10 {
-            let request = ClientRequest::new(Bytes::from(format!("entry {i}")));
+            let request = ClientRequest::new(Bytes::from(format!("entry {i}")), Bytes::new());
             node.handle_client_request(request);
         }
 
@@ -2229,7 +2233,7 @@ mod tests {
 
         // Add entries.
         for i in 0..5 {
-            let request = ClientRequest::new(Bytes::from(format!("entry {i}")));
+            let request = ClientRequest::new(Bytes::from(format!("entry {i}")), Bytes::new());
             node.handle_client_request(request);
         }
 
@@ -2272,7 +2276,7 @@ mod tests {
 
         // Add entries.
         for i in 0..3 {
-            let request = ClientRequest::new(Bytes::from(format!("entry {i}")));
+            let request = ClientRequest::new(Bytes::from(format!("entry {i}")), Bytes::new());
             node.handle_client_request(request);
         }
 
@@ -2301,7 +2305,7 @@ mod tests {
 
         // Add entries.
         for i in 0..5 {
-            let request = ClientRequest::new(Bytes::from(format!("entry {i}")));
+            let request = ClientRequest::new(Bytes::from(format!("entry {i}")), Bytes::new());
             node.handle_client_request(request);
         }
 
@@ -2445,6 +2449,7 @@ mod tests {
             TermId::new(4),
             LogIndex::new(11),
             Bytes::from("new-entry"),
+            Bytes::new(),
         )];
         let req = AppendEntriesRequest::new(
             TermId::new(4),
@@ -2563,8 +2568,8 @@ mod tests {
 
         // Provide entries as if read from WAL.
         let entries = vec![
-            LogEntry::new(TermId::new(3), LogIndex::new(5), Bytes::from("cmd-5")),
-            LogEntry::new(TermId::new(3), LogIndex::new(6), Bytes::from("cmd-6")),
+            LogEntry::new(TermId::new(3), LogIndex::new(5), Bytes::from("cmd-5"), Bytes::new()),
+            LogEntry::new(TermId::new(3), LogIndex::new(6), Bytes::from("cmd-6"), Bytes::new()),
         ];
 
         let outputs = node.provide_entries(
@@ -2628,7 +2633,7 @@ mod tests {
             peer,
             LogIndex::new(4),
             TermId::new(3),
-            vec![LogEntry::new(TermId::new(3), LogIndex::new(5), Bytes::from("cmd"))],
+            vec![LogEntry::new(TermId::new(3), LogIndex::new(5), Bytes::from("cmd"), Bytes::new())],
         );
 
         assert!(
@@ -2676,7 +2681,7 @@ mod tests {
             NodeId::new(2), // us
             LogIndex::new(10),
             TermId::new(3),
-            vec![LogEntry::new(TermId::new(4), LogIndex::new(11), Bytes::from("data"))],
+            vec![LogEntry::new(TermId::new(4), LogIndex::new(11), Bytes::from("data"), Bytes::new())],
             LogIndex::new(10),
         );
 
@@ -2778,7 +2783,7 @@ mod tests {
         // Propose entries.
         for i in 0..entry_count {
             let data = Bytes::from(format!("entry-{i}"));
-            node.handle_client_request(ClientRequest::new(data));
+            node.handle_client_request(ClientRequest::new(data, Bytes::new()));
         }
 
         // Ack from peer to commit (quorum = 2 in a 3-node cluster).
@@ -2849,7 +2854,7 @@ mod tests {
         // Propose 20 entries.
         for i in 0..20 {
             let data = Bytes::from(format!("entry-{i}"));
-            node.handle_client_request(ClientRequest::new(data));
+            node.handle_client_request(ClientRequest::new(data, Bytes::new()));
         }
 
         // Peer2 has caught up to index 21, peer3 only to index 10.
@@ -2898,7 +2903,7 @@ mod tests {
         // Propose 30 entries.
         for i in 0..30 {
             let data = Bytes::from(format!("entry-{i}"));
-            node.handle_client_request(ClientRequest::new(data));
+            node.handle_client_request(ClientRequest::new(data, Bytes::new()));
         }
 
         // Peer2 fully caught up, peer3 stuck at index 2 (very lagging).
@@ -2961,6 +2966,7 @@ mod tests {
                 term,
                 LogIndex::new(i),
                 Bytes::from(format!("data-{i}")),
+                Bytes::new(),
             ));
         }
 
@@ -3070,6 +3076,7 @@ mod tests {
                     TermId::new(1),
                     LogIndex::new(i),
                     Bytes::from(format!("wal-{i}")),
+                    Bytes::new(),
                 )
             })
             .collect();

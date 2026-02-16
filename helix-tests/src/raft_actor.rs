@@ -291,11 +291,16 @@ fn serialize_message(msg: &Message) -> Vec<u8> {
             for entry in &req.entries {
                 buf.extend_from_slice(&entry.term.get().to_le_bytes());
                 buf.extend_from_slice(&entry.index.get().to_le_bytes());
-                // Safe cast: entry data size is bounded by message limits which fit in u32.
+                // Encode metadata + payload as a framed field: [meta_len:4][metadata][payload].
                 #[allow(clippy::cast_possible_truncation)]
-                let data_len = entry.data.len() as u32;
-                buf.extend_from_slice(&data_len.to_le_bytes());
-                buf.extend_from_slice(&entry.data);
+                let meta_len = entry.metadata.len() as u32;
+                let total_len = 4 + entry.metadata.len() + entry.payload.len();
+                #[allow(clippy::cast_possible_truncation)]
+                let total_len_u32 = total_len as u32;
+                buf.extend_from_slice(&total_len_u32.to_le_bytes());
+                buf.extend_from_slice(&meta_len.to_le_bytes());
+                buf.extend_from_slice(&entry.metadata);
+                buf.extend_from_slice(&entry.payload);
             }
         }
         Message::AppendEntriesResponse(resp) => {
@@ -445,9 +450,16 @@ fn deserialize_append_entries(data: &[u8]) -> Option<Message> {
         if offset + data_len > data.len() {
             return None;
         }
-        let entry_data = Bytes::copy_from_slice(&data[offset..offset + data_len]);
+        // Unframe: [meta_len:4][metadata][payload].
+        if data_len < 4 || offset + data_len > data.len() {
+            return None;
+        }
+        let framed = &data[offset..offset + data_len];
+        let meta_len = u32::from_le_bytes([framed[0], framed[1], framed[2], framed[3]]) as usize;
+        let metadata = Bytes::copy_from_slice(&framed[4..4 + meta_len]);
+        let payload = Bytes::copy_from_slice(&framed[4 + meta_len..]);
         offset += data_len;
-        entries.push(LogEntry::new(entry_term, entry_index, entry_data));
+        entries.push(LogEntry::new(entry_term, entry_index, metadata, payload));
     }
 
     Some(Message::AppendEntries(AppendEntriesRequest::new(
@@ -695,7 +707,7 @@ impl RaftActor {
     ///
     /// Returns outputs to process if this node is the leader, None otherwise.
     pub fn submit_request(&mut self, data: Bytes, ctx: &mut SimulationContext) -> bool {
-        let request = ClientRequest::new(data);
+        let request = ClientRequest::new(data, Bytes::new());
         self.node
             .handle_client_request(request)
             .is_some_and(|outputs| {
@@ -711,13 +723,14 @@ impl RaftActor {
                 RaftOutput::SendMessage(msg) => {
                     self.send_raft_message(&msg, ctx);
                 }
-                RaftOutput::CommitEntry { index, data, .. } => {
+                RaftOutput::CommitEntry { index, metadata, .. } => {
                     // Record applied entry for StateMachineSafety verification.
-                    self.record_applied_entry(index, &data);
+                    // Non-blob commands: metadata is the full data.
+                    self.record_applied_entry(index, &metadata);
                     debug!(
                         actor = %self.name,
                         index = index.get(),
-                        data_len = data.len(),
+                        data_len = metadata.len(),
                         "committed entry"
                     );
                 }
@@ -908,7 +921,7 @@ impl SimulatedActor for RaftActor {
 
             EventKind::Custom { name, data, .. } => {
                 if name == custom_events::CLIENT_REQUEST {
-                    let request = ClientRequest::new(Bytes::from(data));
+                    let request = ClientRequest::new(Bytes::from(data), Bytes::new());
                     if let Some(outputs) = self.node.handle_client_request(request) {
                         self.process_outputs(outputs, ctx);
                         debug!(actor = %self.name, "accepted client request");
@@ -1051,8 +1064,8 @@ mod tests {
             LogIndex::new(5),
             TermId::new(2),
             vec![
-                LogEntry::new(TermId::new(3), LogIndex::new(6), Bytes::from("cmd1")),
-                LogEntry::new(TermId::new(3), LogIndex::new(7), Bytes::from("cmd2")),
+                LogEntry::new(TermId::new(3), LogIndex::new(6), Bytes::from("cmd1"), Bytes::new()),
+                LogEntry::new(TermId::new(3), LogIndex::new(7), Bytes::from("cmd2"), Bytes::new()),
             ],
             LogIndex::new(4),
         ));

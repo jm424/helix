@@ -242,9 +242,21 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                         group_id: gid,
                         index,
                         term,
-                        data: entry_data,
+                        metadata,
+                        payload,
                     } = output
                     {
+                        // Reconstitute data (single-node legacy path).
+                        let entry_data = if payload.is_empty() {
+                            metadata.clone()
+                        } else {
+                            let mut buf = bytes::BytesMut::with_capacity(
+                                metadata.len() + payload.len(),
+                            );
+                            buf.extend_from_slice(metadata);
+                            buf.extend_from_slice(payload);
+                            buf.freeze()
+                        };
                         info!(
                             commit_group_id = gid.get(),
                             expected_group_id = group_id.get(),
@@ -259,7 +271,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                             };
                             if let Some(ps_lock) = ps_lock {
                                 let mut ps = ps_lock.write().await;
-                                ps.apply_entry_async(*index, *term, entry_data)
+                                ps.apply_entry_async(*index, *term, &entry_data)
                                     .await
                                     .map_err(|e| ServerError::Internal {
                                         message: format!("failed to apply: {e}"),
@@ -640,9 +652,21 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                         group_id: gid,
                         index,
                         term,
-                        data: entry_data,
+                        metadata,
+                        payload,
                     } = output
                     {
+                        // Reconstitute data (single-node legacy path).
+                        let entry_data = if payload.is_empty() {
+                            metadata.clone()
+                        } else {
+                            let mut buf = bytes::BytesMut::with_capacity(
+                                metadata.len() + payload.len(),
+                            );
+                            buf.extend_from_slice(metadata);
+                            buf.extend_from_slice(payload);
+                            buf.freeze()
+                        };
                         if *gid == group_id {
                             let ps_lock = {
                                 let storage = self.partition_storage.read().await;
@@ -650,7 +674,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                             };
                             if let Some(ps_lock) = ps_lock {
                                 let mut ps = ps_lock.write().await;
-                                ps.apply_entry_async(*index, *term, entry_data)
+                                ps.apply_entry_async(*index, *term, &entry_data)
                                     .await
                                     .map_err(|e| ServerError::Internal {
                                         message: format!("failed to apply: {e}"),

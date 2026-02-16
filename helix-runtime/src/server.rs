@@ -338,7 +338,7 @@ impl RaftServer {
         }
 
         // Create client request.
-        let request = ClientRequest::new(data);
+        let request = ClientRequest::new(data, Bytes::new());
 
         // Handle the request.
         if let Some(outputs) = self.node.handle_client_request(request) {
@@ -386,8 +386,18 @@ impl RaftServer {
                     message,
                 });
             }
-            RaftOutput::CommitEntry { index, data, .. } => {
+            RaftOutput::CommitEntry { index, metadata, payload, .. } => {
                 info!(index = index.get(), "Entry committed");
+
+                // Reconstitute data for event (non-hot path).
+                let data = if payload.is_empty() {
+                    metadata.clone()
+                } else {
+                    let mut buf = bytes::BytesMut::with_capacity(metadata.len() + payload.len());
+                    buf.extend_from_slice(&metadata);
+                    buf.extend_from_slice(&payload);
+                    buf.freeze()
+                };
 
                 // Send event.
                 let _ = self
@@ -438,7 +448,16 @@ impl RaftServer {
             RaftOutput::SendMessage(_message) => {
                 // Messages are handled separately.
             }
-            RaftOutput::CommitEntry { index, data, .. } => {
+            RaftOutput::CommitEntry { index, metadata, payload, .. } => {
+                // Reconstitute data for event (non-hot path).
+                let data = if payload.is_empty() {
+                    metadata
+                } else {
+                    let mut buf = bytes::BytesMut::with_capacity(metadata.len() + payload.len());
+                    buf.extend_from_slice(&metadata);
+                    buf.extend_from_slice(&payload);
+                    buf.freeze()
+                };
                 let _ = events.send(ServerEvent::Committed { index, data }).await;
             }
             RaftOutput::BecameLeader => {

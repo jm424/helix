@@ -428,6 +428,7 @@ mod tests {
             TermId::new(term),
             LogIndex::new(index),
             Bytes::from(format!("entry-{index}")),
+            Bytes::new(),
         )
     }
 

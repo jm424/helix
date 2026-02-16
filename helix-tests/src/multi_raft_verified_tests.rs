@@ -712,10 +712,11 @@ impl VerifiedMultiRaftActor {
                 MultiRaftOutput::CommitEntry {
                     group_id,
                     index,
-                    data,
+                    metadata,
                     ..
                 } => {
-                    self.record_applied(group_id, index, &data);
+                    // Non-blob commands: metadata is the full data.
+                    self.record_applied(group_id, index, &metadata);
                 }
                 MultiRaftOutput::BecameLeader { .. } | MultiRaftOutput::SteppedDown { .. } => {
                     // State change - will be captured in report_state.
@@ -1077,9 +1078,10 @@ fn serialize_message_to(buf: &mut Vec<u8>, msg: &Message) {
                 buf.extend_from_slice(&entry.term.get().to_le_bytes());
                 buf.extend_from_slice(&entry.index.get().to_le_bytes());
                 #[allow(clippy::cast_possible_truncation)]
-                let data_len = entry.data.len() as u32;
+                let data_len = (entry.metadata.len() + entry.payload.len()) as u32;
                 buf.extend_from_slice(&data_len.to_le_bytes());
-                buf.extend_from_slice(&entry.data);
+                buf.extend_from_slice(&entry.metadata);
+                buf.extend_from_slice(&entry.payload);
             }
         }
         Message::AppendEntriesResponse(resp) => {
@@ -1286,7 +1288,7 @@ fn deserialize_message_with_len(payload: &[u8]) -> Option<(Message, usize)> {
                 }
                 let data = Bytes::copy_from_slice(&payload[offset..offset + data_len]);
                 offset += data_len;
-                entries.push(LogEntry::new(entry_term, entry_index, data));
+                entries.push(LogEntry::new(entry_term, entry_index, data, Bytes::new()));
             }
 
             Some((

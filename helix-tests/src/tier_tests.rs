@@ -1,3 +1,9 @@
+// TokioStorage tests require a real tokio reactor for tokio::fs.
+// madsim-tokio does not simulate tokio::fs (re-exports real tokio::fs),
+// so these tests cannot run under the madsim deterministic runtime.
+// Same pattern as server_tests.rs and shared_wal_integration_tests.rs.
+#![cfg(not(madsim))]
+
 //! Tiered storage simulation tests.
 //!
 //! These tests verify tiering correctness under fault conditions using

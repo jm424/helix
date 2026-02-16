@@ -152,11 +152,23 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                 group_id: gid,
                 index,
                 term,
-                data: entry_data,
+                metadata,
+                payload,
             } = output
             {
                 if *gid == group_id && *index == proposed_index {
-                    committed_entry_data = Some((entry_data.clone(), *term));
+                    // Reconstitute data (single-node legacy path).
+                    let entry_data = if payload.is_empty() {
+                        metadata.clone()
+                    } else {
+                        let mut buf = bytes::BytesMut::with_capacity(
+                            metadata.len() + payload.len(),
+                        );
+                        buf.extend_from_slice(metadata);
+                        buf.extend_from_slice(payload);
+                        buf.freeze()
+                    };
+                    committed_entry_data = Some((entry_data, *term));
                 }
             }
         }

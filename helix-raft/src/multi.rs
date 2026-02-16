@@ -94,8 +94,10 @@ pub enum MultiRaftOutput {
         index: LogIndex,
         /// The Raft term of the committed entry.
         term: TermId,
-        /// The committed data.
-        data: Bytes,
+        /// Command header of the committed entry.
+        metadata: Bytes,
+        /// Blob payload of the committed entry (empty for non-blob commands).
+        payload: Bytes,
     },
     /// A group elected a new leader (this node).
     BecameLeader {
@@ -502,7 +504,7 @@ impl MultiRaft {
     pub fn propose(&mut self, group_id: GroupId, data: Bytes) -> Option<Vec<MultiRaftOutput>> {
         let info = self.groups.get_mut(&group_id)?;
 
-        let request = ClientRequest::new(data);
+        let request = ClientRequest::new(data, Bytes::new());
         let outputs = info.node.handle_client_request(request)?;
         Some(self.process_outputs(group_id, outputs))
     }
@@ -522,7 +524,7 @@ impl MultiRaft {
         // Get the index that will be assigned to the new entry.
         let proposed_index = LogIndex::new(info.node.log().last_index().get() + 1);
 
-        let request = ClientRequest::new(data);
+        let request = ClientRequest::new(data, Bytes::new());
         let outputs = info.node.handle_client_request(request)?;
 
         Some((self.process_outputs(group_id, outputs), proposed_index))
@@ -658,12 +660,13 @@ impl MultiRaft {
                         result.push(MultiRaftOutput::SendMessages { to: dest, messages });
                     }
                 }
-                RaftOutput::CommitEntry { index, term, data } => {
+                RaftOutput::CommitEntry { index, term, metadata, payload } => {
                     result.push(MultiRaftOutput::CommitEntry {
                         group_id,
                         index,
                         term,
-                        data,
+                        metadata,
+                        payload,
                     });
                 }
                 RaftOutput::BecameLeader => {

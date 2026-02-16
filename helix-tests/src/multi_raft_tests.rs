@@ -423,9 +423,10 @@ fn serialize_message_to(buf: &mut Vec<u8>, msg: &Message) {
                 buf.extend_from_slice(&entry.index.get().to_le_bytes());
                 // Safe cast: data length is bounded.
                 #[allow(clippy::cast_possible_truncation)]
-                let data_len = entry.data.len() as u32;
+                let data_len = (entry.metadata.len() + entry.payload.len()) as u32;
                 buf.extend_from_slice(&data_len.to_le_bytes());
-                buf.extend_from_slice(&entry.data);
+                buf.extend_from_slice(&entry.metadata);
+                buf.extend_from_slice(&entry.payload);
             }
         }
         Message::AppendEntriesResponse(resp) => {
@@ -638,7 +639,7 @@ fn deserialize_message_with_len(payload: &[u8]) -> Option<(Message, usize)> {
                 }
                 let data = Bytes::copy_from_slice(&payload[offset..offset + data_len]);
                 offset += data_len;
-                entries.push(LogEntry::new(entry_term, entry_index, data));
+                entries.push(LogEntry::new(entry_term, entry_index, data, Bytes::new()));
             }
 
             Some((

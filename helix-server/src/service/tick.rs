@@ -375,7 +375,7 @@ pub async fn process_controller_outputs<
             MultiRaftOutput::CommitEntry {
                 group_id,
                 index,
-                data,
+                metadata,
                 ..
             } => {
                 // Only process controller partition commits.
@@ -384,7 +384,8 @@ pub async fn process_controller_outputs<
                     continue;
                 }
 
-                let Some(cmd) = ControllerCommand::decode(data) else {
+                // Controller commands are non-blob; metadata is the full command.
+                let Some(cmd) = ControllerCommand::decode(metadata) else {
                     warn!(index = index.get(), "Failed to decode controller command");
                     continue;
                 };
@@ -645,7 +646,7 @@ pub async fn process_controller_outputs<
             if let MultiRaftOutput::CommitEntry {
                 group_id,
                 index,
-                data,
+                metadata,
                 ..
             } = output
             {
@@ -653,7 +654,8 @@ pub async fn process_controller_outputs<
                     continue;
                 }
 
-                let Some(cmd) = ControllerCommand::decode(data) else {
+                // Controller commands are non-blob; metadata is the full command.
+                let Some(cmd) = ControllerCommand::decode(metadata) else {
                     warn!(
                         index = index.get(),
                         "Failed to decode follow-up controller command"
@@ -947,8 +949,21 @@ async fn process_outputs<S: Storage + Clone + Send + Sync + 'static>(
                 group_id,
                 index,
                 term,
-                data,
+                metadata,
+                payload,
             } => {
+                // Reconstitute data from metadata+payload (legacy non-actor path).
+                let data = if payload.is_empty() {
+                    metadata.clone()
+                } else {
+                    let mut buf = bytes::BytesMut::with_capacity(
+                        metadata.len() + payload.len(),
+                    );
+                    buf.extend_from_slice(metadata);
+                    buf.extend_from_slice(payload);
+                    buf.freeze()
+                };
+
                 let key = {
                     let gm = group_map.read().await;
                     gm.get_key(*group_id)
@@ -975,7 +990,7 @@ async fn process_outputs<S: Storage + Clone + Send + Sync + 'static>(
                     };
                     if let Some(ps_lock) = ps_lock {
                         let mut ps = ps_lock.write().await;
-                        match ps.apply_entry_async(*index, *term, data).await {
+                        match ps.apply_entry_async(*index, *term, &data).await {
                             Ok(offset) => Ok(offset),
                             Err(e) => {
                                 warn!(
@@ -1002,7 +1017,7 @@ async fn process_outputs<S: Storage + Clone + Send + Sync + 'static>(
                 // Critical for PREVIOUS_TERM entries on new leader.
                 if apply_result.is_ok() {
                     extract_and_record_producer_state(
-                        data,
+                        &data,
                         base_offset,
                         *group_id,
                         partition_storage,

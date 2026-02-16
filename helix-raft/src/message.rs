@@ -337,17 +337,23 @@ impl AppendEntriesResponse {
 }
 
 /// Client request to the Raft cluster.
+///
+/// Split into `metadata` (command header) and `payload` (blob data) to
+/// avoid copying large blobs on the propose path. Non-blob commands use
+/// metadata only with an empty payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientRequest {
-    /// The command data to replicate.
-    pub data: Bytes,
+    /// Command header (type, offsets, counts, per-blob headers).
+    pub metadata: Bytes,
+    /// Blob data (empty for non-blob commands).
+    pub payload: Bytes,
 }
 
 impl ClientRequest {
-    /// Creates a new client request.
+    /// Creates a new client request with metadata and payload.
     #[must_use]
-    pub const fn new(data: Bytes) -> Self {
-        Self { data }
+    pub const fn new(metadata: Bytes, payload: Bytes) -> Self {
+        Self { metadata, payload }
     }
 }
 
@@ -528,7 +534,7 @@ mod tests {
 
     #[test]
     fn test_append_entries_with_entries() {
-        let entry = LogEntry::new(TermId::new(1), LogIndex::new(1), Bytes::from("test"));
+        let entry = LogEntry::new(TermId::new(1), LogIndex::new(1), Bytes::from("test"), Bytes::new());
         let req = AppendEntriesRequest::new(
             TermId::new(1),
             NodeId::new(1),

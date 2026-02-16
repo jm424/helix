@@ -137,16 +137,21 @@ pub async fn output_processor_task<
             PartitionOutput::EntryCommitted {
                 index,
                 term,
-                data,
+                metadata,
+                payload,
                 batch_notify,
             } => {
-                info!(
-                    group = group_id.get(),
-                    index = index.get(),
-                    term = term.get(),
-                    batch_notify_present = batch_notify.is_some(),
-                    "Output processor received EntryCommitted"
-                );
+                // Reconstitute data from metadata+payload for downstream.
+                let data = if payload.is_empty() {
+                    metadata
+                } else {
+                    let mut buf = bytes::BytesMut::with_capacity(
+                        metadata.len() + payload.len(),
+                    );
+                    buf.extend_from_slice(&metadata);
+                    buf.extend_from_slice(&payload);
+                    buf.freeze()
+                };
                 handle_entry_committed(
                     group_id,
                     index,
@@ -340,12 +345,15 @@ async fn handle_need_wal_entries<S: Storage + Clone + Send + Sync + 'static>(
     }
 
     // Convert WAL entries to LogEntry format.
+    // Data WAL stores the full encoded command; put it all in metadata
+    // (payload is empty since we don't split at the WAL level).
     let log_entries: Vec<helix_raft::LogEntry> = wal_entries
         .into_iter()
         .map(|e| helix_raft::LogEntry {
             term: TermId::new(e.term()),
             index: LogIndex::new(e.index()),
-            data: bytes::Bytes::copy_from_slice(&e.payload),
+            metadata: bytes::Bytes::copy_from_slice(&e.payload),
+            payload: bytes::Bytes::new(),
         })
         .collect();
 
@@ -937,7 +945,8 @@ mod tests {
             output: PartitionOutput::EntryCommitted {
                 index: LogIndex::new(1),
                 term: TermId::new(1),
-                data: Bytes::from("test data"),
+                metadata: Bytes::from("test data"),
+                payload: Bytes::new(),
                 batch_notify: None,
             },
         };
@@ -1048,7 +1057,8 @@ mod tests {
             output: PartitionOutput::EntryCommitted {
                 index,
                 term: TermId::new(1),
-                data,
+                metadata: data,
+                payload: Bytes::new(),
                 batch_notify: None,
             },
         };
