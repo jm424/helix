@@ -49,6 +49,14 @@ const READ_BUFFER_SIZE: usize = 1024 * 1024;
 /// Connection timeout in milliseconds.
 const CONNECT_TIMEOUT_MS: u64 = 5000;
 
+/// TCP keepalive interval in seconds.
+///
+/// Detects half-open connections when a peer pod restarts. Without this,
+/// the kernel buffers writes to the dead IP for up to 2 hours (default
+/// TCP keepalive timeout), so the sender_loop never discovers the broken
+/// connection and Raft heartbeats silently fail.
+const TCP_KEEPALIVE_SECS: u64 = 5;
+
 /// Maximum pending messages per peer.
 const MAX_PENDING_MESSAGES: usize = 1000;
 
@@ -650,6 +658,21 @@ impl Transport {
             Ok(Ok(stream)) => {
                 // Disable Nagle's algorithm for lower latency.
                 stream.set_nodelay(true)?;
+
+                // Enable TCP keepalive to detect half-open connections.
+                // When a peer pod restarts, the old TCP connection becomes
+                // half-open: writes succeed (kernel buffers them) but data
+                // never reaches the peer. Without keepalive, this persists
+                // for ~2 hours. With a 5s interval, the OS detects the dead
+                // connection within ~15s and the sender_loop reconnects.
+                let sock = socket2::SockRef::from(&stream);
+                let keepalive = socket2::TcpKeepalive::new()
+                    .with_time(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS))
+                    .with_interval(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS));
+                if let Err(e) = sock.set_tcp_keepalive(&keepalive) {
+                    warn!(peer_id = peer_id.get(), error = %e, "Failed to set TCP keepalive");
+                }
+
                 Ok(stream)
             }
             Ok(Err(e)) => Err(TransportError::ConnectFailed {
