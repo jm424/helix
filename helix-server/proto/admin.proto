@@ -6,6 +6,9 @@ package kafkaadmin;
 // Implements the kafkaadmin.Resources API for creating, describing, and
 // deleting topics. Runs on port 8090 alongside the primary Kafka protocol
 // server.
+//
+// Field numbers and types match resources.proto and common.proto
+// for wire compatibility with external admin tooling.
 service Resources {
   rpc CreateTopic(CreateTopicRequest) returns (CreateTopicResponse);
   rpc DescribeTopic(DescribeTopicRequest) returns (DescribeTopicResponse);
@@ -17,6 +20,9 @@ service Resources {
   rpc GetHealth(GetHealthRequest) returns (GetHealthResponse);
   rpc GetTopicState(GetTopicStateRequest) returns (GetTopicStateResponse);
   rpc GetTopicStates(GetTopicStatesRequest) returns (GetTopicStatesResponse);
+  rpc ListUsableBrokerIds(ListUsableBrokerIdsRequest) returns (ListUsableBrokerIdsResponse);
+  rpc ListTopicConfigs(ListTopicConfigsRequest) returns (ListTopicConfigsResponse);
+  rpc UpdateTopicConfig(UpdateTopicConfigRequest) returns (UpdateTopicConfigResponse);
 }
 
 message CreateTopicRequest {
@@ -70,12 +76,13 @@ message ListTopicsResponse {
   repeated string topic_names = 1;
 }
 
-// Simplified TopicConfig inlined from kafka.TopicConfig (common.proto).
-// Field numbers match the real proto for wire compatibility.
+// TopicConfig matches kafka.TopicConfig from common.proto for wire compatibility.
+// Field numbers match the real proto.
 message TopicConfig {
-  int32 partition_count = 1;
-  int32 replication_factor = 2;
-  map<string, string> config = 3;
+  uint64 retention_ms = 1;
+  int32 partitions = 2;
+  int32 replication_factor = 3;
+  map<string, string> config = 4;
 }
 
 message TopicDescription {
@@ -90,23 +97,18 @@ message DescribeTopicsResponse {
   map<string, TopicDescription> topics = 1;
 }
 
-message BrokersUp {
-  int32 total = 1;
-  int32 up = 2;
-}
-
 message GetHealthRequest {}
 message GetHealthResponse {
   bool is_healthy = 1;
-  map<string, BrokersUp> brokers_up = 2;
+  map<string, bool> brokers_up = 2;
 }
 
+// TopicState matches the real resources.proto for wire compatibility.
 message TopicState {
-  int32 partition_count = 1;
-  bool is_optimally_placed = 2;
-  bool spans_usable_brokers = 3;
-  bool has_out_of_sync_replicas = 4;
-  bool has_under_replicated_partitions = 5;
+  bool is_optimally_placed = 1;
+  bool spans_usable_brokers = 2;
+  bool uses_non_usable_brokers = 3;
+  int32 broker_aligned_partition_count = 4;
 }
 
 message GetTopicStateRequest {
@@ -120,5 +122,26 @@ message GetTopicStatesRequest {
   bool include_usage = 1;
 }
 message GetTopicStatesResponse {
-  map<string, TopicState> topic_states = 1;
+  map<string, TopicState> states = 1;
 }
+
+// --- Additional RPCs for admin tooling compatibility ---
+
+message ListUsableBrokerIdsRequest {}
+message ListUsableBrokerIdsResponse {
+  repeated int32 broker_ids = 1;
+}
+
+message ListTopicConfigsRequest {
+  bool internal = 1;
+  map<string, string> tags = 2;
+}
+message ListTopicConfigsResponse {
+  map<string, TopicConfig> topic_configs = 1;
+}
+
+message UpdateTopicConfigRequest {
+  string topic_name = 1;
+  map<string, string> config = 2;
+}
+message UpdateTopicConfigResponse {}

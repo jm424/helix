@@ -59,6 +59,7 @@ toml = "0.8"
 # gRPC.
 tonic = { version = "0.11", features = ["tls"] }
 tonic-build = "0.11"
+tonic-reflection = "0.11"
 
 # Data structures.
 roaring = "0.10"

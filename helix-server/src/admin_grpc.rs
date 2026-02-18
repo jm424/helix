@@ -3,9 +3,8 @@
 //! Implements the `kafkaadmin.Resources` gRPC trait for topic lifecycle
 //! management (create, describe, delete topics).
 //!
-//! Write operations (create/delete topic) are tried locally first. If this
-//! node is not the controller leader, the error includes a leader hint which
-//! is used to forward the request to the correct node.
+//! Write operations (create/delete topic) return UNAVAILABLE when this
+//! node is not the controller leader. Callers retry with DNS round-robin.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,26 +13,28 @@ use helix_core::ConsumerGroupId;
 use helix_progress::ProgressStore;
 use helix_runtime::TransportHandle;
 use helix_wal::TokioStorage;
-use tonic::transport::Channel;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 
-use crate::generated_admin::resources_client::ResourcesClient;
 use crate::generated_admin::resources_server::Resources;
 use crate::generated_admin::{
-    BrokersUp, CreateTopicRequest, CreateTopicResponse, DeleteConsumerGroupsRequest,
+    CreateTopicRequest, CreateTopicResponse, DeleteConsumerGroupsRequest,
     DeleteConsumerGroupsResponse, DeleteTopicRequest, DeleteTopicResponse,
     DescribeTopicRequest, DescribeTopicResponse, DescribeTopicsRequest, DescribeTopicsResponse,
     GetHealthRequest, GetHealthResponse, GetTopicStateRequest, GetTopicStateResponse,
-    GetTopicStatesRequest, GetTopicStatesResponse, ListTopicsRequest, ListTopicsResponse,
+    GetTopicStatesRequest, GetTopicStatesResponse, ListTopicConfigsRequest,
+    ListTopicConfigsResponse, ListTopicsRequest, ListTopicsResponse,
+    ListUsableBrokerIdsRequest, ListUsableBrokerIdsResponse,
     TagTopicsRequest, TagTopicsResponse, TopicConfig, TopicDescription, TopicState,
+    UpdateTopicConfigRequest, UpdateTopicConfigResponse,
 };
 use crate::service::HelixService;
 
 /// Admin gRPC service wrapping `HelixService`.
 pub struct AdminService {
     service: Arc<HelixService<TokioStorage, TransportHandle>>,
-    admin_port: u16,
+    /// Default retention in milliseconds (from `--retention-ms` flag).
+    default_retention_ms: u64,
 }
 
 impl AdminService {
@@ -41,35 +42,12 @@ impl AdminService {
     #[must_use]
     pub const fn new(
         service: Arc<HelixService<TokioStorage, TransportHandle>>,
-        admin_port: u16,
+        default_retention_ms: u64,
     ) -> Self {
         Self {
             service,
-            admin_port,
+            default_retention_ms,
         }
-    }
-
-    /// Connects to a peer node's admin gRPC port given its node ID.
-    async fn connect_to_node(
-        &self,
-        node_id: u64,
-    ) -> Result<ResourcesClient<Channel>, Status> {
-        let nid = helix_core::NodeId::new(node_id);
-        let peer_addr = self
-            .service
-            .get_node_address(nid)
-            .ok_or_else(|| Status::internal(format!("no address for node {node_id}")))?;
-
-        let host = peer_addr
-            .rfind(':')
-            .map_or(peer_addr, |i| &peer_addr[..i]);
-
-        let addr = format!("http://{host}:{}", self.admin_port);
-        debug!(node_id, addr = %addr, "Forwarding to controller leader");
-
-        ResourcesClient::connect(addr)
-            .await
-            .map_err(|e| Status::unavailable(format!("failed to connect to node {node_id}: {e}")))
     }
 }
 
@@ -106,11 +84,9 @@ impl Resources for AdminService {
                 info!(topic = %name, "Topic already exists (idempotent create)");
                 Ok(Response::new(CreateTopicResponse {}))
             }
-            Err(e) if e.controller_hint().is_some() => {
-                let hint = e.controller_hint().expect("checked above");
-                info!(topic = %name, leader = hint, "Forwarding CreateTopic to leader");
-                let mut client = self.connect_to_node(hint).await?;
-                client.create_topic(Request::new(req)).await
+            Err(e) if e.message().contains("not the controller") => {
+                warn!(topic = %name, "Not controller leader, returning UNAVAILABLE");
+                Err(Status::unavailable("not the controller leader, retry"))
             }
             Err(e) => {
                 warn!(topic = %name, error = %e, "Admin CreateTopic failed");
@@ -135,8 +111,15 @@ impl Resources for AdminService {
         let response = DescribeTopicResponse {
             partition_count: topic_info.partition_count as i32,
             replication_factor: topic_info.replication_factor as i32,
-            config: std::collections::HashMap::new(),
-            tags: std::collections::HashMap::new(),
+            config: {
+                let mut config = HashMap::new();
+                config.insert(
+                    "retention.ms".to_owned(),
+                    self.default_retention_ms.to_string(),
+                );
+                config
+            },
+            tags: HashMap::new(),
         };
         drop(state);
 
@@ -164,11 +147,9 @@ impl Resources for AdminService {
             Err(e) if e.message().contains("not found") => {
                 Err(Status::not_found(format!("topic '{name}' not found")))
             }
-            Err(e) if e.controller_hint().is_some() => {
-                let hint = e.controller_hint().expect("checked above");
-                info!(topic = %name, leader = hint, "Forwarding DeleteTopic to leader");
-                let mut client = self.connect_to_node(hint).await?;
-                client.delete_topic(Request::new(req)).await
+            Err(e) if e.message().contains("not the controller") => {
+                warn!(topic = %name, "Not controller leader, returning UNAVAILABLE");
+                Err(Status::unavailable("not the controller leader, retry"))
             }
             Err(e) => {
                 warn!(topic = %name, error = %e, "Admin DeleteTopic failed");
@@ -225,12 +206,18 @@ impl Resources for AdminService {
         if requested.is_empty() {
             // Return all topics when no names specified.
             for info in state.topics() {
-                topics.insert(info.name.clone(), build_topic_description(info));
+                topics.insert(
+                    info.name.clone(),
+                    build_topic_description(info, self.default_retention_ms),
+                );
             }
         } else {
             for name in &requested {
                 if let Some(info) = state.get_topic(name) {
-                    topics.insert(name.clone(), build_topic_description(info));
+                    topics.insert(
+                        name.clone(),
+                        build_topic_description(info, self.default_retention_ms),
+                    );
                 }
             }
         }
@@ -246,14 +233,12 @@ impl Resources for AdminService {
     ) -> Result<Response<GetHealthResponse>, Status> {
         let live = self.service.live_brokers().await;
 
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let total = self.service.cluster_nodes().len() as i32;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let up = live.len() as i32;
-
+        let total = self.service.cluster_nodes().len();
+        let up = live.len();
         let is_healthy = up == total;
-        let mut brokers_up: HashMap<String, BrokersUp> = HashMap::new();
-        brokers_up.insert("default".to_owned(), BrokersUp { total, up });
+
+        let mut brokers_up: HashMap<String, bool> = HashMap::new();
+        brokers_up.insert("default".to_owned(), is_healthy);
 
         debug!(is_healthy, total, up, "Admin GetHealth");
         Ok(Response::new(GetHealthResponse {
@@ -288,15 +273,71 @@ impl Resources for AdminService {
         _request: Request<GetTopicStatesRequest>,
     ) -> Result<Response<GetTopicStatesResponse>, Status> {
         let state = self.service.controller_state().read().await;
-        let mut topic_states: HashMap<String, TopicState> = HashMap::new();
+        let mut states: HashMap<String, TopicState> = HashMap::new();
 
         for info in state.topics() {
-            topic_states.insert(info.name.clone(), build_topic_state(info));
+            states.insert(info.name.clone(), build_topic_state(info));
         }
         drop(state);
 
-        debug!(count = topic_states.len(), "Admin GetTopicStates");
-        Ok(Response::new(GetTopicStatesResponse { topic_states }))
+        debug!(count = states.len(), "Admin GetTopicStates");
+        Ok(Response::new(GetTopicStatesResponse { states }))
+    }
+
+    async fn list_usable_broker_ids(
+        &self,
+        _request: Request<ListUsableBrokerIdsRequest>,
+    ) -> Result<Response<ListUsableBrokerIdsResponse>, Status> {
+        let live = self.service.live_brokers().await;
+
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let broker_ids: Vec<i32> = live.iter().map(|n| n.get() as i32).collect();
+
+        debug!(count = broker_ids.len(), "Admin ListUsableBrokerIds");
+        Ok(Response::new(ListUsableBrokerIdsResponse { broker_ids }))
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    async fn list_topic_configs(
+        &self,
+        _request: Request<ListTopicConfigsRequest>,
+    ) -> Result<Response<ListTopicConfigsResponse>, Status> {
+        let state = self.service.controller_state().read().await;
+        let mut topic_configs: HashMap<String, TopicConfig> = HashMap::new();
+
+        for info in state.topics() {
+            topic_configs.insert(
+                info.name.clone(),
+                build_topic_config(info, self.default_retention_ms),
+            );
+        }
+        drop(state);
+
+        debug!(count = topic_configs.len(), "Admin ListTopicConfigs");
+        Ok(Response::new(ListTopicConfigsResponse { topic_configs }))
+    }
+
+    async fn update_topic_config(
+        &self,
+        request: Request<UpdateTopicConfigRequest>,
+    ) -> Result<Response<UpdateTopicConfigResponse>, Status> {
+        let req = request.into_inner();
+        info!(topic = %req.topic_name, "Admin UpdateTopicConfig (no-op stub)");
+        Ok(Response::new(UpdateTopicConfigResponse {}))
+    }
+}
+
+/// Builds a `TopicConfig` from controller `TopicInfo`.
+#[allow(clippy::cast_possible_wrap)]
+fn build_topic_config(
+    info: &crate::controller::TopicInfo,
+    default_retention_ms: u64,
+) -> TopicConfig {
+    TopicConfig {
+        retention_ms: default_retention_ms,
+        partitions: info.partition_count as i32,
+        replication_factor: info.replication_factor as i32,
+        config: HashMap::new(),
     }
 }
 
@@ -304,27 +345,24 @@ impl Resources for AdminService {
 #[allow(clippy::cast_possible_wrap)]
 fn build_topic_description(
     info: &crate::controller::TopicInfo,
+    default_retention_ms: u64,
 ) -> TopicDescription {
     TopicDescription {
-        topic_config: Some(TopicConfig {
-            partition_count: info.partition_count as i32,
-            replication_factor: info.replication_factor as i32,
-            config: HashMap::new(),
-        }),
+        topic_config: Some(build_topic_config(info, default_retention_ms)),
         tags: HashMap::new(),
     }
 }
 
 /// Builds a `TopicState` from controller `TopicInfo`.
-#[allow(clippy::cast_possible_wrap)]
+///
+/// Field layout matches the real resources.proto for wire compatibility.
 const fn build_topic_state(
-    info: &crate::controller::TopicInfo,
+    _info: &crate::controller::TopicInfo,
 ) -> TopicState {
     TopicState {
-        partition_count: info.partition_count as i32,
         is_optimally_placed: true,
         spans_usable_brokers: true,
-        has_out_of_sync_replicas: false,
-        has_under_replicated_partitions: false,
+        uses_non_usable_brokers: false,
+        broker_aligned_partition_count: 0,
     }
 }

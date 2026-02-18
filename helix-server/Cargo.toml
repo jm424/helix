@@ -31,6 +31,7 @@ kafka-protocol = { workspace = true }
 tokio = { workspace = true }
 socket2 = { workspace = true }
 tonic = { workspace = true }
+tonic-reflection = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }
 crc32fast = { workspace = true }

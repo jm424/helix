@@ -107,16 +107,18 @@ pub struct ListTopicsResponse {
     #[prost(string, repeated, tag = "1")]
     pub topic_names: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
-/// Simplified TopicConfig inlined from kafka.TopicConfig (common.proto).
-/// Field numbers match the real proto for wire compatibility.
+/// TopicConfig matches kafka.TopicConfig from common.proto for wire compatibility.
+/// Field numbers match the real proto.
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TopicConfig {
-    #[prost(int32, tag = "1")]
-    pub partition_count: i32,
+    #[prost(uint64, tag = "1")]
+    pub retention_ms: u64,
     #[prost(int32, tag = "2")]
+    pub partitions: i32,
+    #[prost(int32, tag = "3")]
     pub replication_factor: i32,
-    #[prost(map = "string, string", tag = "3")]
+    #[prost(map = "string, string", tag = "4")]
     pub config: ::std::collections::HashMap<
         ::prost::alloc::string::String,
         ::prost::alloc::string::String,
@@ -150,39 +152,27 @@ pub struct DescribeTopicsResponse {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct BrokersUp {
-    #[prost(int32, tag = "1")]
-    pub total: i32,
-    #[prost(int32, tag = "2")]
-    pub up: i32,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetHealthRequest {}
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetHealthResponse {
     #[prost(bool, tag = "1")]
     pub is_healthy: bool,
-    #[prost(map = "string, message", tag = "2")]
-    pub brokers_up: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        BrokersUp,
-    >,
+    #[prost(map = "string, bool", tag = "2")]
+    pub brokers_up: ::std::collections::HashMap<::prost::alloc::string::String, bool>,
 }
+/// TopicState matches the real resources.proto for wire compatibility.
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TopicState {
-    #[prost(int32, tag = "1")]
-    pub partition_count: i32,
-    #[prost(bool, tag = "2")]
+    #[prost(bool, tag = "1")]
     pub is_optimally_placed: bool,
-    #[prost(bool, tag = "3")]
+    #[prost(bool, tag = "2")]
     pub spans_usable_brokers: bool,
-    #[prost(bool, tag = "4")]
-    pub has_out_of_sync_replicas: bool,
-    #[prost(bool, tag = "5")]
-    pub has_under_replicated_partitions: bool,
+    #[prost(bool, tag = "3")]
+    pub uses_non_usable_brokers: bool,
+    #[prost(int32, tag = "4")]
+    pub broker_aligned_partition_count: i32,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -206,11 +196,51 @@ pub struct GetTopicStatesRequest {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetTopicStatesResponse {
     #[prost(map = "string, message", tag = "1")]
-    pub topic_states: ::std::collections::HashMap<
+    pub states: ::std::collections::HashMap<::prost::alloc::string::String, TopicState>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListUsableBrokerIdsRequest {}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListUsableBrokerIdsResponse {
+    #[prost(int32, repeated, tag = "1")]
+    pub broker_ids: ::prost::alloc::vec::Vec<i32>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListTopicConfigsRequest {
+    #[prost(bool, tag = "1")]
+    pub internal: bool,
+    #[prost(map = "string, string", tag = "2")]
+    pub tags: ::std::collections::HashMap<
         ::prost::alloc::string::String,
-        TopicState,
+        ::prost::alloc::string::String,
     >,
 }
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ListTopicConfigsResponse {
+    #[prost(map = "string, message", tag = "1")]
+    pub topic_configs: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        TopicConfig,
+    >,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpdateTopicConfigRequest {
+    #[prost(string, tag = "1")]
+    pub topic_name: ::prost::alloc::string::String,
+    #[prost(map = "string, string", tag = "2")]
+    pub config: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpdateTopicConfigResponse {}
 /// Generated client implementations.
 pub mod resources_client {
     #![allow(unused_variables, dead_code, missing_docs, clippy::let_unit_value)]
@@ -221,6 +251,9 @@ pub mod resources_client {
     /// Implements the kafkaadmin.Resources API for creating, describing, and
     /// deleting topics. Runs on port 8090 alongside the primary Kafka protocol
     /// server.
+    ///
+    /// Field numbers and types match resources.proto and common.proto
+    /// for wire compatibility with external admin tooling.
     #[derive(Debug, Clone)]
     pub struct ResourcesClient<T> {
         inner: tonic::client::Grpc<T>,
@@ -551,6 +584,81 @@ pub mod resources_client {
                 .insert(GrpcMethod::new("kafkaadmin.Resources", "GetTopicStates"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn list_usable_broker_ids(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListUsableBrokerIdsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListUsableBrokerIdsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/kafkaadmin.Resources/ListUsableBrokerIds",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("kafkaadmin.Resources", "ListUsableBrokerIds"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn list_topic_configs(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ListTopicConfigsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListTopicConfigsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/kafkaadmin.Resources/ListTopicConfigs",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("kafkaadmin.Resources", "ListTopicConfigs"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn update_topic_config(
+            &mut self,
+            request: impl tonic::IntoRequest<super::UpdateTopicConfigRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::UpdateTopicConfigResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/kafkaadmin.Resources/UpdateTopicConfig",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("kafkaadmin.Resources", "UpdateTopicConfig"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -630,12 +738,36 @@ pub mod resources_server {
             tonic::Response<super::GetTopicStatesResponse>,
             tonic::Status,
         >;
+        async fn list_usable_broker_ids(
+            &self,
+            request: tonic::Request<super::ListUsableBrokerIdsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListUsableBrokerIdsResponse>,
+            tonic::Status,
+        >;
+        async fn list_topic_configs(
+            &self,
+            request: tonic::Request<super::ListTopicConfigsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ListTopicConfigsResponse>,
+            tonic::Status,
+        >;
+        async fn update_topic_config(
+            &self,
+            request: tonic::Request<super::UpdateTopicConfigRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::UpdateTopicConfigResponse>,
+            tonic::Status,
+        >;
     }
     /// Kafka admin gRPC service for topic lifecycle management.
     ///
     /// Implements the kafkaadmin.Resources API for creating, describing, and
     /// deleting topics. Runs on port 8090 alongside the primary Kafka protocol
     /// server.
+    ///
+    /// Field numbers and types match resources.proto and common.proto
+    /// for wire compatibility with external admin tooling.
     #[derive(Debug)]
     pub struct ResourcesServer<T: Resources> {
         inner: _Inner<T>,
@@ -1161,6 +1293,145 @@ pub mod resources_server {
                     let fut = async move {
                         let inner = inner.0;
                         let method = GetTopicStatesSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/kafkaadmin.Resources/ListUsableBrokerIds" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListUsableBrokerIdsSvc<T: Resources>(pub Arc<T>);
+                    impl<
+                        T: Resources,
+                    > tonic::server::UnaryService<super::ListUsableBrokerIdsRequest>
+                    for ListUsableBrokerIdsSvc<T> {
+                        type Response = super::ListUsableBrokerIdsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListUsableBrokerIdsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Resources>::list_usable_broker_ids(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = ListUsableBrokerIdsSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/kafkaadmin.Resources/ListTopicConfigs" => {
+                    #[allow(non_camel_case_types)]
+                    struct ListTopicConfigsSvc<T: Resources>(pub Arc<T>);
+                    impl<
+                        T: Resources,
+                    > tonic::server::UnaryService<super::ListTopicConfigsRequest>
+                    for ListTopicConfigsSvc<T> {
+                        type Response = super::ListTopicConfigsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ListTopicConfigsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Resources>::list_topic_configs(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = ListTopicConfigsSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/kafkaadmin.Resources/UpdateTopicConfig" => {
+                    #[allow(non_camel_case_types)]
+                    struct UpdateTopicConfigSvc<T: Resources>(pub Arc<T>);
+                    impl<
+                        T: Resources,
+                    > tonic::server::UnaryService<super::UpdateTopicConfigRequest>
+                    for UpdateTopicConfigSvc<T> {
+                        type Response = super::UpdateTopicConfigResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::UpdateTopicConfigRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Resources>::update_topic_config(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = UpdateTopicConfigSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

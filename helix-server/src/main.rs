@@ -660,7 +660,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Spawn admin gRPC server if --admin-addr is specified.
             if let Some(admin_addr) = args.admin_addr {
                 let admin_svc = Arc::clone(&service);
-                let admin_port = admin_addr.port();
+                let retention_ms = args.retention_ms;
                 let admin_tls_cert = args.admin_tls_cert.clone();
                 let admin_tls_key = args.admin_tls_key.clone();
                 tokio::spawn(async move {
@@ -686,9 +686,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         info!(addr = %admin_addr, "Admin gRPC server listening (plaintext)");
                     }
 
+                    let reflection_service = tonic_reflection::server::Builder::configure()
+                        .register_encoded_file_descriptor_set(
+                            tonic::include_file_descriptor_set!("admin_descriptor"),
+                        )
+                        .build()
+                        .expect("failed to build reflection service");
+
                     if let Err(e) = builder
+                        .add_service(reflection_service)
                         .add_service(ResourcesServer::new(
-                            AdminService::new(admin_svc, admin_port),
+                            AdminService::new(admin_svc, retention_ms),
                         ))
                         .serve(admin_addr)
                         .await

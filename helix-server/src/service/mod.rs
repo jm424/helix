@@ -1061,6 +1061,48 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             (None, Arc::new(RwLock::new(HashMap::new())))
         };
 
+        // Replay controller entries from SharedWAL into ControllerState.
+        // This restores topics and partition assignments after a pod restart.
+        #[allow(clippy::significant_drop_tightening)]
+        {
+            let mut recovered = recovered_entries.write().await;
+            if let Some(controller_entries) = recovered.remove(&CONTROLLER_GROUP_ID) {
+                let mut state = controller_state.write().await;
+                let mut count = 0u64;
+                let mut max_raft_index = 0u64;
+                for entry in &controller_entries {
+                    if entry.header.raft_index > max_raft_index {
+                        max_raft_index = entry.header.raft_index;
+                    }
+                    if let Some(cmd) =
+                        crate::controller::ControllerCommand::decode(&entry.payload)
+                    {
+                        // Discard follow-ups — they were already committed
+                        // and persisted as separate WAL entries.
+                        let _ = state.apply(&cmd, &cluster_nodes);
+                        count += 1;
+                    } else {
+                        warn!(
+                            raft_index = entry.header.raft_index,
+                            "Failed to decode controller entry during recovery"
+                        );
+                    }
+                }
+                drop(state);
+                // Tell tick tasks to skip WAL writes for entries at or
+                // below this index — they're already persisted.
+                tick::CONTROLLER_LAST_PERSISTED_INDEX
+                    .store(max_raft_index, std::sync::atomic::Ordering::Relaxed);
+                if count > 0 {
+                    info!(
+                        replayed = count,
+                        max_raft_index,
+                        "Replayed controller state from SharedWAL"
+                    );
+                }
+            }
+        }
+
         let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
 
         // Create batch pending proposals map.

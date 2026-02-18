@@ -9,12 +9,12 @@
 //! +----------+----------+----------+----------+----------+-----------+----------+
 //! ```
 //!
-//! - CRC32: Checksum of Length + `GroupId` + Term + Index + RaftIndex + Payload
+//! - CRC32: Checksum of Length + `GroupId` + Term + Index + `RaftIndex` + Payload
 //! - Length: Payload length in bytes (not including header)
 //! - PID: Group ID that owns this entry
 //! - Term: Raft term when entry was created
 //! - Index: Log index of this entry (partition-local auto-counter)
-//! - RaftIndex: Actual Raft log index (may differ from Index due to no-ops)
+//! - `RaftIndex`: Actual Raft log index (may differ from Index due to no-ops)
 //! - Payload: Application data
 //!
 //! All integers are stored in little-endian format.

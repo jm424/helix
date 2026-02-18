@@ -458,6 +458,17 @@ impl Transport {
     }
 
     /// Loop that sends messages to a peer.
+    ///
+    /// When the TCP connection to a peer is lost (peer killed/restarted),
+    /// this loop enters a reconnect cycle with exponential backoff. During
+    /// reconnect, stale Raft messages accumulate in the mpsc queue. If the
+    /// queue fills (1000 entries), ALL new `try_send` calls fail with
+    /// `QueueFull`, blocking Raft progress for every group.
+    ///
+    /// To prevent this, we drain stale messages from the queue on each
+    /// failed connect attempt and after a successful reconnect. Raft
+    /// messages are idempotent — the leader will resend anything the
+    /// follower actually needs.
     #[allow(clippy::items_after_statements)]
     async fn sender_loop(
         node_id: NodeId,
@@ -494,6 +505,25 @@ impl Transport {
             if stream.is_none() {
                 match Self::connect_to_peer(peer_id, &addr).await {
                     Ok(s) => {
+                        // Drain stale messages that accumulated while disconnected.
+                        // Raft will resend anything the follower needs; stale
+                        // AppendEntries to a restarted peer are useless.
+                        let mut drained = 0u32;
+                        while rx.try_recv().is_ok() {
+                            drained += 1;
+                        }
+                        // Also discard the pending message — it's from
+                        // before the reconnect and equally stale.
+                        pending = None;
+                        if drained > 0 {
+                            info!(
+                                node_id = node_id.get(),
+                                peer_id = peer_id.get(),
+                                drained,
+                                "Drained stale messages after reconnect"
+                            );
+                        }
+
                         stream = Some(s);
                         reconnect_delay_ms = 100;
                         info!(
@@ -504,6 +534,25 @@ impl Transport {
                         );
                     }
                     Err(e) => {
+                        // Drain stale messages to prevent queue saturation.
+                        // While we sleep in backoff, tick tasks enqueue ~500
+                        // msgs/sec across all Raft groups. The 1000-entry
+                        // queue fills in ~2s, after which ALL try_send calls
+                        // fail, blocking Raft progress cluster-wide.
+                        let mut drained = 0u32;
+                        while rx.try_recv().is_ok() {
+                            drained += 1;
+                        }
+                        pending = None;
+                        if drained > 0 {
+                            debug!(
+                                node_id = node_id.get(),
+                                peer_id = peer_id.get(),
+                                drained,
+                                "Drained stale messages during reconnect backoff"
+                            );
+                        }
+
                         warn!(
                             node_id = node_id.get(),
                             peer_id = peer_id.get(),
@@ -557,7 +606,19 @@ impl Transport {
                             "Failed to send data, reconnecting"
                         );
                         stream = None;
-                        // Retry the same pending message after backoff.
+                        // Drain stale messages — same rationale as reconnect.
+                        let mut drained = 0u32;
+                        while rx.try_recv().is_ok() {
+                            drained += 1;
+                        }
+                        pending = None;
+                        if drained > 0 {
+                            debug!(
+                                peer_id = peer_id.get(),
+                                drained,
+                                "Drained stale messages after send failure"
+                            );
+                        }
                         tokio::time::sleep(tokio::time::Duration::from_millis(reconnect_delay_ms))
                             .await;
                         reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);

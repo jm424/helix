@@ -20,6 +20,16 @@ use tracing::{debug, error, info, trace, warn};
 use crate::vote_store::{LocalFileVoteStorage, VoteStore};
 
 use crate::controller::{ControllerCommand, ControllerState, CONTROLLER_GROUP_ID};
+
+/// Last Raft index persisted for the controller partition (group 0) in the
+/// SharedWAL. Set during WAL recovery in `new_multi_node_internal`; checked
+/// before each append in `process_controller_outputs` to avoid re-persisting
+/// entries that were already recovered. Without this guard, a follower that
+/// replays entries from the leader after restart can hit the SharedWAL's
+/// term-monotonicity assertion (term from an earlier Raft epoch < the term
+/// of the last recovered entry).
+pub static CONTROLLER_LAST_PERSISTED_INDEX: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 use crate::error::ServerError;
 use crate::group_map::GroupMap;
 use crate::partition_storage::PartitionStorage;
@@ -568,6 +578,7 @@ pub async fn process_controller_outputs<
             MultiRaftOutput::CommitEntry {
                 group_id,
                 index,
+                term,
                 metadata,
                 ..
             } => {
@@ -590,6 +601,31 @@ pub async fn process_controller_outputs<
                 );
                 let mut state = controller_state.write().await;
                 let follow_ups = state.apply(&cmd, cluster_nodes);
+
+                // Persist controller entry to SharedWAL for crash recovery.
+                // Skip entries already recovered from WAL to avoid the
+                // term-monotonicity assertion (a follower replaying from
+                // the leader may see entries with earlier terms).
+                let last_persisted =
+                    CONTROLLER_LAST_PERSISTED_INDEX.load(std::sync::atomic::Ordering::Relaxed);
+                if index.get() > last_persisted {
+                    if let Some(pool) = shared_wal_pool {
+                        let handle = pool.handle(CONTROLLER_GROUP_ID);
+                        if let Err(e) = handle
+                            .append_nowait(term.get(), index.get(), metadata.clone())
+                            .await
+                        {
+                            error!(
+                                index = index.get(),
+                                error = %e,
+                                "Failed to persist controller entry to SharedWAL"
+                            );
+                        } else {
+                            CONTROLLER_LAST_PERSISTED_INDEX
+                                .store(index.get(), std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
 
                 // Notify any pending controller proposals for this index.
                 {
@@ -839,6 +875,7 @@ pub async fn process_controller_outputs<
             if let MultiRaftOutput::CommitEntry {
                 group_id,
                 index,
+                term,
                 metadata,
                 ..
             } = output
@@ -860,6 +897,28 @@ pub async fn process_controller_outputs<
                 {
                     let mut state = controller_state.write().await;
                     let _ = state.apply(&cmd, cluster_nodes);
+                }
+
+                // Persist follow-up controller entry to SharedWAL.
+                let last_persisted =
+                    CONTROLLER_LAST_PERSISTED_INDEX.load(std::sync::atomic::Ordering::Relaxed);
+                if index.get() > last_persisted {
+                    if let Some(pool) = shared_wal_pool {
+                        let handle = pool.handle(CONTROLLER_GROUP_ID);
+                        if let Err(e) = handle
+                            .append_nowait(term.get(), index.get(), metadata.clone())
+                            .await
+                        {
+                            error!(
+                                index = index.get(),
+                                error = %e,
+                                "Failed to persist follow-up controller entry to SharedWAL"
+                            );
+                        } else {
+                            CONTROLLER_LAST_PERSISTED_INDEX
+                                .store(index.get(), std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
                 }
 
                 // Handle AssignPartition by creating partition actor.
