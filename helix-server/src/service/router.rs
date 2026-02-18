@@ -291,6 +291,18 @@ impl PartitionRouter {
     pub async fn group_ids(&self) -> Vec<GroupId> {
         self.partitions.read().await.keys().copied().collect()
     }
+
+    /// Returns `(group_id, min_replicated_index)` for all partitions.
+    ///
+    /// Used by the retention system to determine safe deletion bounds.
+    /// Only meaningful for groups where this node is leader (non-zero value).
+    pub async fn min_replicated_indices(&self) -> Vec<(GroupId, u64)> {
+        let partitions = self.partitions.read().await;
+        partitions
+            .iter()
+            .map(|(&gid, handle)| (gid, handle.min_replicated_index()))
+            .collect()
+    }
 }
 
 impl Default for PartitionRouter {

@@ -46,6 +46,18 @@ use crate::storage::{
     PartitionCommand as StoragePartitionCommand,
 };
 
+/// Ticks without a commit before the actor considers quorum lost.
+///
+/// When the actor is leader with pending proposals and no `CommitEntry`
+/// arrives for this many ticks, new proposals are rejected immediately
+/// with `NotEnoughReplicas`. This prevents accumulating uncommittable
+/// entries in the Raft log when a majority of followers are unreachable.
+///
+/// Set to 20 ticks (= 1 second at 50ms tick interval), which is 2×
+/// the default election timeout. This gives enough time for normal
+/// replication latency while detecting sustained quorum loss quickly.
+const QUORUM_LOSS_TICKS: u32 = 20;
+
 // =============================================================================
 // Commands
 // =============================================================================
@@ -278,6 +290,12 @@ pub struct PartitionActorHandle {
     /// commit. Allows the batcher to read the offset without
     /// acquiring `partition_storage` locks.
     blob_end_offset_cache: Arc<AtomicU64>,
+    /// Minimum `match_index` across all Raft followers (leader only).
+    ///
+    /// Updated by the partition actor after each tick/output processing.
+    /// Read by the retention task to determine safe deletion bounds.
+    /// 0 means unknown or not leader.
+    min_replicated_index: Arc<AtomicU64>,
 }
 
 impl PartitionActorHandle {
@@ -292,6 +310,7 @@ impl PartitionActorHandle {
             group_id,
             is_leader_cache: Arc::new(AtomicBool::new(false)),
             blob_end_offset_cache: Arc::new(AtomicU64::new(0)),
+            min_replicated_index: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -326,6 +345,21 @@ impl PartitionActorHandle {
     #[must_use]
     pub const fn group_id(&self) -> GroupId {
         self.group_id
+    }
+
+    /// Returns the minimum replicated index across all followers (~1 ns).
+    ///
+    /// Returns 0 if this partition is not the leader or has no followers.
+    #[must_use]
+    pub fn min_replicated_index(&self) -> u64 {
+        self.min_replicated_index.load(Ordering::Acquire)
+    }
+
+    /// Returns the shared `min_replicated_index` atomic for the actor
+    /// to update after processing Raft outputs.
+    #[must_use]
+    pub fn min_replicated_index_arc(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.min_replicated_index)
     }
 
     /// Proposes a new entry to the Raft log.
@@ -707,6 +741,7 @@ pub fn spawn_partition_actor_shared_with_batch_config(
     let (cmd_tx, cmd_rx) = mpsc::channel(config.channel_buffer_size);
     let handle = PartitionActorHandle::new(cmd_tx, group_id);
     let is_leader_cache = handle.leader_cache();
+    let min_replicated_index = handle.min_replicated_index_arc();
 
     let backpressure = PartitionBackpressure::new(
         batch_config.max_pending_bytes,
@@ -726,9 +761,11 @@ pub fn spawn_partition_actor_shared_with_batch_config(
         next_base_offset: Offset::new(0),
         offset_seeded: false,
         is_leader_cache,
+        min_replicated_index,
         batcher_stats,
         global_backpressure,
         producer_state: PartitionProducerState::new(),
+        ticks_without_commit: 0,
     };
     tokio::spawn(actor.run());
 
@@ -842,6 +879,9 @@ struct PartitionActorShared {
     next_base_offset: Offset,
     offset_seeded: bool,
     is_leader_cache: Arc<AtomicBool>,
+    /// Minimum match_index across all Raft followers, updated after
+    /// each tick/output for the retention system to read lock-free.
+    min_replicated_index: Arc<AtomicU64>,
     batcher_stats: Option<Arc<super::BatcherStats>>,
     #[allow(dead_code)]
     global_backpressure:
@@ -852,6 +892,14 @@ struct PartitionActorShared {
     /// leadership changes. Sequence checks run after the `offset_seeded`
     /// gate, guaranteeing fully-rebuilt state.
     producer_state: PartitionProducerState,
+    /// Ticks since the last `CommitEntry` was received while leader.
+    /// Reset to 0 on every commit. Incremented on every tick when
+    /// there are pending (uncommitted) proposals. Used to detect
+    /// quorum loss: if proposals aren't committing for an extended
+    /// period, the leader has likely lost its quorum and should
+    /// reject new writes immediately rather than accumulating
+    /// uncommittable entries.
+    ticks_without_commit: u32,
 }
 
 impl PartitionActorShared {
@@ -946,8 +994,24 @@ impl PartitionActorShared {
                 .await;
             }
             PartitionCommand::TransferLeadership { target } => {
-                if let Some(outputs) = self.raft_node.transfer_leadership(target) {
-                    self.process_raft_outputs(outputs).await;
+                // Only transfer if the target follower has replicated
+                // at least one entry. A match_index of 0 means the
+                // follower has never responded since we became leader,
+                // likely because it's dead or unreachable.
+                let target_responsive = self
+                    .raft_node
+                    .follower_match_index(target)
+                    .is_some_and(|idx| idx.get() > 0);
+                if target_responsive {
+                    if let Some(outputs) = self.raft_node.transfer_leadership(target) {
+                        self.process_raft_outputs(outputs).await;
+                    }
+                } else {
+                    debug!(
+                        group_id = self.group_id.get(),
+                        target = target.get(),
+                        "Skipping leadership transfer: target has not replicated"
+                    );
                 }
             }
             PartitionCommand::SeedOffset { offset } => {
@@ -1026,6 +1090,20 @@ impl PartitionActorShared {
                     .raft_node
                     .leader_id()
                     .map(NodeId::get),
+            };
+            for result_tx in batch_info.result_txs {
+                let _ = result_tx.send(Err(err.clone()));
+            }
+            return;
+        }
+
+        // Reject writes if quorum appears lost. This prevents
+        // accumulating uncommittable entries in the Raft log when
+        // a majority of followers are unreachable.
+        if self.is_quorum_lost() {
+            let err = ServerError::NotEnoughReplicas {
+                topic: "unknown".to_string(),
+                partition: 0,
             };
             for result_tx in batch_info.result_txs {
                 let _ = result_tx.send(Err(err.clone()));
@@ -1171,6 +1249,28 @@ impl PartitionActorShared {
     async fn handle_tick(&mut self) {
         let outputs = self.raft_node.tick();
         self.process_raft_outputs(outputs).await;
+
+        // Track quorum liveness: if we're leader with pending proposals
+        // but no commits are arriving, we've likely lost quorum.
+        if self.raft_node.is_leader() && self.has_pending_proposals() {
+            self.ticks_without_commit += 1;
+        } else {
+            self.ticks_without_commit = 0;
+        }
+    }
+
+    /// Returns true if there are any uncommitted proposals in flight.
+    fn has_pending_proposals(&self) -> bool {
+        !self.pending_proposals.is_empty()
+            || !self.batch_pending_proposals.is_empty()
+    }
+
+    /// Returns true if the leader appears to have lost quorum.
+    ///
+    /// Detected when proposals have been pending for `QUORUM_LOSS_TICKS`
+    /// without any commits arriving.
+    fn is_quorum_lost(&self) -> bool {
+        self.ticks_without_commit >= QUORUM_LOSS_TICKS
     }
 
     async fn handle_raft_message(
@@ -1651,6 +1751,9 @@ impl PartitionActorShared {
                     }
                 }
                 RaftOutput::CommitEntry { index, term, metadata, payload } => {
+                    // Quorum is alive — a commit means majority replicated.
+                    self.ticks_without_commit = 0;
+
                     // Advance next_base_offset and record producer state
                     // from committed entries (including PREVIOUS_TERM).
                     // Reconstitute full data for decode (encode_split
@@ -1723,6 +1826,7 @@ impl PartitionActorShared {
                     self.is_leader_cache
                         .store(true, Ordering::Relaxed);
                     self.offset_seeded = false;
+                    self.ticks_without_commit = 0;
                     // Reset producer state — will be rebuilt from
                     // PREVIOUS_TERM CommitEntry events before
                     // offset_seeded is set.
@@ -1820,8 +1924,17 @@ impl PartitionActorShared {
         // Compact the Raft log after processing outputs to bound memory.
         if self.raft_node.is_leader() {
             self.raft_node.compact_log();
+            // Update min_replicated_index for the retention system.
+            let min_match = self
+                .raft_node
+                .min_match_index()
+                .map_or(0, helix_core::LogIndex::get);
+            self.min_replicated_index
+                .store(min_match, Ordering::Release);
         } else {
             self.raft_node.compact_log_follower();
+            // Not leader — reset to 0 (retention only runs on leader).
+            self.min_replicated_index.store(0, Ordering::Release);
         }
     }
 }
@@ -2194,9 +2307,11 @@ mod tests {
             next_base_offset,
             offset_seeded,
             is_leader_cache: Arc::new(AtomicBool::new(false)),
+            min_replicated_index: Arc::new(AtomicU64::new(0)),
             batcher_stats: None,
             global_backpressure: None,
             producer_state: PartitionProducerState::new(),
+            ticks_without_commit: 0,
         };
         (actor, output_rx, cmd_tx)
     }

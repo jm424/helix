@@ -458,16 +458,49 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
         let mut partition_response = MetadataResponsePartition::default();
         partition_response.partition_index = partition_id;
 
+        // Look up partition assignment from controller state to get the actual
+        // replica list. This is needed for correct ISR and replica reporting.
+        // Safe cast: partition_id is validated non-negative by callers.
+        #[allow(clippy::cast_sign_loss)]
+        let assignment_replicas = {
+            let state = self.service.controller_state().read().await;
+            state.get_topic(topic_name).and_then(|info| {
+                let pid = helix_core::PartitionId::new(partition_id as u64);
+                state
+                    .get_assignment(info.topic_id, pid)
+                    .map(|a| a.replicas.clone())
+            })
+        };
+
         // Get leader from MultiRaft.
         let leader_id = self.service.get_leader(topic_name, partition_id).await;
+
+        let live_brokers = self.service.live_brokers().await;
 
         // Safe cast: NodeId (u64) fits in i32 for reasonable cluster sizes.
         #[allow(clippy::cast_possible_truncation)]
         if let Some(leader) = leader_id {
             partition_response.error_code = 0;
             partition_response.leader_id = BrokerId(leader.get() as i32);
-            partition_response.isr_nodes = vec![BrokerId(leader.get() as i32)];
-            debug!(topic = %topic_name, partition = partition_id, leader = leader.get(), "Partition leader for metadata");
+
+            // ISR = assigned replicas that are currently live.
+            // In Raft, all replicas that are up-to-date with the leader are in-sync.
+            // Filter to only live brokers so clients don't see dead nodes as in-sync.
+            if let Some(ref replicas) = assignment_replicas {
+                partition_response.isr_nodes = replicas
+                    .iter()
+                    .filter(|r| live_brokers.contains(r))
+                    .map(|n| BrokerId(n.get() as i32))
+                    .collect();
+            } else {
+                partition_response.isr_nodes = vec![BrokerId(leader.get() as i32)];
+            }
+            debug!(
+                topic = %topic_name, partition = partition_id,
+                leader = leader.get(),
+                isr_size = partition_response.isr_nodes.len(),
+                "Partition leader for metadata"
+            );
         } else {
             // No leader elected yet - return LEADER_NOT_AVAILABLE (error code 5).
             // This tells the client to retry after refreshing metadata.
@@ -477,19 +510,29 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
             debug!(topic = %topic_name, partition = partition_id, "No partition leader elected");
         }
 
+        // Replica list = assigned replicas for this partition (not all brokers).
         // Safe cast: NodeId (u64) fits in i32 for reasonable cluster sizes.
-        // Only include live brokers in replica list to prevent clients from trying
-        // to connect to dead brokers.
-        let live_brokers = self.service.live_brokers().await;
         #[allow(clippy::cast_possible_truncation)]
-        {
+        if let Some(ref replicas) = assignment_replicas {
+            partition_response.replica_nodes = replicas
+                .iter()
+                .map(|n| BrokerId(n.get() as i32))
+                .collect();
+            // Offline replicas = assigned replicas that are NOT live.
+            partition_response.offline_replicas = replicas
+                .iter()
+                .filter(|r| !live_brokers.contains(r))
+                .map(|n| BrokerId(n.get() as i32))
+                .collect();
+        } else {
+            // Fallback: use live brokers if no assignment found.
             partition_response.replica_nodes = live_brokers
                 .iter()
                 .map(|n| BrokerId(n.get() as i32))
                 .collect();
+            partition_response.offline_replicas = vec![];
         }
         partition_response.leader_epoch = 0;
-        partition_response.offline_replicas = vec![];
 
         partition_response
     }
@@ -690,6 +733,14 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
                 );
                 (0, 57) // INVALID_PRODUCER_EPOCH
             }
+            Err(crate::ServerError::NotEnoughReplicas { .. }) => {
+                warn!(
+                    topic = %topic,
+                    partition,
+                    "Not enough replicas (quorum lost)"
+                );
+                (0, 19) // NOT_ENOUGH_REPLICAS
+            }
             Err(crate::ServerError::Overloaded {
                 pending_requests,
                 pending_bytes,
@@ -859,6 +910,45 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
                             );
                         }
                     }
+                    Err(crate::ServerError::NotLeader { .. }) => {
+                        warn!(
+                            topic = %topic_name,
+                            partition = partition_id,
+                            "Fetch: not leader for partition"
+                        );
+                        partition_response.error_code = 6; // NOT_LEADER_OR_FOLLOWER
+                        partition_response.high_watermark = -1;
+                        partition_response.last_stable_offset = -1;
+                        partition_response.log_start_offset = -1;
+                        partition_response.records = Some(Bytes::new());
+                    }
+                    Err(
+                        crate::ServerError::TopicNotFound { .. }
+                        | crate::ServerError::PartitionNotFound { .. },
+                    ) => {
+                        warn!(
+                            topic = %topic_name,
+                            partition = partition_id,
+                            "Fetch: unknown topic or partition"
+                        );
+                        partition_response.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
+                        partition_response.high_watermark = -1;
+                        partition_response.last_stable_offset = -1;
+                        partition_response.log_start_offset = -1;
+                        partition_response.records = Some(Bytes::new());
+                    }
+                    Err(crate::ServerError::OffsetOutOfRange { .. }) => {
+                        warn!(
+                            topic = %topic_name,
+                            partition = partition_id,
+                            "Fetch: offset out of range"
+                        );
+                        partition_response.error_code = 1; // OFFSET_OUT_OF_RANGE
+                        partition_response.high_watermark = -1;
+                        partition_response.last_stable_offset = -1;
+                        partition_response.log_start_offset = -1;
+                        partition_response.records = Some(Bytes::new());
+                    }
                     Err(e) => {
                         warn!(
                             topic = %topic_name,
@@ -866,7 +956,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
                             error = %e,
                             "Fetch failed"
                         );
-                        partition_response.error_code = 1; // UNKNOWN_SERVER_ERROR
+                        partition_response.error_code = -1; // UNKNOWN_SERVER_ERROR
                         partition_response.high_watermark = -1;
                         partition_response.last_stable_offset = -1;
                         partition_response.log_start_offset = -1;

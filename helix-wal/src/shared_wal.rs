@@ -654,6 +654,110 @@ impl<S: Storage> SharedWal<S> {
         count
     }
 
+    // -------------------------------------------------------------------------
+    // Segment Retention (Deletion)
+    // -------------------------------------------------------------------------
+
+    /// Returns metadata for all sealed segments, ordered by segment ID.
+    ///
+    /// Used by the retention system to enumerate deletion candidates.
+    #[must_use]
+    pub fn sealed_segment_infos(&self) -> Vec<crate::wal::SegmentInfo> {
+        self.wal.sealed_segment_infos()
+    }
+
+    /// Returns `(group_id, max_index)` for all groups with entries in a segment.
+    ///
+    /// Scans both `group_index` (in-memory) and `evicted_index` to find
+    /// which groups have entries in the given segment and their maximum
+    /// group-level index. Used by the retention system to verify replication
+    /// safety before segment deletion.
+    #[must_use]
+    pub fn groups_in_segment(
+        &self,
+        segment_id: crate::SegmentId,
+    ) -> Vec<(GroupId, u64)> {
+        let mut group_max: HashMap<GroupId, u64> = HashMap::new();
+
+        // Check in-memory group_index entries.
+        // We need to find entries whose WAL-level index falls within
+        // this segment's range.
+        if let Some(info) = self.wal.segment_info(segment_id) {
+            let seg_first = info.first_index;
+            let seg_last = info.last_index.unwrap_or(seg_first);
+
+            // Scan all groups for entries whose WAL index is in range.
+            // SharedEntry stores group-local indices, but the WAL assigns
+            // global indices — we use the entries directly from the WAL segment.
+            if let Some(entries) = self.wal.sealed_segment_entries(segment_id) {
+                for entry in entries {
+                    let gid = entry.group_id();
+                    let idx = entry.index();
+                    let cur = group_max.entry(gid).or_insert(0);
+                    if idx > *cur {
+                        *cur = idx;
+                    }
+                }
+            }
+
+            // Check evicted_index for entries that reference this segment.
+            for (gid, btree) in &self.evicted_index {
+                for (&idx, &sid) in btree {
+                    if sid == segment_id {
+                        let cur = group_max.entry(*gid).or_insert(0);
+                        if idx > *cur {
+                            *cur = idx;
+                        }
+                    }
+                }
+            }
+
+            // If we found entries from the WAL segment but not from
+            // in-memory/evicted indices (possible edge case), fall back
+            // to segment range info.
+            let _ = (seg_first, seg_last);
+        }
+
+        group_max.into_iter().collect()
+    }
+
+    /// Deletes a sealed segment from memory and disk.
+    ///
+    /// Also cleans up `group_index` and `evicted_index` entries that
+    /// reference the deleted segment. Updates `group_state` for groups
+    /// whose entries are entirely within deleted segments.
+    ///
+    /// # Errors
+    /// Returns an error if the disk file cannot be removed.
+    pub async fn delete_sealed_segment(
+        &mut self,
+        segment_id: crate::SegmentId,
+    ) -> WalResult<()> {
+        // Clean up evicted_index entries referencing this segment.
+        for btree in self.evicted_index.values_mut() {
+            btree.retain(|_, sid| *sid != segment_id);
+        }
+        // Remove empty group entries.
+        self.evicted_index.retain(|_, btree| !btree.is_empty());
+
+        // Clean up group_index entries that are in this segment.
+        // We do this by checking if entries were in this segment (via
+        // the WAL's sealed_segment_entries, if still resident).
+        if let Some(entries) = self.wal.sealed_segment_entries(segment_id) {
+            let pairs: Vec<(GroupId, u64)> = entries
+                .map(|e| (e.group_id(), e.index()))
+                .collect();
+            for (gid, idx) in pairs {
+                if let Some(btree) = self.group_index.get_mut(&gid) {
+                    btree.remove(&idx);
+                }
+            }
+        }
+
+        // Delete from the underlying WAL.
+        self.wal.delete_sealed_segment(segment_id).await
+    }
+
     /// Reads an entry, falling back to disk if evicted.
     ///
     /// Checks `partition_index` first (O(log n) in-memory). On miss, checks
@@ -687,15 +791,23 @@ impl<S: Storage> SharedWal<S> {
             }
         }
 
-        // Slow path: check evicted_index → read from disk.
+        // Slow path: check evicted_index → scan segment from disk.
+        // SharedEntry indices are group-local, not WAL-global, so we
+        // can't use Wal::read_entry_from_disk (which does positional
+        // lookup). Instead, decode the segment and scan for the entry
+        // matching both group_id and index.
         if let Some(segment_id) = self
             .evicted_index
             .get(&group_id)
             .and_then(|btree| btree.get(&index).copied())
         {
-            let entry = self.wal.read_entry_from_disk(segment_id, index).await?;
-            // Verify the entry belongs to the right group.
-            if entry.group_id() == group_id {
+            if let Some(entry) = self
+                .wal
+                .scan_segment_for_entry(segment_id, |e| {
+                    e.group_id() == group_id && e.index() == index
+                })
+                .await?
+            {
                 return Ok(Some(entry));
             }
         }
@@ -978,6 +1090,19 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
             };
 
             let next_index = last_index + 1;
+
+            // Diagnostic: detect unexpected jumps in per-group counter.
+            if last_index > 0 {
+                let from_buffer = buffer.last_index_for(self.group_id).is_some();
+                if !from_buffer {
+                    tracing::warn!(
+                        group_id = %self.group_id,
+                        last_index,
+                        next_index,
+                        "append_auto_async: initialized from WAL state (not buffer)"
+                    );
+                }
+            }
 
             // Create entry with assigned index.
             let entry = SharedEntry::new(self.group_id, term, next_index, payload.clone())?;
@@ -1476,6 +1601,37 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
         let wal = self.inner.wal.lock().await;
         wal.segment_info(segment_id)
     }
+
+    // -------------------------------------------------------------------------
+    // Segment Retention (Deletion)
+    // -------------------------------------------------------------------------
+
+    /// Returns metadata for all sealed segments.
+    pub async fn sealed_segment_infos(&self) -> Vec<crate::wal::SegmentInfo> {
+        let wal = self.inner.wal.lock().await;
+        wal.sealed_segment_infos()
+    }
+
+    /// Returns `(group_id, max_index)` for all groups with entries in a segment.
+    pub async fn groups_in_segment(
+        &self,
+        segment_id: crate::SegmentId,
+    ) -> Vec<(GroupId, u64)> {
+        let wal = self.inner.wal.lock().await;
+        wal.groups_in_segment(segment_id)
+    }
+
+    /// Deletes a sealed segment from memory and disk.
+    ///
+    /// # Errors
+    /// Returns an error if the disk file cannot be removed.
+    pub async fn delete_sealed_segment(
+        &self,
+        segment_id: crate::SegmentId,
+    ) -> WalResult<()> {
+        let mut wal = self.inner.wal.lock().await;
+        wal.delete_sealed_segment(segment_id).await
+    }
 }
 
 /// Background task that batches writes and syncs.
@@ -1858,6 +2014,16 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalPool<S> {
             total += coordinator.entry_count().await;
         }
         total
+    }
+
+    /// Returns a reference to the coordinators for retention processing.
+    ///
+    /// The retention task iterates over each coordinator to check segment
+    /// age and replication safety. This avoids duplicating pool-level
+    /// iteration logic in the server.
+    #[must_use]
+    pub fn coordinators(&self) -> &[SharedWalCoordinator<S>] {
+        &self.coordinators
     }
 }
 

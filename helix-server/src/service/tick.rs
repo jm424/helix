@@ -15,7 +15,7 @@ use helix_raft::RaftState;
 use helix_runtime::{BrokerHeartbeat, IncomingMessage, TransportService};
 use helix_wal::{SharedEntry, SharedWalPool, Storage};
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::vote_store::{LocalFileVoteStorage, VoteStore};
 
@@ -60,6 +60,13 @@ pub const LEADER_REBALANCE_INTERVAL_MS: u64 = 10_000; // 10 seconds.
 /// converge in ~17 minutes. For typical workloads (128-512 partitions),
 /// convergence is 1-2 cycles.
 pub const MAX_TRANSFERS_PER_CYCLE: usize = 10;
+
+/// Interval for segment retention checks (in milliseconds).
+///
+/// Set to 60 seconds — retention is not latency-sensitive. Checks all
+/// shared and dedicated WAL segments for age + replication safety, then
+/// deletes eligible segments.
+pub const RETENTION_INTERVAL_MS: u64 = 60_000; // 60 seconds.
 
 /// Background task to handle Raft ticks for all groups (single-node).
 #[allow(clippy::significant_drop_tightening, clippy::implicit_hasher)]
@@ -140,6 +147,7 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
     data_dir: Option<PathBuf>,
     recovered_entries: Arc<RwLock<HashMap<GroupId, Vec<SharedEntry>>>>,
     storage: S,
+    local_retention_ms: Option<u64>,
     mut incoming_rx: mpsc::Receiver<IncomingMessage>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
@@ -149,6 +157,8 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
         tokio::time::interval(tokio::time::Duration::from_millis(HEARTBEAT_INTERVAL_MS));
     let mut tiering_interval =
         tokio::time::interval(tokio::time::Duration::from_millis(TIERING_INTERVAL_MS));
+    let mut retention_interval =
+        tokio::time::interval(tokio::time::Duration::from_millis(RETENTION_INTERVAL_MS));
 
     let initial_partition_count = router.partition_count().await;
     info!(
@@ -182,6 +192,17 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
                 // Process tiering for all durable partitions.
                 process_tiering(&partition_storage).await;
             }
+            _ = retention_interval.tick() => {
+                // Delete old WAL segments that have been replicated.
+                if let Some(retention_ms) = local_retention_ms {
+                    process_retention(
+                        &partition_storage,
+                        &router,
+                        shared_wal_pool.as_ref(),
+                        retention_ms,
+                    ).await;
+                }
+            }
             Some(incoming) = incoming_rx.recv() => {
                 // Route incoming messages to partition actors or MultiRaft.
                 match incoming {
@@ -198,7 +219,7 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
                         // Step controller messages through MultiRaft and process ALL outputs.
                         // This includes BecameLeader, CommitEntry, etc. - not just SendMessages.
                         if !controller_msgs.is_empty() {
-                            info!(
+                            trace!(
                                 count = controller_msgs.len(),
                                 "Received controller messages in tick_task_actor"
                             );
@@ -206,7 +227,7 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
                                 let mut mr = multi_raft.write().await;
                                 mr.handle_messages(controller_msgs)
                             };
-                            info!(
+                            trace!(
                                 output_count = outputs.len(),
                                 "Processed controller messages, got outputs"
                             );
@@ -293,6 +314,7 @@ pub async fn tick_task_controller<
     data_dir: Option<PathBuf>,
     recovered_entries: Arc<RwLock<HashMap<GroupId, Vec<SharedEntry>>>>,
     storage: S,
+    local_broker_heartbeats: Arc<RwLock<HashMap<NodeId, u64>>>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
     let mut tick_interval =
@@ -351,6 +373,7 @@ pub async fn tick_task_controller<
                     &controller_state,
                     &cluster_nodes,
                     &router,
+                    &local_broker_heartbeats,
                 ).await;
             }
         }
@@ -368,11 +391,22 @@ pub async fn tick_task_controller<
 ///
 /// Only runs when this node is the controller leader. Follows the Kafka
 /// `auto.leader.rebalance` pattern.
+/// Nodes muted from rebalance after a failed leadership transfer.
+///
+/// Tracks `(node_id, mute_until_ms)`. When a transfer to a node fails
+/// (e.g., target is dead), the node is muted for one rebalance interval
+/// to avoid retrying immediately. Same pattern as Redpanda's
+/// `leadership_transfer_backoff`.
+static REBALANCE_MUTED: std::sync::LazyLock<
+    tokio::sync::Mutex<HashMap<NodeId, u64>>,
+> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+
 async fn rebalance_partition_leaders(
     multi_raft: &Arc<RwLock<MultiRaft>>,
     controller_state: &Arc<RwLock<ControllerState>>,
     cluster_nodes: &[NodeId],
     router: &Arc<super::router::PartitionRouter>,
+    local_broker_heartbeats: &Arc<RwLock<HashMap<NodeId, u64>>>,
 ) {
     // Only the controller leader should rebalance.
     let is_controller_leader = {
@@ -390,6 +424,30 @@ async fn rebalance_partition_leaders(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
 
+    // Check broker liveness from BOTH sources:
+    // 1. local_broker_heartbeats: soft-state heartbeats exchanged via
+    //    transport in production mode.
+    // 2. controller_state.broker_heartbeats: Raft-replicated heartbeats
+    //    used in DST (deterministic simulation testing).
+    //
+    // A broker is considered alive if EITHER source has a recent
+    // heartbeat. This ensures the same rebalance logic works in both
+    // production and DST.
+    let local_live: std::collections::HashSet<NodeId> = {
+        let hb = local_broker_heartbeats.read().await;
+        hb.iter()
+            .filter(|(_, &ts)| now_ms.saturating_sub(ts) < crate::controller::BROKER_HEARTBEAT_TIMEOUT_MS)
+            .map(|(&id, _)| id)
+            .collect()
+    };
+
+    // Expire old mutes and collect the currently muted set.
+    let muted_nodes: std::collections::HashSet<NodeId> = {
+        let mut muted = REBALANCE_MUTED.lock().await;
+        muted.retain(|_, &mut until| until > now_ms);
+        muted.keys().copied().collect()
+    };
+
     // Collect imbalanced partitions: preferred leader != actual leader.
     let imbalanced: Vec<(GroupId, NodeId)> = {
         let state = controller_state.read().await;
@@ -401,8 +459,15 @@ async fn rebalance_partition_leaders(
                 if assignment.leader == Some(preferred) {
                     return None;
                 }
-                // Skip if preferred leader is not alive.
-                if !state.is_broker_live(preferred, now_ms) {
+                // Skip if preferred leader is not alive (check both sources).
+                let alive = local_live.contains(&preferred)
+                    || state.is_broker_live(preferred, now_ms);
+                if !alive {
+                    return None;
+                }
+                // Skip if the target node is muted from a recent
+                // failed transfer attempt.
+                if muted_nodes.contains(&preferred) {
                     return None;
                 }
                 Some((assignment.group_id, preferred))
@@ -442,6 +507,11 @@ async fn rebalance_partition_leaders(
                         target = preferred.get(),
                         "Initiated leadership transfer to preferred replica"
                     );
+                    // Mute this target for one rebalance interval to avoid
+                    // retrying if the transfer fails (target unreachable).
+                    // The mute is cleared automatically when it expires.
+                    let mute_until = now_ms + LEADER_REBALANCE_INTERVAL_MS;
+                    REBALANCE_MUTED.lock().await.insert(*preferred, mute_until);
                 }
             }
             Err(_) => {
@@ -1317,6 +1387,128 @@ async fn process_tiering<S: Storage + Clone + Send + Sync + 'static>(
                         error = %e,
                         "Failed to tier eligible segments"
                     );
+                }
+            }
+        }
+    }
+}
+
+/// Runs segment retention for both dedicated and shared WAL partitions.
+///
+/// For **dedicated WAL** partitions: calls `run_retention(min_replicated_index)`
+/// on each partition where this node is the leader.
+///
+/// For **shared WAL** pools: checks each coordinator's sealed segments, verifies
+/// that ALL groups with entries in a segment are fully replicated, and deletes
+/// eligible segments that are old enough.
+async fn process_retention<S: Storage + Clone + Send + Sync + 'static>(
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
+    router: &Arc<super::router::PartitionRouter>,
+    shared_wal_pool: Option<&Arc<SharedWalPool<S>>>,
+    local_retention_ms: u64,
+) {
+    // Collect min_replicated_index from all partition actors.
+    let replicated_indices: HashMap<GroupId, u64> = router
+        .min_replicated_indices()
+        .await
+        .into_iter()
+        .collect();
+
+    // --- Dedicated WAL retention ---
+    // Only process partitions where this node is leader (non-zero min_replicated_index).
+    let dedicated_groups: Vec<(GroupId, Arc<RwLock<PartitionStorage<S>>>)> = {
+        let storage = partition_storage.read().await;
+        storage
+            .iter()
+            .filter_map(|(gid, ps_lock)| {
+                let min_rep = replicated_indices.get(gid).copied().unwrap_or(0);
+                if min_rep > 0 {
+                    Some((*gid, ps_lock.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
+    // TigerStyle: bounded iteration.
+    for (group_id, ps_lock) in dedicated_groups.iter().take(200) {
+        let min_rep = replicated_indices.get(group_id).copied().unwrap_or(0);
+        let mut ps = ps_lock.write().await;
+        match ps.run_retention(min_rep, local_retention_ms).await {
+            Ok(deleted) if deleted > 0 => {
+                info!(
+                    group = group_id.get(),
+                    deleted,
+                    "Retention: deleted dedicated WAL segments"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    group = group_id.get(),
+                    error = %e,
+                    "Failed to run retention"
+                );
+            }
+        }
+    }
+
+    // --- Shared WAL retention ---
+    if let Some(pool) = shared_wal_pool {
+        for coordinator in pool.coordinators() {
+            let infos = coordinator.sealed_segment_infos().await;
+            if infos.is_empty() {
+                continue;
+            }
+
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .expect("system clock before UNIX epoch")
+                .as_secs();
+
+            // TigerStyle: bounded iteration.
+            for info in infos.iter().take(200) {
+                if !info.is_sealed {
+                    continue;
+                }
+
+                let retention_secs = local_retention_ms / 1000;
+                let age_ok = info
+                    .sealed_at_secs
+                    .is_some_and(|sealed_at| now_secs.saturating_sub(sealed_at) >= retention_secs);
+                if !age_ok {
+                    continue;
+                }
+
+                // Check that ALL groups in this segment are fully replicated.
+                let groups = coordinator.groups_in_segment(info.segment_id).await;
+                let all_replicated = groups.iter().all(|(gid, max_idx)| {
+                    let min_rep = replicated_indices.get(gid).copied().unwrap_or(0);
+                    // If min_rep is 0, this node is not leader for this group.
+                    // We can't safely delete — skip this segment.
+                    min_rep > 0 && *max_idx <= min_rep
+                });
+
+                if !all_replicated {
+                    continue;
+                }
+
+                match coordinator.delete_sealed_segment(info.segment_id).await {
+                    Ok(()) => {
+                        info!(
+                            segment_id = info.segment_id.get(),
+                            groups = groups.len(),
+                            "Retention: deleted shared WAL segment"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            segment_id = info.segment_id.get(),
+                            error = %e,
+                            "Failed to delete shared WAL segment"
+                        );
+                    }
                 }
             }
         }

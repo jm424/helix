@@ -17,6 +17,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use tracing::{debug, info, warn};
 
@@ -43,6 +44,9 @@ pub struct SegmentInfo {
     pub entry_count: u64,
     /// Whether the segment is sealed (no more writes).
     pub is_sealed: bool,
+    /// Unix timestamp (seconds) when this segment was sealed.
+    /// `None` for the active segment or if the seal time is unknown.
+    pub sealed_at_secs: Option<u64>,
 }
 
 /// WAL configuration.
@@ -182,7 +186,16 @@ fn segment_info_from<E: WalEntry>(
         size_bytes: segment.size_bytes(),
         entry_count: segment.entry_count(),
         is_sealed: segment.is_sealed(),
+        sealed_at_secs: None,
     }
+}
+
+/// Returns the current Unix timestamp in seconds.
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_secs()
 }
 
 impl<S: Storage, E: WalEntry> Wal<S, E> {
@@ -247,7 +260,11 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
                         last_index = Some(idx);
                     }
 
-                    let info = segment_info_from(segment_id, &segment);
+                    let mut info = segment_info_from(segment_id, &segment);
+                    // On recovery, reset the seal clock to now. This is
+                    // conservative: segments may live longer than necessary,
+                    // but never shorter. We avoid adding mtime to Storage.
+                    info.sealed_at_secs = Some(unix_now_secs());
                     sealed_segments.insert(
                         segment_id,
                         SealedSegment {
@@ -1070,7 +1087,8 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
             active.segment.seal();
 
             let segment_id = active.segment.id();
-            let info = segment_info_from(segment_id, &active.segment);
+            let mut info = segment_info_from(segment_id, &active.segment);
+            info.sealed_at_secs = Some(unix_now_secs());
             info!(
                 segment_id = segment_id.get(),
                 entries = info.entry_count,
@@ -1215,6 +1233,47 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
         entry
     }
 
+    /// Scans a sealed segment for an entry matching a predicate.
+    ///
+    /// Reads the segment from disk (or cache), decodes all entries, and
+    /// returns the first entry matching `predicate`. Used by `SharedWal`
+    /// for group-local index lookups where positional arithmetic doesn't
+    /// apply.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the segment file cannot be read or decoded.
+    pub async fn scan_segment_for_entry<F>(
+        &mut self,
+        segment_id: SegmentId,
+        predicate: F,
+    ) -> WalResult<Option<E>>
+    where
+        F: Fn(&E) -> bool,
+    {
+        // Check cache first.
+        if let Some((cached_id, ref cached_seg)) = self.cached_segment {
+            if cached_id == segment_id {
+                return Ok(cached_seg.entries().find(|e| predicate(e)).cloned());
+            }
+        }
+
+        // Cache miss — read from disk.
+        let sealed = self
+            .sealed_segments
+            .get(&segment_id)
+            .ok_or_else(|| WalError::SegmentNotFound {
+                segment_id: segment_id.get(),
+            })?;
+
+        let file = self.storage.open(&sealed.path).await?;
+        let data = file.read_all().await?;
+        let segment = Segment::<E>::decode(data, self.config.segment_config)?;
+        let result = segment.entries().find(|e| predicate(e)).cloned();
+        self.cached_segment = Some((segment_id, segment));
+        Ok(result)
+    }
+
     /// Returns the entries of a sealed segment (before eviction).
     ///
     /// This is used by [`SharedWal`](crate::SharedWal) to build the
@@ -1275,6 +1334,96 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
             debug!(count, "Evicted all sealed segments from memory");
         }
         count
+    }
+
+    // -------------------------------------------------------------------------
+    // Segment Retention (Deletion)
+    // -------------------------------------------------------------------------
+
+    /// Returns metadata for all sealed segments, ordered by segment ID.
+    ///
+    /// Used by the retention system to enumerate deletion candidates.
+    #[must_use]
+    pub fn sealed_segment_infos(&self) -> Vec<SegmentInfo> {
+        self.sealed_segments
+            .values()
+            .map(|sealed| sealed.info)
+            .collect()
+    }
+
+    /// Deletes a sealed segment from memory and disk.
+    ///
+    /// Removes the segment from the in-memory map, invalidates any read
+    /// cache referencing it, deletes the file on disk, and advances
+    /// `first_index` to the next segment's start index.
+    ///
+    /// # Safety Invariants
+    ///
+    /// - Never deletes the active (writable) segment.
+    /// - The caller must ensure all entries in this segment have been
+    ///   replicated and are no longer needed for Raft catch-up.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the disk file cannot be removed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `segment_id` refers to the active segment.
+    pub async fn delete_sealed_segment(
+        &mut self,
+        segment_id: SegmentId,
+    ) -> WalResult<()> {
+        // Precondition: must not delete the active segment.
+        if let Some(active) = &self.active_segment {
+            assert!(
+                active.segment.id() != segment_id,
+                "cannot delete the active segment"
+            );
+        }
+
+        let Some(sealed) = self.sealed_segments.remove(&segment_id) else {
+            return Ok(()); // Already deleted or doesn't exist.
+        };
+
+        // Invalidate read cache if it holds this segment.
+        if self
+            .cached_segment
+            .as_ref()
+            .is_some_and(|(id, _)| *id == segment_id)
+        {
+            self.cached_segment = None;
+        }
+
+        // Remove pending sync entries for this segment.
+        self.sealed_segments_pending_sync
+            .retain(|id| *id != segment_id);
+
+        // Delete file on disk.
+        if let Err(e) = self.storage.remove(&sealed.path).await {
+            warn!(
+                segment_id = segment_id.get(),
+                error = %e,
+                "Failed to delete segment file (will retry)"
+            );
+            return Err(e);
+        }
+
+        // Advance first_index to the next segment's start.
+        if let Some((_, next_sealed)) = self.sealed_segments.iter().next() {
+            self.first_index = next_sealed.info.first_index;
+        } else if let Some(ref active) = self.active_segment {
+            self.first_index = active.segment.first_index();
+        }
+        // If no segments remain, first_index stays as-is (WAL is empty).
+
+        info!(
+            segment_id = segment_id.get(),
+            first_index = self.first_index,
+            "Deleted segment (retention)"
+        );
+
+        Ok(())
     }
 }
 
@@ -1597,5 +1746,232 @@ mod tests {
                 assert_eq!(entry.index(), i);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_sealed_segment_infos() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = WalConfig::new(temp_dir.path())
+            .with_segment_config(crate::SegmentConfig::new().with_max_entries(2));
+
+        let mut wal: Wal<TokioStorage> = Wal::open(TokioStorage::new(), config).await.unwrap();
+
+        // Before any writes, no sealed segments.
+        assert!(wal.sealed_segment_infos().is_empty());
+
+        // Append 5 entries — with max 2 per segment, creates 2 sealed + 1 active.
+        for i in 1..=5 {
+            let entry = Entry::new(1, i, Bytes::from("data")).unwrap();
+            wal.append(entry).await.unwrap();
+        }
+        wal.sync().await.unwrap();
+
+        let infos = wal.sealed_segment_infos();
+        assert_eq!(infos.len(), 2);
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        for info in &infos {
+            assert!(info.is_sealed);
+            // sealed_at_secs should be set and within the last 10 seconds.
+            let sealed_at = info.sealed_at_secs.expect("sealed_at_secs must be set");
+            assert!(
+                now_secs.saturating_sub(sealed_at) < 10,
+                "sealed_at_secs should be recent, got {sealed_at} vs now {now_secs}"
+            );
+            // Each sealed segment should have 2 entries.
+            assert_eq!(info.entry_count, 2);
+        }
+
+        // Verify first sealed segment covers entries 1-2.
+        assert_eq!(infos[0].first_index, 1);
+        assert_eq!(infos[0].last_index, Some(2));
+        // Second covers 3-4.
+        assert_eq!(infos[1].first_index, 3);
+        assert_eq!(infos[1].last_index, Some(4));
+    }
+
+    #[tokio::test]
+    async fn test_delete_sealed_segment() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = WalConfig::new(temp_dir.path())
+            .with_segment_config(crate::SegmentConfig::new().with_max_entries(3));
+
+        let mut wal: Wal<TokioStorage> = Wal::open(TokioStorage::new(), config).await.unwrap();
+
+        // Append 9 entries — creates 2 sealed (3 each) + 1 active (3).
+        for i in 1..=9 {
+            let entry = Entry::new(1, i, Bytes::from(format!("data-{i}"))).unwrap();
+            wal.append(entry).await.unwrap();
+        }
+        wal.sync().await.unwrap();
+
+        assert_eq!(wal.sealed_segment_count(), 2);
+        let sealed_ids = wal.sealed_segment_ids();
+        assert_eq!(sealed_ids.len(), 2);
+
+        // Verify we CAN read entries 1-3 before deletion.
+        for i in 1..=3 {
+            assert!(wal.read(i).is_ok(), "entry {i} should be readable before delete");
+        }
+
+        // Count segment files on disk before deletion.
+        let files_before: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "wal"))
+            .collect();
+
+        // Delete the first sealed segment (entries 1-3).
+        wal.delete_sealed_segment(sealed_ids[0]).await.unwrap();
+        assert_eq!(wal.sealed_segment_count(), 1);
+
+        // first_index should be exactly 4 (start of second segment).
+        assert_eq!(wal.first_index(), 4);
+
+        // Verify entries 1-3 are NO LONGER readable.
+        for i in 1..=3 {
+            assert!(wal.read(i).is_err(), "entry {i} should NOT be readable after delete");
+        }
+
+        // Remaining entries 4-9 are still readable with correct data.
+        for i in 4..=9 {
+            let entry = wal.read(i).unwrap();
+            assert_eq!(entry.index(), i);
+            assert_eq!(entry.payload, Bytes::from(format!("data-{i}")));
+        }
+
+        // Verify one fewer file on disk.
+        let files_after: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "wal"))
+            .collect();
+        assert_eq!(
+            files_after.len(),
+            files_before.len() - 1,
+            "one segment file should be deleted from disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_updates_first_index() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = WalConfig::new(temp_dir.path())
+            .with_segment_config(crate::SegmentConfig::new().with_max_entries(2));
+
+        let mut wal: Wal<TokioStorage> = Wal::open(TokioStorage::new(), config).await.unwrap();
+
+        // Append 6 entries — creates 2 sealed (2 each) + 1 active (2).
+        for i in 1..=6 {
+            let entry = Entry::new(1, i, Bytes::from("data")).unwrap();
+            wal.append(entry).await.unwrap();
+        }
+        wal.sync().await.unwrap();
+
+        let sealed_ids = wal.sealed_segment_ids();
+        assert_eq!(sealed_ids.len(), 2);
+
+        // Verify starting state.
+        assert_eq!(wal.first_index(), 1);
+        let info1 = wal.segment_info(sealed_ids[0]).unwrap();
+        assert_eq!(info1.first_index, 1);
+        assert_eq!(info1.last_index, Some(2));
+        let info2 = wal.segment_info(sealed_ids[1]).unwrap();
+        assert_eq!(info2.first_index, 3);
+        assert_eq!(info2.last_index, Some(4));
+
+        // Delete first segment.
+        wal.delete_sealed_segment(sealed_ids[0]).await.unwrap();
+
+        // first_index should advance to exactly 3.
+        assert_eq!(wal.first_index(), 3);
+
+        // Delete second segment.
+        wal.delete_sealed_segment(sealed_ids[1]).await.unwrap();
+
+        // first_index should advance to 5 (start of the active segment).
+        assert_eq!(wal.first_index(), 5);
+        assert_eq!(wal.sealed_segment_count(), 0);
+
+        // Active segment entries 5-6 still readable.
+        for i in 5..=6 {
+            let entry = wal.read(i).unwrap();
+            assert_eq!(entry.index(), i);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delete_preserves_other_segments() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = WalConfig::new(temp_dir.path())
+            .with_segment_config(crate::SegmentConfig::new().with_max_entries(2));
+
+        let mut wal: Wal<TokioStorage> = Wal::open(TokioStorage::new(), config).await.unwrap();
+
+        // Append 8 entries — creates 3 sealed (2 each) + 1 active (2).
+        for i in 1..=8 {
+            let entry = Entry::new(1, i, Bytes::from(format!("val-{i}"))).unwrap();
+            wal.append(entry).await.unwrap();
+        }
+        wal.sync().await.unwrap();
+
+        let sealed_ids = wal.sealed_segment_ids();
+        assert_eq!(sealed_ids.len(), 3);
+
+        // Delete the middle segment (entries 3-4).
+        wal.delete_sealed_segment(sealed_ids[1]).await.unwrap();
+        assert_eq!(wal.sealed_segment_count(), 2);
+
+        // First and third sealed segments still exist with correct metadata.
+        let s0 = wal.segment_info(sealed_ids[0]).unwrap();
+        assert_eq!(s0.first_index, 1);
+        assert_eq!(s0.last_index, Some(2));
+        let s2 = wal.segment_info(sealed_ids[2]).unwrap();
+        assert_eq!(s2.first_index, 5);
+        assert_eq!(s2.last_index, Some(6));
+        assert!(wal.segment_info(sealed_ids[1]).is_none());
+
+        // Entries in surviving segments are readable with correct data.
+        for i in 1..=2 {
+            let entry = wal.read(i).unwrap();
+            assert_eq!(entry.payload, Bytes::from(format!("val-{i}")));
+        }
+        for i in 5..=8 {
+            let entry = wal.read(i).unwrap();
+            assert_eq!(entry.payload, Bytes::from(format!("val-{i}")));
+        }
+
+        // Entries from deleted segment are NOT readable.
+        for i in 3..=4 {
+            assert!(wal.read(i).is_err(), "entry {i} should not be readable");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delete_nonexistent_is_noop() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = WalConfig::new(temp_dir.path())
+            .with_segment_config(crate::SegmentConfig::new().with_max_entries(2));
+
+        let mut wal: Wal<TokioStorage> = Wal::open(TokioStorage::new(), config).await.unwrap();
+
+        for i in 1..=4 {
+            let entry = Entry::new(1, i, Bytes::from("data")).unwrap();
+            wal.append(entry).await.unwrap();
+        }
+        wal.sync().await.unwrap();
+
+        assert_eq!(wal.sealed_segment_count(), 1);
+
+        // Delete a segment ID that doesn't exist — should be a no-op.
+        wal.delete_sealed_segment(SegmentId::new(999))
+            .await
+            .unwrap();
+        assert_eq!(wal.sealed_segment_count(), 1);
+        assert_eq!(wal.first_index(), 1);
     }
 }

@@ -201,13 +201,26 @@ impl RaftLog {
             self.last_index().get() + 1
         };
 
-        assert_eq!(
-            entry.index.get(),
-            expected_index,
-            "log entry index must be sequential: expected {}, got {}",
-            expected_index,
-            entry.index.get()
-        );
+        if entry.index.get() != expected_index {
+            // Log full state before panicking for post-mortem analysis.
+            eprintln!(
+                "RAFT_LOG_PANIC: expected={} got={} compacted_index={} \
+                 compacted_term={} first_index={} entries_len={} \
+                 entry_term={}",
+                expected_index,
+                entry.index.get(),
+                self.compacted_index,
+                self.compacted_term,
+                self.first_index,
+                self.entries.len(),
+                entry.term.get(),
+            );
+            panic!(
+                "log entry index must be sequential: expected {}, got {}",
+                expected_index,
+                entry.index.get()
+            );
+        }
 
         self.entries.push(entry);
     }

@@ -174,6 +174,19 @@ pub enum ServerError {
         pending_bytes: u64,
     },
 
+    /// Not enough in-sync replicas to accept writes.
+    ///
+    /// The leader has lost contact with enough followers that it cannot
+    /// form a quorum. Writes are rejected immediately to prevent
+    /// accumulating uncommittable entries.
+    #[error("not enough replicas for partition {partition} of topic {topic}")]
+    NotEnoughReplicas {
+        /// The topic name.
+        topic: String,
+        /// The partition index.
+        partition: i32,
+    },
+
     /// Internal error.
     #[error("internal error: {message}")]
     Internal {
@@ -205,6 +218,7 @@ impl ServerError {
             Self::OutOfOrderSequence { .. } => ErrorCode::OutOfOrderSequence,
             Self::ProducerFenced { .. } => ErrorCode::ProducerFenced,
             Self::Overloaded { .. } => ErrorCode::BrokerNotAvailable,
+            Self::NotEnoughReplicas { .. } => ErrorCode::BrokerNotAvailable,
             Self::Internal { .. } => ErrorCode::Unknown,
         }
     }
@@ -213,6 +227,16 @@ impl ServerError {
     #[must_use]
     pub fn message(&self) -> String {
         self.to_string()
+    }
+
+    /// Returns the controller leader hint, if this is a `NotController` error.
+    #[must_use]
+    pub const fn controller_hint(&self) -> Option<u64> {
+        if let Self::NotController { controller_hint } = self {
+            *controller_hint
+        } else {
+            None
+        }
     }
 }
 

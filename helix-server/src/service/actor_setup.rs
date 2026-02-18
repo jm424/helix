@@ -251,6 +251,7 @@ pub async fn setup_multi_partition<
     data_dir: Option<PathBuf>,
     recovered_entries: Arc<RwLock<HashMap<GroupId, Vec<SharedEntry>>>>,
     storage: S,
+    local_retention_ms: Option<u64>,
 ) -> ActorSetupHandles {
     let group_count = initial_groups.len();
 
@@ -335,6 +336,7 @@ pub async fn setup_multi_partition<
         data_dir,
         recovered_entries,
         storage,
+        local_retention_ms,
         incoming_rx,
         shutdown_rx,
     ));

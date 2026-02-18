@@ -162,6 +162,25 @@ impl BlobIndex {
     fn len(&self) -> usize {
         self.entries.len()
     }
+
+    /// Removes all entries whose `wal_index` is below `min_wal_index`.
+    ///
+    /// Called after WAL segment deletion to clean up stale index entries
+    /// that point to WAL indices that no longer exist.
+    fn truncate_below(&mut self, min_wal_index: u64) {
+        let before = self.entries.len();
+        self.entries
+            .retain(|e| e.wal_index >= min_wal_index);
+        let removed = before - self.entries.len();
+        if removed > 0 {
+            tracing::debug!(
+                removed,
+                min_wal_index,
+                remaining = self.entries.len(),
+                "BlobIndex: truncated stale entries"
+            );
+        }
+    }
 }
 use helix_progress::{
     Lease, ProgressConfig, ProgressError, ProgressManager, SimulatedProgressStore,
@@ -1477,6 +1496,12 @@ pub struct DurablePartitionConfig {
     /// Takes precedence over `object_storage_dir` if both are set.
     #[cfg(feature = "s3")]
     pub s3_config: Option<S3Config>,
+    /// Local disk retention in milliseconds.
+    ///
+    /// Sealed WAL segments older than this are deleted from local disk.
+    /// Only deletes segments whose entries have been fully replicated.
+    /// `None` means retention is disabled (segments kept forever).
+    pub local_retention_ms: Option<u64>,
 }
 
 #[allow(dead_code)] // Used in tests and will be used in service.rs integration.
@@ -1495,6 +1520,7 @@ impl DurablePartitionConfig {
             object_storage_dir: None,
             #[cfg(feature = "s3")]
             s3_config: None,
+            local_retention_ms: None,
         }
     }
 
@@ -1552,6 +1578,16 @@ impl DurablePartitionConfig {
     #[must_use]
     pub fn with_s3_config(mut self, config: S3Config) -> Self {
         self.s3_config = Some(config);
+        self
+    }
+
+    /// Sets the local disk retention in milliseconds.
+    ///
+    /// Sealed WAL segments older than this are deleted from local disk,
+    /// provided all entries have been replicated via Raft.
+    #[must_use]
+    pub const fn with_local_retention_ms(mut self, ms: u64) -> Self {
+        self.local_retention_ms = Some(ms);
         self
     }
 
@@ -1892,7 +1928,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         let mut last_applied_index = 0u64;
         let mut last_applied_term = 0u64;
 
-        for entry in &recovered_entries {
+        // Diagnostic: track index range and gaps for debugging index space issues.
+        let mut first_entry_index = 0u64;
+        let mut prev_entry_index = 0u64;
+        let mut gap_count = 0u64;
+
+        for (i, entry) in recovered_entries.iter().enumerate() {
             if let Err(e) =
                 Self::apply_shared_entry_to_cache(&mut cache, &mut blob_index, entry)
             {
@@ -1902,6 +1943,22 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                     "Failed to apply entry during recovery"
                 );
             }
+            if i == 0 {
+                first_entry_index = entry.index();
+            } else if entry.index() != prev_entry_index + 1 {
+                gap_count += 1;
+                if gap_count <= 5 {
+                    warn!(
+                        topic = config.topic_id.get(),
+                        partition = config.partition_id.get(),
+                        prev_index = prev_entry_index,
+                        curr_index = entry.index(),
+                        gap = entry.index() - prev_entry_index - 1,
+                        "SharedWal recovery: non-contiguous per-group index"
+                    );
+                }
+            }
+            prev_entry_index = entry.index();
             last_applied_term = entry.term();
             last_applied_index = entry.index();
         }
@@ -1928,7 +1985,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
 
         info!(
             entries = recovered_entries.len(),
+            first_index = first_entry_index,
             last_index = last_applied_index,
+            gap_count,
             recovered_hwm = %recovered_hwm,
             "Recovery complete"
         );
@@ -2402,11 +2461,22 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                 raft_index
             }
             WalBackend::Shared(handle) => {
-                handle.append_nowait(term, data).await.map_err(|e| {
+                let wal_index = handle.append_nowait(term, data).await.map_err(|e| {
                     DurablePartitionError::WalWrite {
                         message: e.to_string(),
                     }
-                })?
+                })?;
+                if wal_index != raft_index {
+                    warn!(
+                        topic = self.config.topic_id.get(),
+                        partition = self.config.partition_id.get(),
+                        raft_index,
+                        wal_index,
+                        delta = wal_index as i64 - raft_index as i64,
+                        "SharedWal auto-index diverged from Raft index"
+                    );
+                }
+                wal_index
             }
         };
 
@@ -3188,6 +3258,125 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             .map_err(|e| DurablePartitionError::Tiering {
                 message: e.to_string(),
             })
+    }
+
+    // -------------------------------------------------------------------------
+    // Segment Retention
+    // -------------------------------------------------------------------------
+
+    /// Runs retention for a dedicated WAL partition.
+    ///
+    /// Deletes sealed segments that are:
+    /// 1. Older than `local_retention_ms`
+    /// 2. Fully replicated (`last_index <= min_replicated_index`)
+    ///
+    /// After deleting segments, cleans up stale `BlobIndex` entries.
+    ///
+    /// Returns the number of segments deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a segment file cannot be removed from disk.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the system clock is before the UNIX epoch.
+    pub async fn run_retention(
+        &mut self,
+        min_replicated_index: u64,
+        local_retention_ms: u64,
+    ) -> Result<u32, DurablePartitionError> {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_secs();
+
+        // Only operates on dedicated WAL. Shared WAL retention is
+        // coordinated at the tick level across all partitions.
+        let WalBackend::Dedicated(ref wal) = self.wal else {
+            return Ok(0);
+        };
+
+        // Collect eligible segments: sealed, old enough, and replicated.
+        let retention_secs = local_retention_ms / 1000;
+        let infos = wal.sealed_segment_infos().await;
+        let mut to_delete = Vec::new();
+
+        for info in &infos {
+            // Must be sealed.
+            if !info.is_sealed {
+                continue;
+            }
+            // Must be old enough.
+            let age_ok = info
+                .sealed_at_secs
+                .is_some_and(|sealed_at| now_secs.saturating_sub(sealed_at) >= retention_secs);
+            if !age_ok {
+                continue;
+            }
+            // All entries must be replicated.
+            let replicated =
+                info.last_index.is_none_or(|last| last <= min_replicated_index);
+            if !replicated {
+                continue;
+            }
+            to_delete.push(info.segment_id);
+        }
+
+        if to_delete.is_empty() {
+            return Ok(0);
+        }
+
+        let mut deleted = 0u32;
+        for segment_id in &to_delete {
+            match wal.delete_sealed_segment(*segment_id).await {
+                Ok(()) => {
+                    deleted += 1;
+                }
+                Err(e) => {
+                    warn!(
+                        segment_id = segment_id.get(),
+                        error = %e,
+                        "Failed to delete segment during retention"
+                    );
+                    return Err(DurablePartitionError::WalWrite {
+                        message: format!("retention delete failed: {e}"),
+                    });
+                }
+            }
+        }
+
+        // Clean up stale BlobIndex entries. The WAL's first_index has
+        // advanced past the deleted segments' entries.
+        let new_first_index = match &self.wal {
+            WalBackend::Dedicated(w) => {
+                let ids = w.sealed_segment_ids().await;
+                if ids.is_empty() {
+                    // No sealed segments left — all entries are in active.
+                    self.last_applied_index + 1
+                } else {
+                    // First sealed segment's first_index.
+                    w.segment_info(ids[0]).await.map_or(
+                        0,
+                        |i| i.first_index,
+                    )
+                }
+            }
+            WalBackend::Shared(_) => 0, // Shared WAL handled separately.
+        };
+        if new_first_index > 0 {
+            self.blob_index.truncate_below(new_first_index);
+        }
+
+        info!(
+            topic = self.config.topic_id.get(),
+            partition = self.config.partition_id.get(),
+            deleted,
+            retention_secs,
+            "Retention: deleted old segments"
+        );
+
+        Ok(deleted)
     }
 }
 

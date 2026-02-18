@@ -482,6 +482,28 @@ impl<S: Storage + Send + Sync + 'static> BufferedWal<S> {
         guard.wal.evict_all_sealed_segments()
     }
 
+    /// Returns metadata for all sealed segments.
+    ///
+    /// Pass-through to underlying WAL for retention support.
+    pub async fn sealed_segment_infos(&self) -> Vec<crate::SegmentInfo> {
+        let guard = self.inner.lock().await;
+        guard.wal.sealed_segment_infos()
+    }
+
+    /// Deletes a sealed segment from memory and disk.
+    ///
+    /// Pass-through to underlying WAL for retention support.
+    ///
+    /// # Errors
+    /// Returns an error if the segment file cannot be removed.
+    pub async fn delete_sealed_segment(
+        &self,
+        segment_id: crate::SegmentId,
+    ) -> WalResult<()> {
+        let mut guard = self.inner.lock().await;
+        guard.wal.delete_sealed_segment(segment_id).await
+    }
+
     /// Stops the background flush task and flushes remaining entries.
     ///
     /// # Errors

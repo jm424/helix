@@ -430,4 +430,142 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
         let state = self.controller_state.read().await;
         state.topic_exists(topic)
     }
+
+    /// Deletes a topic through the controller partition (multi-node mode).
+    ///
+    /// This proposes a `DeleteTopic` command to the controller Raft group and
+    /// waits for the command to commit. The controller state machine removes
+    /// the topic and all partition assignments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this node is not the controller leader, if the
+    /// topic does not exist, or if the proposal fails or times out.
+    ///
+    /// # Panics
+    ///
+    /// Panics in single-node actor mode if internal actor output channels are
+    /// unexpectedly unavailable during immediate output processing.
+    pub async fn delete_topic_via_controller(&self, name: String) -> ServerResult<()> {
+        const DELETE_TIMEOUT_MS: u64 = 30_000;
+        const POLL_INTERVAL_MS: u64 = 50;
+
+        // Check if topic exists in controller state.
+        {
+            let state = self.controller_state.read().await;
+            if !state.topic_exists(&name) {
+                return Err(ServerError::TopicNotFound {
+                    topic: name,
+                });
+            }
+        }
+
+        // Propose DeleteTopic command.
+        let command = ControllerCommand::DeleteTopic { name: name.clone() };
+        let encoded = command.encode();
+
+        let (result_tx, result_rx) = oneshot::channel();
+
+        // For single-node with actor infrastructure, process outputs immediately.
+        let is_single_node_actor =
+            self.cluster_nodes.len() == 1 && self.actor_router.is_some();
+
+        let (proposed_index, propose_outputs) = {
+            let mut mr = self.multi_raft.write().await;
+            let Some((outputs, index)) = mr.propose_with_index(CONTROLLER_GROUP_ID, encoded)
+            else {
+                let controller_hint = mr
+                    .group_state(CONTROLLER_GROUP_ID)
+                    .and_then(|s| s.leader_id)
+                    .map(helix_core::NodeId::get);
+                drop(mr);
+                return Err(ServerError::NotController { controller_hint });
+            };
+            drop(mr);
+            (index, outputs)
+        };
+
+        // Register the pending controller proposal.
+        {
+            let mut proposals = self.pending_controller_proposals.write().await;
+            proposals.push(PendingControllerProposal {
+                log_index: proposed_index,
+                result_tx,
+            });
+        }
+
+        // For single-node actor mode, process propose outputs immediately.
+        if is_single_node_actor && !propose_outputs.is_empty() {
+            if let (Some(router), Some(output_tx)) = (&self.actor_router, &self.actor_output_tx) {
+                crate::service::tick::process_controller_outputs(
+                    &propose_outputs,
+                    &self.multi_raft,
+                    &self.partition_storage,
+                    &self.group_map,
+                    &self.controller_state,
+                    &self.pending_proposals,
+                    &self.pending_controller_proposals,
+                    &self.cluster_nodes,
+                    self.transport_handle
+                        .as_ref()
+                        .expect("transport must be set"),
+                    router,
+                    output_tx,
+                    None,
+                    self.shared_wal_pool.as_ref(),
+                    self.data_dir.as_ref(),
+                    Some(&self.recovered_entries),
+                    Some(&self.storage),
+                )
+                .await;
+            }
+        }
+
+        info!(
+            topic = %name,
+            log_index = proposed_index.get(),
+            "Proposed topic deletion to controller, waiting for commit"
+        );
+
+        // Wait for DeleteTopic command to commit.
+        tokio::time::timeout(
+            std::time::Duration::from_millis(DELETE_TIMEOUT_MS),
+            result_rx,
+        )
+        .await
+        .map_err(|_| ServerError::Internal {
+            message: format!("timeout waiting for DeleteTopic commit for {name}"),
+        })?
+        .map_err(|_| ServerError::Internal {
+            message: "controller proposal channel closed".to_string(),
+        })??;
+
+        // Wait for topic to be removed from controller state.
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(DELETE_TIMEOUT_MS);
+
+        loop {
+            let deleted = {
+                let state = self.controller_state.read().await;
+                !state.topic_exists(&name)
+            };
+
+            if deleted {
+                break;
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ServerError::Internal {
+                    message: format!(
+                        "timeout waiting for topic deletion to propagate for {name}"
+                    ),
+                });
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+        }
+
+        info!(topic = %name, "Topic deleted successfully");
+        Ok(())
+    }
 }

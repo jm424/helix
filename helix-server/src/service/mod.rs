@@ -538,6 +538,9 @@ pub struct HelixService<
     /// Uses Arc<Mutex> for thread-safe access from tick tasks.
     #[allow(dead_code)] // Used by tick tasks for vote persistence.
     pub(crate) vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
+    /// Local disk retention in milliseconds.
+    /// `None` means retention is disabled (segments kept forever).
+    pub(crate) local_retention_ms: Option<u64>,
 }
 
 /// Type alias for production Helix service using `TokioStorage` and `TransportHandle`.
@@ -755,6 +758,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             controller_shutdown_tx: None,
             actor_backpressure: None,
             vote_store: None, // Single-node mode doesn't persist vote state.
+            local_retention_ms: None,
         };
 
         (service, shutdown_rx)
@@ -793,6 +797,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
         shared_wal_count: Option<u32>,
         write_durability: WriteDurability,
         storage: S,
+        local_retention_ms: Option<u64>,
     ) -> Result<Self, TransportError> {
         Self::new_multi_node_internal(
             cluster_id,
@@ -808,6 +813,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             shared_wal_count,
             write_durability,
             storage,
+            local_retention_ms,
         )
         .await
     }
@@ -843,6 +849,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
         shared_wal_count: Option<u32>,
         write_durability: WriteDurability,
         storage: S,
+        local_retention_ms: Option<u64>,
     ) -> Result<Self, TransportError> {
         Self::new_multi_node_internal(
             cluster_id,
@@ -857,6 +864,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             shared_wal_count,
             write_durability,
             storage,
+            local_retention_ms,
         )
         .await
     }
@@ -876,6 +884,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
         shared_wal_count: Option<u32>,
         write_durability: WriteDurability,
         storage: S,
+        local_retention_ms: Option<u64>,
     ) -> Result<Self, TransportError> {
         let node_id = NodeId::new(node_id);
 
@@ -1083,6 +1092,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             data_dir.clone(),
             Arc::clone(&recovered_entries),
             storage.clone(),
+            local_retention_ms,
         )
         .await;
 
@@ -1105,6 +1115,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                 data_dir.clone(),
                 Arc::clone(&recovered_entries),
                 storage.clone(),
+                Arc::clone(&local_broker_heartbeats),
                 rx,
             ));
             tx
@@ -1155,6 +1166,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             controller_shutdown_tx: Some(controller_shutdown_tx),
             actor_backpressure: Some(actor_handles.backpressure),
             vote_store,
+            local_retention_ms,
         })
     }
 
@@ -1164,6 +1176,15 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
     #[cfg(feature = "s3")]
     pub fn set_s3_config(&mut self, config: helix_tier::S3Config) {
         self.s3_config = Some(config);
+    }
+
+    /// Sets the local disk retention in milliseconds.
+    ///
+    /// When set, sealed WAL segments older than this value are deleted
+    /// from local disk, provided all entries have been replicated.
+    /// Set to 0 to disable retention.
+    pub fn set_local_retention_ms(&mut self, ms: u64) {
+        self.local_retention_ms = if ms == 0 { None } else { Some(ms) };
     }
 
     /// Shuts down the service gracefully.
@@ -1326,6 +1347,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             controller_shutdown_tx: None,
             actor_backpressure: None,
             vote_store: None,
+            local_retention_ms: None,
         }
     }
 
@@ -1755,6 +1777,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             data_dir.clone(),
             Arc::clone(&recovered_entries),
             storage.clone(),
+            None, // local_retention_ms — set after service creation.
         )
         .await;
 
@@ -1777,6 +1800,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                 data_dir.clone(),
                 Arc::clone(&recovered_entries),
                 storage.clone(),
+                Arc::clone(&local_broker_heartbeats),
                 rx,
             ));
             tx
@@ -1828,6 +1852,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             controller_shutdown_tx: Some(controller_shutdown_tx),
             actor_backpressure: Some(actor_handles.backpressure),
             vote_store,
+            local_retention_ms: None,
         }
     }
 }
@@ -1980,6 +2005,7 @@ impl ProductionHelixService {
         kafka_peer_addrs: HashMap<NodeId, String>,
         shared_wal_count: Option<u32>,
         write_durability: WriteDurability,
+        local_retention_ms: Option<u64>,
     ) -> Result<Self, TransportError> {
         Self::new_multi_node_with_storage(
             cluster_id,
@@ -1995,6 +2021,7 @@ impl ProductionHelixService {
             shared_wal_count,
             write_durability,
             TokioStorage::new(),
+            local_retention_ms,
         )
         .await
     }
@@ -2028,6 +2055,7 @@ impl ProductionHelixService {
         kafka_peer_addrs: HashMap<NodeId, String>,
         shared_wal_count: Option<u32>,
         write_durability: WriteDurability,
+        local_retention_ms: Option<u64>,
     ) -> Result<Self, TransportError> {
         Self::new_multi_node_with_storage(
             cluster_id,
@@ -2042,6 +2070,7 @@ impl ProductionHelixService {
             shared_wal_count,
             write_durability,
             TokioStorage::new(),
+            local_retention_ms,
         )
         .await
     }

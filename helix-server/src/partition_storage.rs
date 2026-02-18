@@ -866,6 +866,37 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     }
 
     // -------------------------------------------------------------------------
+    // Segment Retention
+    // -------------------------------------------------------------------------
+
+    /// Runs segment retention for the underlying durable partition.
+    ///
+    /// Deletes sealed WAL segments that are older than `local_retention_ms`
+    /// and whose entries have all been replicated.
+    ///
+    /// Returns 0 for in-memory storage (no WAL to retain).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a segment file cannot be removed.
+    pub async fn run_retention(
+        &mut self,
+        min_replicated_index: u64,
+        local_retention_ms: u64,
+    ) -> Result<u32, ServerError> {
+        match &mut self.inner {
+            PartitionStorageInner::InMemory(_) => Ok(0),
+            PartitionStorageInner::Durable(p) => {
+                p.run_retention(min_replicated_index, local_retention_ms)
+                    .await
+                    .map_err(|e| ServerError::Internal {
+                        message: format!("retention failed: {e}"),
+                    })
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // WAL Read Methods (for WAL-backed AppendEntries)
     // -------------------------------------------------------------------------
 

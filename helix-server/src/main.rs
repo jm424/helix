@@ -208,6 +208,30 @@ struct Args {
     #[arg(long)]
     kafka_advertise_addr: Option<String>,
 
+    /// Advertised Kafka address for a peer node in format `node_id:host:port`.
+    /// Overrides the peer's Kafka address in Metadata API responses.
+    /// Use when peers need different internal (Raft) and external (Kafka) addresses,
+    /// e.g., internal headless DNS for Raft but Fabric DNS for Kafka clients.
+    /// Can be specified multiple times for multiple peers.
+    #[arg(long = "peer-kafka-advertise", value_parser = parse_peer_advertise)]
+    peer_kafka_advertises: Vec<PeerAdvertise>,
+
+    /// Local disk retention in milliseconds.
+    ///
+    /// Sealed WAL segments older than this are deleted from local disk,
+    /// provided all entries have been replicated via Raft. Always active.
+    /// Default: 4 hours (14400000 ms). Set to 0 to disable retention.
+    #[arg(long, default_value = "14400000")]
+    local_retention_ms: u64,
+
+    /// Total retention in milliseconds (S3 lifetime).
+    ///
+    /// Only meaningful when tiering is configured — extends data lifetime
+    /// beyond local disk. Must be >= local_retention_ms.
+    /// Default: 4 days (345600000 ms).
+    #[arg(long, default_value = "345600000")]
+    retention_ms: u64,
+
     /// Pre-create a topic at startup in format `name:partitions` (e.g., `test-topic:1`).
     /// Can be specified multiple times for multiple topics.
     /// All nodes should use the same topics for consistent Raft group allocation.
@@ -323,6 +347,33 @@ fn parse_peer(s: &str) -> Result<ExtendedPeerInfo, String> {
     })
 }
 
+/// Peer advertised Kafka address override.
+#[derive(Debug, Clone)]
+struct PeerAdvertise {
+    /// Node ID of the peer.
+    node_id: NodeId,
+    /// Advertised Kafka address (`host:port`) for Metadata responses.
+    addr: String,
+}
+
+/// Parses a peer advertise spec in format `node_id:host:port`.
+fn parse_peer_advertise(s: &str) -> Result<PeerAdvertise, String> {
+    let first_colon = s
+        .find(':')
+        .ok_or_else(|| format!("invalid peer-kafka-advertise '{s}', expected 'node_id:host:port'"))?;
+    let node_id: u64 = s[..first_colon]
+        .parse()
+        .map_err(|_| format!("invalid node_id in peer-kafka-advertise '{s}'"))?;
+    let addr = s[first_colon + 1..].to_string();
+    if !addr.contains(':') {
+        return Err(format!("invalid addr in peer-kafka-advertise '{s}', expected 'host:port'"));
+    }
+    Ok(PeerAdvertise {
+        node_id: NodeId::new(node_id),
+        addr,
+    })
+}
+
 /// Parses an advertise address in format `host:port` into `(String, i32)`.
 ///
 /// Splits on the last `:` to handle IPv6 addresses.
@@ -383,11 +434,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
 
         // Build Kafka peer addresses map for metadata responses.
-        let kafka_peer_addrs: HashMap<NodeId, String> = args
+        // Start with peer addresses from --peer, then override with --peer-kafka-advertise.
+        let mut kafka_peer_addrs: HashMap<NodeId, String> = args
             .peers
             .iter()
             .map(|p| (p.node_id, p.kafka_addr()))
             .collect();
+        for adv in &args.peer_kafka_advertises {
+            kafka_peer_addrs.insert(adv.node_id, adv.addr.clone());
+        }
 
         // This node's Kafka address for metadata responses.
         // Use --kafka-advertise-addr if set, otherwise fall back to --listen-addr.
@@ -435,6 +490,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let write_durability = args.write_durability.into();
 
+        let local_retention_ms = if args.local_retention_ms == 0 {
+            None
+        } else {
+            Some(args.local_retention_ms)
+        };
+
         #[cfg(feature = "s3")]
         let service = HelixService::new_multi_node(
             args.cluster_id,
@@ -449,6 +510,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             kafka_peer_addrs,
             args.shared_wal_count,
             write_durability,
+            local_retention_ms,
         )
         .await?;
         #[cfg(not(feature = "s3"))]
@@ -464,6 +526,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             kafka_peer_addrs,
             args.shared_wal_count,
             write_durability,
+            local_retention_ms,
         )
         .await?;
 

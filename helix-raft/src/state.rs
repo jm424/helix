@@ -226,6 +226,10 @@ pub struct RaftNode {
     // Leadership transfer state.
     /// Target node for leadership transfer (if in progress).
     transfer_target: Option<NodeId>,
+    /// Ticks elapsed since the transfer started. Used to abort stale
+    /// transfers (e.g., target node is dead). Aborts after one election
+    /// timeout, same as etcd/Raft.
+    transfer_elapsed: u32,
 
     // Snapshot state.
     /// Latest snapshot metadata (if any).
@@ -337,6 +341,7 @@ impl RaftNode {
             votes_received: HashSet::new(),
             leader_id: None,
             transfer_target: None,
+            transfer_elapsed: 0,
             snapshot_meta: None,
             election_elapsed: 0,
             heartbeat_elapsed: 0,
@@ -397,6 +402,7 @@ impl RaftNode {
             votes_received: HashSet::new(),
             leader_id: None,
             transfer_target: None,
+            transfer_elapsed: 0,
             snapshot_meta: None,
             election_elapsed: 0,
             heartbeat_elapsed: 0,
@@ -518,6 +524,23 @@ impl RaftNode {
     /// Also tracks inflight timeouts to handle follower crash/recovery.
     fn tick_leader(&mut self) -> Vec<RaftOutput> {
         self.heartbeat_elapsed += 1;
+
+        // Abort stale leadership transfers. If the target node is dead or
+        // unreachable, the transfer will never complete. Abort after one
+        // election timeout to unblock proposals. Same policy as etcd/Raft.
+        if self.transfer_target.is_some() {
+            self.transfer_elapsed += 1;
+            if self.transfer_elapsed >= self.config.election_tick {
+                warn!(
+                    node_id = self.config.node_id.get(),
+                    target = ?self.transfer_target,
+                    elapsed = self.transfer_elapsed,
+                    "Aborting stale leadership transfer (target unreachable)"
+                );
+                self.transfer_target = None;
+                self.transfer_elapsed = 0;
+            }
+        }
 
         // Track inflight timeouts for each follower.
         // If we've been waiting too long for responses, reset inflight state.
@@ -1353,8 +1376,9 @@ impl RaftNode {
 
         let mut outputs = Vec::new();
 
-        // Set the transfer target.
+        // Set the transfer target and reset the elapsed counter.
         self.transfer_target = Some(target);
+        self.transfer_elapsed = 0;
 
         // Check if target is already caught up.
         let target_match = self
@@ -1757,6 +1781,42 @@ impl RaftNode {
 
         self.log.truncate_prefix(LogIndex::new(compact_to));
         true
+    }
+
+    /// Returns the minimum `match_index` across all followers.
+    ///
+    /// Only meaningful when this node is the leader. Returns `None` if
+    /// the node is not a leader or has no followers (single-node cluster).
+    ///
+    /// Used by the retention system to determine the oldest WAL entry
+    /// that may still be needed for Raft replication.
+    #[must_use]
+    pub fn min_match_index(&self) -> Option<LogIndex> {
+        if self.state != RaftState::Leader {
+            return None;
+        }
+        self.replication_state
+            .values()
+            .map(|s| s.match_index)
+            .min()
+    }
+
+    /// Returns the `match_index` for a specific follower.
+    ///
+    /// Returns `None` if not leader or the follower is not in the
+    /// replication state. Returns `Some(0)` if the follower exists but
+    /// has never successfully replicated.
+    ///
+    /// Used by the application layer to check whether a follower is
+    /// responsive before initiating leadership transfer.
+    #[must_use]
+    pub fn follower_match_index(&self, follower: NodeId) -> Option<LogIndex> {
+        if self.state != RaftState::Leader {
+            return None;
+        }
+        self.replication_state
+            .get(&follower)
+            .map(|s| s.match_index)
     }
 
     /// Applies committed entries up to the given index.
@@ -3119,5 +3179,55 @@ mod tests {
 
         // Last entry should still be accessible.
         assert!(node.log.get(last_before).is_some());
+    }
+
+    #[test]
+    fn test_min_match_index_leader_only() {
+        let config = make_config(1);
+        let node = RaftNode::new(config);
+
+        // Not a leader — should return None.
+        assert!(node.min_match_index().is_none());
+    }
+
+    #[test]
+    fn test_min_match_index_tracks_lagging_follower() {
+        let config = make_config(1);
+        let mut node = RaftNode::new(config);
+        make_leader(&mut node);
+
+        let peer2 = NodeId::new(2);
+        let peer3 = NodeId::new(3);
+
+        // Propose entries so there's something to replicate.
+        for i in 0..5 {
+            let data = Bytes::from(format!("entry-{i}"));
+            node.handle_client_request(ClientRequest::new(data, Bytes::new()));
+        }
+
+        // Peer2 catches up to index 6, peer3 only to 3.
+        let resp2 = AppendEntriesResponse::new(
+            node.current_term(),
+            peer2,
+            node.node_id(),
+            true,
+            LogIndex::new(6),
+            LogIndex::new(0),
+        );
+        node.handle_message(Message::AppendEntriesResponse(resp2));
+
+        let resp3 = AppendEntriesResponse::new(
+            node.current_term(),
+            peer3,
+            node.node_id(),
+            true,
+            LogIndex::new(3),
+            LogIndex::new(0),
+        );
+        node.handle_message(Message::AppendEntriesResponse(resp3));
+
+        // min_match_index should be 3 (the lagging follower).
+        let min = node.min_match_index().expect("leader should have min_match");
+        assert_eq!(min.get(), 3);
     }
 }

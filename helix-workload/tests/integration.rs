@@ -794,6 +794,132 @@ async fn test_multi_partition_node_failure() {
     );
 }
 
+/// SharedWal per-group index divergence on node restart.
+///
+/// Reproduces a bug where SharedWal auto-assigned indices diverge from
+/// Raft indices when multiple groups share the same WAL shard.
+///
+/// Root cause: `append_auto_async` increments a counter that advances
+/// across ALL groups on the same shard. With N groups per shard, each
+/// group's entries are spaced ~N apart. On recovery, these non-contiguous
+/// indices become `compacted_index` in the Raft log, but the leader sends
+/// entries at actual sequential Raft indices, causing an assertion failure.
+///
+/// Trigger: 5+ topics with 1 partition each → group_ids 1..5. With
+/// `wal_count=4`, groups 1 and 5 both map to shard 1 (`id % 4`).
+/// Write data, kill node, write more, restart → crash.
+#[tokio::test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "E2E workload integration tests are slow in debug; run: cargo test --release -p helix-workload --test integration"
+)]
+async fn test_node_restart_with_large_raft_gap() {
+    let topic_count = 5; // 5 topics → group_ids 1..5. Groups 1,5 share shard 1.
+    let mut topics: Vec<String> = Vec::with_capacity(topic_count);
+    for i in 0..topic_count {
+        topics.push(format!("test-gap-{i}"));
+    }
+
+    let mut builder = RealCluster::builder()
+        .nodes(3)
+        .base_port(find_available_base_port(20500, 3))
+        .raft_base_port(find_available_base_port(20600, 3))
+        .binary_path(binary_path())
+        .data_dir(test_data_dir("node_restart_large_raft_gap"))
+        .auto_create_topics(true)
+        .default_replication_factor(3);
+    for t in &topics {
+        builder = builder.topic(t, 1);
+    }
+    let mut cluster = builder.build().expect("failed to start cluster");
+
+    let executor = RealExecutor::new(&cluster).expect("failed to create executor");
+    executor
+        .wait_ready(Duration::from_secs(60))
+        .await
+        .expect("cluster not ready");
+
+    // Phase 1: Write to all topics to build WAL state with multiple groups per shard.
+    let partitions: i32 = 1;
+    println!("=== Phase 1: 200 messages per topic ({topic_count} topics) ===");
+    for t in &topics {
+        let mut workload = Workload::builder()
+            .seed(1)
+            .topics(vec![TopicConfig::new(t.as_str(), partitions, 3)])
+            .operations(200)
+            .pattern(WorkloadPattern::ManyPartitions {
+                partition_count: partitions,
+                operations_per_partition: 200,
+            })
+            .message_size(SizeDistribution::Fixed(512))
+            .build();
+        let stats: WorkloadStats = workload.run(&executor).await;
+        assert!(stats.sends_ok >= 190, "Phase 1 {t}: expected >= 190, got {}", stats.sends_ok);
+    }
+    let stats1_ok = 200 * topic_count;
+
+    // Kill node 2.
+    println!("=== Killing node 2 ===");
+    cluster.kill_node(2).expect("failed to kill node 2");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Phase 2: Write more to one topic while node 2 is down.
+    // The leader's Raft index advances, but node 2's WAL counter is frozen.
+    let hot_topic = topics[0].as_str();
+    println!("=== Phase 2: 1000 messages to {hot_topic} with node 2 down ===");
+    let mut workload2 = Workload::builder()
+        .seed(2)
+        .topics(vec![TopicConfig::new(hot_topic, partitions, 3)])
+        .operations(1000)
+        .pattern(WorkloadPattern::ManyPartitions {
+            partition_count: partitions,
+            operations_per_partition: 1000,
+        })
+        .message_size(SizeDistribution::Fixed(512))
+        .build();
+    let stats2: WorkloadStats = workload2.run(&executor).await;
+    assert!(
+        stats2.sends_ok >= 900,
+        "Phase 2: expected at least 900 successful, got {}",
+        stats2.sends_ok
+    );
+
+    // Restart node 2.
+    // With multiple groups per shard, the per-group WAL counter has gaps.
+    // compacted_index is set from the non-contiguous counter, but the
+    // leader sends entries at sequential Raft indices → assertion failure.
+    println!("=== Restarting node 2 ===");
+    cluster.restart_node(2).expect("failed to restart node 2");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    // Phase 3: Verify the cluster is still functional after recovery.
+    println!("=== Phase 3: 200 messages after recovery ===");
+    let mut workload3 = Workload::builder()
+        .seed(3)
+        .topics(vec![TopicConfig::new(hot_topic, partitions, 3)])
+        .operations(200)
+        .pattern(WorkloadPattern::ManyPartitions {
+            partition_count: partitions,
+            operations_per_partition: 200,
+        })
+        .message_size(SizeDistribution::Fixed(512))
+        .build();
+    let stats3: WorkloadStats = workload3.run(&executor).await;
+
+    println!("=== SharedWal Index Divergence Test Summary ===");
+    println!(
+        "Phase 1: {stats1_ok}, Phase 2: {}, Phase 3: {}",
+        stats2.sends_ok,
+        stats3.sends_ok,
+    );
+
+    assert_eq!(
+        stats3.sends_ok, 200,
+        "Phase 3: expected all 200 successful after recovery, got {}",
+        stats3.sends_ok
+    );
+}
+
 /// Multi-partition scale test.
 ///
 /// Tests correctness at scale:

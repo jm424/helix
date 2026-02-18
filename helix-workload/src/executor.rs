@@ -1173,7 +1173,10 @@ impl RealExecutor {
             .set("retry.backoff.ms", "500") // Wait between retries
             .set("acks", "all")
             .set("reconnect.backoff.ms", "100")
-            .set("reconnect.backoff.max.ms", "1000"); // 1s max backoff for faster recovery
+            .set("reconnect.backoff.max.ms", "1000") // 1s max backoff for faster recovery
+            .set("topic.metadata.refresh.interval.ms", "500") // Refresh metadata every 500ms
+            .set("topic.metadata.refresh.fast.interval.ms", "100") // 100ms fast refresh on failure
+            .set("socket.timeout.ms", "3000"); // 3s socket timeout to detect dead brokers faster
 
         if log_mode == TestLogMode::Verbose {
             config.set("debug", "fetch,broker,topic,msg,protocol");
