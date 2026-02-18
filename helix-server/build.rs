@@ -8,8 +8,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .out_dir("src/generated")
         .compile(&["proto/helix.proto"], &["proto"])?;
 
-    // Tell Cargo to rerun if the proto file changes.
+    // Compile the admin proto (kafkaadmin.Resources service).
+    // Client enabled for leader forwarding (non-leader nodes proxy to the leader).
+    tonic_build::configure()
+        .build_server(true)
+        .build_client(true)
+        .out_dir("src/generated")
+        .compile(&["proto/admin.proto"], &["proto"])?;
+
+    // Tell Cargo to rerun if proto files change.
     println!("cargo:rerun-if-changed=proto/helix.proto");
+    println!("cargo:rerun-if-changed=proto/admin.proto");
 
     Ok(())
 }

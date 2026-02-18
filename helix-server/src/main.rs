@@ -64,7 +64,9 @@ use tonic::transport::Server;
 use tracing::{info, Level};
 use tracing_subscriber::{fmt::format::FmtSpan, FmtSubscriber};
 
+use helix_server::admin_grpc::AdminService;
 use helix_server::generated::helix_server::HelixServer;
+use helix_server::generated_admin::resources_server::ResourcesServer;
 use helix_server::kafka::{KafkaServer, KafkaServerConfig};
 use helix_server::HelixService;
 #[cfg(feature = "s3")]
@@ -199,6 +201,20 @@ struct Args {
     /// Default number of partitions for auto-created topics.
     #[arg(long, default_value = "1")]
     auto_create_partitions: u32,
+
+    /// Address to listen on for the admin gRPC API (kafkaadmin.Resources).
+    /// Used for topic lifecycle management.
+    /// If not specified, the admin server is not started.
+    #[arg(long)]
+    admin_addr: Option<SocketAddr>,
+
+    /// Path to TLS certificate for the admin gRPC server (PEM format).
+    #[arg(long)]
+    admin_tls_cert: Option<String>,
+
+    /// Path to TLS private key for the admin gRPC server (PEM format).
+    #[arg(long)]
+    admin_tls_key: Option<String>,
 
     /// Advertised Kafka address for this node (`host:port`).
     /// Used in Metadata API responses so clients can connect.
@@ -640,6 +656,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Protocol::Kafka => {
             // For Kafka mode, wrap service in Arc for sharing.
             let service = Arc::new(service);
+
+            // Spawn admin gRPC server if --admin-addr is specified.
+            if let Some(admin_addr) = args.admin_addr {
+                let admin_svc = Arc::clone(&service);
+                let admin_port = admin_addr.port();
+                let admin_tls_cert = args.admin_tls_cert.clone();
+                let admin_tls_key = args.admin_tls_key.clone();
+                tokio::spawn(async move {
+                    let mut builder = Server::builder();
+
+                    // Configure TLS if cert and key paths are provided.
+                    if let (Some(cert_path), Some(key_path)) =
+                        (admin_tls_cert, admin_tls_key)
+                    {
+                        let cert = tokio::fs::read(&cert_path)
+                            .await
+                            .unwrap_or_else(|e| panic!("failed to read TLS cert {cert_path}: {e}"));
+                        let key = tokio::fs::read(&key_path)
+                            .await
+                            .unwrap_or_else(|e| panic!("failed to read TLS key {key_path}: {e}"));
+                        let tls_config = tonic::transport::ServerTlsConfig::new()
+                            .identity(tonic::transport::Identity::from_pem(cert, key));
+                        builder = builder
+                            .tls_config(tls_config)
+                            .expect("failed to configure TLS for admin server");
+                        info!(addr = %admin_addr, "Admin gRPC server listening (TLS)");
+                    } else {
+                        info!(addr = %admin_addr, "Admin gRPC server listening (plaintext)");
+                    }
+
+                    if let Err(e) = builder
+                        .add_service(ResourcesServer::new(
+                            AdminService::new(admin_svc, admin_port),
+                        ))
+                        .serve(admin_addr)
+                        .await
+                    {
+                        tracing::error!(error = %e, "Admin gRPC server failed");
+                    }
+                });
+            }
 
             // Configure Kafka server.
             let mut kafka_config = KafkaServerConfig::new(args.listen_addr)

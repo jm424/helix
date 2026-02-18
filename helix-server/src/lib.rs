@@ -10,6 +10,8 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+/// Kafka admin gRPC service (kafkaadmin.Resources on port 8090).
+pub mod admin_grpc;
 /// Controller partition for cluster metadata coordination.
 pub mod controller;
 mod error;
@@ -38,6 +40,15 @@ pub mod generated {
     #![allow(clippy::pedantic)]
     #![allow(clippy::nursery)]
     include!("generated/helix.v1.rs");
+}
+
+/// Generated kafkaadmin protobuf types (admin API).
+pub mod generated_admin {
+    #![allow(clippy::all)]
+    #![allow(clippy::pedantic)]
+    #![allow(clippy::nursery)]
+    #![allow(missing_docs)]
+    include!("generated/kafkaadmin.rs");
 }
 
 pub use error::{ServerError, ServerResult};
