@@ -1,5 +1,9 @@
 # Build artifacts
 /target/
+/bazel-bin
+/bazel-out
+/bazel-helix
+/bazel-testlogs
 
 # IDE
 .idea/
