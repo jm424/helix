@@ -1584,10 +1584,10 @@ mod tests {
         // P1: indices 1, 2, 3, 4, 5 with term=1
         // P2: indices 1, 2, 3, 4, 5 with term=2
         for i in 1..=5u64 {
-            let entry = SharedEntry::new(p1, 1, i, Bytes::from(format!("p1-{i}"))).unwrap();
+            let entry = SharedEntry::new(p1, 1, i, 0, Bytes::from(format!("p1-{i}"))).unwrap();
             wal.append(entry).await.unwrap();
 
-            let entry = SharedEntry::new(p2, 2, i, Bytes::from(format!("p2-{i}"))).unwrap();
+            let entry = SharedEntry::new(p2, 2, i, 0, Bytes::from(format!("p2-{i}"))).unwrap();
             wal.append(entry).await.unwrap();
         }
 

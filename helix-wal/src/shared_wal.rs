@@ -198,6 +198,7 @@ impl<S: Storage> SharedWal<S> {
         group_id: GroupId,
         term: u64,
         index: u64,
+        raft_index: u64,
         payload: Bytes,
     ) -> WalResult<()> {
         // TigerStyle: Assert per-group indices are strictly increasing.
@@ -222,7 +223,7 @@ impl<S: Storage> SharedWal<S> {
             // We allow any starting index to support recovery scenarios.
         }
 
-        let entry = SharedEntry::new(group_id, term, index, payload)?;
+        let entry = SharedEntry::new(group_id, term, index, raft_index, payload)?;
         self.wal.append(entry.clone()).await?;
 
         // Update group state.
@@ -959,6 +960,8 @@ pub struct DurableAck {
     pub index: u64,
     /// The term of the entry.
     pub term: u64,
+    /// The actual Raft log index.
+    pub raft_index: u64,
 }
 
 /// A group's handle to a coordinated shared WAL.
@@ -984,8 +987,14 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
     /// # Errors
     ///
     /// Returns an error if the append or sync fails.
-    pub async fn append(&self, term: u64, index: u64, payload: Bytes) -> WalResult<DurableAck> {
-        let rx = self.append_async(term, index, payload).await?;
+    pub async fn append(
+        &self,
+        term: u64,
+        index: u64,
+        raft_index: u64,
+        payload: Bytes,
+    ) -> WalResult<DurableAck> {
+        let rx = self.append_async(term, index, raft_index, payload).await?;
         rx.await.map_err(|_| crate::WalError::Shutdown)?
     }
 
@@ -1002,13 +1011,14 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
         &self,
         term: u64,
         index: u64,
+        raft_index: u64,
         payload: Bytes,
     ) -> WalResult<oneshot::Receiver<WalResult<DurableAck>>> {
         if self.inner.shutdown.load(Ordering::Acquire) {
             return Err(crate::WalError::Shutdown);
         }
 
-        let entry = SharedEntry::new(self.group_id, term, index, payload.clone())?;
+        let entry = SharedEntry::new(self.group_id, term, index, raft_index, payload.clone())?;
         let (tx, rx) = oneshot::channel();
 
         let pending = PendingWrite {
@@ -1044,8 +1054,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
     /// # Errors
     ///
     /// Returns an error if the append or sync fails.
-    pub async fn append_auto(&self, term: u64, payload: Bytes) -> WalResult<DurableAck> {
-        let (_index, rx) = self.append_auto_async(term, payload).await?;
+    pub async fn append_auto(
+        &self,
+        term: u64,
+        raft_index: u64,
+        payload: Bytes,
+    ) -> WalResult<DurableAck> {
+        let (_index, rx) = self.append_auto_async(term, raft_index, payload).await?;
         rx.await.map_err(|_| crate::WalError::Shutdown)?
     }
 
@@ -1063,6 +1078,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
     pub async fn append_auto_async(
         &self,
         term: u64,
+        raft_index: u64,
         payload: Bytes,
     ) -> WalResult<(u64, oneshot::Receiver<WalResult<DurableAck>>)> {
         if self.inner.shutdown.load(Ordering::Acquire) {
@@ -1105,7 +1121,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
             }
 
             // Create entry with assigned index.
-            let entry = SharedEntry::new(self.group_id, term, next_index, payload.clone())?;
+            let entry = SharedEntry::new(
+                self.group_id,
+                term,
+                next_index,
+                raft_index,
+                payload.clone(),
+            )?;
 
             // Clone for group_index pre-registration (O(1), Bytes refcount).
             let entry_for_index = entry.clone();
@@ -1165,8 +1187,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
     /// # Errors
     ///
     /// Returns an error if the coordinator is shut down.
-    pub async fn append_nowait(&self, term: u64, payload: Bytes) -> WalResult<u64> {
-        let (index, _rx) = self.append_auto_async(term, payload).await?;
+    pub async fn append_nowait(&self, term: u64, raft_index: u64, payload: Bytes) -> WalResult<u64> {
+        let (index, _rx) = self.append_auto_async(term, raft_index, payload).await?;
         Ok(index)
     }
 
@@ -1668,6 +1690,7 @@ async fn flush_loop<S: Storage + Clone + Send + Sync + 'static>(inner: Arc<Coord
                     group_id: pw.entry.group_id(),
                     index: pw.entry.index(),
                     term: pw.entry.term(),
+                    raft_index: pw.entry.raft_index(),
                 };
                 (pw.durable_tx, ack)
             })
@@ -2048,10 +2071,10 @@ mod tests {
         let p2 = GroupId::new(2);
 
         // Append entries from two partitions.
-        wal.append(p1, 1, 1, Bytes::from("p1-1")).await.unwrap();
-        wal.append(p2, 1, 1, Bytes::from("p2-1")).await.unwrap();
-        wal.append(p1, 1, 2, Bytes::from("p1-2")).await.unwrap();
-        wal.append(p2, 1, 2, Bytes::from("p2-2")).await.unwrap();
+        wal.append(p1, 1, 1, 0, Bytes::from("p1-1")).await.unwrap();
+        wal.append(p2, 1, 1, 0, Bytes::from("p2-1")).await.unwrap();
+        wal.append(p1, 1, 2, 0, Bytes::from("p1-2")).await.unwrap();
+        wal.append(p2, 1, 2, 0, Bytes::from("p2-2")).await.unwrap();
 
         wal.sync().await.unwrap();
 
@@ -2073,11 +2096,11 @@ mod tests {
                 .await
                 .unwrap();
 
-            wal.append(p1, 1, 1, Bytes::from("p1-1")).await.unwrap();
-            wal.append(p2, 1, 1, Bytes::from("p2-1")).await.unwrap();
-            wal.append(p1, 1, 2, Bytes::from("p1-2")).await.unwrap();
-            wal.append(p3, 1, 1, Bytes::from("p3-1")).await.unwrap();
-            wal.append(p2, 1, 2, Bytes::from("p2-2")).await.unwrap();
+            wal.append(p1, 1, 1, 0, Bytes::from("p1-1")).await.unwrap();
+            wal.append(p2, 1, 1, 0, Bytes::from("p2-1")).await.unwrap();
+            wal.append(p1, 1, 2, 0, Bytes::from("p1-2")).await.unwrap();
+            wal.append(p3, 1, 1, 0, Bytes::from("p3-1")).await.unwrap();
+            wal.append(p2, 1, 2, 0, Bytes::from("p2-2")).await.unwrap();
 
             wal.sync().await.unwrap();
         }
@@ -2106,8 +2129,8 @@ mod tests {
             assert_eq!(p3_entries[0].index(), 1);
 
             // Can continue appending after recovery.
-            wal.append(p1, 1, 3, Bytes::from("p1-3")).await.unwrap();
-            wal.append(p3, 1, 2, Bytes::from("p3-2")).await.unwrap();
+            wal.append(p1, 1, 3, 0, Bytes::from("p1-3")).await.unwrap();
+            wal.append(p3, 1, 2, 0, Bytes::from("p3-2")).await.unwrap();
             wal.sync().await.unwrap();
 
             assert_eq!(wal.entry_count(), 7);
@@ -2124,10 +2147,10 @@ mod tests {
         let p1 = GroupId::new(1);
         let p2 = GroupId::new(2);
 
-        wal.append(p1, 1, 1, Bytes::from("p1-1")).await.unwrap();
-        wal.append(p2, 1, 1, Bytes::from("p2-1")).await.unwrap();
-        wal.append(p1, 1, 2, Bytes::from("p1-2")).await.unwrap();
-        wal.append(p1, 1, 3, Bytes::from("p1-3")).await.unwrap();
+        wal.append(p1, 1, 1, 0, Bytes::from("p1-1")).await.unwrap();
+        wal.append(p2, 1, 1, 0, Bytes::from("p2-1")).await.unwrap();
+        wal.append(p1, 1, 2, 0, Bytes::from("p1-2")).await.unwrap();
+        wal.append(p1, 1, 3, 0, Bytes::from("p1-3")).await.unwrap();
         wal.sync().await.unwrap();
 
         let p1_entries = wal.entries_for_group(p1);
@@ -2151,9 +2174,9 @@ mod tests {
 
         let p1 = GroupId::new(1);
 
-        wal.append(p1, 1, 1, Bytes::from("p1-1")).await.unwrap();
+        wal.append(p1, 1, 1, 0, Bytes::from("p1-1")).await.unwrap();
         // Skip index 2 - gaps are allowed.
-        wal.append(p1, 1, 3, Bytes::from("p1-3")).await.unwrap();
+        wal.append(p1, 1, 3, 0, Bytes::from("p1-3")).await.unwrap();
         wal.sync().await.unwrap();
 
         let entries = wal.entries_for_group(p1);
@@ -2173,9 +2196,9 @@ mod tests {
 
         let p1 = GroupId::new(1);
 
-        wal.append(p1, 1, 5, Bytes::from("p1-5")).await.unwrap();
+        wal.append(p1, 1, 5, 0, Bytes::from("p1-5")).await.unwrap();
         // Going backwards - should panic.
-        wal.append(p1, 1, 3, Bytes::from("p1-3")).await.unwrap();
+        wal.append(p1, 1, 3, 0, Bytes::from("p1-3")).await.unwrap();
     }
 
     #[tokio::test]
@@ -2188,9 +2211,9 @@ mod tests {
 
         let p1 = GroupId::new(1);
 
-        wal.append(p1, 5, 1, Bytes::from("p1-1")).await.unwrap();
+        wal.append(p1, 5, 1, 0, Bytes::from("p1-1")).await.unwrap();
         // Term goes backwards - should panic.
-        wal.append(p1, 3, 2, Bytes::from("p1-2")).await.unwrap();
+        wal.append(p1, 3, 2, 0, Bytes::from("p1-2")).await.unwrap();
     }
 
     #[tokio::test]
@@ -2204,10 +2227,10 @@ mod tests {
         let p2 = GroupId::new(2);
 
         // Both partitions can have index 1, 2, 3...
-        wal.append(p1, 1, 1, Bytes::from("p1-1")).await.unwrap();
-        wal.append(p2, 1, 1, Bytes::from("p2-1")).await.unwrap();
-        wal.append(p1, 1, 2, Bytes::from("p1-2")).await.unwrap();
-        wal.append(p2, 1, 2, Bytes::from("p2-2")).await.unwrap();
+        wal.append(p1, 1, 1, 0, Bytes::from("p1-1")).await.unwrap();
+        wal.append(p2, 1, 1, 0, Bytes::from("p2-1")).await.unwrap();
+        wal.append(p1, 1, 2, 0, Bytes::from("p1-2")).await.unwrap();
+        wal.append(p2, 1, 2, 0, Bytes::from("p2-2")).await.unwrap();
 
         wal.sync().await.unwrap();
 
@@ -2232,7 +2255,7 @@ mod tests {
 
         // Append entries 1-5.
         for i in 1..=5u64 {
-            wal.append(p1, 1, i, Bytes::from(format!("p1-{i}")))
+            wal.append(p1, 1, i, 0, Bytes::from(format!("p1-{i}")))
                 .await
                 .unwrap();
         }
@@ -2252,8 +2275,8 @@ mod tests {
         assert!(wal.read(p1, 5).is_none());
 
         // Can append new entries starting from 4.
-        wal.append(p1, 2, 4, Bytes::from("p1-4-new")).await.unwrap();
-        wal.append(p1, 2, 5, Bytes::from("p1-5-new")).await.unwrap();
+        wal.append(p1, 2, 4, 0, Bytes::from("p1-4-new")).await.unwrap();
+        wal.append(p1, 2, 5, 0, Bytes::from("p1-5-new")).await.unwrap();
         wal.sync().await.unwrap();
 
         // Now we should have 5 entries: 1, 2, 3, 4-new, 5-new.
@@ -2280,7 +2303,7 @@ mod tests {
 
             // Write entries 1-5 at term 1.
             for i in 1..=5u64 {
-                wal.append(p1, 1, i, Bytes::from(format!("old-{i}")))
+                wal.append(p1, 1, i, 0, Bytes::from(format!("old-{i}")))
                     .await
                     .unwrap();
             }
@@ -2291,7 +2314,7 @@ mod tests {
 
             // Write new entries 4-6 at term 2.
             for i in 4..=6u64 {
-                wal.append(p1, 2, i, Bytes::from(format!("new-{i}")))
+                wal.append(p1, 2, i, 0, Bytes::from(format!("new-{i}")))
                     .await
                     .unwrap();
             }
@@ -2336,7 +2359,7 @@ mod tests {
 
         // Append entries 1-3.
         for i in 1..=3u64 {
-            wal.append(p1, 1, i, Bytes::from(format!("p1-{i}")))
+            wal.append(p1, 1, i, 0, Bytes::from(format!("p1-{i}")))
                 .await
                 .unwrap();
         }
@@ -2357,10 +2380,10 @@ mod tests {
 
         // Append entries for both partitions.
         for i in 1..=5u64 {
-            wal.append(p1, 1, i, Bytes::from(format!("p1-{i}")))
+            wal.append(p1, 1, i, 0, Bytes::from(format!("p1-{i}")))
                 .await
                 .unwrap();
-            wal.append(p2, 1, i, Bytes::from(format!("p2-{i}")))
+            wal.append(p2, 1, i, 0, Bytes::from(format!("p2-{i}")))
                 .await
                 .unwrap();
         }
@@ -2374,7 +2397,7 @@ mod tests {
         assert_eq!(wal.entries_for_group(p2).len(), 5);
 
         // Append new entries to p1.
-        wal.append(p1, 2, 3, Bytes::from("p1-3-new")).await.unwrap();
+        wal.append(p1, 2, 3, 0, Bytes::from("p1-3-new")).await.unwrap();
         wal.sync().await.unwrap();
 
         assert_eq!(wal.entries_for_group(p1).len(), 3);
@@ -2393,10 +2416,10 @@ mod tests {
 
         // Append entries.
         for i in 1..=5u64 {
-            wal.append(p1, 1, i, Bytes::from(format!("p1-{i}")))
+            wal.append(p1, 1, i, 0, Bytes::from(format!("p1-{i}")))
                 .await
                 .unwrap();
-            wal.append(p2, 1, i, Bytes::from(format!("p2-{i}")))
+            wal.append(p2, 1, i, 0, Bytes::from(format!("p2-{i}")))
                 .await
                 .unwrap();
         }
@@ -2404,7 +2427,7 @@ mod tests {
 
         // Force rotation by appending enough to create a new segment.
         // First, we need entries in a sealed segment, so append more to trigger rotation.
-        wal.append(p1, 1, 6, Bytes::from("p1-6")).await.unwrap();
+        wal.append(p1, 1, 6, 0, Bytes::from("p1-6")).await.unwrap();
         wal.sync().await.unwrap();
 
         let sealed_ids = wal.sealed_segment_ids();
@@ -2460,14 +2483,14 @@ mod tests {
         let p1 = GroupId::new(1);
 
         for i in 1..=3u64 {
-            wal.append(p1, 1, i, Bytes::from(format!("data-{i}")))
+            wal.append(p1, 1, i, 0, Bytes::from(format!("data-{i}")))
                 .await
                 .unwrap();
         }
         wal.sync().await.unwrap();
 
         // Append more to trigger rotation.
-        wal.append(p1, 1, 4, Bytes::from("data-4")).await.unwrap();
+        wal.append(p1, 1, 4, 0, Bytes::from("data-4")).await.unwrap();
 
         let sealed_ids = wal.sealed_segment_ids();
         if sealed_ids.is_empty() {
@@ -2491,6 +2514,123 @@ mod tests {
 
         // partition_last_index still correct.
         assert_eq!(wal.group_last_index(p1), Some(4));
+    }
+
+    /// Verifies that raft_index survives WAL round-trip through recovery.
+    ///
+    /// This is the core property: after write → crash → recover, the
+    /// `raft_index` field in each entry must reflect the actual Raft index
+    /// (not the auto-counter), so `compacted_index` is set correctly.
+    #[tokio::test]
+    async fn test_raft_index_preserved_through_recovery() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = SharedWalConfig::new(temp_dir.path());
+
+        let p1 = GroupId::new(1);
+
+        // Simulate entries where raft_index diverges from auto-counter index.
+        // This happens when leader elections produce no-op entries that
+        // increment the Raft index but are never written to the data WAL.
+        //
+        // auto-counter: 1, 2, 3, 4, 5
+        // raft_index:  10, 11, 15, 16, 20  (gaps from elections/no-ops)
+        let raft_indices = [10u64, 11, 15, 16, 20];
+
+        {
+            let mut wal = SharedWal::open(TokioStorage::new(), config.clone())
+                .await
+                .unwrap();
+
+            for (i, &raft_idx) in raft_indices.iter().enumerate() {
+                let auto_idx = (i + 1) as u64;
+                wal.append(
+                    p1,
+                    1,
+                    auto_idx,
+                    raft_idx,
+                    Bytes::from(format!("data-{auto_idx}")),
+                )
+                .await
+                .unwrap();
+            }
+            wal.sync().await.unwrap();
+        }
+
+        // Reopen and recover — simulates crash + restart.
+        {
+            let mut wal = SharedWal::open(TokioStorage::new(), config).await.unwrap();
+            let by_partition = wal.recover().unwrap();
+            let entries = by_partition.get(&p1).unwrap();
+
+            assert_eq!(entries.len(), 5);
+
+            for (i, entry) in entries.iter().enumerate() {
+                let expected_auto = (i + 1) as u64;
+                let expected_raft = raft_indices[i];
+
+                // Auto-counter (index) must be preserved.
+                assert_eq!(
+                    entry.index(),
+                    expected_auto,
+                    "auto-counter mismatch at position {i}"
+                );
+                // Raft index must be preserved — this is the critical property.
+                assert_eq!(
+                    entry.raft_index(),
+                    expected_raft,
+                    "raft_index mismatch at position {i}: \
+                     expected {expected_raft}, got {}",
+                    entry.raft_index()
+                );
+            }
+
+            // The last recovered entry's raft_index is what would become
+            // compacted_index. It must be the actual Raft index (20),
+            // NOT the auto-counter (5).
+            let last = entries.last().unwrap();
+            assert_eq!(last.raft_index(), 20);
+            assert_eq!(last.index(), 5);
+        }
+    }
+
+    /// Verifies that multiple partitions can have independently diverging
+    /// raft_index values, and recovery preserves them correctly.
+    #[tokio::test]
+    async fn test_raft_index_independent_per_partition() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = SharedWalConfig::new(temp_dir.path());
+
+        let p1 = GroupId::new(1);
+        let p2 = GroupId::new(2);
+
+        {
+            let mut wal = SharedWal::open(TokioStorage::new(), config.clone())
+                .await
+                .unwrap();
+
+            // p1: auto=1 raft=100, auto=2 raft=105 (5 elections happened)
+            wal.append(p1, 1, 1, 100, Bytes::from("p1-1")).await.unwrap();
+            wal.append(p1, 1, 2, 105, Bytes::from("p1-2")).await.unwrap();
+
+            // p2: auto=1 raft=200, auto=2 raft=201 (no elections)
+            wal.append(p2, 1, 1, 200, Bytes::from("p2-1")).await.unwrap();
+            wal.append(p2, 1, 2, 201, Bytes::from("p2-2")).await.unwrap();
+
+            wal.sync().await.unwrap();
+        }
+
+        {
+            let mut wal = SharedWal::open(TokioStorage::new(), config).await.unwrap();
+            let by_partition = wal.recover().unwrap();
+
+            let p1_entries = by_partition.get(&p1).unwrap();
+            assert_eq!(p1_entries[0].raft_index(), 100);
+            assert_eq!(p1_entries[1].raft_index(), 105);
+
+            let p2_entries = by_partition.get(&p2).unwrap();
+            assert_eq!(p2_entries[0].raft_index(), 200);
+            assert_eq!(p2_entries[1].raft_index(), 201);
+        }
     }
 }
 
@@ -2527,8 +2667,8 @@ mod coordinator_tests {
 
         // Concurrent writes from two partitions.
         let (r1, r2) = tokio::join!(
-            h1.append(1, 1, Bytes::from("p1-1")),
-            h2.append(1, 1, Bytes::from("p2-1")),
+            h1.append(1, 1, 0, Bytes::from("p1-1")),
+            h2.append(1, 1, 0, Bytes::from("p2-1")),
         );
 
         assert!(r1.is_ok());
@@ -2561,7 +2701,7 @@ mod coordinator_tests {
         // Sequential writes.
         for i in 1..=10u64 {
             let ack = h1
-                .append(1, i, Bytes::from(format!("entry-{i}")))
+                .append(1, i, 0, Bytes::from(format!("entry-{i}")))
                 .await
                 .unwrap();
             assert_eq!(ack.index, i);
@@ -2596,7 +2736,7 @@ mod coordinator_tests {
             let task = tokio::spawn(async move {
                 for i in 1..=entries_per_partition as u64 {
                     let ack = handle
-                        .append(1, i, Bytes::from(format!("p{}-{}", p_idx + 1, i)))
+                        .append(1, i, 0, Bytes::from(format!("p{}-{}", p_idx + 1, i)))
                         .await
                         .unwrap();
                     assert_eq!(ack.index, i);
@@ -2635,10 +2775,10 @@ mod coordinator_tests {
             let h2 = coordinator.handle(p2);
 
             for i in 1..=5u64 {
-                h1.append(1, i, Bytes::from(format!("p1-{i}")))
+                h1.append(1, i, 0, Bytes::from(format!("p1-{i}")))
                     .await
                     .unwrap();
-                h2.append(1, i, Bytes::from(format!("p2-{i}")))
+                h2.append(1, i, 0, Bytes::from(format!("p2-{i}")))
                     .await
                     .unwrap();
             }
@@ -2660,7 +2800,7 @@ mod coordinator_tests {
 
             // Can continue appending.
             let h1 = coordinator.handle(p1);
-            h1.append(1, 6, Bytes::from("p1-6")).await.unwrap();
+            h1.append(1, 6, 0, Bytes::from("p1-6")).await.unwrap();
 
             assert_eq!(coordinator.entry_count().await, 11);
 
@@ -2683,9 +2823,9 @@ mod coordinator_tests {
         let h1_clone = h1.clone();
 
         // Both handles can write.
-        h1.append(1, 1, Bytes::from("from-original")).await.unwrap();
+        h1.append(1, 1, 0, Bytes::from("from-original")).await.unwrap();
         h1_clone
-            .append(1, 2, Bytes::from("from-clone"))
+            .append(1, 2, 0, Bytes::from("from-clone"))
             .await
             .unwrap();
 
@@ -2708,7 +2848,7 @@ mod coordinator_tests {
         let h1 = coordinator.handle(p1);
 
         // Write without waiting for automatic flush.
-        let rx = h1.append_async(1, 1, Bytes::from("entry")).await.unwrap();
+        let rx = h1.append_async(1, 1, 0, Bytes::from("entry")).await.unwrap();
 
         // Force flush.
         coordinator.flush().await.unwrap();
@@ -2736,7 +2876,7 @@ mod coordinator_tests {
 
             let h1 = coordinator.handle(p1);
             // Use append_async so we don't wait for the 60s flush interval.
-            let _rx = h1.append_async(1, 1, Bytes::from("entry-1")).await.unwrap();
+            let _rx = h1.append_async(1, 1, 0, Bytes::from("entry-1")).await.unwrap();
 
             // Shutdown should flush any pending entries.
             coordinator.shutdown().await.unwrap();
@@ -2772,8 +2912,8 @@ mod coordinator_tests {
         assert_eq!(coordinator.group_durable_index(p1).await, None);
 
         // Write and wait for durability.
-        h1.append(1, 1, Bytes::from("entry-1")).await.unwrap();
-        h1.append(1, 2, Bytes::from("entry-2")).await.unwrap();
+        h1.append(1, 1, 0, Bytes::from("entry-1")).await.unwrap();
+        h1.append(1, 2, 0, Bytes::from("entry-2")).await.unwrap();
 
         // Now durable index should be 2.
         assert_eq!(coordinator.group_durable_index(p1).await, Some(2));
@@ -2801,7 +2941,7 @@ mod coordinator_tests {
 
         // Write enough entries to trigger segment rotation.
         for i in 1..=20u64 {
-            h1.append(1, i, Bytes::from(format!("entry-{i}")))
+            h1.append(1, i, 0, Bytes::from(format!("entry-{i}")))
                 .await
                 .unwrap();
         }
@@ -2818,6 +2958,82 @@ mod coordinator_tests {
         // Range read should work.
         let entries = h1.read_entries_range(1, 10, u64::MAX).await;
         assert!(!entries.is_empty(), "range read should return entries");
+
+        coordinator.shutdown().await.unwrap();
+    }
+
+    /// Verifies raft_index survives the coordinator path (append_nowait → flush
+    /// → recovery). This is the production write path for shared WAL partitions.
+    #[tokio::test]
+    async fn test_coordinator_raft_index_through_recovery() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = CoordinatorConfig::new(temp_dir.path())
+            .with_flush_interval(Duration::from_millis(5));
+
+        let p1 = GroupId::new(1);
+
+        // Write entries with diverging raft_index through the coordinator path.
+        {
+            let coordinator = SharedWalCoordinator::open(TokioStorage::new(), config.clone())
+                .await
+                .unwrap();
+
+            let h1 = coordinator.handle(p1);
+
+            // append_nowait(term, raft_index, payload) → auto-counter assigned internally.
+            // auto=1 raft=100, auto=2 raft=105, auto=3 raft=110
+            h1.append_nowait(1, 100, Bytes::from("entry-1")).await.unwrap();
+            h1.append_nowait(1, 105, Bytes::from("entry-2")).await.unwrap();
+            h1.append_nowait(1, 110, Bytes::from("entry-3")).await.unwrap();
+
+            // Ensure everything is flushed to disk.
+            coordinator.flush().await.unwrap();
+            coordinator.shutdown().await.unwrap();
+        }
+
+        // Recover and verify raft_index is preserved.
+        {
+            let coordinator = SharedWalCoordinator::open(TokioStorage::new(), config)
+                .await
+                .unwrap();
+
+            let recovered = coordinator.recover().await.unwrap();
+            let entries = recovered.get(&p1).unwrap();
+
+            assert_eq!(entries.len(), 3);
+
+            // Auto-counter (index) must be sequential: 1, 2, 3.
+            assert_eq!(entries[0].index(), 1);
+            assert_eq!(entries[1].index(), 2);
+            assert_eq!(entries[2].index(), 3);
+
+            // Raft index must match what was passed: 100, 105, 110.
+            assert_eq!(entries[0].raft_index(), 100);
+            assert_eq!(entries[1].raft_index(), 105);
+            assert_eq!(entries[2].raft_index(), 110);
+
+            coordinator.shutdown().await.unwrap();
+        }
+    }
+
+    /// Verifies the DurableAck returned from append contains the correct raft_index.
+    #[tokio::test]
+    async fn test_coordinator_durable_ack_has_raft_index() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = CoordinatorConfig::new(temp_dir.path())
+            .with_flush_interval(Duration::from_millis(5));
+
+        let coordinator = SharedWalCoordinator::open(TokioStorage::new(), config)
+            .await
+            .unwrap();
+
+        let p1 = GroupId::new(1);
+        let h1 = coordinator.handle(p1);
+
+        // append() waits for durability and returns DurableAck.
+        let ack = h1.append(1, 1, 7254, Bytes::from("data")).await.unwrap();
+        assert_eq!(ack.index, 1); // auto-counter
+        assert_eq!(ack.raft_index, 7254); // actual Raft index
 
         coordinator.shutdown().await.unwrap();
     }
@@ -2860,8 +3076,8 @@ mod pool_tests {
         let h1 = pool.handle(p1);
         let h2 = pool.handle(p2);
 
-        h1.append(1, 1, Bytes::from("p1-entry-1")).await.unwrap();
-        h2.append(1, 1, Bytes::from("p2-entry-1")).await.unwrap();
+        h1.append(1, 1, 0, Bytes::from("p1-entry-1")).await.unwrap();
+        h2.append(1, 1, 0, Bytes::from("p2-entry-1")).await.unwrap();
 
         // Verify entry count.
         assert_eq!(pool.entry_count().await, 2);
@@ -2889,9 +3105,9 @@ mod pool_tests {
             let h1 = pool.handle(p1);
             let h2 = pool.handle(p2);
 
-            h1.append(1, 1, Bytes::from("p1-1")).await.unwrap();
-            h1.append(1, 2, Bytes::from("p1-2")).await.unwrap();
-            h2.append(1, 1, Bytes::from("p2-1")).await.unwrap();
+            h1.append(1, 1, 0, Bytes::from("p1-1")).await.unwrap();
+            h1.append(1, 2, 0, Bytes::from("p1-2")).await.unwrap();
+            h2.append(1, 1, 0, Bytes::from("p2-1")).await.unwrap();
 
             pool.shutdown().await.unwrap();
         }

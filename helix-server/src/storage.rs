@@ -1637,8 +1637,17 @@ pub struct DurablePartition<S: Storage + Clone + Send + Sync + 'static> {
     /// Used to serve blob reads from the WAL instead of an in-memory cache.
     /// 20 bytes per blob vs ~16 KB — an 800x memory reduction.
     blob_index: BlobIndex,
-    /// Last applied WAL index.
+    /// Last applied Raft index (or WAL entry index for dedicated WALs).
+    ///
+    /// For shared WALs, this is the actual Raft log index recovered from
+    /// `SharedEntry.raft_index()`. For dedicated WALs, raft_index == WAL index.
     last_applied_index: u64,
+    /// Last applied WAL auto-counter index (shared WAL only).
+    ///
+    /// This is the per-group auto-counter from the shared WAL, NOT the Raft index.
+    /// Used for `BlobIndex` entries since `SharedWalHandle::read_entry()` looks up
+    /// by this auto-counter. For dedicated WALs, this equals `last_applied_index`.
+    last_applied_wal_index: u64,
     /// Term of the last applied WAL entry.
     last_applied_term: u64,
     /// Tiering manager for object storage uploads (optional).
@@ -1888,6 +1897,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             cache,
             blob_index,
             last_applied_index,
+            last_applied_wal_index: last_applied_index,
             last_applied_term,
             tiering,
             tiered_segments: std::collections::HashSet::new(),
@@ -1926,6 +1936,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         let mut cache = Partition::new(partition_config);
         let mut blob_index = BlobIndex::new();
         let mut last_applied_index = 0u64;
+        let mut last_applied_wal_index = 0u64;
         let mut last_applied_term = 0u64;
 
         // Diagnostic: track index range and gaps for debugging index space issues.
@@ -1960,7 +1971,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             }
             prev_entry_index = entry.index();
             last_applied_term = entry.term();
-            last_applied_index = entry.index();
+            // Use the actual Raft index from the entry header, not the auto-counter.
+            // This is the core fix: compacted_index must match the real Raft index
+            // so that AppendEntries from the leader targets the right position.
+            last_applied_index = entry.raft_index();
+            last_applied_wal_index = entry.index();
         }
 
         // Recovered entries were previously committed through Raft, so the
@@ -1969,19 +1984,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         let recovered_hwm = cache.blob_log_end_offset();
         cache.set_high_watermark(recovered_hwm);
 
-        // Query the SharedWal for any pending/durable entries we might have missed.
-        // This handles the case where the DurablePartition is recreated but the
-        // SharedWal has entries that weren't included in recovered_entries.
-        if let Some(wal_last_index) = wal_handle.last_index().await {
-            if wal_last_index > last_applied_index {
-                warn!(
-                    recovered_last = last_applied_index,
-                    wal_last = wal_last_index,
-                    "SharedWal has entries beyond recovered entries, adjusting last_applied_index"
-                );
-                last_applied_index = wal_last_index;
-            }
-        }
+        // Note: We no longer compare wal_handle.last_index() against last_applied_index
+        // because they are in different index spaces (WAL auto-counter vs Raft index).
+        // Recovery captures all WAL entries via recovered_entries, so no adjustment needed.
 
         info!(
             entries = recovered_entries.len(),
@@ -2038,6 +2043,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             cache,
             blob_index,
             last_applied_index,
+            last_applied_wal_index,
             last_applied_term,
             tiering,
             tiered_segments: std::collections::HashSet::new(),
@@ -2068,13 +2074,24 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         self.cache.set_high_watermark(hwm);
     }
 
-    /// Returns the last applied WAL index.
+    /// Returns the last applied Raft index.
     ///
-    /// This is the index of the last entry that was applied to the partition,
-    /// recovered from the WAL on startup. Used to initialize idempotency tracking.
+    /// For shared WALs, this is the actual Raft index from `SharedEntry.raft_index()`.
+    /// For dedicated WALs, this equals the WAL entry index.
+    /// Used to initialize `compacted_index` in the Raft log after recovery.
     #[must_use]
     pub const fn last_applied_index(&self) -> u64 {
         self.last_applied_index
+    }
+
+    /// Returns the last applied WAL auto-counter index (shared WAL only).
+    ///
+    /// This is the per-group auto-counter, NOT the Raft index. Used for
+    /// `BlobIndex` entries since `SharedWalHandle::read_entry()` looks up
+    /// by this value. For dedicated WALs, equals `last_applied_index`.
+    #[must_use]
+    pub const fn last_applied_wal_index(&self) -> u64 {
+        self.last_applied_wal_index
     }
 
     /// Returns the term of the last applied WAL entry.
@@ -2138,11 +2155,14 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                 // Use auto-index assignment to eliminate TOCTOU races.
                 // Don't wait for fsync - durability is provided by Raft replication.
                 // The entry is buffered and will be fsynced within flush_interval.
-                handle.append_nowait(term, data).await.map_err(|e| {
-                    DurablePartitionError::WalWrite {
-                        message: e.to_string(),
-                    }
-                })?
+                let wal_index =
+                    handle.append_nowait(term, raft_index, data).await.map_err(|e| {
+                        DurablePartitionError::WalWrite {
+                            message: e.to_string(),
+                        }
+                    })?;
+                self.last_applied_wal_index = wal_index;
+                raft_index
             }
         };
 
@@ -2285,11 +2305,17 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                 // Use auto-index assignment to eliminate TOCTOU races.
                 // Don't wait for fsync - durability is provided by Raft replication.
                 // The entry is buffered and will be fsynced within flush_interval.
-                handle.append_nowait(term, data).await.map_err(|e| {
-                    DurablePartitionError::WalWrite {
-                        message: e.to_string(),
-                    }
-                })?
+                let wal_index =
+                    handle.append_nowait(term, raft_index, data).await.map_err(|e| {
+                        DurablePartitionError::WalWrite {
+                            message: e.to_string(),
+                        }
+                    })?;
+                self.last_applied_wal_index = wal_index;
+                // BlobIndex uses WAL auto-counter (read_entry looks up by this).
+                self.blob_index
+                    .push(base_offset.get(), wal_index, record_count);
+                raft_index
             }
         };
 
@@ -2299,8 +2325,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             .map_err(|e| DurablePartitionError::CacheUpdate {
                 message: e.to_string(),
             })?;
-        self.blob_index
-            .push(base_offset.get(), assigned_index, record_count);
+
+        // For dedicated WAL, BlobIndex uses raft_index (which == WAL index).
+        if matches!(&self.wal, WalBackend::Dedicated(_)) {
+            self.blob_index
+                .push(base_offset.get(), assigned_index, record_count);
+        }
 
         self.last_applied_index = assigned_index;
         self.last_applied_term = term;
@@ -2461,22 +2491,15 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                 raft_index
             }
             WalBackend::Shared(handle) => {
-                let wal_index = handle.append_nowait(term, data).await.map_err(|e| {
-                    DurablePartitionError::WalWrite {
-                        message: e.to_string(),
-                    }
-                })?;
-                if wal_index != raft_index {
-                    warn!(
-                        topic = self.config.topic_id.get(),
-                        partition = self.config.partition_id.get(),
-                        raft_index,
-                        wal_index,
-                        delta = wal_index as i64 - raft_index as i64,
-                        "SharedWal auto-index diverged from Raft index"
-                    );
-                }
-                wal_index
+                let wal_index =
+                    handle.append_nowait(term, raft_index, data).await.map_err(|e| {
+                        DurablePartitionError::WalWrite {
+                            message: e.to_string(),
+                        }
+                    })?;
+                // Track both indices: raft_index for Raft state, wal_index for BlobIndex.
+                self.last_applied_wal_index = wal_index;
+                raft_index
             }
         };
 
@@ -4190,5 +4213,181 @@ mod tests {
         let mid_entries = partition.read_wal_entries(3, 100_000).await.unwrap();
         assert_eq!(mid_entries.len(), 3, "Should return entries 3, 4, 5");
         assert_eq!(mid_entries[0].index(), 3);
+    }
+
+    /// Verifies write + apply on a shared-WAL partition:
+    /// - `last_applied_index()` returns the Raft index (for compacted_index)
+    /// - `last_applied_wal_index()` returns the auto-counter (for BlobIndex)
+    /// - BlobIndex entries use the WAL auto-counter so reads work
+    #[tokio::test]
+    async fn test_write_wal_entry_sets_raft_index_not_auto_counter() {
+        use helix_wal::{CoordinatorConfig, SharedWalCoordinator};
+        use std::time::Duration;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let wal_dir = temp_dir.path().join("wal");
+        let coord_config = CoordinatorConfig::new(&wal_dir)
+            .with_flush_interval(Duration::from_millis(5));
+
+        let coordinator = SharedWalCoordinator::open(TokioStorage::new(), coord_config)
+            .await
+            .unwrap();
+
+        let group_id = helix_core::GroupId::new(1);
+        let handle = coordinator.handle(group_id);
+
+        let config = DurablePartitionConfig::new(
+            temp_dir.path().join("data"),
+            TopicId::new(1),
+            PartitionId::new(0),
+        );
+
+        let mut partition =
+            DurablePartition::open_with_shared_wal(config, handle, vec![])
+                .await
+                .unwrap();
+
+        // Build a valid AppendBlob command with real data.
+        let blob1 = Bytes::from(vec![0xABu8; 100]);
+        let cmd1 = PartitionCommand::AppendBlob {
+            blob: blob1,
+            record_count: 1,
+            format: BlobFormat::Raw,
+            base_offset: Offset::new(0),
+        };
+        let data1 = Bytes::from(cmd1.encode());
+
+        // First write: raft_index=100, then apply to cache.
+        partition.write_wal_entry(100, 1, data1.clone()).await.unwrap();
+        let wal_index1 = partition.last_applied_wal_index();
+        partition.apply_command_to_cache(wal_index1, &data1).unwrap();
+
+        assert_eq!(partition.last_applied_index(), 100,
+            "last_applied_index must be the Raft index (100), not auto-counter");
+        assert_eq!(wal_index1, 1,
+            "last_applied_wal_index must be the auto-counter (1)");
+        // Cache should have advanced.
+        assert_eq!(partition.blob_log_end_offset(), Offset::new(1));
+
+        // Second write: raft_index=105 (gap from election no-ops).
+        let blob2 = Bytes::from(vec![0xCDu8; 200]);
+        let cmd2 = PartitionCommand::AppendBlob {
+            blob: blob2,
+            record_count: 3,
+            format: BlobFormat::Raw,
+            base_offset: Offset::new(1),
+        };
+        let data2 = Bytes::from(cmd2.encode());
+
+        partition.write_wal_entry(105, 1, data2.clone()).await.unwrap();
+        let wal_index2 = partition.last_applied_wal_index();
+        partition.apply_command_to_cache(wal_index2, &data2).unwrap();
+
+        assert_eq!(partition.last_applied_index(), 105);
+        assert_eq!(wal_index2, 2);
+        assert_eq!(partition.blob_log_end_offset(), Offset::new(4));
+
+        // Verify blob reads work — BlobIndex must use WAL auto-counter,
+        // not Raft index, since read_entry() looks up by auto-counter.
+        let blobs = partition.read_blobs(Offset::new(0), 100_000).await.unwrap();
+        assert!(!blobs.is_empty(), "BlobIndex should find entries for reads");
+        assert_eq!(blobs[0].base_offset, Offset::new(0));
+
+        coordinator.shutdown().await.unwrap();
+    }
+
+    /// Verifies full write → crash → recover cycle on shared WAL:
+    /// - Recovery sets last_applied_index to Raft index (not auto-counter)
+    /// - Recovery sets last_applied_wal_index to auto-counter
+    /// - BlobIndex is populated from recovery, blob reads work
+    #[tokio::test]
+    async fn test_shared_wal_recovery_uses_raft_index() {
+        use helix_wal::{CoordinatorConfig, SharedWalCoordinator};
+        use std::time::Duration;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let wal_dir = temp_dir.path().join("wal");
+        let coord_config = CoordinatorConfig::new(&wal_dir)
+            .with_flush_interval(Duration::from_millis(5));
+
+        let group_id = helix_core::GroupId::new(1);
+
+        // Phase 1: Write valid PartitionCommand entries with diverging raft_index.
+        {
+            let coordinator = SharedWalCoordinator::open(TokioStorage::new(), coord_config.clone())
+                .await
+                .unwrap();
+
+            let handle = coordinator.handle(group_id);
+
+            // Write 3 AppendBlob commands: auto-counter 1,2,3 but raft indices 50,55,60.
+            for (i, raft_idx) in [(0u64, 50u64), (1, 55), (2, 60)] {
+                let cmd = PartitionCommand::AppendBlob {
+                    blob: Bytes::from(format!("blob-data-{i}")),
+                    record_count: 1,
+                    format: BlobFormat::Raw,
+                    base_offset: Offset::new(i),
+                };
+                handle
+                    .append_nowait(1, raft_idx, Bytes::from(cmd.encode()))
+                    .await
+                    .unwrap();
+            }
+
+            coordinator.flush().await.unwrap();
+            coordinator.shutdown().await.unwrap();
+        }
+
+        // Phase 2: Recover and open partition — simulates node restart.
+        {
+            let coordinator = SharedWalCoordinator::open(TokioStorage::new(), coord_config)
+                .await
+                .unwrap();
+
+            let recovered = coordinator.recover().await.unwrap();
+            let entries = recovered.get(&group_id).unwrap_or(&vec![]).clone();
+            assert_eq!(entries.len(), 3, "should recover all 3 entries");
+
+            // Verify raft_index survived the round-trip at WAL level.
+            assert_eq!(entries[0].raft_index(), 50);
+            assert_eq!(entries[1].raft_index(), 55);
+            assert_eq!(entries[2].raft_index(), 60);
+            // Auto-counter should be 1, 2, 3.
+            assert_eq!(entries[0].index(), 1);
+            assert_eq!(entries[1].index(), 2);
+            assert_eq!(entries[2].index(), 3);
+
+            let handle = coordinator.handle(group_id);
+            let config = DurablePartitionConfig::new(
+                temp_dir.path().join("data"),
+                TopicId::new(1),
+                PartitionId::new(0),
+            );
+
+            let partition =
+                DurablePartition::open_with_shared_wal(config, handle, entries)
+                    .await
+                    .unwrap();
+
+            // Core assertion: last_applied_index is the Raft index (60),
+            // not the auto-counter (3). This becomes compacted_index.
+            assert_eq!(partition.last_applied_index(), 60,
+                "last_applied_index must be Raft index (60), not auto-counter (3)");
+            assert_eq!(partition.last_applied_wal_index(), 3,
+                "last_applied_wal_index must be auto-counter (3)");
+
+            // Recovery should have applied the commands to the cache.
+            assert_eq!(partition.blob_log_end_offset(), Offset::new(3),
+                "cache should reflect all 3 blobs after recovery");
+
+            // Blob reads should work — BlobIndex uses WAL auto-counter.
+            let blobs = partition.read_blobs(Offset::new(0), 100_000).await.unwrap();
+            assert_eq!(blobs.len(), 3, "should read all 3 blobs via BlobIndex");
+            assert_eq!(blobs[0].base_offset, Offset::new(0));
+            assert_eq!(blobs[1].base_offset, Offset::new(1));
+            assert_eq!(blobs[2].base_offset, Offset::new(2));
+
+            coordinator.shutdown().await.unwrap();
+        }
     }
 }

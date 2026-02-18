@@ -36,6 +36,8 @@ pub enum WalCommand {
         term: u64,
         /// Log index (partition-local).
         index: u64,
+        /// Actual Raft log index.
+        raft_index: u64,
         /// Entry payload.
         payload: Bytes,
         /// Channel to send the result.
@@ -87,6 +89,7 @@ impl WalActorHandle {
         group_id: GroupId,
         term: u64,
         index: u64,
+        raft_index: u64,
         payload: Bytes,
     ) -> WalResult<DurableAck> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -96,6 +99,7 @@ impl WalActorHandle {
                 group_id,
                 term,
                 index,
+                raft_index,
                 payload,
                 reply: reply_tx,
             })
@@ -150,6 +154,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> WalActor<S> {
                     group_id,
                     term,
                     index,
+                    raft_index,
                     payload,
                     reply,
                 } => {
@@ -157,7 +162,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> WalActor<S> {
                     // Spawn the append to not block the actor loop.
                     // The handle's append already does batching via the coordinator.
                     tokio::spawn(async move {
-                        let result = handle.append(term, index, payload).await;
+                        let result = handle.append(term, index, raft_index, payload).await;
                         let _ = reply.send(result);
                     });
                 }
@@ -219,7 +224,7 @@ mod tests {
 
         let partition = GroupId::new(1);
         let result = handle
-            .append(partition, 1, 1, Bytes::from("test data"))
+            .append(partition, 1, 1, 0, Bytes::from("test data"))
             .await;
 
         assert!(result.is_ok());
@@ -239,8 +244,8 @@ mod tests {
         let p2 = GroupId::new(2);
 
         // Append to both partitions.
-        let r1 = handle.append(p1, 1, 1, Bytes::from("p1 data")).await;
-        let r2 = handle.append(p2, 1, 1, Bytes::from("p2 data")).await;
+        let r1 = handle.append(p1, 1, 1, 0, Bytes::from("p1 data")).await;
+        let r2 = handle.append(p2, 1, 1, 0, Bytes::from("p2 data")).await;
 
         assert!(r1.is_ok());
         assert!(r2.is_ok());
@@ -260,7 +265,7 @@ mod tests {
         // Append multiple entries sequentially.
         for i in 1..=5 {
             let result = handle
-                .append(partition, 1, i, Bytes::from(format!("data {i}")))
+                .append(partition, 1, i, 0, Bytes::from(format!("data {i}")))
                 .await;
             assert!(result.is_ok());
             assert_eq!(result.unwrap().index, i);
@@ -281,7 +286,7 @@ mod tests {
             let h = handle.clone();
             let partition = GroupId::new(i);
             join_handles.push(tokio::spawn(async move {
-                h.append(partition, 1, 1, Bytes::from(format!("data {i}")))
+                h.append(partition, 1, 1, 0, Bytes::from(format!("data {i}")))
                     .await
             }));
         }
@@ -304,8 +309,8 @@ mod tests {
         let partition = GroupId::new(1);
 
         // Both handles should work.
-        let r1 = handle1.append(partition, 1, 1, Bytes::from("data1")).await;
-        let r2 = handle2.append(partition, 1, 2, Bytes::from("data2")).await;
+        let r1 = handle1.append(partition, 1, 1, 0, Bytes::from("data1")).await;
+        let r2 = handle2.append(partition, 1, 2, 0, Bytes::from("data2")).await;
 
         assert!(r1.is_ok());
         assert!(r2.is_ok());

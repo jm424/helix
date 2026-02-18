@@ -997,6 +997,14 @@ async fn test_multi_partition_leader_failover_verified() {
     }
 
     // Step 5: Write more to all partitions after failure - 100 per partition = 800 total
+    //
+    // Wait for the producer's metadata cache to refresh before writing.
+    // rdkafka refreshes metadata every 500ms (topic.metadata.refresh.interval.ms)
+    // and on errors (100ms fast interval). However, with request.timeout.ms=12500
+    // and message.timeout.ms=15000, only ~1 internal retry fits before the message
+    // times out. If the first send goes to the dead broker and burns 12.5s, the
+    // single retry may not be enough. Sleeping 1s lets metadata settle first.
+    tokio::time::sleep(Duration::from_secs(1)).await;
     println!("\nStep 5: Writing 100 more messages to each partition (800 total)...");
     let mut phase2_success = 0u32;
     let mut phase2_fail = 0u32;
@@ -1011,7 +1019,10 @@ async fn test_multi_partition_leader_failover_verified() {
                     acknowledged[partition as usize].push((offset, payload));
                     phase2_success += 1;
                 }
-                Err(_) => {
+                Err(e) => {
+                    eprintln!(
+                        "  Phase 2 send failed: partition={partition} i={i} err={e:?}"
+                    );
                     phase2_fail += 1;
                 }
             }

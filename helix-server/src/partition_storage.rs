@@ -772,9 +772,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                     })?;
 
                 // Decode and apply to cache only (no additional WAL writes).
-                // Pass wal_index for BlobIndex population. write_wal_entry
-                // already set last_applied_index to the assigned WAL index.
-                let wal_index = partition.last_applied_index();
+                // Pass wal_index for BlobIndex population. For shared WALs, this
+                // is the auto-counter (not the Raft index), since read_entry()
+                // looks up by auto-counter.
+                let wal_index = partition.last_applied_wal_index();
                 partition
                     .apply_command_to_cache(wal_index, data)
                     .map_err(|e| ServerError::Internal {

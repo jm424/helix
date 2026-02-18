@@ -3,17 +3,18 @@
 //! Each entry in a shared WAL has the following binary format:
 //!
 //! ```text
-//! +----------+----------+----------+----------+----------+----------+
-//! |  CRC32   |  Length  |  PID     |   Term   |  Index   | Payload  |
-//! | (4 bytes)| (4 bytes)| (8 bytes)| (8 bytes)| (8 bytes)| (N bytes)|
-//! +----------+----------+----------+----------+----------+----------+
+//! +----------+----------+----------+----------+----------+-----------+----------+
+//! |  CRC32   |  Length  |  PID     |   Term   |  Index   | RaftIndex | Payload  |
+//! | (4 bytes)| (4 bytes)| (8 bytes)| (8 bytes)| (8 bytes)| (8 bytes) | (N bytes)|
+//! +----------+----------+----------+----------+----------+-----------+----------+
 //! ```
 //!
-//! - CRC32: Checksum of Length + `GroupId` + Term + Index + Payload
+//! - CRC32: Checksum of Length + `GroupId` + Term + Index + RaftIndex + Payload
 //! - Length: Payload length in bytes (not including header)
 //! - PID: Group ID that owns this entry
 //! - Term: Raft term when entry was created
-//! - Index: Log index of this entry (partition-local)
+//! - Index: Log index of this entry (partition-local auto-counter)
+//! - RaftIndex: Actual Raft log index (may differ from Index due to no-ops)
 //! - Payload: Application data
 //!
 //! All integers are stored in little-endian format.
@@ -30,7 +31,7 @@ use crate::limits::ENTRY_PAYLOAD_SIZE_BYTES_MAX;
 // ----------------------------------------------------------------------------
 
 /// Size of the shared entry header in bytes.
-pub const SHARED_ENTRY_HEADER_SIZE: usize = 32; // 4 + 4 + 8 + 8 + 8
+pub const SHARED_ENTRY_HEADER_SIZE: usize = 40; // 4 + 4 + 8 + 8 + 8 + 8
 
 /// Maximum payload length.
 const ENTRY_LENGTH_MAX: u32 = ENTRY_PAYLOAD_SIZE_BYTES_MAX;
@@ -52,8 +53,14 @@ pub struct SharedEntryHeader {
     pub group_id: GroupId,
     /// Raft term when this entry was created.
     pub term: u64,
-    /// Log index of this entry (partition-local).
+    /// Log index of this entry (partition-local auto-counter).
     pub index: u64,
+    /// Actual Raft log index.
+    ///
+    /// May differ from `index` because the auto-counter doesn't account for
+    /// Raft no-op entries (leader elections) or gaps from `ReplicationOnly`
+    /// durability mode. Recovery uses this value for `compacted_index`.
+    pub raft_index: u64,
 }
 
 impl SharedEntryHeader {
@@ -67,6 +74,7 @@ impl SharedEntryHeader {
         group_id: GroupId,
         term: u64,
         index: u64,
+        raft_index: u64,
         payload: &[u8],
     ) -> WalResult<Self> {
         let length = payload.len();
@@ -84,8 +92,8 @@ impl SharedEntryHeader {
         #[allow(clippy::cast_possible_truncation)]
         let length = length as u32;
 
-        // Compute CRC over length + group_id + term + index + payload.
-        let crc = Self::compute_crc(length, group_id, term, index, payload);
+        // Compute CRC over length + group_id + term + index + raft_index + payload.
+        let crc = Self::compute_crc(length, group_id, term, index, raft_index, payload);
 
         Ok(Self {
             crc,
@@ -93,6 +101,7 @@ impl SharedEntryHeader {
             group_id,
             term,
             index,
+            raft_index,
         })
     }
 
@@ -102,6 +111,7 @@ impl SharedEntryHeader {
         group_id: GroupId,
         term: u64,
         index: u64,
+        raft_index: u64,
         payload: &[u8],
     ) -> u32 {
         let mut hasher = crc32fast::Hasher::new();
@@ -109,6 +119,7 @@ impl SharedEntryHeader {
         hasher.update(&group_id.get().to_le_bytes());
         hasher.update(&term.to_le_bytes());
         hasher.update(&index.to_le_bytes());
+        hasher.update(&raft_index.to_le_bytes());
         hasher.update(payload);
         hasher.finalize()
     }
@@ -123,6 +134,7 @@ impl SharedEntryHeader {
             self.group_id,
             self.term,
             self.index,
+            self.raft_index,
             payload,
         );
         if expected != self.crc {
@@ -142,6 +154,7 @@ impl SharedEntryHeader {
         buf.put_u64_le(self.group_id.get());
         buf.put_u64_le(self.term);
         buf.put_u64_le(self.index);
+        buf.put_u64_le(self.raft_index);
     }
 
     /// Decodes a header from bytes.
@@ -161,6 +174,7 @@ impl SharedEntryHeader {
         let group_id = GroupId::new(buf.get_u64_le());
         let term = buf.get_u64_le();
         let index = buf.get_u64_le();
+        let raft_index = buf.get_u64_le();
 
         // Validate length is reasonable.
         if length > ENTRY_LENGTH_MAX {
@@ -176,6 +190,7 @@ impl SharedEntryHeader {
             group_id,
             term,
             index,
+            raft_index,
         })
     }
 
@@ -211,9 +226,10 @@ impl SharedEntry {
         group_id: GroupId,
         term: u64,
         index: u64,
+        raft_index: u64,
         payload: Bytes,
     ) -> WalResult<Self> {
-        let header = SharedEntryHeader::new(group_id, term, index, &payload)?;
+        let header = SharedEntryHeader::new(group_id, term, index, raft_index, &payload)?;
         Ok(Self { header, payload })
     }
 
@@ -229,10 +245,19 @@ impl SharedEntry {
         self.header.term
     }
 
-    /// Returns the log index.
+    /// Returns the log index (partition-local auto-counter).
     #[must_use]
     pub const fn index(&self) -> u64 {
         self.header.index
+    }
+
+    /// Returns the actual Raft log index.
+    ///
+    /// This is the index used by the Raft consensus layer. It may differ
+    /// from `index()` due to no-op entries from leader elections.
+    #[must_use]
+    pub const fn raft_index(&self) -> u64 {
+        self.header.raft_index
     }
 
     /// Returns the payload length.
@@ -331,11 +356,12 @@ mod tests {
     fn test_shared_entry_roundtrip() {
         let group_id = GroupId::new(42);
         let payload = Bytes::from("hello, shared world!");
-        let entry = SharedEntry::new(group_id, 1, 100, payload.clone()).unwrap();
+        let entry = SharedEntry::new(group_id, 1, 100, 500, payload.clone()).unwrap();
 
         assert_eq!(entry.group_id(), group_id);
         assert_eq!(entry.term(), 1);
         assert_eq!(entry.index(), 100);
+        assert_eq!(entry.raft_index(), 500);
         assert_eq!(entry.payload, payload);
 
         // Encode.
@@ -352,7 +378,8 @@ mod tests {
 
     #[test]
     fn test_shared_entry_checksum_detects_corruption() {
-        let entry = SharedEntry::new(GroupId::new(1), 1, 1, Bytes::from("test")).unwrap();
+        let entry =
+            SharedEntry::new(GroupId::new(1), 1, 1, 1, Bytes::from("test")).unwrap();
 
         let mut buf = BytesMut::new();
         entry.encode(&mut buf);
@@ -369,14 +396,14 @@ mod tests {
     #[test]
     fn test_shared_entry_too_large() {
         let payload = Bytes::from(vec![0u8; ENTRY_PAYLOAD_SIZE_BYTES_MAX as usize + 1]);
-        let result = SharedEntry::new(GroupId::new(1), 1, 1, payload);
+        let result = SharedEntry::new(GroupId::new(1), 1, 1, 1, payload);
         assert!(matches!(result, Err(WalError::EntryTooLarge { .. })));
     }
 
     #[test]
     fn test_shared_entry_header_size() {
         // Verify our constant matches actual encoded size.
-        let header = SharedEntryHeader::new(GroupId::new(1), 1, 1, &[]).unwrap();
+        let header = SharedEntryHeader::new(GroupId::new(1), 1, 1, 1, &[]).unwrap();
         let mut buf = BytesMut::new();
         header.encode(&mut buf);
         assert_eq!(buf.len(), SHARED_ENTRY_HEADER_SIZE);
@@ -384,7 +411,8 @@ mod tests {
 
     #[test]
     fn test_truncated_shared_entry() {
-        let entry = SharedEntry::new(GroupId::new(1), 1, 1, Bytes::from("hello")).unwrap();
+        let entry =
+            SharedEntry::new(GroupId::new(1), 1, 1, 1, Bytes::from("hello")).unwrap();
         let mut buf = BytesMut::new();
         entry.encode(&mut buf);
 
@@ -398,7 +426,8 @@ mod tests {
     #[test]
     fn test_shared_entry_walentry_trait() {
         // Verify SharedEntry implements WalEntry correctly.
-        let entry = SharedEntry::new(GroupId::new(99), 5, 42, Bytes::from("data")).unwrap();
+        let entry =
+            SharedEntry::new(GroupId::new(99), 5, 42, 200, Bytes::from("data")).unwrap();
 
         // Check trait constants and methods.
         assert_eq!(SharedEntry::HEADER_SIZE, SHARED_ENTRY_HEADER_SIZE);
@@ -416,18 +445,38 @@ mod tests {
         // Decode via trait.
         let decoded = <SharedEntry as WalEntry>::decode(&mut buf.freeze(), 0).unwrap();
         assert_eq!(decoded, entry);
+        assert_eq!(decoded.raft_index(), 200);
     }
 
     #[test]
     fn test_shared_entry_multiple_partitions() {
         // Test entries from different partitions can be distinguished.
-        let entry1 = SharedEntry::new(GroupId::new(1), 1, 1, Bytes::from("p1")).unwrap();
-        let entry2 = SharedEntry::new(GroupId::new(2), 1, 1, Bytes::from("p2")).unwrap();
-        let entry3 = SharedEntry::new(GroupId::new(1), 1, 2, Bytes::from("p1-2")).unwrap();
+        let entry1 = SharedEntry::new(GroupId::new(1), 1, 1, 10, Bytes::from("p1")).unwrap();
+        let entry2 = SharedEntry::new(GroupId::new(2), 1, 1, 20, Bytes::from("p2")).unwrap();
+        let entry3 =
+            SharedEntry::new(GroupId::new(1), 1, 2, 11, Bytes::from("p1-2")).unwrap();
 
         assert_ne!(entry1.group_id(), entry2.group_id());
         assert_eq!(entry1.group_id(), entry3.group_id());
         assert_eq!(entry1.index(), entry2.index());
         assert_ne!(entry1.index(), entry3.index());
+        assert_ne!(entry1.raft_index(), entry2.raft_index());
+    }
+
+    #[test]
+    fn test_raft_index_differs_from_auto_counter() {
+        // Verify raft_index and index are independent fields.
+        // This simulates the case where leader elections create no-op entries
+        // that increment the Raft index but not the WAL auto-counter.
+        let entry = SharedEntry::new(GroupId::new(1), 3, 5, 7254, Bytes::from("data")).unwrap();
+        assert_eq!(entry.index(), 5);
+        assert_eq!(entry.raft_index(), 7254);
+
+        // Round-trip preserves both.
+        let mut buf = BytesMut::new();
+        entry.encode(&mut buf);
+        let decoded = SharedEntry::decode(&mut buf.freeze(), 0).unwrap();
+        assert_eq!(decoded.index(), 5);
+        assert_eq!(decoded.raft_index(), 7254);
     }
 }

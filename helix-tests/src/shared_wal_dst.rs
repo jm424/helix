@@ -28,6 +28,7 @@ use helix_wal::{FaultConfig, SharedEntry, SharedWal, SharedWalConfig, SimulatedS
 struct TrackedEntry {
     term: u64,
     index: u64,
+    raft_index: u64,
     payload: Bytes,
 }
 
@@ -239,6 +240,57 @@ fn verify_partition_isolation(recovered: &HashMap<GroupId, Vec<SharedEntry>>) ->
     violations
 }
 
+/// Property: Raft index preserved through WAL round-trip.
+///
+/// Every recovered entry's `raft_index()` must match the `raft_index` that was
+/// passed when the entry was appended. This is the core invariant for the
+/// crash-recovery fix: if `raft_index` is corrupted or lost, `compacted_index`
+/// will be wrong and the node will crash-loop on restart.
+fn verify_raft_index(
+    state: &PropertyState,
+    recovered: &HashMap<GroupId, Vec<SharedEntry>>,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+
+    for (partition_id, recovered_entries) in recovered {
+        // Build lookup of appended entries by auto-counter index.
+        let appended_by_index: HashMap<u64, &TrackedEntry> = state
+            .appended
+            .get(partition_id)
+            .map_or_else(HashMap::new, |v| v.iter().map(|e| (e.index, e)).collect());
+
+        for recovered_entry in recovered_entries {
+            if let Some(appended) = appended_by_index.get(&recovered_entry.index()) {
+                if recovered_entry.raft_index() != appended.raft_index {
+                    violations.push(format!(
+                        "RaftIndex violation: partition {} auto-index {} \
+                         expected raft_index={}, got raft_index={}",
+                        partition_id,
+                        recovered_entry.index(),
+                        appended.raft_index,
+                        recovered_entry.raft_index()
+                    ));
+                }
+            }
+        }
+    }
+
+    violations
+}
+
+/// Computes a synthetic raft_index that diverges from the auto-counter.
+///
+/// Simulates the production scenario where no-op entries from leader elections
+/// cause the Raft index to run ahead of the WAL auto-counter. The gap grows
+/// based on partition and seed to exercise diverse divergence patterns.
+fn synthetic_raft_index(partition: u64, auto_index: u64, seed: u64) -> u64 {
+    // Base offset per partition (simulates different election histories).
+    let base = partition * 1000 + seed % 100;
+    // Gap grows with auto_index (simulates elections happening over time).
+    let election_gap = (auto_index / 3) * 2;
+    base + auto_index + election_gap
+}
+
 #[tokio::test]
 async fn test_dst_shared_wal_basic_durability() {
     // Basic test: append, sync, "crash" (drop), recover, verify.
@@ -256,19 +308,23 @@ async fn test_dst_shared_wal_basic_durability() {
             .unwrap();
 
         for i in 1..=10u64 {
+            let raft_idx1 = synthetic_raft_index(1, i, 1);
             let payload1 = Bytes::from(format!("p1-{i}"));
-            wal.append(p1, 1, i, payload1.clone()).await.unwrap();
+            wal.append(p1, 1, i, raft_idx1, payload1.clone()).await.unwrap();
             state.appended.entry(p1).or_default().push(TrackedEntry {
                 term: 1,
                 index: i,
+                raft_index: raft_idx1,
                 payload: payload1,
             });
 
+            let raft_idx2 = synthetic_raft_index(2, i, 1);
             let payload2 = Bytes::from(format!("p2-{i}"));
-            wal.append(p2, 1, i, payload2.clone()).await.unwrap();
+            wal.append(p2, 1, i, raft_idx2, payload2.clone()).await.unwrap();
             state.appended.entry(p2).or_default().push(TrackedEntry {
                 term: 1,
                 index: i,
+                raft_index: raft_idx2,
                 payload: payload2,
             });
         }
@@ -302,11 +358,12 @@ async fn test_dst_shared_wal_basic_durability() {
             }
         }
 
-        // Verify ALL properties including content.
+        // Verify ALL properties including content and raft_index.
         let durability_violations = verify_durability(&state);
         let ordering_violations = verify_ordering(&recovered);
         let phantom_violations = verify_no_phantoms(&state, &recovered);
         let content_violations = verify_content(&state, &recovered);
+        let raft_index_violations = verify_raft_index(&state, &recovered);
 
         assert!(
             durability_violations.is_empty(),
@@ -327,6 +384,11 @@ async fn test_dst_shared_wal_basic_durability() {
             content_violations.is_empty(),
             "Content violations: {:?}",
             content_violations
+        );
+        assert!(
+            raft_index_violations.is_empty(),
+            "RaftIndex violations: {:?}",
+            raft_index_violations
         );
 
         // Verify counts.
@@ -351,7 +413,7 @@ async fn test_dst_shared_wal_unsynced_entries_may_be_lost() {
 
         // Append and sync first 5.
         for i in 1..=5u64 {
-            wal.append(p1, 1, i, Bytes::from(format!("p1-{i}")))
+            wal.append(p1, 1, i, 0, Bytes::from(format!("p1-{i}")))
                 .await
                 .unwrap();
         }
@@ -359,7 +421,7 @@ async fn test_dst_shared_wal_unsynced_entries_may_be_lost() {
 
         // Append 5 more but DON'T sync.
         for i in 6..=10u64 {
-            wal.append(p1, 1, i, Bytes::from(format!("p1-{i}")))
+            wal.append(p1, 1, i, 0, Bytes::from(format!("p1-{i}")))
                 .await
                 .unwrap();
         }
@@ -424,7 +486,7 @@ async fn test_dst_shared_wal_fsync_failure_rate_statistics() {
         };
 
         // Write just one entry to minimize torn write interference.
-        if wal.append(p1, 1, 1, Bytes::from("test")).await.is_err() {
+        if wal.append(p1, 1, 1, 0, Bytes::from("test")).await.is_err() {
             continue;
         }
 
@@ -465,7 +527,7 @@ async fn test_dst_shared_wal_fsync_failure_no_durability_guarantee() {
 
     // Append entries.
     for i in 1..=5u64 {
-        wal.append(p1, 1, i, Bytes::from(format!("p1-{i}")))
+        wal.append(p1, 1, i, 0, Bytes::from(format!("p1-{i}")))
             .await
             .unwrap();
     }
@@ -499,7 +561,7 @@ async fn test_dst_shared_wal_multi_partition_interleaved() {
             for p in 1..=partition_count as u64 {
                 let partition_id = GroupId::new(p);
                 let payload = Bytes::from(format!("p{p}-{i}"));
-                wal.append(partition_id, 1, i, payload.clone())
+                wal.append(partition_id, 1, i, 0, payload.clone())
                     .await
                     .unwrap();
                 state
@@ -509,6 +571,7 @@ async fn test_dst_shared_wal_multi_partition_interleaved() {
                     .push(TrackedEntry {
                         term: 1,
                         index: i,
+                        raft_index: 0,
                         payload,
                     });
             }
@@ -600,7 +663,7 @@ async fn test_dst_shared_wal_multiple_crash_recover_cycles() {
             let start = expected_count + 1;
             let end = expected_count + 10;
             for i in start..=end {
-                wal.append(p1, cycle, i, Bytes::from(format!("cycle{cycle}-{i}")))
+                wal.append(p1, cycle, i, 0, Bytes::from(format!("cycle{cycle}-{i}")))
                     .await
                     .unwrap();
             }
@@ -659,7 +722,7 @@ async fn test_dst_shared_wal_torn_write_recovery() {
 
         for i in 1..=20u64 {
             // Some appends may fail due to torn writes.
-            let _ = wal.append(p1, 1, i, Bytes::from(format!("p1-{i}"))).await;
+            let _ = wal.append(p1, 1, i, 0, Bytes::from(format!("p1-{i}"))).await;
         }
 
         // Sync may partially succeed.
@@ -712,16 +775,19 @@ fn test_verify_durability_catches_missing_entry() {
             TrackedEntry {
                 term: 1,
                 index: 1,
+                raft_index: 0,
                 payload: Bytes::from("e1"),
             },
             TrackedEntry {
                 term: 1,
                 index: 2,
+                raft_index: 0,
                 payload: Bytes::from("e2"),
             },
             TrackedEntry {
                 term: 1,
                 index: 3,
+                raft_index: 0,
                 payload: Bytes::from("e3"),
             },
         ],
@@ -746,9 +812,9 @@ fn test_verify_ordering_catches_out_of_order() {
     let p1 = GroupId::new(1);
 
     // Create entries with out-of-order indices.
-    let entry1 = SharedEntry::new(p1, 1, 1, Bytes::from("e1")).unwrap();
-    let entry3 = SharedEntry::new(p1, 1, 3, Bytes::from("e3")).unwrap();
-    let entry2 = SharedEntry::new(p1, 1, 2, Bytes::from("e2")).unwrap();
+    let entry1 = SharedEntry::new(p1, 1, 1, 0, Bytes::from("e1")).unwrap();
+    let entry3 = SharedEntry::new(p1, 1, 3, 0, Bytes::from("e3")).unwrap();
+    let entry2 = SharedEntry::new(p1, 1, 2, 0, Bytes::from("e2")).unwrap();
 
     // Recovered in wrong order: 1, 3, 2 (should be 1, 2, 3).
     let mut recovered = HashMap::new();
@@ -776,20 +842,22 @@ fn test_verify_no_phantoms_catches_phantom() {
             TrackedEntry {
                 term: 1,
                 index: 1,
+                raft_index: 0,
                 payload: Bytes::from("e1"),
             },
             TrackedEntry {
                 term: 1,
                 index: 2,
+                raft_index: 0,
                 payload: Bytes::from("e2"),
             },
         ],
     );
 
     // Create entry 3 that was never appended.
-    let entry1 = SharedEntry::new(p1, 1, 1, Bytes::from("e1")).unwrap();
-    let entry2 = SharedEntry::new(p1, 1, 2, Bytes::from("e2")).unwrap();
-    let phantom = SharedEntry::new(p1, 1, 3, Bytes::from("phantom")).unwrap();
+    let entry1 = SharedEntry::new(p1, 1, 1, 0, Bytes::from("e1")).unwrap();
+    let entry2 = SharedEntry::new(p1, 1, 2, 0, Bytes::from("e2")).unwrap();
+    let phantom = SharedEntry::new(p1, 1, 3, 0, Bytes::from("phantom")).unwrap();
 
     let mut recovered = HashMap::new();
     recovered.insert(p1, vec![entry1, entry2, phantom]);
@@ -816,16 +884,19 @@ fn test_verify_all_properties_pass_when_correct() {
             TrackedEntry {
                 term: 1,
                 index: 1,
+                raft_index: 0,
                 payload: Bytes::from("e1"),
             },
             TrackedEntry {
                 term: 1,
                 index: 2,
+                raft_index: 0,
                 payload: Bytes::from("e2"),
             },
             TrackedEntry {
                 term: 1,
                 index: 3,
+                raft_index: 0,
                 payload: Bytes::from("e3"),
             },
         ],
@@ -834,9 +905,9 @@ fn test_verify_all_properties_pass_when_correct() {
     state.recovered.insert(p1, HashSet::from([1, 2, 3]));
 
     // Create correctly ordered entries with matching content.
-    let entry1 = SharedEntry::new(p1, 1, 1, Bytes::from("e1")).unwrap();
-    let entry2 = SharedEntry::new(p1, 1, 2, Bytes::from("e2")).unwrap();
-    let entry3 = SharedEntry::new(p1, 1, 3, Bytes::from("e3")).unwrap();
+    let entry1 = SharedEntry::new(p1, 1, 1, 0, Bytes::from("e1")).unwrap();
+    let entry2 = SharedEntry::new(p1, 1, 2, 0, Bytes::from("e2")).unwrap();
+    let entry3 = SharedEntry::new(p1, 1, 3, 0, Bytes::from("e3")).unwrap();
 
     let mut recovered = HashMap::new();
     recovered.insert(p1, vec![entry1, entry2, entry3]);
@@ -860,6 +931,7 @@ fn test_verify_content_catches_payload_mismatch() {
         vec![TrackedEntry {
             term: 1,
             index: 1,
+            raft_index: 0,
             payload: Bytes::from("original-payload"),
         }],
     );
@@ -867,7 +939,7 @@ fn test_verify_content_catches_payload_mismatch() {
     state.recovered.insert(p1, HashSet::from([1]));
 
     // Create entry with DIFFERENT payload than what was appended.
-    let corrupted_entry = SharedEntry::new(p1, 1, 1, Bytes::from("corrupted-payload")).unwrap();
+    let corrupted_entry = SharedEntry::new(p1, 1, 1, 0, Bytes::from("corrupted-payload")).unwrap();
 
     let mut recovered = HashMap::new();
     recovered.insert(p1, vec![corrupted_entry]);
@@ -893,6 +965,7 @@ fn test_verify_content_catches_term_mismatch() {
         vec![TrackedEntry {
             term: 1,
             index: 1,
+            raft_index: 0,
             payload: Bytes::from("data"),
         }],
     );
@@ -900,7 +973,7 @@ fn test_verify_content_catches_term_mismatch() {
     state.recovered.insert(p1, HashSet::from([1]));
 
     // Create entry with DIFFERENT term (but same payload) than what was appended.
-    let wrong_term_entry = SharedEntry::new(p1, 2, 1, Bytes::from("data")).unwrap();
+    let wrong_term_entry = SharedEntry::new(p1, 2, 1, 0, Bytes::from("data")).unwrap();
 
     let mut recovered = HashMap::new();
     recovered.insert(p1, vec![wrong_term_entry]);
@@ -919,9 +992,9 @@ fn test_verify_no_duplicates_catches_duplicate() {
     let p1 = GroupId::new(1);
 
     // Create entries with duplicate index.
-    let entry1 = SharedEntry::new(p1, 1, 1, Bytes::from("first")).unwrap();
-    let entry2 = SharedEntry::new(p1, 1, 2, Bytes::from("second")).unwrap();
-    let duplicate = SharedEntry::new(p1, 1, 1, Bytes::from("duplicate")).unwrap(); // Same index!
+    let entry1 = SharedEntry::new(p1, 1, 1, 0, Bytes::from("first")).unwrap();
+    let entry2 = SharedEntry::new(p1, 1, 2, 0, Bytes::from("second")).unwrap();
+    let duplicate = SharedEntry::new(p1, 1, 1, 0, Bytes::from("duplicate")).unwrap(); // Same index!
 
     let mut recovered = HashMap::new();
     recovered.insert(p1, vec![entry1, entry2, duplicate]);
@@ -944,8 +1017,8 @@ fn test_verify_prefix_consistency_catches_hole() {
     state.synced.insert(p1, HashSet::from([1, 2, 3]));
 
     // But only recovered 1 and 3 (missing 2 - a "hole").
-    let entry1 = SharedEntry::new(p1, 1, 1, Bytes::from("e1")).unwrap();
-    let entry3 = SharedEntry::new(p1, 1, 3, Bytes::from("e3")).unwrap();
+    let entry1 = SharedEntry::new(p1, 1, 1, 0, Bytes::from("e1")).unwrap();
+    let entry3 = SharedEntry::new(p1, 1, 3, 0, Bytes::from("e3")).unwrap();
 
     let mut recovered = HashMap::new();
     recovered.insert(p1, vec![entry1, entry3]);
@@ -965,7 +1038,7 @@ fn test_verify_partition_isolation_catches_mismatch() {
     let p2 = GroupId::new(2);
 
     // Entry claims to be for partition 2 but stored under partition 1.
-    let wrong_partition_entry = SharedEntry::new(p2, 1, 1, Bytes::from("data")).unwrap();
+    let wrong_partition_entry = SharedEntry::new(p2, 1, 1, 0, Bytes::from("data")).unwrap();
 
     let mut recovered = HashMap::new();
     recovered.insert(p1, vec![wrong_partition_entry]); // Stored under p1!
@@ -984,9 +1057,9 @@ fn test_verify_all_new_properties_pass_when_correct() {
     let p1 = GroupId::new(1);
 
     // Create correctly ordered entries with no duplicates.
-    let entry1 = SharedEntry::new(p1, 1, 1, Bytes::from("e1")).unwrap();
-    let entry2 = SharedEntry::new(p1, 1, 2, Bytes::from("e2")).unwrap();
-    let entry3 = SharedEntry::new(p1, 1, 3, Bytes::from("e3")).unwrap();
+    let entry1 = SharedEntry::new(p1, 1, 1, 0, Bytes::from("e1")).unwrap();
+    let entry2 = SharedEntry::new(p1, 1, 2, 0, Bytes::from("e2")).unwrap();
+    let entry3 = SharedEntry::new(p1, 1, 3, 0, Bytes::from("e3")).unwrap();
 
     let mut recovered = HashMap::new();
     recovered.insert(p1, vec![entry1, entry2, entry3]);
@@ -1021,7 +1094,7 @@ async fn test_dst_shared_wal_multi_seed_sync_durability() {
                 .expect("open should succeed without faults");
 
             for i in 1..=10u64 {
-                wal.append(p1, 1, i, Bytes::from(format!("entry-{i}")))
+                wal.append(p1, 1, i, 0, Bytes::from(format!("entry-{i}")))
                     .await
                     .expect("append should succeed without faults");
             }
@@ -1082,7 +1155,7 @@ async fn test_dst_shared_wal_multi_seed_fsync_failures() {
                 .expect("open should succeed");
 
             for i in 1..=5u64 {
-                wal.append(p1, 1, i, Bytes::from(format!("entry-{i}")))
+                wal.append(p1, 1, i, 0, Bytes::from(format!("entry-{i}")))
                     .await
                     .expect("append should succeed");
             }
@@ -1137,7 +1210,7 @@ async fn test_dst_shared_wal_multi_seed_torn_writes() {
 
             for i in 1..=10u64 {
                 if wal
-                    .append(p1, 1, i, Bytes::from(format!("entry-{i}")))
+                    .append(p1, 1, i, 0, Bytes::from(format!("entry-{i}")))
                     .await
                     .is_ok()
                 {
@@ -1236,12 +1309,15 @@ async fn test_dst_shared_wal_comprehensive_stress() {
             };
 
             // Write all entries, tracking what succeeded with full content.
+            // Use synthetic raft_index that diverges from auto-counter to
+            // exercise the raft_index preservation property.
             for p in 1..=PARTITION_COUNT {
                 let partition_id = GroupId::new(p);
 
                 for i in 1..=ENTRIES_PER_PARTITION {
+                    let raft_idx = synthetic_raft_index(p, i, seed);
                     let payload = Bytes::from(format!("p{p}-{i}"));
-                    match wal.append(partition_id, 1, i, payload.clone()).await {
+                    match wal.append(partition_id, 1, i, raft_idx, payload.clone()).await {
                         Ok(()) => {
                             state
                                 .appended
@@ -1250,6 +1326,7 @@ async fn test_dst_shared_wal_comprehensive_stress() {
                                 .push(TrackedEntry {
                                     term: 1,
                                     index: i,
+                                    raft_index: raft_idx,
                                     payload,
                                 });
                             entries_appended += 1;
@@ -1355,6 +1432,12 @@ async fn test_dst_shared_wal_comprehensive_stress() {
             let isolation_violations = verify_partition_isolation(&recovered);
             seed_violations.extend(isolation_violations);
 
+            // Raft index: recovered raft_index must match what was written.
+            if sync_succeeded {
+                let raft_index_violations = verify_raft_index(&state, &recovered);
+                seed_violations.extend(raft_index_violations);
+            }
+
             if !seed_violations.is_empty() {
                 total_violations += seed_violations.len();
                 seeds_with_issues.push((seed, seed_violations));
@@ -1419,7 +1502,7 @@ async fn test_dst_shared_wal_stress_with_truncation() {
 
             // Write entries 1-10.
             for i in 1..=10u64 {
-                wal.append(p1, 1, i, Bytes::from(format!("old-{i}")))
+                wal.append(p1, 1, i, 0, Bytes::from(format!("old-{i}")))
                     .await
                     .unwrap();
             }
@@ -1430,7 +1513,7 @@ async fn test_dst_shared_wal_stress_with_truncation() {
 
             // Write new entries 6-15 at term 2.
             for i in 6..=15u64 {
-                wal.append(p1, 2, i, Bytes::from(format!("new-{i}")))
+                wal.append(p1, 2, i, 0, Bytes::from(format!("new-{i}")))
                     .await
                     .unwrap();
             }
@@ -1508,7 +1591,7 @@ async fn test_dst_shared_wal_multi_crash_recovery_cycles() {
                 let start = expected_index + 1;
                 let end = expected_index + 10;
                 for i in start..=end {
-                    wal.append(p1, cycle, i, Bytes::from(format!("c{cycle}-{i}")))
+                    wal.append(p1, cycle, i, 0, Bytes::from(format!("c{cycle}-{i}")))
                         .await
                         .expect("append should succeed");
                 }
@@ -1613,7 +1696,7 @@ async fn test_dst_shared_wal_last_write_wins_semantics() {
             let mut all_ok = true;
             for i in 1..=10u64 {
                 if wal
-                    .append(p1, 1, i, Bytes::from(format!("old-{i}")))
+                    .append(p1, 1, i, 0, Bytes::from(format!("old-{i}")))
                     .await
                     .is_err()
                 {
@@ -1643,7 +1726,7 @@ async fn test_dst_shared_wal_last_write_wins_semantics() {
             let mut all_ok = true;
             for i in 6..=10u64 {
                 if wal
-                    .append(p1, 2, i, Bytes::from(format!("new-{i}")))
+                    .append(p1, 2, i, 0, Bytes::from(format!("new-{i}")))
                     .await
                     .is_err()
                 {
@@ -1745,7 +1828,7 @@ async fn test_dst_shared_wal_partial_overwrite_stale_entries_reappear() {
             .unwrap();
 
         for i in 1..=10u64 {
-            wal.append(p1, 1, i, Bytes::from(format!("old-{i}")))
+            wal.append(p1, 1, i, 0, Bytes::from(format!("old-{i}")))
                 .await
                 .unwrap();
         }
@@ -1763,7 +1846,7 @@ async fn test_dst_shared_wal_partial_overwrite_stale_entries_reappear() {
 
         // Write only 6-8, NOT 9-10.
         for i in 6..=8u64 {
-            wal.append(p1, 2, i, Bytes::from(format!("new-{i}")))
+            wal.append(p1, 2, i, 0, Bytes::from(format!("new-{i}")))
                 .await
                 .unwrap();
         }
@@ -1821,12 +1904,21 @@ async fn test_dst_shared_wal_partial_overwrite_stale_entries_reappear() {
 }
 
 /// Test: Maximum entry size boundary.
+///
+/// Uses a segment large enough to hold a max-size entry (5MB payload + 40B header).
+/// The default segment size (4MB) is smaller than the max payload, so we must
+/// configure a larger segment.
 #[tokio::test]
 async fn test_dst_shared_wal_max_entry_size() {
     use helix_wal::limits::ENTRY_PAYLOAD_SIZE_BYTES_MAX;
+    use helix_wal::SegmentConfig;
 
     let storage = SimulatedStorage::new(42);
-    let config = SharedWalConfig::new("/test/max-size");
+    // Segment must be large enough to hold header + max payload.
+    let segment_config = SegmentConfig::new()
+        .with_max_size(ENTRY_PAYLOAD_SIZE_BYTES_MAX as u64 + 1024 * 1024);
+    let config = SharedWalConfig::new("/test/max-size")
+        .with_segment_config(segment_config);
 
     let p1 = GroupId::new(1);
 
@@ -1836,12 +1928,12 @@ async fn test_dst_shared_wal_max_entry_size() {
 
     // Create payload at exactly max size.
     let max_payload = vec![b'x'; ENTRY_PAYLOAD_SIZE_BYTES_MAX as usize];
-    let result = wal.append(p1, 1, 1, Bytes::from(max_payload)).await;
+    let result = wal.append(p1, 1, 1, 0, Bytes::from(max_payload)).await;
     assert!(result.is_ok(), "Max size entry should succeed");
 
     // Create payload over max size.
     let over_payload = vec![b'y'; ENTRY_PAYLOAD_SIZE_BYTES_MAX as usize + 1];
-    let result = wal.append(p1, 1, 2, Bytes::from(over_payload)).await;
+    let result = wal.append(p1, 1, 2, 0, Bytes::from(over_payload)).await;
     assert!(result.is_err(), "Over-max-size entry should fail");
 
     // Sync and verify recovery of the valid entry.
@@ -1881,7 +1973,7 @@ async fn test_dst_shared_wal_segment_rollover() {
     let entry_count = 12_000u64;
     for i in 1..=entry_count {
         let payload = format!("entry-{i:08}");
-        wal.append(p1, 1, i, Bytes::from(payload)).await.unwrap();
+        wal.append(p1, 1, i, 0, Bytes::from(payload)).await.unwrap();
 
         if i % 1000 == 0 {
             wal.sync().await.unwrap();
@@ -1965,7 +2057,7 @@ async fn test_dst_shared_wal_segment_rollover_with_faults() {
                 payload[0..8].copy_from_slice(&next_index.to_le_bytes());
 
                 if wal
-                    .append(p1, 1, next_index, Bytes::from(payload))
+                    .append(p1, 1, next_index, 0, Bytes::from(payload))
                     .await
                     .is_ok()
                 {
@@ -2122,8 +2214,10 @@ async fn test_dst_shared_wal_high_fidelity_stress() {
                         (p2, &mut p2_next_idx, p2_term)
                     };
 
+                    // Use synthetic raft_index that diverges from auto-counter.
+                    let raft_idx = synthetic_raft_index(pid.get(), *next_idx, seed);
                     let payload = Bytes::from(format!("s{seed}-o{op_num}-i{}", *next_idx));
-                    if wal.append(pid, term, *next_idx, payload).await.is_ok() {
+                    if wal.append(pid, term, *next_idx, raft_idx, payload).await.is_ok() {
                         *next_idx += 1;
                     }
                 }
@@ -2222,6 +2316,30 @@ async fn test_dst_shared_wal_high_fidelity_stress() {
                                 dup_violations
                             );
 
+                            // Raft index: every recovered entry must have a non-zero
+                            // raft_index that matches synthetic_raft_index for its
+                            // partition and auto-counter. This catches corruption or
+                            // loss of the raft_index field through the WAL round-trip.
+                            for (pid, entries) in &recovered {
+                                for entry in entries {
+                                    let expected = synthetic_raft_index(
+                                        pid.get(),
+                                        entry.index(),
+                                        seed,
+                                    );
+                                    assert_eq!(
+                                        entry.raft_index(),
+                                        expected,
+                                        "seed {seed}, op {op_num}: RAFT_INDEX VIOLATION - \
+                                         partition {} auto-index {} expected raft_index={}, got {}",
+                                        pid.get(),
+                                        entry.index(),
+                                        expected,
+                                        entry.raft_index()
+                                    );
+                                }
+                            }
+
                             // Reset state based on recovery
                             p1_next_idx = recovered
                                 .get(&p1)
@@ -2289,6 +2407,27 @@ async fn test_dst_shared_wal_high_fidelity_stress() {
                     recovered_count >= durable,
                     "seed {seed}: FINAL P2 DURABILITY VIOLATION - recovered {recovered_count} < durable {durable}"
                 );
+            }
+
+            // Final raft_index verification.
+            for (pid, entries) in &recovered {
+                for entry in entries {
+                    let expected = synthetic_raft_index(
+                        pid.get(),
+                        entry.index(),
+                        seed,
+                    );
+                    assert_eq!(
+                        entry.raft_index(),
+                        expected,
+                        "seed {seed}: FINAL RAFT_INDEX VIOLATION - \
+                         partition {} auto-index {} expected raft_index={}, got {}",
+                        pid.get(),
+                        entry.index(),
+                        expected,
+                        entry.raft_index()
+                    );
+                }
             }
         }
     }
