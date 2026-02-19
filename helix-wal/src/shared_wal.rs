@@ -31,8 +31,8 @@
 //! // Single sync makes both entries durable.
 //! wal.sync().await?;
 //!
-//! // Recovery groups entries by group.
-//! let by_group = wal.recover()?;
+//! // Recovery groups entries by group (loads segments one at a time to avoid OOM).
+//! let by_group = wal.recover().await?;
 //! ```
 
 use std::collections::{BTreeMap, HashMap};
@@ -438,23 +438,42 @@ impl<S: Storage> SharedWal<S> {
     /// and re-append), the last entry in WAL order wins. This ensures that after
     /// truncation and new appends, recovery returns the correct (new) entries.
     ///
+    /// # Memory Efficiency
+    ///
+    /// Sealed segments are loaded from disk one at a time and freed after
+    /// their entries are extracted. Peak memory during recovery is bounded
+    /// to one segment at a time plus the deduplicated entry set, rather than
+    /// all historical segment data simultaneously.
+    ///
     /// Also rebuilds internal group state and durable tracking for assertion checking.
     ///
     /// # Errors
-    /// Currently infallible, but returns `Result` for future extensibility.
-    pub fn recover(&mut self) -> WalResult<HashMap<GroupId, Vec<SharedEntry>>> {
+    /// Returns an error if any sealed segment file cannot be read or decoded.
+    pub async fn recover(&mut self) -> WalResult<HashMap<GroupId, Vec<SharedEntry>>> {
         // Use HashMap to deduplicate: last-write-wins for same (group, index).
         let mut by_group_map: HashMap<GroupId, HashMap<u64, SharedEntry>> = HashMap::new();
 
-        for entry in self.wal.entries() {
-            let group_id = entry.group_id();
-            let index = entry.index();
+        // Process sealed segments one at a time (load → extract → drop).
+        // This bounds peak memory to one segment worth of raw data at a time.
+        let sealed_ids = self.wal.sealed_segment_ids();
+        for segment_id in sealed_ids {
+            let segment = self.wal.load_sealed_segment_for_recovery(segment_id).await?;
+            for entry in segment.entries() {
+                // Last-write-wins: later segments overwrite earlier entries.
+                by_group_map
+                    .entry(entry.group_id())
+                    .or_default()
+                    .insert(entry.index(), entry.clone());
+            }
+            // segment is dropped here, freeing raw payload bytes.
+        }
 
-            // Last-write-wins: later entries with same index overwrite earlier ones.
+        // Process entries in the active segment (always resident in memory).
+        for entry in self.wal.active_entries() {
             by_group_map
-                .entry(group_id)
+                .entry(entry.group_id())
                 .or_default()
-                .insert(index, entry.clone());
+                .insert(entry.index(), entry.clone());
         }
 
         // Convert to sorted Vec and update group state.
@@ -481,8 +500,7 @@ impl<S: Storage> SharedWal<S> {
 
         // Recovered entries are durable - update per-group durable indices.
         for (group_id, state) in &self.group_state {
-            self.group_durable
-                .insert(*group_id, state.last_index);
+            self.group_durable.insert(*group_id, state.last_index);
         }
 
         // Populate group index from recovered entries.
@@ -1534,7 +1552,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
     pub async fn recover(&self) -> WalResult<HashMap<GroupId, Vec<SharedEntry>>> {
         let result = {
             let mut wal = self.inner.wal.lock().await;
-            wal.recover()?
+            wal.recover().await?
         };
 
         // Update group_last_index from recovered state.
@@ -2109,7 +2127,7 @@ mod tests {
         {
             let mut wal = SharedWal::open(TokioStorage::new(), config).await.unwrap();
 
-            let by_partition = wal.recover().unwrap();
+            let by_partition = wal.recover().await.unwrap();
 
             // Verify partition 1.
             let p1_entries = by_partition.get(&p1).unwrap();
@@ -2325,7 +2343,7 @@ mod tests {
         {
             let mut wal = SharedWal::open(TokioStorage::new(), config).await.unwrap();
 
-            let by_partition = wal.recover().unwrap();
+            let by_partition = wal.recover().await.unwrap();
             let entries = by_partition.get(&p1).unwrap();
 
             // Should have 6 entries: 1, 2, 3 (old), 4, 5, 6 (new).
@@ -2559,7 +2577,7 @@ mod tests {
         // Reopen and recover — simulates crash + restart.
         {
             let mut wal = SharedWal::open(TokioStorage::new(), config).await.unwrap();
-            let by_partition = wal.recover().unwrap();
+            let by_partition = wal.recover().await.unwrap();
             let entries = by_partition.get(&p1).unwrap();
 
             assert_eq!(entries.len(), 5);
@@ -2621,7 +2639,7 @@ mod tests {
 
         {
             let mut wal = SharedWal::open(TokioStorage::new(), config).await.unwrap();
-            let by_partition = wal.recover().unwrap();
+            let by_partition = wal.recover().await.unwrap();
 
             let p1_entries = by_partition.get(&p1).unwrap();
             assert_eq!(p1_entries[0].raft_index(), 100);

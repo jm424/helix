@@ -342,6 +342,17 @@ impl WalEntry for SharedEntry {
     fn uses_global_index() -> bool {
         false
     }
+
+    fn scan_header_info(header_bytes: &[u8]) -> (u64, u32) {
+        debug_assert!(header_bytes.len() >= SHARED_ENTRY_HEADER_SIZE);
+        // SharedEntry layout: [crc:u32(4), length:u32(4), group_id:u64(8),
+        //                       term:u64(8), index:u64(8), raft_index:u64(8)]
+        let payload_len =
+            u32::from_le_bytes(header_bytes[4..8].try_into().expect("4 bytes"));
+        let index =
+            u64::from_le_bytes(header_bytes[24..32].try_into().expect("8 bytes"));
+        (index, payload_len)
+    }
 }
 
 // ----------------------------------------------------------------------------

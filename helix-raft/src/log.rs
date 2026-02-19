@@ -229,7 +229,11 @@ impl RaftLog {
     ///
     /// This handles the case where entries might conflict with existing ones.
     /// If a conflict is found, the log is truncated and new entries are appended.
-    pub fn append_entries(&mut self, entries: Vec<LogEntry>) {
+    ///
+    /// Returns `false` if the entries contain a gap (non-sequential index) relative
+    /// to the current log tail. The caller should reject the AppendEntries request
+    /// and let the leader retry from the correct position.
+    pub fn append_entries(&mut self, entries: Vec<LogEntry>) -> bool {
         for entry in entries {
             // Check for conflict.
             if let Some(existing) = self.get(entry.index) {
@@ -241,9 +245,27 @@ impl RaftLog {
 
             // Append if we don't already have this entry.
             if self.is_empty() || entry.index.get() > self.last_index().get() {
+                // Verify sequential order before appending. A gap means the
+                // leader sent entries that don't connect to our current tail
+                // (e.g., due to pipelining with a stale next_index). Reject
+                // so the leader can recalculate from our match_index.
+                let expected = if self.entries.is_empty() {
+                    if self.compacted_index > 0 {
+                        self.compacted_index + 1
+                    } else {
+                        // No prior state: first entry sets the log start.
+                        entry.index.get()
+                    }
+                } else {
+                    self.last_index().get() + 1
+                };
+                if entry.index.get() != expected {
+                    return false;
+                }
                 self.append(entry);
             }
         }
+        true
     }
 
     /// Truncates the log after the given index.
@@ -474,6 +496,36 @@ mod tests {
         assert_eq!(log.len(), 3);
         assert_eq!(log.term_at(LogIndex::new(2)).get(), 2);
         assert_eq!(log.term_at(LogIndex::new(3)).get(), 2);
+    }
+
+    #[test]
+    fn test_append_entries_gap_returns_false() {
+        // Simulates the CLBO bug: follower has entries [407159..407208] from a
+        // WAL-backed batch (prev_log_index=0), then receives a second batch
+        // starting at 485106. The gap must be detected and return false rather
+        // than panicking, so handle_append_entries can send a rejection.
+        let mut log = RaftLog::new();
+
+        // First batch: entries 1..50 (simulating index 407159..407208).
+        for i in 1u64..=50 {
+            log.append(make_entry(1, i));
+        }
+        assert_eq!(log.last_index().get(), 50);
+
+        // Second batch: jumps to index 100 (simulating index 485106).
+        // Must return false (gap), not panic.
+        let gap_entries = vec![
+            LogEntry::new(
+                TermId::new(1),
+                LogIndex::new(100),
+                Bytes::new(),
+                Bytes::new(),
+            ),
+        ];
+        assert!(!log.append_entries(gap_entries), "gap should return false");
+
+        // Log should be unchanged.
+        assert_eq!(log.last_index().get(), 50);
     }
 
     #[test]

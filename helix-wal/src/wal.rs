@@ -227,6 +227,14 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
         let mut last_index = None;
 
         // Recover existing segments.
+        //
+        // For global-index entry types (Entry): fully decode each segment into
+        // memory. The in-memory representation is needed for reads and recovery.
+        //
+        // For non-global-index entry types (SharedEntry): scan headers only,
+        // storing segment metadata without entry payloads. This prevents OOM
+        // when restarting with many sealed segments containing historical data.
+        // SharedWal::recover() loads one segment at a time during recovery.
         for path in &segment_files {
             let file = storage.open(path).await?;
             let data = file.read_all().await?;
@@ -236,46 +244,93 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
                 continue;
             }
 
-            match Segment::<E>::decode(data.clone(), config.segment_config) {
-                Ok(segment) => {
-                    let segment_id = segment.id();
-                    debug!(
-                        segment_id = segment_id.get(),
-                        first_index = segment.first_index(),
-                        last_index = ?segment.last_index(),
-                        entries = segment.entry_count(),
-                        "Recovered segment"
-                    );
+            if E::uses_global_index() {
+                // Full decode: entry payloads are needed for reads.
+                match Segment::<E>::decode(data, config.segment_config) {
+                    Ok(segment) => {
+                        let segment_id = segment.id();
+                        debug!(
+                            segment_id = segment_id.get(),
+                            first_index = segment.first_index(),
+                            last_index = ?segment.last_index(),
+                            entries = segment.entry_count(),
+                            "Recovered segment"
+                        );
 
-                    // Update tracking.
-                    if segment_id >= next_segment_id {
-                        next_segment_id = segment_id.next();
+                        if segment_id >= next_segment_id {
+                            next_segment_id = segment_id.next();
+                        }
+                        if sealed_segments.is_empty() {
+                            first_index = segment.first_index();
+                        }
+                        if let Some(idx) = segment.last_index() {
+                            last_index = Some(idx);
+                        }
+
+                        let mut info = segment_info_from(segment_id, &segment);
+                        // On recovery, reset the seal clock to now. This is
+                        // conservative: segments may live longer than necessary,
+                        // but never shorter. We avoid adding mtime to Storage.
+                        info.sealed_at_secs = Some(unix_now_secs());
+                        sealed_segments.insert(
+                            segment_id,
+                            SealedSegment {
+                                segment: Some(segment),
+                                info,
+                                path: path.clone(),
+                            },
+                        );
                     }
-
-                    if sealed_segments.is_empty() {
-                        first_index = segment.first_index();
+                    Err(e) => {
+                        warn!(?path, error = %e, "Failed to recover segment, skipping");
                     }
-
-                    if let Some(idx) = segment.last_index() {
-                        last_index = Some(idx);
-                    }
-
-                    let mut info = segment_info_from(segment_id, &segment);
-                    // On recovery, reset the seal clock to now. This is
-                    // conservative: segments may live longer than necessary,
-                    // but never shorter. We avoid adding mtime to Storage.
-                    info.sealed_at_secs = Some(unix_now_secs());
-                    sealed_segments.insert(
-                        segment_id,
-                        SealedSegment {
-                            segment: Some(segment),
-                            info,
-                            path: path.clone(),
-                        },
-                    );
                 }
-                Err(e) => {
-                    warn!(?path, error = %e, "Failed to recover segment, skipping");
+            } else {
+                // Header scan only: avoid loading entry payloads into RAM.
+                // SharedWal::recover() will load segments one at a time.
+                match Segment::<E>::decode_info(data, config.segment_config) {
+                    Ok((seg_header, entry_count, last_index_opt, seg_size_bytes)) => {
+                        let segment_id = seg_header.segment_id;
+                        debug!(
+                            segment_id = segment_id.get(),
+                            first_index = seg_header.first_index,
+                            last_index = ?last_index_opt,
+                            entries = entry_count,
+                            "Scanned segment metadata"
+                        );
+
+                        if segment_id >= next_segment_id {
+                            next_segment_id = segment_id.next();
+                        }
+                        if sealed_segments.is_empty() {
+                            first_index = seg_header.first_index;
+                        }
+                        if let Some(idx) = last_index_opt {
+                            last_index = Some(idx);
+                        }
+
+                        let info = SegmentInfo {
+                            segment_id,
+                            first_index: seg_header.first_index,
+                            last_index: last_index_opt,
+                            size_bytes: seg_size_bytes,
+                            entry_count,
+                            is_sealed: true,
+                            sealed_at_secs: Some(unix_now_secs()),
+                        };
+                        sealed_segments.insert(
+                            segment_id,
+                            SealedSegment {
+                                // No entry data in memory — loaded on demand during recovery.
+                                segment: None,
+                                info,
+                                path: path.clone(),
+                            },
+                        );
+                    }
+                    Err(e) => {
+                        warn!(?path, error = %e, "Failed to scan segment metadata, skipping");
+                    }
                 }
             }
         }
@@ -1129,6 +1184,43 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
         self.sealed_segments.keys().copied().collect()
     }
 
+    /// Loads a sealed segment from disk for streaming recovery.
+    ///
+    /// Returns the fully decoded segment. The caller should process entries
+    /// and drop the segment to free memory before loading the next one.
+    ///
+    /// This is used by `SharedWal::recover()` to process sealed segments
+    /// one at a time, avoiding the OOM that would occur if all segments
+    /// were loaded simultaneously.
+    ///
+    /// # Errors
+    /// Returns an error if the segment is not found, cannot be read, or
+    /// the data is corrupted.
+    pub async fn load_sealed_segment_for_recovery(
+        &self,
+        segment_id: SegmentId,
+    ) -> WalResult<Segment<E>> {
+        let sealed =
+            self.sealed_segments
+                .get(&segment_id)
+                .ok_or_else(|| WalError::Io {
+                    operation: "load_sealed_segment_for_recovery",
+                    message: format!("segment {segment_id} not found"),
+                })?;
+
+        let file = self.storage.open(&sealed.path).await?;
+        let data = file.read_all().await?;
+        Segment::<E>::decode(data, self.config.segment_config)
+    }
+
+    /// Returns an iterator over entries in the active segment only.
+    ///
+    /// For non-global-index WALs where sealed segments are not resident,
+    /// use this alongside `load_sealed_segment_for_recovery` for full recovery.
+    pub fn active_entries(&self) -> impl Iterator<Item = &E> {
+        self.active_segment.iter().flat_map(|a| a.segment.entries())
+    }
+
     /// Returns the number of sealed segments.
     #[must_use]
     pub fn sealed_segment_count(&self) -> u32 {
@@ -1621,8 +1713,16 @@ mod tests {
         // Verify entry count after recovery.
         assert_eq!(wal.entry_count(), 10);
 
-        // Verify entries after recovery using iterator.
-        let entries: Vec<_> = wal.entries().collect();
+        // After open(), sealed segments are not resident for non-global-index WALs.
+        // Collect entries via streaming recovery: load each sealed segment, extract
+        // entries, drop. This mirrors how SharedWal::recover() works.
+        let mut entries: Vec<SharedEntry> = Vec::new();
+        let sealed_ids = wal.sealed_segment_ids();
+        for seg_id in sealed_ids {
+            let segment = wal.load_sealed_segment_for_recovery(seg_id).await.unwrap();
+            entries.extend(segment.entries().cloned());
+        }
+        entries.extend(wal.active_entries().cloned());
         assert_eq!(entries.len(), 10);
 
         // First entry should be P1 with index 1.

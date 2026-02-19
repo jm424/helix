@@ -345,7 +345,7 @@ async fn test_dst_shared_wal_basic_durability() {
     {
         let mut wal = SharedWal::open(storage.clone(), config).await.unwrap();
 
-        let recovered = wal.recover().unwrap();
+        let recovered = wal.recover().await.unwrap();
 
         // Track recovered entries.
         for (partition_id, entries) in &recovered {
@@ -435,7 +435,7 @@ async fn test_dst_shared_wal_unsynced_entries_may_be_lost() {
     {
         let mut wal = SharedWal::open(storage.clone(), config).await.unwrap();
 
-        let recovered = wal.recover().unwrap();
+        let recovered = wal.recover().await.unwrap();
         let p1_entries = recovered.get(&p1).unwrap();
 
         // Only synced entries (1-5) should be recovered.
@@ -595,7 +595,7 @@ async fn test_dst_shared_wal_multi_partition_interleaved() {
     {
         let mut wal = SharedWal::open(storage.clone(), config).await.unwrap();
 
-        let recovered = wal.recover().unwrap();
+        let recovered = wal.recover().await.unwrap();
 
         // Track recovered.
         for (partition_id, entries) in &recovered {
@@ -656,7 +656,7 @@ async fn test_dst_shared_wal_multiple_crash_recover_cycles() {
 
             // Must recover first to get partition state.
             if cycle > 1 {
-                let _ = wal.recover().unwrap();
+                let _ = wal.recover().await.unwrap();
             }
 
             // Append 10 entries per cycle.
@@ -681,7 +681,7 @@ async fn test_dst_shared_wal_multiple_crash_recover_cycles() {
                 .await
                 .unwrap();
 
-            let recovered = wal.recover().unwrap();
+            let recovered = wal.recover().await.unwrap();
             let p1_entries = recovered.get(&p1).unwrap();
 
             assert_eq!(
@@ -743,7 +743,7 @@ async fn test_dst_shared_wal_torn_write_recovery() {
         );
 
         let mut wal = result.unwrap();
-        let recovered = wal.recover().unwrap();
+        let recovered = wal.recover().await.unwrap();
 
         // Whatever was recovered should be valid.
         let violations = verify_ordering(&recovered);
@@ -1111,7 +1111,7 @@ async fn test_dst_shared_wal_multi_seed_sync_durability() {
                 .await
                 .expect("recovery should succeed");
 
-            let recovered = wal.recover().expect("recover should succeed");
+            let recovered = wal.recover().await.expect("recover should succeed");
             let entries = recovered.get(&p1).expect("partition should have entries");
 
             // Verify all 10 entries recovered.
@@ -1173,7 +1173,7 @@ async fn test_dst_shared_wal_multi_seed_fsync_failures() {
                 continue;
             }
             let mut wal = wal_result.unwrap();
-            let recovered = wal.recover().unwrap_or_default();
+            let recovered = wal.recover().await.unwrap_or_default();
 
             if sync_succeeded {
                 // Sync succeeded - entries MUST be recovered.
@@ -1234,7 +1234,7 @@ async fn test_dst_shared_wal_multi_seed_torn_writes() {
             }
 
             let mut wal = wal_result.unwrap();
-            let recovered = wal.recover().unwrap_or_default();
+            let recovered = wal.recover().await.unwrap_or_default();
 
             // Verify recovered entries are valid and ordered.
             if let Some(entries) = recovered.get(&p1) {
@@ -1372,7 +1372,7 @@ async fn test_dst_shared_wal_comprehensive_stress() {
             }
 
             let mut wal = wal_result.unwrap();
-            let recovered = wal.recover().unwrap_or_default();
+            let recovered = wal.recover().await.unwrap_or_default();
 
             // Track recovered entries.
             for (partition_id, entries) in &recovered {
@@ -1529,7 +1529,7 @@ async fn test_dst_shared_wal_stress_with_truncation() {
                 .await
                 .expect("recovery should succeed");
 
-            let recovered = wal.recover().unwrap();
+            let recovered = wal.recover().await.unwrap();
             let entries = recovered.get(&p1).unwrap();
 
             // Should have 15 entries: 1-5 (old), 6-15 (new).
@@ -1584,7 +1584,7 @@ async fn test_dst_shared_wal_multi_crash_recovery_cycles() {
                     .expect("open should succeed");
 
                 if cycle > 1 {
-                    let _ = wal.recover();
+                    let _ = wal.recover().await;
                 }
 
                 // Append entries for this cycle.
@@ -1608,7 +1608,7 @@ async fn test_dst_shared_wal_multi_crash_recovery_cycles() {
                     .await
                     .expect("recovery should succeed");
 
-                let recovered = wal.recover().unwrap();
+                let recovered = wal.recover().await.unwrap();
                 let entries = recovered.get(&p1).unwrap();
 
                 assert_eq!(
@@ -1652,7 +1652,7 @@ async fn test_dst_shared_wal_empty_recovery() {
                 .await
                 .expect("recovery of empty WAL should succeed");
 
-            let recovered = wal.recover().unwrap();
+            let recovered = wal.recover().await.unwrap();
             assert!(
                 recovered.is_empty(),
                 "Seed {seed}: empty WAL should recover empty"
@@ -1719,7 +1719,7 @@ async fn test_dst_shared_wal_last_write_wins_semantics() {
                 continue;
             };
 
-            let _ = wal.recover();
+            let _ = wal.recover().await;
             wal.truncate_after(p1, 5);
 
             // Write new entries 6-10 at term 2 (overwrites old 6-10).
@@ -1747,7 +1747,7 @@ async fn test_dst_shared_wal_last_write_wins_semantics() {
                 continue;
             };
 
-            let recovered = wal.recover().unwrap_or_default();
+            let recovered = wal.recover().await.unwrap_or_default();
             let entries = recovered.get(&p1).map_or(&[][..], Vec::as_slice);
 
             // Check for ordering violations.
@@ -1841,7 +1841,7 @@ async fn test_dst_shared_wal_partial_overwrite_stale_entries_reappear() {
             .await
             .unwrap();
 
-        let _ = wal.recover();
+        let _ = wal.recover().await;
         wal.truncate_after(p1, 5);
 
         // Write only 6-8, NOT 9-10.
@@ -1859,7 +1859,7 @@ async fn test_dst_shared_wal_partial_overwrite_stale_entries_reappear() {
     // Phase 3: Recover and verify behavior.
     {
         let mut wal = SharedWal::open(storage.clone(), config).await.unwrap();
-        let recovered = wal.recover().unwrap();
+        let recovered = wal.recover().await.unwrap();
         let entries = recovered.get(&p1).unwrap();
 
         // Should have 10 entries (stale 9-10 reappear).
@@ -1943,7 +1943,7 @@ async fn test_dst_shared_wal_max_entry_size() {
     storage.simulate_crash();
 
     let mut wal = SharedWal::open(storage.clone(), config).await.unwrap();
-    let recovered = wal.recover().unwrap();
+    let recovered = wal.recover().await.unwrap();
     let entries = recovered.get(&p1).unwrap();
 
     assert_eq!(entries.len(), 1, "Should recover exactly one entry");
@@ -1992,7 +1992,7 @@ async fn test_dst_shared_wal_segment_rollover() {
     storage.simulate_crash();
 
     let mut wal = SharedWal::open(storage.clone(), config).await.unwrap();
-    let recovered = wal.recover().unwrap();
+    let recovered = wal.recover().await.unwrap();
     let entries = recovered.get(&p1).unwrap();
 
     assert_eq!(
@@ -2088,7 +2088,7 @@ async fn test_dst_shared_wal_segment_rollover_with_faults() {
                 continue;
             };
 
-            let recovered = wal.recover().unwrap_or_default();
+            let recovered = wal.recover().await.unwrap_or_default();
             let entries = recovered.get(&p1).map_or(0, Vec::len);
 
             if entries > 0 {
@@ -2281,7 +2281,7 @@ async fn test_dst_shared_wal_high_fidelity_stress() {
                     match SharedWal::open(storage.clone(), config.clone()).await {
                         Ok(mut w) => {
                             // Verify durability: recovered >= durable_before for each partition
-                            let recovered = w.recover().unwrap_or_default();
+                            let recovered = w.recover().await.unwrap_or_default();
 
                             if let Some(durable) = p1_durable_before {
                                 let recovered_count = recovered.get(&p1).map_or(0, Vec::len) as u64;
@@ -2391,7 +2391,7 @@ async fn test_dst_shared_wal_high_fidelity_stress() {
         }
 
         if let Ok(mut final_wal) = SharedWal::open(storage.clone(), config).await {
-            let recovered = final_wal.recover().unwrap_or_default();
+            let recovered = final_wal.recover().await.unwrap_or_default();
 
             if let Some(durable) = p1_final_durable {
                 let recovered_count = recovered.get(&p1).map_or(0, Vec::len) as u64;

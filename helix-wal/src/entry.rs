@@ -43,7 +43,7 @@ use crate::limits::ENTRY_PAYLOAD_SIZE_BYTES_MAX;
 /// # Implementors
 ///
 /// - [`Entry`] - Standard entry with term, index, and payload (24-byte header)
-/// - [`SharedEntry`](crate::SharedEntry) - Entry with partition ID (32-byte header)
+/// - [`SharedEntry`](crate::SharedEntry) - Entry with partition ID (40-byte header)
 ///
 /// # Example
 ///
@@ -91,6 +91,24 @@ pub trait WalEntry: Sized + Clone + Send + Sync + std::fmt::Debug {
     #[must_use]
     fn uses_global_index() -> bool {
         true
+    }
+
+    /// Extracts `(index, payload_len)` from raw header bytes without full decode.
+    ///
+    /// Used during WAL open to scan segment metadata without allocating entry payloads,
+    /// preventing OOM when recovering large WALs with many sealed segments.
+    ///
+    /// `header_bytes` must have at least `HEADER_SIZE` bytes.
+    ///
+    /// Entry types with `uses_global_index() == false` (e.g. `SharedEntry`) must
+    /// override this method. The default panics.
+    ///
+    /// # Panics
+    /// Panics if not overridden by an entry type that returns `false` from
+    /// `uses_global_index()`.
+    fn scan_header_info(header_bytes: &[u8]) -> (u64, u32) {
+        let _ = header_bytes;
+        panic!("scan_header_info not implemented for this entry type")
     }
 }
 
@@ -329,6 +347,16 @@ impl WalEntry for Entry {
     fn payload_len(&self) -> u32 {
         // Delegate to inherent method.
         Self::payload_len(self)
+    }
+
+    fn scan_header_info(header_bytes: &[u8]) -> (u64, u32) {
+        debug_assert!(header_bytes.len() >= ENTRY_HEADER_SIZE);
+        // Entry layout: [crc:u32(4), length:u32(4), term:u64(8), index:u64(8)]
+        let payload_len =
+            u32::from_le_bytes(header_bytes[4..8].try_into().expect("4 bytes"));
+        let index =
+            u64::from_le_bytes(header_bytes[16..24].try_into().expect("8 bytes"));
+        (index, payload_len)
     }
 }
 

@@ -29,8 +29,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::entry::{Entry, WalEntry};
 use crate::error::{WalError, WalResult};
 use crate::limits::{
-    ENTRIES_PER_SEGMENT_MAX, SEGMENT_SIZE_BYTES_DEFAULT, SEGMENT_SIZE_BYTES_MAX,
-    SEGMENT_SIZE_BYTES_MIN,
+    ENTRIES_PER_SEGMENT_MAX, ENTRY_PAYLOAD_SIZE_BYTES_MAX, SEGMENT_SIZE_BYTES_DEFAULT,
+    SEGMENT_SIZE_BYTES_MAX, SEGMENT_SIZE_BYTES_MIN,
 };
 
 /// Segment header size in bytes.
@@ -492,6 +492,64 @@ impl<E: WalEntry> Segment<E> {
         }
 
         buf.freeze()
+    }
+
+    /// Scans a segment file to collect metadata without loading entry payloads.
+    ///
+    /// Returns `(header, entry_count, last_index, size_bytes)` where `size_bytes`
+    /// is the total size of all complete entries (including their headers).
+    ///
+    /// Unlike [`decode`](Self::decode), this method does not allocate entry payload
+    /// bytes. It is safe to call on large segments without OOM risk. Used during
+    /// WAL open for non-global-index entry types (e.g. `SharedEntry`).
+    ///
+    /// # Errors
+    /// Returns an error if the segment header is invalid or missing.
+    pub fn decode_info(
+        mut data: Bytes,
+        _config: SegmentConfig,
+    ) -> WalResult<(SegmentHeader, u64, Option<u64>, u64)> {
+        let header = SegmentHeader::decode(&mut data)?;
+
+        let mut entry_count: u64 = 0;
+        let mut last_index: Option<u64> = None;
+        let mut size_bytes: u64 = SEGMENT_HEADER_SIZE as u64;
+
+        while data.has_remaining() {
+            if data.remaining() < E::HEADER_SIZE {
+                // Truncated header at end of file — treat as torn write.
+                break;
+            }
+
+            // Peek at header bytes. Bytes is always contiguous (single Arc allocation)
+            // so chunk() returns the full remaining slice.
+            let (entry_index, payload_len) =
+                E::scan_header_info(&data.chunk()[..E::HEADER_SIZE]);
+
+            // Reject payload lengths that exceed the limit — likely corruption.
+            if payload_len > ENTRY_PAYLOAD_SIZE_BYTES_MAX {
+                break;
+            }
+
+            let entry_total = E::HEADER_SIZE + payload_len as usize;
+
+            if data.remaining() < entry_total {
+                // Truncated entry at end of file — treat as torn write.
+                break;
+            }
+
+            // Skip the entire entry (header + payload) without allocating.
+            data.advance(entry_total);
+
+            entry_count += 1;
+            last_index = Some(entry_index);
+            #[allow(clippy::cast_possible_truncation)] // entry_total bounded by limits.
+            {
+                size_bytes += entry_total as u64;
+            }
+        }
+
+        Ok((header, entry_count, last_index, size_bytes))
     }
 
     /// Decodes a segment from bytes.

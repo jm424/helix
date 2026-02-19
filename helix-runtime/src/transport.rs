@@ -489,6 +489,12 @@ impl Transport {
         let mut reconnect_delay_ms: u64 = 100;
         const MAX_RECONNECT_DELAY_MS: u64 = 10000;
         let mut pending: Option<OutgoingData> = None;
+        // Tracks whether we have ever successfully connected to this peer.
+        // On the initial connect, `pending` holds the very first message to send
+        // and should not be discarded. On a reconnect (was_connected=true) we
+        // discard stale Raft messages because the Raft state machine will resend
+        // whatever the follower actually needs from its current position.
+        let mut was_connected = false;
 
         loop {
             if *shutdown.lock().await {
@@ -513,25 +519,30 @@ impl Transport {
             if stream.is_none() {
                 match Self::connect_to_peer(peer_id, &addr).await {
                     Ok(s) => {
-                        // Drain stale messages that accumulated while disconnected.
-                        // Raft will resend anything the follower needs; stale
-                        // AppendEntries to a restarted peer are useless.
-                        let mut drained = 0u32;
-                        while rx.try_recv().is_ok() {
-                            drained += 1;
+                        if was_connected {
+                            // Reconnect after a lost connection — drain stale
+                            // Raft messages. The Raft state machine will resend
+                            // whatever the follower actually needs; stale
+                            // AppendEntries to a restarted peer are useless.
+                            let mut drained = 0u32;
+                            while rx.try_recv().is_ok() {
+                                drained += 1;
+                            }
+                            // Discard the pending message too — it's from before
+                            // the reconnect and equally stale.
+                            pending = None;
+                            if drained > 0 {
+                                info!(
+                                    node_id = node_id.get(),
+                                    peer_id = peer_id.get(),
+                                    drained,
+                                    "Drained stale messages after reconnect"
+                                );
+                            }
                         }
-                        // Also discard the pending message — it's from
-                        // before the reconnect and equally stale.
-                        pending = None;
-                        if drained > 0 {
-                            info!(
-                                node_id = node_id.get(),
-                                peer_id = peer_id.get(),
-                                drained,
-                                "Drained stale messages after reconnect"
-                            );
-                        }
-
+                        // On the initial connect, keep pending — it's the first
+                        // fresh message the caller wants delivered.
+                        was_connected = true;
                         stream = Some(s);
                         reconnect_delay_ms = 100;
                         info!(
@@ -542,16 +553,18 @@ impl Transport {
                         );
                     }
                     Err(e) => {
-                        // Drain stale messages to prevent queue saturation.
-                        // While we sleep in backoff, tick tasks enqueue ~500
-                        // msgs/sec across all Raft groups. The 1000-entry
-                        // queue fills in ~2s, after which ALL try_send calls
-                        // fail, blocking Raft progress cluster-wide.
+                        // Drain the queue to prevent saturation: while we sleep
+                        // in backoff, tick tasks enqueue ~500 msgs/sec across
+                        // all Raft groups; the 1000-entry queue fills in ~2s,
+                        // after which ALL try_send calls fail, blocking Raft
+                        // progress cluster-wide.
+                        // Keep `pending` — we will retry it on the next connect
+                        // attempt. Raft handles duplicate/stale messages via its
+                        // normal rejection flow.
                         let mut drained = 0u32;
                         while rx.try_recv().is_ok() {
                             drained += 1;
                         }
-                        pending = None;
                         if drained > 0 {
                             debug!(
                                 node_id = node_id.get(),

@@ -1118,7 +1118,24 @@ impl RaftNode {
 
         // Append entries (handling conflicts).
         if !req.entries.is_empty() {
-            self.log.append_entries(req.entries);
+            if !self.log.append_entries(req.entries) {
+                // Entries contain a gap relative to our log tail. This can
+                // happen when the leader has a stale next_index from pipelining
+                // and sends a batch that skips indices we don't have yet.
+                // Reject so the leader recalculates from our match_index.
+                let response = AppendEntriesResponse::new(
+                    self.current_term,
+                    self.config.node_id,
+                    req.leader_id,
+                    false,
+                    self.log.last_index(),
+                    self.persisted_commit_index,
+                );
+                outputs.push(RaftOutput::SendMessage(Message::AppendEntriesResponse(
+                    response,
+                )));
+                return outputs;
+            }
         }
 
         // Update commit index.
