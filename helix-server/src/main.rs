@@ -243,7 +243,7 @@ struct Args {
     /// Total retention in milliseconds (S3 lifetime).
     ///
     /// Only meaningful when tiering is configured — extends data lifetime
-    /// beyond local disk. Must be >= local_retention_ms.
+    /// beyond local disk. Must be >= `local_retention_ms`.
     /// Default: 4 days (345600000 ms).
     #[arg(long, default_value = "345600000")]
     retention_ms: u64,

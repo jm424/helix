@@ -217,8 +217,7 @@ impl ServerError {
             Self::Progress(e) => progress_error_to_code(e),
             Self::OutOfOrderSequence { .. } => ErrorCode::OutOfOrderSequence,
             Self::ProducerFenced { .. } => ErrorCode::ProducerFenced,
-            Self::Overloaded { .. } => ErrorCode::BrokerNotAvailable,
-            Self::NotEnoughReplicas { .. } => ErrorCode::BrokerNotAvailable,
+            Self::Overloaded { .. } | Self::NotEnoughReplicas { .. } => ErrorCode::BrokerNotAvailable,
             Self::Internal { .. } => ErrorCode::Unknown,
         }
     }

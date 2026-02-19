@@ -930,7 +930,7 @@ use crate::service::router::PartitionRouter;
 /// - Uses `PartitionRouter` instead of `Arc<RwLock<MultiRaft>>`
 /// - Proposals are sent via `PartitionActorHandle::propose()`
 /// - No write lock contention - each partition processes independently
-#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher, clippy::too_many_lines)]
 pub async fn batcher_task_actor<S: Storage + Clone + Send + Sync + 'static>(
     mut rx: mpsc::Receiver<BatcherMessage>,
     router: Arc<PartitionRouter>,

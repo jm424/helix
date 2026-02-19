@@ -879,7 +879,7 @@ struct PartitionActorShared {
     next_base_offset: Offset,
     offset_seeded: bool,
     is_leader_cache: Arc<AtomicBool>,
-    /// Minimum match_index across all Raft followers, updated after
+    /// Minimum `match_index` across all Raft followers, updated after
     /// each tick/output for the retention system to read lock-free.
     min_replicated_index: Arc<AtomicU64>,
     batcher_stats: Option<Arc<super::BatcherStats>>,
@@ -1269,7 +1269,7 @@ impl PartitionActorShared {
     ///
     /// Detected when proposals have been pending for `QUORUM_LOSS_TICKS`
     /// without any commits arriving.
-    fn is_quorum_lost(&self) -> bool {
+    const fn is_quorum_lost(&self) -> bool {
         self.ticks_without_commit >= QUORUM_LOSS_TICKS
     }
 

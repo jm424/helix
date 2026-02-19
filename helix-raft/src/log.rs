@@ -231,7 +231,7 @@ impl RaftLog {
     /// If a conflict is found, the log is truncated and new entries are appended.
     ///
     /// Returns `false` if the entries contain a gap (non-sequential index) relative
-    /// to the current log tail. The caller should reject the AppendEntries request
+    /// to the current log tail. The caller should reject the `AppendEntries` request
     /// and let the leader retry from the correct position.
     pub fn append_entries(&mut self, entries: Vec<LogEntry>) -> bool {
         for entry in entries {

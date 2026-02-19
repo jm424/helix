@@ -82,8 +82,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     self.object_storage_dir.as_ref(),
                     self.s3_config.as_ref(),
                     self.tiering_config.as_ref(),
-                )
-                .await;
+                );
                 #[cfg(not(feature = "s3"))]
                 let ps_result = PartitionStorage::new_durable_with_shared_wal(
                     data_dir,
@@ -93,8 +92,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     recovered,
                     self.object_storage_dir.as_ref(),
                     self.tiering_config.as_ref(),
-                )
-                .await;
+                );
                 ps_result.map_err(|e| ServerError::Internal {
                     message: format!("failed to create partition with shared WAL: {e}"),
                 })?

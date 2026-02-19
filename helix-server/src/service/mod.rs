@@ -176,7 +176,7 @@ pub struct BatcherStats {
     pub loop_iterations: std::sync::atomic::AtomicU64,
     /// Microseconds spent waiting in recv/select (idle time).
     pub loop_idle_us: std::sync::atomic::AtomicU64,
-    /// Microseconds spent in handle_submit_actor (recv arm).
+    /// Microseconds spent in `handle_submit_actor` (recv arm).
     pub loop_submit_us: std::sync::atomic::AtomicU64,
     /// Number of submit messages received.
     pub loop_submit_count: std::sync::atomic::AtomicU64,
@@ -186,13 +186,13 @@ pub struct BatcherStats {
     pub loop_linger_flush_cycles: std::sync::atomic::AtomicU64,
     /// Total groups flushed via linger.
     pub loop_linger_flush_groups: std::sync::atomic::AtomicU64,
-    /// Microseconds in flush: router.partition() lookup.
+    /// Microseconds in flush: `router.partition()` lookup.
     pub flush_router_us: std::sync::atomic::AtomicU64,
-    /// Microseconds in flush: partition_storage read locks.
+    /// Microseconds in flush: `partition_storage` read locks.
     pub flush_storage_lock_us: std::sync::atomic::AtomicU64,
-    /// Microseconds in flush: encode_split.
+    /// Microseconds in flush: `encode_split`.
     pub flush_encode_us: std::sync::atomic::AtomicU64,
-    /// Microseconds in flush: propose_batch channel send.
+    /// Microseconds in flush: `propose_batch` channel send.
     pub flush_propose_us: std::sync::atomic::AtomicU64,
     /// Number of inline flushes (triggered by size limit in submit).
     pub inline_flush_count: std::sync::atomic::AtomicU64,
@@ -1225,7 +1225,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
     /// When set, sealed WAL segments older than this value are deleted
     /// from local disk, provided all entries have been replicated.
     /// Set to 0 to disable retention.
-    pub fn set_local_retention_ms(&mut self, ms: u64) {
+    pub const fn set_local_retention_ms(&mut self, ms: u64) {
         self.local_retention_ms = if ms == 0 { None } else { Some(ms) };
     }
 

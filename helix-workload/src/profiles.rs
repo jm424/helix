@@ -223,6 +223,7 @@ fn profile(
 
 /// Built-in benchmark profiles for common testing scenarios.
 #[must_use]
+#[allow(clippy::too_many_lines)] // Data initializer — one entry per profile, cannot be split.
 pub fn builtin_profiles() -> HashMap<&'static str, BenchmarkProfile> {
     HashMap::from([
         (

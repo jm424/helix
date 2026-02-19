@@ -106,6 +106,7 @@ pub trait WalEntry: Sized + Clone + Send + Sync + std::fmt::Debug {
     /// # Panics
     /// Panics if not overridden by an entry type that returns `false` from
     /// `uses_global_index()`.
+    #[must_use]
     fn scan_header_info(header_bytes: &[u8]) -> (u64, u32) {
         let _ = header_bytes;
         panic!("scan_header_info not implemented for this entry type")

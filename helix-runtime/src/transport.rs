@@ -52,8 +52,8 @@ const CONNECT_TIMEOUT_MS: u64 = 5000;
 /// TCP keepalive interval in seconds.
 ///
 /// Detects half-open connections when a peer pod restarts. Without this,
-/// the kernel buffers writes to the dead IP for up to 2 hours (default
-/// TCP keepalive timeout), so the sender_loop never discovers the broken
+/// the kernel buffers writes to the dead IP for up to 2 hours (the OS default
+/// probe interval), so the `sender_loop` never discovers the broken
 /// connection and Raft heartbeats silently fail.
 const TCP_KEEPALIVE_SECS: u64 = 5;
 
@@ -524,21 +524,10 @@ impl Transport {
                             // Raft messages. The Raft state machine will resend
                             // whatever the follower actually needs; stale
                             // AppendEntries to a restarted peer are useless.
-                            let mut drained = 0u32;
-                            while rx.try_recv().is_ok() {
-                                drained += 1;
-                            }
+                            Self::drain_channel(&mut rx, peer_id, "reconnect");
                             // Discard the pending message too — it's from before
                             // the reconnect and equally stale.
                             pending = None;
-                            if drained > 0 {
-                                info!(
-                                    node_id = node_id.get(),
-                                    peer_id = peer_id.get(),
-                                    drained,
-                                    "Drained stale messages after reconnect"
-                                );
-                            }
                         }
                         // On the initial connect, keep pending — it's the first
                         // fresh message the caller wants delivered.
@@ -561,19 +550,7 @@ impl Transport {
                         // Keep `pending` — we will retry it on the next connect
                         // attempt. Raft handles duplicate/stale messages via its
                         // normal rejection flow.
-                        let mut drained = 0u32;
-                        while rx.try_recv().is_ok() {
-                            drained += 1;
-                        }
-                        if drained > 0 {
-                            debug!(
-                                node_id = node_id.get(),
-                                peer_id = peer_id.get(),
-                                drained,
-                                "Drained stale messages during reconnect backoff"
-                            );
-                        }
-
+                        Self::drain_channel(&mut rx, peer_id, "connect backoff");
                         warn!(
                             node_id = node_id.get(),
                             peer_id = peer_id.get(),
@@ -594,58 +571,63 @@ impl Transport {
                 continue;
             };
             if let Some(ref mut s) = stream {
-                let result = match data {
-                    OutgoingData::Single(message) => {
-                        let encoded = encode_message(message);
-                        match encoded {
-                            Ok(bytes) => Self::send_bytes(s, &bytes).await,
-                            Err(e) => Err(e.into()),
-                        }
-                    }
-                    OutgoingData::Batch(bytes) | OutgoingData::Heartbeat(bytes) => {
-                        Self::send_bytes(s, bytes).await
-                    }
-                };
-
-                match result {
-                    Ok(()) => {
-                        let msg_desc = match data {
-                            OutgoingData::Single(m) => {
-                                format!("single:{:?}", std::mem::discriminant(m))
-                            }
-                            OutgoingData::Batch(b) => format!("batch:{} bytes", b.len()),
-                            OutgoingData::Heartbeat(_) => "heartbeat".to_string(),
-                        };
-                        debug!(peer_id = peer_id.get(), msg = %msg_desc, "Sent data");
-                        pending = None;
-                        reconnect_delay_ms = 100;
-                    }
-                    Err(e) => {
-                        warn!(
-                            peer_id = peer_id.get(),
-                            error = %e,
-                            "Failed to send data, reconnecting"
-                        );
-                        stream = None;
-                        // Drain stale messages — same rationale as reconnect.
-                        let mut drained = 0u32;
-                        while rx.try_recv().is_ok() {
-                            drained += 1;
-                        }
-                        pending = None;
-                        if drained > 0 {
-                            debug!(
-                                peer_id = peer_id.get(),
-                                drained,
-                                "Drained stale messages after send failure"
-                            );
-                        }
-                        tokio::time::sleep(tokio::time::Duration::from_millis(reconnect_delay_ms))
-                            .await;
-                        reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
-                    }
+                let sent = Self::try_send(s, data).await;
+                if sent {
+                    pending = None;
+                    reconnect_delay_ms = 100;
+                } else {
+                    warn!(peer_id = peer_id.get(), "Failed to send data, reconnecting");
+                    stream = None;
+                    Self::drain_channel(&mut rx, peer_id, "send failure");
+                    pending = None;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(reconnect_delay_ms))
+                        .await;
+                    reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
                 }
             }
+        }
+    }
+
+    /// Sends `data` on `stream`. Returns `true` on success, `false` on error.
+    async fn try_send(stream: &mut TcpStream, data: &OutgoingData) -> bool {
+        let result = match data {
+            OutgoingData::Single(message) => {
+                let encoded = encode_message(message);
+                match encoded {
+                    Ok(bytes) => Self::send_bytes(stream, &bytes).await,
+                    Err(e) => Err(e.into()),
+                }
+            }
+            OutgoingData::Batch(bytes) | OutgoingData::Heartbeat(bytes) => {
+                Self::send_bytes(stream, bytes).await
+            }
+        };
+        match result {
+            Ok(()) => {
+                let msg_desc = match data {
+                    OutgoingData::Single(m) => format!("single:{:?}", std::mem::discriminant(m)),
+                    OutgoingData::Batch(b) => format!("batch:{} bytes", b.len()),
+                    OutgoingData::Heartbeat(_) => "heartbeat".to_string(),
+                };
+                debug!(msg = %msg_desc, "Sent data");
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Drains all pending messages from the channel and logs the count.
+    fn drain_channel(
+        rx: &mut mpsc::Receiver<OutgoingData>,
+        peer_id: NodeId,
+        reason: &str,
+    ) {
+        let mut drained = 0u32;
+        while rx.try_recv().is_ok() {
+            drained += 1;
+        }
+        if drained > 0 {
+            debug!(peer_id = peer_id.get(), drained, reason, "Drained stale messages");
         }
     }
 

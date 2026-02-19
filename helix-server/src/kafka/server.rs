@@ -194,6 +194,7 @@ fn create_reusable_listener(addr: SocketAddr) -> KafkaResult<TcpListener> {
 ///
 /// This allows multiple in-flight requests on a single connection,
 /// significantly improving throughput when requests have latency (e.g., Raft consensus).
+#[allow(clippy::similar_names)] // slot_tx_oneshot/slot_rx_oneshot are canonical tx/rx names.
 async fn handle_connection<S: Storage + Clone + Send + Sync + 'static, T: TransportService>(
     stream: TcpStream,
     peer_addr: SocketAddr,
