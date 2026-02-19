@@ -75,7 +75,8 @@ pub mod limits {
 
     /// Default number of trailing log entries to retain after compaction.
     ///
-    /// At ~1 KB per entry, 10K entries ≈ 10 MB — negligible memory but
-    /// enough for fast in-memory follower catch-up in normal operation.
-    pub const LOG_TRAILING_ENTRIES_DEFAULT: u64 = 10_000;
+    /// Helix entries are large (blob payloads, ~90 KB each). At 1K entries
+    /// this is ~90 MB, providing ~20 seconds of in-memory catch-up buffer
+    /// at typical throughput. Lagging followers use the WAL fallback path.
+    pub const LOG_TRAILING_ENTRIES_DEFAULT: u64 = 1_000;
 }
