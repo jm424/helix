@@ -21,12 +21,12 @@ use crate::vote_store::{LocalFileVoteStorage, VoteStore};
 
 use crate::controller::{ControllerCommand, ControllerState, CONTROLLER_GROUP_ID};
 
-/// Last Raft index persisted for the controller partition (group 0) in the
-/// SharedWAL. Set during WAL recovery in `new_multi_node_internal`; checked
-/// before each append in `process_controller_outputs` to avoid re-persisting
-/// entries that were already recovered. Without this guard, a follower that
-/// replays entries from the leader after restart can hit the SharedWAL's
-/// term-monotonicity assertion (term from an earlier Raft epoch < the term
+/// Last Raft index persisted for the controller partition (group 0) in the `SharedWAL`.
+///
+/// Set during WAL recovery in `new_multi_node_internal`; checked before each append in
+/// `process_controller_outputs` to avoid re-persisting entries that were already recovered.
+/// Without this guard, a follower that replays entries from the leader after restart can hit
+/// the `SharedWAL`'s term-monotonicity assertion (term from an earlier Raft epoch < the term
 /// of the last recovered entry).
 pub static CONTROLLER_LAST_PERSISTED_INDEX: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -136,7 +136,7 @@ pub async fn tick_task<S: Storage + Clone + Send + Sync + 'static>(
 ///    the appropriate partition actors via `router.route_messages()`.
 /// 3. **Heartbeats**: Sends broker heartbeats to all peers (Kafka `KRaft` pattern).
 /// 4. **Tiering**: Processes tiering for durable partitions.
-#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher, clippy::too_many_lines)]
 pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: TransportService>(
     router: Arc<super::router::PartitionRouter>,
     multi_raft: Arc<RwLock<MultiRaft>>,
@@ -1047,8 +1047,7 @@ async fn create_partition_storage<S: Storage + Clone + Send + Sync + 'static>(
             None, // object_storage_dir
             None, // s3_config
             None, // tiering_config
-        )
-        .await;
+        );
         #[cfg(not(feature = "s3"))]
         let result = PartitionStorage::new_durable_with_shared_wal(
             dir,
@@ -1058,8 +1057,7 @@ async fn create_partition_storage<S: Storage + Clone + Send + Sync + 'static>(
             recovered,
             None, // object_storage_dir
             None, // tiering_config
-        )
-        .await;
+        );
 
         return match result {
             Ok(ps) => {
@@ -1560,6 +1558,15 @@ async fn process_retention<S: Storage + Clone + Send + Sync + 'static>(
                             groups = groups.len(),
                             "Retention: deleted shared WAL segment"
                         );
+                        // Trim each affected partition's BlobIndex to free memory.
+                        // segments are deleted FIFO so max_idx+1 is safe as the new floor.
+                        let storage = partition_storage.read().await;
+                        for (group_id, max_idx) in &groups {
+                            if let Some(ps_lock) = storage.get(group_id) {
+                                let mut ps = ps_lock.write().await;
+                                ps.trim_blob_index(max_idx + 1);
+                            }
+                        }
                     }
                     Err(e) => {
                         warn!(

@@ -181,6 +181,25 @@ impl BlobIndex {
             );
         }
     }
+
+    /// Removes all entries at or beyond `from_offset`.
+    ///
+    /// Called during Raft log conflict truncation to remove blob entries
+    /// that are no longer part of the committed log. Entries that start
+    /// before `from_offset` but extend into or beyond it are also removed.
+    fn truncate_at(&mut self, from_offset: u64) {
+        let before = self.entries.len();
+        self.entries.retain(|e| e.base_offset < from_offset);
+        let removed = before - self.entries.len();
+        if removed > 0 {
+            tracing::debug!(
+                removed,
+                from_offset,
+                remaining = self.entries.len(),
+                "BlobIndex: truncated entries at offset"
+            );
+        }
+    }
 }
 use helix_progress::{
     Lease, ProgressConfig, ProgressError, ProgressManager, SimulatedProgressStore,
@@ -1282,6 +1301,14 @@ impl Partition {
         self.blob_log_end_offset
     }
 
+    /// Sets the log end offset for blob storage.
+    ///
+    /// Used during truncation to roll back the end offset after removing
+    /// blob entries that are no longer part of the committed log.
+    pub const fn set_blob_log_end_offset(&mut self, offset: Offset) {
+        self.blob_log_end_offset = offset;
+    }
+
     /// Returns the log start offset for blob storage (earliest available offset).
     #[must_use]
     pub fn blob_log_start_offset(&self) -> Offset {
@@ -1640,7 +1667,7 @@ pub struct DurablePartition<S: Storage + Clone + Send + Sync + 'static> {
     /// Last applied Raft index (or WAL entry index for dedicated WALs).
     ///
     /// For shared WALs, this is the actual Raft log index recovered from
-    /// `SharedEntry.raft_index()`. For dedicated WALs, raft_index == WAL index.
+    /// `SharedEntry.raft_index()`. For dedicated WALs, `raft_index` == WAL index.
     last_applied_index: u64,
     /// Last applied WAL auto-counter index (shared WAL only).
     ///
@@ -1919,7 +1946,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
     /// # Errors
     /// Returns an error if recovery fails or tiering/progress cannot be initialized.
     #[allow(clippy::needless_pass_by_value)] // API consumes handle and entries for cleaner ownership.
-    pub async fn open_with_shared_wal(
+    pub fn open_with_shared_wal(
         config: DurablePartitionConfig,
         wal_handle: SharedWalHandle<S>,
         recovered_entries: Vec<SharedEntry>,
@@ -2589,9 +2616,16 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                 self.cache.set_high_watermark(new_hwm);
                 Some(base_offset)
             }
-            PartitionCommand::Truncate { from_offset: _ } => {
-                // TODO: Implement truncate for durable partition.
-                warn!("Truncate not yet implemented for durable partition");
+            PartitionCommand::Truncate { from_offset } => {
+                // Remove blob_index entries at or beyond from_offset.
+                self.blob_index.truncate_at(from_offset.get());
+                // Roll back the cache's end offset to reflect the truncation.
+                if self.cache.blob_log_end_offset() > from_offset {
+                    self.cache.set_blob_log_end_offset(from_offset);
+                    if self.cache.high_watermark() > from_offset {
+                        self.cache.set_high_watermark(from_offset);
+                    }
+                }
                 None
             }
             PartitionCommand::UpdateHighWatermark { high_watermark } => {
@@ -3400,6 +3434,15 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         );
 
         Ok(deleted)
+    }
+
+    /// Trims `BlobIndex` entries that reference WAL indices below `min_wal_index`.
+    ///
+    /// Called after a shared WAL segment is deleted to remove stale `blob_index`
+    /// entries pointing to indices that no longer exist on disk. For dedicated WAL
+    /// partitions, this is handled automatically within `run_retention()`.
+    pub fn trim_blob_index(&mut self, min_wal_index: u64) {
+        self.blob_index.truncate_below(min_wal_index);
     }
 }
 
@@ -4244,7 +4287,6 @@ mod tests {
 
         let mut partition =
             DurablePartition::open_with_shared_wal(config, handle, vec![])
-                .await
                 .unwrap();
 
         // Build a valid AppendBlob command with real data.
@@ -4366,7 +4408,6 @@ mod tests {
 
             let partition =
                 DurablePartition::open_with_shared_wal(config, handle, entries)
-                    .await
                     .unwrap();
 
             // Core assertion: last_applied_index is the Raft index (60),

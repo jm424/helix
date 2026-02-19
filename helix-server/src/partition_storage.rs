@@ -219,7 +219,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     /// Returns an error if the partition cannot be opened.
     #[cfg(feature = "s3")]
     #[allow(clippy::too_many_arguments)]
-    pub async fn new_durable_with_shared_wal(
+    pub fn new_durable_with_shared_wal(
         data_dir: &PathBuf,
         topic_id: TopicId,
         partition_id: PartitionId,
@@ -239,7 +239,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
             config = config.with_tiering(tier_cfg.clone());
         }
         let durable =
-            DurablePartition::open_with_shared_wal(config, wal_handle, recovered_entries).await?;
+            DurablePartition::open_with_shared_wal(config, wal_handle, recovered_entries)?;
         // Initialize last_applied from recovered WAL state for proper idempotency.
         let last_applied = LogIndex::new(durable.last_applied_index());
         let last_applied_term = helix_core::TermId::new(durable.last_applied_term());
@@ -261,7 +261,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     /// Returns an error if the partition cannot be opened.
     #[cfg(not(feature = "s3"))]
     #[allow(clippy::too_many_arguments)]
-    pub async fn new_durable_with_shared_wal(
+    pub fn new_durable_with_shared_wal(
         data_dir: &PathBuf,
         topic_id: TopicId,
         partition_id: PartitionId,
@@ -278,7 +278,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
             config = config.with_tiering(tier_cfg.clone());
         }
         let durable =
-            DurablePartition::open_with_shared_wal(config, wal_handle, recovered_entries).await?;
+            DurablePartition::open_with_shared_wal(config, wal_handle, recovered_entries)?;
         // Initialize last_applied from recovered WAL state for proper idempotency.
         let last_applied = LogIndex::new(durable.last_applied_index());
         let last_applied_term = helix_core::TermId::new(durable.last_applied_term());
@@ -894,6 +894,17 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                         message: format!("retention failed: {e}"),
                     })
             }
+        }
+    }
+
+    /// Trims `BlobIndex` entries referencing WAL indices below `min_wal_index`.
+    ///
+    /// Called after a shared WAL segment is deleted to free memory from stale
+    /// `blob_index` entries. No-op for in-memory storage.
+    pub fn trim_blob_index(&mut self, min_wal_index: u64) {
+        match &mut self.inner {
+            PartitionStorageInner::InMemory(_) => {}
+            PartitionStorageInner::Durable(p) => p.trim_blob_index(min_wal_index),
         }
     }
 
