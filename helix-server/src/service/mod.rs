@@ -36,6 +36,7 @@ use helix_raft::multi::MultiRaft;
 use helix_runtime::{PeerInfo, TransportConfig, TransportError, TransportHandle, TransportService};
 use helix_tier::SimulatedObjectStorage;
 use helix_wal::{PoolConfig, SharedEntry, SharedWalPool, Storage, TokioStorage};
+use crate::storage::PartitionRecoveryState;
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tracing::{debug, error, info, warn};
 
@@ -504,10 +505,9 @@ pub struct HelixService<
     pub(crate) local_broker_heartbeats: Arc<RwLock<HashMap<NodeId, u64>>>,
     /// Shared WAL pool for fsync amortization. Present when `data_dir` is set.
     pub(crate) shared_wal_pool: Option<Arc<SharedWalPool<S>>>,
-    /// Recovered entries from shared WAL, indexed by `GroupId`.
-    /// Used during partition creation to restore state (Phase 3).
-    #[allow(dead_code)] // Used in Phase 3 of SharedWAL integration.
-    pub(crate) recovered_entries: Arc<RwLock<HashMap<GroupId, Vec<SharedEntry>>>>,
+    /// Pre-built recovery states from streaming WAL recovery, indexed by `GroupId`.
+    /// Used during partition creation to restore state without re-reading WAL entries.
+    pub(crate) recovered_entries: Arc<RwLock<HashMap<GroupId, PartitionRecoveryState>>>,
     /// Pending batched proposals waiting for Raft commit (multi-node mode only).
     /// Indexed by (`GroupId`, `LogIndex`) for O(1) lookup on commit.
     /// Note: This field is shared via Arc with the tick task, not read directly here.
@@ -700,18 +700,31 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                 .await
                 .expect("Failed to open SharedWalPool");
 
-            // Recover all partitions.
-            let recovered = pool
-                .recover()
-                .await
-                .expect("Failed to recover from SharedWalPool");
+            // Streaming recovery: build pre-built states per group without
+            // accumulating all entries in memory (fixes OOM on large WALs).
+            let mut data_partition_states: HashMap<GroupId, PartitionRecoveryState> =
+                HashMap::new();
+            pool.recover_streaming(&mut |group_id, entry| {
+                if group_id != CONTROLLER_GROUP_ID {
+                    data_partition_states
+                        .entry(group_id)
+                        .or_default()
+                        .apply_entry(entry);
+                }
+                // Controller entries in single-node mode are not used — skip.
+            })
+            .await
+            .expect("Failed to recover from SharedWalPool");
 
             info!(
-                partitions = recovered.len(),
+                partitions = data_partition_states.len(),
                 "SharedWalPool recovery complete"
             );
 
-            (Some(Arc::new(pool)), Arc::new(RwLock::new(recovered)))
+            (
+                Some(Arc::new(pool)),
+                Arc::new(RwLock::new(data_partition_states)),
+            )
         } else {
             // In-memory mode.
             (None, Arc::new(RwLock::new(HashMap::new())))
@@ -977,35 +990,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                 (None, VoteState::new(), false)
             };
 
-        // Create controller partition (group 0) with all cluster nodes.
-        // Use persisted vote state if available to restore term/voted_for.
-        let controller_vote = initial_vote_state.get_group(CONTROLLER_GROUP_ID);
-        let (term, voted_for) =
-            controller_vote.map_or((TermId::new(0), None), |v| (v.term, v.voted_for));
-
-        let create_result = multi_raft.write().await.create_group_with_state(
-            CONTROLLER_GROUP_ID,
-            cluster_nodes.clone(),
-            term,
-            voted_for,
-            recovered_from_remote, // observation mode if recovered from S3
-        );
-
-        match create_result {
-            Ok(()) => {
-                info!(
-                    group_id = CONTROLLER_GROUP_ID.get(),
-                    term = term.get(),
-                    voted_for = voted_for.map(NodeId::get),
-                    observation_mode = recovered_from_remote,
-                    nodes = ?cluster_nodes.iter().map(|n| n.get()).collect::<Vec<_>>(),
-                    "Created controller partition with restored vote state"
-                );
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to create controller partition");
-            }
-        }
+        // Controller partition (group 0) is created after WAL recovery so that
+        // the committed log position from the WAL can be passed to the Raft
+        // initialiser.  This prevents a new leader from overwriting already-
+        // committed controller entries on nodes whose in-memory Raft state was
+        // reset to commit_index=0 after restart.
 
         // Create progress manager.
         let progress_store = SimulatedProgressStore::new(node_id.get());
@@ -1013,7 +1002,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
         let progress_manager = Arc::new(ProgressManager::new(progress_store, progress_config));
 
         // Initialize SharedWalPool if data_dir is set.
-        let (shared_wal_pool, recovered_entries) = if let Some(ref dir) = data_dir {
+        // Also returns the highest committed controller Raft index and term seen
+        // in the WAL, so the controller group can be created with correct state.
+        let (shared_wal_pool, recovered_entries, controller_wal_commit_index, controller_wal_commit_term) =
+            if let Some(ref dir) = data_dir {
             // Determine WAL count (default 4, or user override).
             let wal_count = shared_wal_count.unwrap_or(4);
             assert!(
@@ -1044,35 +1036,44 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                 .await
                 .expect("Failed to open SharedWalPool");
 
-            // Recover all partitions.
-            let recovered = pool
-                .recover()
-                .await
-                .expect("Failed to recover from SharedWalPool");
+            // Streaming recovery: build pre-built states per group while
+            // collecting controller entries separately (small, OK to clone).
+            let mut controller_entries_raw: Vec<SharedEntry> = Vec::new();
+            let mut data_partition_states: HashMap<GroupId, PartitionRecoveryState> =
+                HashMap::new();
+            pool.recover_streaming(&mut |group_id, entry| {
+                if group_id == CONTROLLER_GROUP_ID {
+                    controller_entries_raw.push(entry.clone());
+                } else {
+                    data_partition_states
+                        .entry(group_id)
+                        .or_default()
+                        .apply_entry(entry);
+                }
+            })
+            .await
+            .expect("Failed to recover from SharedWalPool");
 
             info!(
-                partitions = recovered.len(),
+                partitions = data_partition_states.len(),
+                controller_entries = controller_entries_raw.len(),
                 "SharedWalPool recovery complete for multi-node"
             );
 
-            (Some(Arc::new(pool)), Arc::new(RwLock::new(recovered)))
-        } else {
-            // In-memory mode.
-            (None, Arc::new(RwLock::new(HashMap::new())))
-        };
-
-        // Replay controller entries from SharedWAL into ControllerState.
-        // This restores topics and partition assignments after a pod restart.
-        #[allow(clippy::significant_drop_tightening)]
-        {
-            let mut recovered = recovered_entries.write().await;
-            if let Some(controller_entries) = recovered.remove(&CONTROLLER_GROUP_ID) {
+            // Replay controller entries into ControllerState immediately.
+            // This restores topics and partition assignments after a pod restart.
+            // Also capture the highest committed Raft index and its term so the
+            // controller Raft group can be initialised with correct compacted
+            // state, preventing log divergence after restart.
+            let (ctl_commit_index, ctl_commit_term) = {
                 let mut state = controller_state.write().await;
                 let mut count = 0u64;
                 let mut max_raft_index = 0u64;
-                for entry in &controller_entries {
+                let mut max_raft_term = 0u64;
+                for entry in &controller_entries_raw {
                     if entry.header.raft_index > max_raft_index {
                         max_raft_index = entry.header.raft_index;
+                        max_raft_term = entry.header.term;
                     }
                     if let Some(cmd) =
                         crate::controller::ControllerCommand::decode(&entry.payload)
@@ -1097,8 +1098,61 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                     info!(
                         replayed = count,
                         max_raft_index,
+                        max_raft_term,
                         "Replayed controller state from SharedWAL"
                     );
+                }
+                (max_raft_index, max_raft_term)
+            };
+
+            (
+                Some(Arc::new(pool)),
+                Arc::new(RwLock::new(data_partition_states)),
+                ctl_commit_index,
+                ctl_commit_term,
+            )
+        } else {
+            // In-memory mode — no persisted state, start from zero.
+            (None, Arc::new(RwLock::new(HashMap::new())), 0u64, 0u64)
+        };
+
+        // Create controller partition (group 0) with all cluster nodes.
+        // Uses WAL-recovered commit state so the Raft log's compacted position
+        // reflects entries that are already durable.  This prevents a new leader
+        // from overwriting committed entries at indices that a recovering follower
+        // has already marked as applied.
+        {
+            let controller_vote = initial_vote_state.get_group(CONTROLLER_GROUP_ID);
+            let (term, voted_for) =
+                controller_vote.map_or((TermId::new(0), None), |v| (v.term, v.voted_for));
+            let commit_index = LogIndex::new(controller_wal_commit_index);
+            let commit_term = TermId::new(controller_wal_commit_term);
+
+            let create_result = multi_raft.write().await.create_group_with_recovery_state(
+                CONTROLLER_GROUP_ID,
+                cluster_nodes.clone(),
+                term,
+                voted_for,
+                recovered_from_remote, // observation mode if recovered from S3
+                commit_index,
+                commit_term,
+            );
+
+            match create_result {
+                Ok(()) => {
+                    info!(
+                        group_id = CONTROLLER_GROUP_ID.get(),
+                        term = term.get(),
+                        voted_for = voted_for.map(NodeId::get),
+                        observation_mode = recovered_from_remote,
+                        commit_index = commit_index.get(),
+                        commit_term = commit_term.get(),
+                        nodes = ?cluster_nodes.iter().map(|n| n.get()).collect::<Vec<_>>(),
+                        "Created controller partition with restored vote and WAL commit state"
+                    );
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to create controller partition");
                 }
             }
         }
@@ -1158,6 +1212,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                 Arc::clone(&recovered_entries),
                 storage.clone(),
                 Arc::clone(&local_broker_heartbeats),
+                actor_handles.leader_update_rx,
                 rx,
             ));
             tx
@@ -1540,9 +1595,11 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
         &self.controller_state
     }
 
-    /// Returns access to recovered entries for DST.
+    /// Returns access to recovered partition states for DST.
     #[must_use]
-    pub const fn recovered_entries(&self) -> &Arc<RwLock<HashMap<GroupId, Vec<SharedEntry>>>> {
+    pub const fn recovered_entries(
+        &self,
+    ) -> &Arc<RwLock<HashMap<GroupId, PartitionRecoveryState>>> {
         &self.recovered_entries
     }
 
@@ -1774,17 +1831,30 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     .await
                     .expect("Failed to open SharedWalPool");
 
-                let recovered = pool
-                    .recover()
-                    .await
-                    .expect("Failed to recover from SharedWalPool");
+                // Streaming recovery for DST: controller entries are not replayed
+                // here (DST does not test crash recovery of controller state).
+                let mut data_partition_states: HashMap<GroupId, PartitionRecoveryState> =
+                    HashMap::new();
+                pool.recover_streaming(&mut |group_id, entry| {
+                    if group_id != CONTROLLER_GROUP_ID {
+                        data_partition_states
+                            .entry(group_id)
+                            .or_default()
+                            .apply_entry(entry);
+                    }
+                })
+                .await
+                .expect("Failed to recover from SharedWalPool");
 
                 info!(
-                    partitions = recovered.len(),
+                    partitions = data_partition_states.len(),
                     "SharedWalPool recovery complete for DST multi-node"
                 );
 
-                (Some(Arc::new(pool)), Arc::new(RwLock::new(recovered)))
+                (
+                    Some(Arc::new(pool)),
+                    Arc::new(RwLock::new(data_partition_states)),
+                )
             } else {
                 if data_dir.is_some() {
                     info!("Using per-partition WAL mode (no SharedWalPool)");
@@ -1843,6 +1913,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                 Arc::clone(&recovered_entries),
                 storage.clone(),
                 Arc::clone(&local_broker_heartbeats),
+                actor_handles.leader_update_rx,
                 rx,
             ));
             tx

@@ -396,43 +396,110 @@ pub fn check_single_leader_from_state(state: &PropertyState) -> Vec<PropertyViol
 
 /// Checks `LogMatching` from shared property state.
 ///
-/// Only checks COMMITTED entries - uncommitted entries can legitimately differ
-/// during partitions. For each node pair, we check that committed entries
-/// (index <= min of both commit indices) have matching terms.
+/// For each active node, every in-memory committed entry is checked against the
+/// canonical `committed_log_terms` record (populated at commit time, before any
+/// compaction). This catches term mismatches even when only one node still holds
+/// the entry in memory, covering the full committed history rather than just
+/// the trailing in-memory window.
 #[must_use]
 pub fn check_log_matching_from_state(state: &PropertyState) -> Vec<PropertyViolation> {
     let mut violations = Vec::new();
 
-    // Get active (non-crashed) nodes.
     let active_nodes: Vec<_> = state.nodes.values().filter(|n| !n.crashed).collect();
 
-    // Compare logs pairwise - only for committed entries.
-    for (i, node_a) in active_nodes.iter().enumerate() {
-        for node_b in active_nodes.iter().skip(i + 1) {
-            // Only check entries that are committed on BOTH nodes.
-            let common_commit = node_a.commit_index.min(node_b.commit_index);
+    for node in &active_nodes {
+        // Check every in-memory entry against the canonical committed record.
+        for (&idx, &node_term) in &node.log_terms {
+            // Only check committed entries.
+            if idx > node.commit_index || node_term == 0 {
+                continue;
+            }
+            if let Some(&canonical_term) = state.committed_log_terms.get(&idx) {
+                if node_term != canonical_term {
+                    violations.push(PropertyViolation::LogMismatch {
+                        index: idx,
+                        node_a: node.node_id,
+                        term_a: node_term,
+                        // node_b=0 indicates the canonical committed record.
+                        node_b: 0,
+                        term_b: canonical_term,
+                    });
+                }
+            }
+        }
 
-            // Skip if neither has committed anything.
+        // Also compare pairwise for any two nodes that both have an entry in memory,
+        // catching divergence before it's visible in committed_log_terms.
+        for other in active_nodes.iter().filter(|o| o.node_id > node.node_id) {
+            let common_commit = node.commit_index.min(other.commit_index);
             if common_commit == 0 {
                 continue;
             }
-
-            // Check entries from 1 to common_commit.
-            for idx in 1..=common_commit {
-                let term_a = node_a.log_terms.get(&idx).copied().unwrap_or(0);
-                let term_b = node_b.log_terms.get(&idx).copied().unwrap_or(0);
-
-                // Only flag if both have the entry (non-zero term) and terms differ.
-                if term_a != term_b && term_a != 0 && term_b != 0 {
+            // Only check the overlapping in-memory range.
+            let start = node.log_first_index.max(other.log_first_index);
+            let end = node.last_log_index.min(other.last_log_index).min(common_commit);
+            for idx in start..=end {
+                let term_a = node.log_terms.get(&idx).copied().unwrap_or(0);
+                let term_b = other.log_terms.get(&idx).copied().unwrap_or(0);
+                if term_a != 0 && term_b != 0 && term_a != term_b {
                     violations.push(PropertyViolation::LogMismatch {
                         index: idx,
-                        node_a: node_a.node_id,
+                        node_a: node.node_id,
                         term_a,
-                        node_b: node_b.node_id,
+                        node_b: other.node_id,
                         term_b,
                     });
                 }
             }
+        }
+    }
+
+    violations
+}
+
+/// Checks `LeaderCompleteness` from shared property state.
+///
+/// Any current leader must have committed every entry that has ever been
+/// committed in the cluster. Checks two conditions for each leader L and each
+/// canonical committed entry `(index I, term T)`:
+///
+/// 1. `L.commit_index >= I` — the leader has advanced past this entry.
+/// 2. If `I` is in L's in-memory window, `L.log_terms[I] == T` — no term
+///    corruption on the path from snapshot through `AppendEntries`.
+#[must_use]
+pub fn check_leader_completeness_from_state(state: &PropertyState) -> Vec<PropertyViolation> {
+    let mut violations = Vec::new();
+
+    let leaders: Vec<_> = state
+        .nodes
+        .values()
+        .filter(|n| !n.crashed && n.state == RaftState::Leader)
+        .collect();
+
+    for leader in leaders {
+        for (&index, &committed_term) in &state.committed_log_terms {
+            if index > leader.commit_index {
+                // Leader's commit_index is behind a globally committed entry.
+                violations.push(PropertyViolation::MissingCommittedEntry {
+                    index,
+                    term: committed_term,
+                    leader_node: leader.node_id,
+                    leader_term: leader.current_term,
+                });
+            } else if index >= leader.log_first_index {
+                // Entry is in the leader's in-memory window; term must match.
+                let leader_term = leader.log_terms.get(&index).copied().unwrap_or(0);
+                if leader_term != 0 && leader_term != committed_term {
+                    violations.push(PropertyViolation::MissingCommittedEntry {
+                        index,
+                        term: committed_term,
+                        leader_node: leader.node_id,
+                        leader_term: leader.current_term,
+                    });
+                }
+            }
+            // index < log_first_index: entry was committed before this leader's snapshot.
+            // The leader applied the snapshot (advancing commit_index) which subsumes it.
         }
     }
 
@@ -555,9 +622,13 @@ impl PropertyCheckResult {
 /// Checks all properties from shared property state.
 #[must_use]
 pub fn check_all_from_state(state: &PropertyState) -> PropertyCheckResult {
+    // Collect log-related violations from both LogMatching and LeaderCompleteness.
+    let mut log_violations = check_log_matching_from_state(state);
+    log_violations.extend(check_leader_completeness_from_state(state));
+
     PropertyCheckResult {
         leader_violations: check_single_leader_from_state(state),
-        log_violations: check_log_matching_from_state(state),
+        log_violations,
         state_machine_violations: check_state_machine_safety(state),
     }
 }

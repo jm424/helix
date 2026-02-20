@@ -65,7 +65,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     .as_ref()
                     .expect("data_dir must be set with shared_wal_pool");
                 let wal_handle = pool.handle(group_id);
-                let recovered = self
+                let state = self
                     .recovered_entries
                     .write()
                     .await
@@ -73,23 +73,23 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     .unwrap_or_default();
 
                 #[cfg(feature = "s3")]
-                let ps_result = PartitionStorage::new_durable_with_shared_wal(
+                let ps_result = PartitionStorage::new_durable_with_shared_wal_state(
                     data_dir,
                     topic_id,
                     partition_id,
                     wal_handle,
-                    recovered,
+                    state,
                     self.object_storage_dir.as_ref(),
                     self.s3_config.as_ref(),
                     self.tiering_config.as_ref(),
                 );
                 #[cfg(not(feature = "s3"))]
-                let ps_result = PartitionStorage::new_durable_with_shared_wal(
+                let ps_result = PartitionStorage::new_durable_with_shared_wal_state(
                     data_dir,
                     topic_id,
                     partition_id,
                     wal_handle,
-                    recovered,
+                    state,
                     self.object_storage_dir.as_ref(),
                     self.tiering_config.as_ref(),
                 );

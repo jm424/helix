@@ -52,6 +52,13 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
+// Use jemalloc as the global allocator when dhat profiling is not active.
+// jemalloc provides better multi-threaded performance than the system allocator
+// and exposes mallctl stats queryable via --alloc-stats-port.
+#[cfg(not(feature = "dhat-heap"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -253,6 +260,21 @@ struct Args {
     /// All nodes should use the same topics for consistent Raft group allocation.
     #[arg(long = "topic", value_parser = parse_topic)]
     topics: Vec<TopicSpec>,
+
+    /// Port for the jemalloc allocator stats TCP server.
+    ///
+    /// When set, a TCP listener on `127.0.0.1:{port}` accepts connections and
+    /// responds with one line then closes:
+    ///
+    /// ```text
+    /// allocated=N active=N resident=N retained=N
+    /// ```
+    ///
+    /// `allocated` is the exact bytes held by live allocations, unaffected by
+    /// OS page-reclaim timing. Useful for memory regression tests and profiling.
+    /// For callsite attribution, also set `MALLOC_CONF=prof:true`.
+    #[arg(long)]
+    alloc_stats_port: Option<u16>,
 }
 
 /// Topic specification for pre-creation.
@@ -635,6 +657,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+    }
+
+    // Start allocator stats server if requested.
+    if let Some(port) = args.alloc_stats_port {
+        helix_server::alloc_stats::spawn(port);
     }
 
     // Start the appropriate server based on protocol.

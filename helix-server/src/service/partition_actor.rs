@@ -151,6 +151,19 @@ pub enum PartitionCommand {
         entries: Vec<helix_raft::LogEntry>,
     },
 
+    /// Provide snapshot position to fast-forward a follower past the WAL floor.
+    ///
+    /// Sent by the output processor when a WAL read fails because the follower's
+    /// `next_index` is below the WAL floor (retention has advanced past it).
+    ProvideSnapshot {
+        /// The follower that needs the snapshot.
+        follower_id: NodeId,
+        /// Last index covered by the snapshot (= WAL floor - 1).
+        last_included_index: LogIndex,
+        /// Term at `last_included_index`.
+        last_included_term: helix_core::TermId,
+    },
+
     /// Graceful shutdown.
     Shutdown,
 }
@@ -544,6 +557,27 @@ impl PartitionActorHandle {
                 prev_log_index,
                 prev_log_term,
                 entries,
+            })
+            .await
+            .map_err(|_| PartitionError::ActorShutdown)
+    }
+
+    /// Provides a snapshot position to fast-forward a follower past the WAL floor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor has shut down.
+    pub async fn provide_snapshot(
+        &self,
+        follower_id: NodeId,
+        last_included_index: LogIndex,
+        last_included_term: helix_core::TermId,
+    ) -> Result<(), PartitionError> {
+        self.tx
+            .send(PartitionCommand::ProvideSnapshot {
+                follower_id,
+                last_included_index,
+                last_included_term,
             })
             .await
             .map_err(|_| PartitionError::ActorShutdown)
@@ -1043,6 +1077,18 @@ impl PartitionActorShared {
                 );
                 self.process_raft_outputs(outputs).await;
             }
+            PartitionCommand::ProvideSnapshot {
+                follower_id,
+                last_included_index,
+                last_included_term,
+            } => {
+                let outputs = self.raft_node.provide_snapshot(
+                    follower_id,
+                    last_included_index,
+                    last_included_term,
+                );
+                self.process_raft_outputs(outputs).await;
+            }
             PartitionCommand::Shutdown => {
                 info!("Partition actor (shared) shutting down");
                 self.flush_pending_batch(FlushReason::Shutdown).await;
@@ -1249,6 +1295,13 @@ impl PartitionActorShared {
     async fn handle_tick(&mut self) {
         let outputs = self.raft_node.tick();
         self.process_raft_outputs(outputs).await;
+
+        // Compact the in-memory Raft log to prevent unbounded memory growth.
+        if self.raft_node.is_leader() {
+            self.raft_node.compact_log();
+        } else {
+            self.raft_node.compact_log_follower();
+        }
 
         // Track quorum liveness: if we're leader with pending proposals
         // but no commits are arriving, we've likely lost quorum.
@@ -2012,6 +2065,18 @@ impl PartitionActor {
                     );
                     self.process_raft_outputs(outputs).await;
                 }
+                PartitionCommand::ProvideSnapshot {
+                    follower_id,
+                    last_included_index,
+                    last_included_term,
+                } => {
+                    let outputs = self.raft_node.provide_snapshot(
+                        follower_id,
+                        last_included_index,
+                        last_included_term,
+                    );
+                    self.process_raft_outputs(outputs).await;
+                }
                 PartitionCommand::Shutdown => {
                     info!("Partition actor shutting down");
                     break;
@@ -2057,6 +2122,13 @@ impl PartitionActor {
     async fn handle_tick(&mut self) {
         let outputs = self.raft_node.tick();
         self.process_raft_outputs(outputs).await;
+
+        // Compact the in-memory Raft log to prevent unbounded memory growth.
+        if self.raft_node.is_leader() {
+            self.raft_node.compact_log();
+        } else {
+            self.raft_node.compact_log_follower();
+        }
     }
 
     async fn handle_raft_message(

@@ -1324,12 +1324,16 @@ impl RaftNode {
         }
         self.reset_election_elapsed();
 
-        // For now, acknowledge receipt.
-        // Full implementation would:
-        // 1. Save snapshot chunks to storage
-        // 2. When complete, install snapshot and truncate log
-        // 3. Reset state machine state from snapshot
         let response = if req.done {
+            // Final chunk: install the snapshot. Advance commit and log floor so that
+            // subsequent AppendEntries consistency checks (prev_log_index <= commit_index)
+            // and term-at-index lookups both return correct results.
+            let snap_index = req.last_included_index;
+            let snap_term = req.last_included_term;
+            self.persisted_commit_index =
+                LogIndex::new(self.persisted_commit_index.get().max(snap_index.get()));
+            self.commit_index = LogIndex::new(self.commit_index.get().max(snap_index.get()));
+            self.log.set_compacted_state(snap_index.get(), snap_term.get());
             InstallSnapshotResponse::complete(self.current_term, self.config.node_id, req.leader_id)
         } else {
             // Request next chunk.
@@ -1350,16 +1354,20 @@ impl RaftNode {
 
     /// Handles an `InstallSnapshotResponse` from a follower.
     ///
-    /// This is called when the leader receives acknowledgment of a snapshot chunk.
-    ///
-    /// Note: Full implementation requires snapshot chunking and sending logic.
-    /// This is a placeholder.
-    #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
-    fn handle_install_snapshot_response(&self, _resp: InstallSnapshotResponse) -> Vec<RaftOutput> {
-        // Full implementation would:
-        // 1. Track progress per follower
-        // 2. Send next chunk if not complete
-        // 3. Update match_index when snapshot is fully installed
+    /// Decrements the inflight count on success so that the leader can
+    /// pipeline the next `AppendEntries` request to catch the follower up.
+    fn handle_install_snapshot_response(&mut self, resp: InstallSnapshotResponse) -> Vec<RaftOutput> {
+        // Term check is done by handle_message before dispatching here.
+        if self.state != RaftState::Leader || resp.term != self.current_term {
+            return Vec::new();
+        }
+
+        if let Some(state) = self.replication_state.get_mut(&resp.from) {
+            if resp.success {
+                state.inflight_count = state.inflight_count.saturating_sub(1);
+            }
+        }
+
         Vec::new()
     }
 
@@ -1652,6 +1660,59 @@ impl RaftNode {
             self.commit_index,
         );
         outputs.push(RaftOutput::SendMessage(Message::AppendEntries(request)));
+
+        outputs
+    }
+
+    /// Called when the WAL floor has advanced past a follower's `next_index`.
+    ///
+    /// Sends `InstallSnapshot` to fast-forward the follower to the WAL floor.
+    /// The snapshot carries no state data for helix WAL partitions — it only
+    /// establishes the `(last_included_index, last_included_term)` boundary so
+    /// that the subsequent `AppendEntries` consistency check can pass.
+    ///
+    /// # Why this is correct
+    ///
+    /// The follower's log is either empty (fresh node) or has entries that are
+    /// all below the WAL floor (stale node). In both cases, those entries are
+    /// outside the leader's retention window and can be discarded. After the
+    /// snapshot installs the floor boundary, normal Raft replication from the
+    /// WAL floor onward resumes.
+    pub fn provide_snapshot(
+        &mut self,
+        follower_id: NodeId,
+        last_included_index: LogIndex,
+        last_included_term: TermId,
+    ) -> Vec<RaftOutput> {
+        let mut outputs = Vec::new();
+
+        // Clear pending flag regardless of outcome.
+        self.wal_read_pending.remove(&follower_id);
+
+        if self.state != RaftState::Leader {
+            return outputs;
+        }
+
+        let Some(state) = self.replication_state.get_mut(&follower_id) else {
+            return outputs;
+        };
+
+        // Advance next_index past the snapshot boundary.
+        state.next_index = LogIndex::new(last_included_index.get() + 1);
+        state.inflight_count += 1;
+
+        outputs.push(RaftOutput::SendMessage(Message::InstallSnapshot(
+            InstallSnapshotRequest::new(
+                self.current_term,
+                self.config.node_id,
+                follower_id,
+                last_included_index,
+                last_included_term,
+                0,
+                bytes::Bytes::new(), // No state to install for WAL snapshots.
+                true,                // Single chunk, done immediately.
+            ),
+        )));
 
         outputs
     }
@@ -3244,5 +3305,161 @@ mod tests {
         // min_match_index should be 3 (the lagging follower).
         let min = node.min_match_index().expect("leader should have min_match");
         assert_eq!(min.get(), 3);
+    }
+
+    #[test]
+    fn test_provide_snapshot_sends_install_snapshot() {
+        // Leader with a follower whose next_index is below WAL floor.
+        // provide_snapshot should clear wal_read_pending, advance next_index,
+        // increment inflight_count, and emit InstallSnapshot.
+        let mut node = make_recovered_leader(10, 3);
+        let peer = NodeId::new(2);
+
+        // Simulate that NeedEntries was emitted and WAL read is pending.
+        node.wal_read_pending.insert(peer);
+        assert!(node.wal_read_pending.contains(&peer));
+
+        // Record inflight_count before the call.
+        let inflight_before = node.replication_state.get(&peer).unwrap().inflight_count;
+
+        // Provide the snapshot boundary — WAL floor is at index 5, term 2.
+        let outputs = node.provide_snapshot(peer, LogIndex::new(5), TermId::new(2));
+
+        // wal_read_pending must be cleared.
+        assert!(
+            !node.wal_read_pending.contains(&peer),
+            "provide_snapshot must clear wal_read_pending"
+        );
+
+        // next_index must advance to floor + 1.
+        let repl_state = node.replication_state.get(&peer).expect("peer must exist");
+        assert_eq!(
+            repl_state.next_index.get(),
+            6,
+            "next_index must be last_included_index + 1"
+        );
+
+        // inflight_count must be incremented by exactly 1.
+        assert_eq!(
+            repl_state.inflight_count,
+            inflight_before + 1,
+            "inflight_count must be incremented by 1"
+        );
+
+        // An InstallSnapshot message must be emitted.
+        let snap = outputs.iter().find_map(|o| match o {
+            RaftOutput::SendMessage(Message::InstallSnapshot(req)) => Some(req),
+            _ => None,
+        });
+        assert!(snap.is_some(), "provide_snapshot must emit InstallSnapshot");
+
+        let req = snap.unwrap();
+        assert_eq!(req.to, peer, "InstallSnapshot must target the follower");
+        assert_eq!(req.last_included_index.get(), 5, "last_included_index must match floor");
+        assert_eq!(req.last_included_term.get(), 2, "last_included_term must match floor term");
+        assert_eq!(req.term, node.current_term(), "InstallSnapshot must carry current term");
+        assert!(req.done, "single-chunk snapshot must have done=true");
+
+        // next_index must advance to floor + 1.
+        let repl_state = node.replication_state.get(&peer).expect("peer must exist");
+        assert_eq!(
+            repl_state.next_index.get(),
+            6,
+            "next_index must be last_included_index + 1"
+        );
+    }
+
+    #[test]
+    fn test_provide_snapshot_clears_pending_even_as_follower() {
+        // provide_snapshot should clear wal_read_pending even if the node has
+        // stepped down, so the flag doesn't leak across term boundaries.
+        let mut node = make_recovered_leader(10, 3);
+        let peer = NodeId::new(2);
+
+        node.wal_read_pending.insert(peer);
+
+        // Step down to follower before calling provide_snapshot.
+        node.step_down(TermId::new(5));
+        assert_eq!(node.state, RaftState::Follower);
+
+        // Re-insert the flag (step_down already clears it, so simulate a race).
+        node.wal_read_pending.insert(peer);
+
+        let outputs = node.provide_snapshot(peer, LogIndex::new(5), TermId::new(2));
+
+        assert!(
+            !node.wal_read_pending.contains(&peer),
+            "provide_snapshot must clear wal_read_pending even as follower"
+        );
+        // Non-leader must not emit messages.
+        assert!(
+            outputs.iter().all(|o| !matches!(o, RaftOutput::SendMessage(_))),
+            "non-leader must not send messages from provide_snapshot"
+        );
+    }
+
+    #[test]
+    fn test_install_snapshot_response_decrements_inflight() {
+        // After the follower acknowledges the snapshot, inflight_count should
+        // drop back to zero so AppendEntries pipelining can proceed.
+        let mut node = make_recovered_leader(10, 3);
+        let peer = NodeId::new(2);
+
+        // Simulate an in-flight snapshot.
+        node.wal_read_pending.insert(peer);
+        let inflight_before = node.replication_state.get(&peer).unwrap().inflight_count;
+        let _ = node.provide_snapshot(peer, LogIndex::new(5), TermId::new(2));
+
+        let state = node.replication_state.get(&peer).unwrap();
+        assert_eq!(
+            state.inflight_count,
+            inflight_before + 1,
+            "precondition: inflight_count must have incremented"
+        );
+        let inflight_after_provide = state.inflight_count;
+
+        // Receive a success response from the follower.
+        let resp = InstallSnapshotResponse::complete(
+            node.current_term(),
+            peer,
+            node.node_id(),
+        );
+        node.handle_message(Message::InstallSnapshotResponse(resp));
+
+        let state = node.replication_state.get(&peer).unwrap();
+        assert_eq!(
+            state.inflight_count,
+            inflight_after_provide - 1,
+            "inflight_count must be decremented on success response"
+        );
+    }
+
+    #[test]
+    fn test_install_snapshot_response_ignored_on_failure() {
+        // A failed response must NOT decrement inflight_count.
+        let mut node = make_recovered_leader(10, 3);
+        let peer = NodeId::new(2);
+
+        node.wal_read_pending.insert(peer);
+        let _ = node.provide_snapshot(peer, LogIndex::new(5), TermId::new(2));
+
+        let state = node.replication_state.get(&peer).unwrap();
+        let inflight_after_provide = state.inflight_count;
+
+        let resp = InstallSnapshotResponse::new(
+            node.current_term(),
+            peer,
+            node.node_id(),
+            false, // not success
+            0,
+        );
+        node.handle_message(Message::InstallSnapshotResponse(resp));
+
+        let state = node.replication_state.get(&peer).unwrap();
+        assert_eq!(
+            state.inflight_count,
+            inflight_after_provide,
+            "failed response must NOT decrement inflight_count"
+        );
     }
 }

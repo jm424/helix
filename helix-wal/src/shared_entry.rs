@@ -330,6 +330,11 @@ impl WalEntry for SharedEntry {
         Self::index(self)
     }
 
+    fn term(&self) -> u64 {
+        // Delegate to inherent method.
+        Self::term(self)
+    }
+
     fn payload_len(&self) -> u32 {
         // Delegate to inherent method.
         Self::payload_len(self)

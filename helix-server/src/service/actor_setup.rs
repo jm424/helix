@@ -40,7 +40,8 @@ use helix_runtime::{IncomingMessage, TransportService};
 use tokio::sync::{mpsc, RwLock};
 use tracing::info;
 
-use helix_wal::{SharedEntry, SharedWalPool, Storage};
+use helix_wal::{SharedWalPool, Storage};
+use crate::storage::PartitionRecoveryState;
 
 use crate::vote_store::{LocalFileVoteStorage, VoteStore};
 
@@ -84,6 +85,11 @@ pub struct ActorSetupHandles {
     pub partition_handles: HashMap<GroupId, PartitionActorHandle>,
     /// Output channel sender for creating new partition actors.
     pub output_tx: mpsc::Sender<GroupedOutput>,
+    /// Receiver for leader-change notifications from the output processor.
+    ///
+    /// Pass to `tick_task_controller` so it can propose `UpdatePartitionLeader`
+    /// commands whenever a data partition elects a new leader.
+    pub leader_update_rx: mpsc::UnboundedReceiver<crate::controller::ControllerCommand>,
 }
 
 /// Sets up the actor-based service for a single partition group.
@@ -163,7 +169,7 @@ pub async fn setup_single_partition<
     // Create output processor stats for bottleneck analysis.
     let output_processor_stats = Arc::new(super::OutputProcessorStats::default());
 
-    // Spawn the output processor.
+    // Spawn the output processor (no leader update channel for single-partition mode).
     tokio::spawn(output_processor::output_processor_task(
         output_rx,
         Arc::clone(&partition_storage),
@@ -175,6 +181,8 @@ pub async fn setup_single_partition<
         vote_store,
         Some(Arc::clone(&router)),
         Some(Arc::clone(&output_processor_stats)),
+        None, // No node_id — single-partition mode has no controller.
+        None, // No leader_update_tx — single-partition mode has no controller.
     ));
 
     info!(
@@ -188,6 +196,9 @@ pub async fn setup_single_partition<
     let mut partition_handles = HashMap::new();
     partition_handles.insert(group_id, partition_handle);
 
+    // No controller tick task for single-partition mode; use a dead receiver.
+    let (_, leader_update_rx) = mpsc::unbounded_channel::<crate::controller::ControllerCommand>();
+
     ActorSetupHandles {
         router,
         batcher_handle,
@@ -197,6 +208,7 @@ pub async fn setup_single_partition<
         shutdown_tx,
         partition_handles,
         output_tx,
+        leader_update_rx,
     }
 }
 
@@ -249,7 +261,7 @@ pub async fn setup_multi_partition<
     vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
     shared_wal_pool: Option<Arc<SharedWalPool<S>>>,
     data_dir: Option<PathBuf>,
-    recovered_entries: Arc<RwLock<HashMap<GroupId, Vec<SharedEntry>>>>,
+    recovered_entries: Arc<RwLock<HashMap<GroupId, PartitionRecoveryState>>>,
     storage: S,
     local_retention_ms: Option<u64>,
 ) -> ActorSetupHandles {
@@ -258,6 +270,11 @@ pub async fn setup_multi_partition<
     // Create shared output channel.
     let (output_tx, output_rx) =
         output_processor::create_output_channel(config.output_processor_config);
+
+    // Create leader-update channel so the output processor can notify the
+    // controller tick task when data partition leaders change.
+    let (leader_update_tx, leader_update_rx) =
+        mpsc::unbounded_channel::<crate::controller::ControllerCommand>();
 
     // Create partition actors for each initial group.
     let mut router = PartitionRouter::with_capacity(group_count, 0);
@@ -312,6 +329,8 @@ pub async fn setup_multi_partition<
         vote_store.clone(),
         Some(Arc::clone(&router)),
         Some(Arc::clone(&output_processor_stats)),
+        Some(node_id),
+        Some(leader_update_tx),
     ));
 
     // Create shutdown channel for tick task.
@@ -356,6 +375,7 @@ pub async fn setup_multi_partition<
         shutdown_tx,
         partition_handles,
         output_tx,
+        leader_update_rx,
     }
 }
 

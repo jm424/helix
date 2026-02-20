@@ -49,13 +49,37 @@ const READ_BUFFER_SIZE: usize = 1024 * 1024;
 /// Connection timeout in milliseconds.
 const CONNECT_TIMEOUT_MS: u64 = 5000;
 
-/// TCP keepalive interval in seconds.
+/// TCP keepalive idle/interval in seconds.
 ///
-/// Detects half-open connections when a peer pod restarts. Without this,
-/// the kernel buffers writes to the dead IP for up to 2 hours (the OS default
-/// probe interval), so the `sender_loop` never discovers the broken
-/// connection and Raft heartbeats silently fail.
+/// Detects half-open connections when idle (no pending unacked data). When
+/// a peer pod restarts and the OS send buffer is empty, keepalive probes
+/// fire after this many seconds of inactivity and detect the dead connection
+/// within `TCP_KEEPALIVE_SECS` + `TCP_KEEPALIVE_SECS` * `TCP_KEEPALIVE_CNT` seconds.
 const TCP_KEEPALIVE_SECS: u64 = 5;
+
+/// TCP keepalive probe count.
+///
+/// After `TCP_KEEPALIVE_SECS` idle, the OS sends up to this many probes at
+/// `TCP_KEEPALIVE_SECS` intervals before declaring the connection dead.
+/// Total idle-connection detection time: 5s + 5s * 5 = 30s.
+const TCP_KEEPALIVE_CNT: u32 = 5;
+
+/// `TCP_USER_TIMEOUT` in seconds.
+///
+/// This is the correct fix for half-open connections when the send buffer
+/// has pending data. `SO_KEEPALIVE` probes are suppressed by the retransmission
+/// timer when there is unacked data in the send buffer — so keepalive alone
+/// cannot detect a wedged connection under load. `TCP_USER_TIMEOUT` tells the
+/// kernel: "abort this connection if transmitted data goes unacknowledged for
+/// more than N seconds." This covers the case where Raft heartbeats have
+/// filled the send buffer on a stale connection (e.g. peer pod restarted
+/// mid-send). Without this, the connection wedges for ~15 minutes (the
+/// `tcp_retries2` default). With it, detection occurs within ~30 seconds.
+/// Used by gRPC (proposal A18), Linkerd, and etcd for the same reason.
+///
+/// Set to match `TCP_KEEPALIVE_SECS` + `TCP_KEEPALIVE_SECS` * `TCP_KEEPALIVE_CNT`
+/// so both code paths (idle vs. data-pending) have the same ~30s bound.
+const TCP_USER_TIMEOUT_SECS: u64 = TCP_KEEPALIVE_SECS + TCP_KEEPALIVE_SECS * TCP_KEEPALIVE_CNT as u64;
 
 /// Maximum pending messages per peer.
 const MAX_PENDING_MESSAGES: usize = 1000;
@@ -654,18 +678,33 @@ impl Transport {
                 // Disable Nagle's algorithm for lower latency.
                 stream.set_nodelay(true)?;
 
-                // Enable TCP keepalive to detect half-open connections.
+                // Enable TCP keepalive to detect idle half-open connections.
                 // When a peer pod restarts, the old TCP connection becomes
                 // half-open: writes succeed (kernel buffers them) but data
-                // never reaches the peer. Without keepalive, this persists
-                // for ~2 hours. With a 5s interval, the OS detects the dead
-                // connection within ~15s and the sender_loop reconnects.
+                // never reaches the peer. Keepalive detects this within
+                // TCP_KEEPALIVE_SECS + TCP_KEEPALIVE_SECS * TCP_KEEPALIVE_CNT
+                // seconds (~30s) when the send buffer is empty.
                 let sock = socket2::SockRef::from(&stream);
                 let keepalive = socket2::TcpKeepalive::new()
                     .with_time(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS))
-                    .with_interval(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS));
+                    .with_interval(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS))
+                    .with_retries(TCP_KEEPALIVE_CNT);
                 if let Err(e) = sock.set_tcp_keepalive(&keepalive) {
                     warn!(peer_id = peer_id.get(), error = %e, "Failed to set TCP keepalive");
+                }
+
+                // Set TCP_USER_TIMEOUT to detect half-open connections when
+                // the send buffer has pending unacked data. SO_KEEPALIVE is
+                // suppressed by the retransmission timer in this case, so
+                // keepalive alone cannot detect a wedged connection under
+                // load. TCP_USER_TIMEOUT aborts after N ms of unacknowledged
+                // data, matching the ~30s bound of our keepalive config.
+                // Linux only; macOS does not support this socket option.
+                #[cfg(target_os = "linux")]
+                if let Err(e) = sock.set_tcp_user_timeout(Some(
+                    std::time::Duration::from_secs(TCP_USER_TIMEOUT_SECS),
+                )) {
+                    warn!(peer_id = peer_id.get(), error = %e, "Failed to set TCP_USER_TIMEOUT");
                 }
 
                 Ok(stream)
@@ -684,8 +723,18 @@ impl Transport {
     }
 
     /// Sends raw bytes over a TCP stream.
+    ///
+    /// Wraps writes in a timeout so that a wedged connection (send buffer full,
+    /// peer unreachable) is detected at the application layer regardless of OS
+    /// TCP timer support. On Linux, `TCP_USER_TIMEOUT` provides the primary
+    /// detection; this timeout is defense-in-depth that also works on macOS.
     async fn send_bytes(stream: &mut TcpStream, data: &[u8]) -> TransportResult<()> {
-        stream.write_all(data).await?;
+        let write_timeout = tokio::time::Duration::from_secs(TCP_USER_TIMEOUT_SECS);
+        tokio::time::timeout(write_timeout, stream.write_all(data))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "write timed out: peer unreachable")
+            })??;
         stream.flush().await?;
         Ok(())
     }

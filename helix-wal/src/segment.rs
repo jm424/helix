@@ -285,6 +285,12 @@ impl<E: WalEntry> Segment<E> {
         self.entries.last().map(WalEntry::index)
     }
 
+    /// Returns the term of the last entry, or None if empty.
+    #[must_use]
+    pub fn last_term(&self) -> Option<u64> {
+        self.entries.last().map(WalEntry::term)
+    }
+
     /// Returns the number of entries in this segment.
     #[must_use]
     pub fn entry_count(&self) -> u64 {

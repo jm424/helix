@@ -338,6 +338,19 @@ impl RaftLog {
         self.first_index = last_to_remove.get() + 1;
     }
 
+    /// Advances the compacted floor to `(index, term)`.
+    ///
+    /// Only monotonically increases; never regresses. Called when an
+    /// `InstallSnapshot` completes so that `last_index()` and `term_at()`
+    /// return the correct values for subsequent `AppendEntries` consistency
+    /// checks.
+    pub const fn set_compacted_state(&mut self, index: u64, term: u64) {
+        if index > self.compacted_index {
+            self.compacted_index = index;
+            self.compacted_term = term;
+        }
+    }
+
     /// Returns entries from `start_index` to the end.
     #[must_use]
     pub fn entries_from(&self, start_index: LogIndex) -> Vec<LogEntry> {

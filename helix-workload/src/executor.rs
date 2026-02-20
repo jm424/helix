@@ -241,6 +241,14 @@ pub struct RealClusterConfig {
     pub tiering_config: TieringTestConfig,
     /// Log level for server nodes (trace, debug, info, warn, error).
     pub log_level: String,
+    /// Local WAL retention in milliseconds. `None` means use server default (4 hours).
+    pub local_retention_ms: Option<u64>,
+    /// Base port for jemalloc allocator stats servers.
+    ///
+    /// When set, node N listens on `alloc_stats_base_port + N`. Each connection
+    /// receives one line: `allocated=N active=N resident=N retained=N`.
+    /// `None` disables the stats servers.
+    pub alloc_stats_base_port: Option<u16>,
 }
 
 impl Default for RealClusterConfig {
@@ -259,6 +267,8 @@ impl Default for RealClusterConfig {
             s3_config: None,
             tiering_config: TieringTestConfig::default(),
             log_level: String::from("info"),
+            local_retention_ms: None,
+            alloc_stats_base_port: None,
         }
     }
 }
@@ -417,6 +427,28 @@ impl RealClusterBuilder {
         self
     }
 
+    /// Set local WAL retention in milliseconds.
+    ///
+    /// Sealed WAL segments older than this are deleted once all entries have
+    /// been replicated. Retention runs every 60 seconds. Use a small value
+    /// (e.g. 1000) in tests to verify `BlobIndex` compaction fires.
+    #[must_use]
+    pub const fn local_retention_ms(mut self, ms: u64) -> Self {
+        self.config.local_retention_ms = Some(ms);
+        self
+    }
+
+    /// Enable jemalloc allocator stats servers on each node.
+    ///
+    /// Node N listens on `base_port + N`. Connect to read exact allocator
+    /// byte counts: `allocated active resident retained`. Use
+    /// [`RealCluster::alloc_stats_port`] to retrieve the port for a node.
+    #[must_use]
+    pub const fn alloc_stats_base_port(mut self, base: u16) -> Self {
+        self.config.alloc_stats_base_port = Some(base);
+        self
+    }
+
     /// Builds and starts the cluster.
     ///
     /// # Errors
@@ -562,6 +594,17 @@ impl RealCluster {
                     .arg(config.tiering_config.min_age_secs.to_string());
             }
 
+            // Pass retention config if set.
+            if let Some(ms) = config.local_retention_ms {
+                cmd.arg("--local-retention-ms").arg(ms.to_string());
+            }
+
+            // Pass allocator stats port if configured.
+            if let Some(base) = config.alloc_stats_base_port {
+                let stats_port = base + u16::try_from(node_id).unwrap_or(0);
+                cmd.arg("--alloc-stats-port").arg(stats_port.to_string());
+            }
+
             // Suppress stdout; configure stderr based on test log mode.
             // Explicitly inherit env so RUST_LOG propagates to child processes.
             cmd.stdout(Stdio::null()).envs(std::env::vars());
@@ -689,6 +732,29 @@ impl RealCluster {
         Ok(())
     }
 
+    /// Returns the OS PIDs of all node processes.
+    ///
+    /// Used by memory-regression tests to measure per-process RSS via
+    /// `/proc/<pid>/status` (Linux) or `ps` (macOS).
+    #[must_use]
+    pub fn node_pids(&self) -> Vec<u32> {
+        self.processes
+            .iter()
+            .map(std::process::Child::id)
+            .collect()
+    }
+
+    /// Returns the jemalloc allocator stats TCP port for the given node.
+    ///
+    /// Returns `None` if stats servers were not configured via
+    /// [`RealClusterBuilder::alloc_stats_base_port`].
+    #[must_use]
+    pub fn alloc_stats_port(&self, node_id: u32) -> Option<u16> {
+        self.config
+            .alloc_stats_base_port
+            .map(|base| base + u16::try_from(node_id).unwrap_or(0))
+    }
+
     /// Stops all processes in the cluster.
     pub fn stop(&mut self) {
         for process in &mut self.processes {
@@ -802,6 +868,12 @@ impl RealCluster {
             // Pass min age when S3 is configured.
             cmd.arg("--tier-min-age-secs")
                 .arg(self.config.tiering_config.min_age_secs.to_string());
+        }
+
+        // Pass allocator stats port if configured.
+        if let Some(base) = self.config.alloc_stats_base_port {
+            let stats_port = base + u16::try_from(node_id).unwrap_or(0);
+            cmd.arg("--alloc-stats-port").arg(stats_port.to_string());
         }
 
         cmd.stdout(Stdio::null()).envs(std::env::vars());

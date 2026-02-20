@@ -504,6 +504,14 @@ impl<S: Storage + Send + Sync + 'static> BufferedWal<S> {
         guard.wal.delete_sealed_segment(segment_id).await
     }
 
+    /// Returns the compact state: (index, term) of the last entry deleted by retention.
+    ///
+    /// Returns `None` if no segments have been deleted yet.
+    pub async fn compact_state(&self) -> Option<(u64, u64)> {
+        let guard = self.inner.lock().await;
+        guard.wal.compact_state()
+    }
+
     /// Stops the background flush task and flushes remaining entries.
     ///
     /// # Errors

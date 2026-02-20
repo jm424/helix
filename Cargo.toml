@@ -102,6 +102,10 @@ rdkafka = { version = "0.36", features = ["cmake-build"] }
 # CRC checksums.
 crc = "3.0"
 
+# Allocator.
+tikv-jemallocator = { version = "0.6", features = ["profiling"] }
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+
 [workspace.lints.rust]
 # Safety: All warnings are errors.
 warnings = "deny"

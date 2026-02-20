@@ -1446,10 +1446,14 @@ impl Partition {
 
     /// Advances blob offset tracking without storing blob data.
     ///
-    /// Updates `blob_log_end_offset` and the dedup index (`blob_offsets`)
-    /// for the given offset / record count, but does NOT push blob bytes
-    /// into `self.blobs`. Used by durable partitions that serve reads
-    /// from the WAL via `BlobIndex` instead of an in-memory cache.
+    /// Updates `blob_log_end_offset` for the given offset / record count,
+    /// but does NOT push blob bytes into `self.blobs`. Used by durable
+    /// partitions that serve reads from the WAL via `BlobIndex`.
+    ///
+    /// No `blob_offsets` dedup here: the durable path is already guarded by
+    /// `PartitionStorage::last_applied` which prevents re-application of
+    /// committed entries. Growing `blob_offsets` in this path accumulates
+    /// one entry per blob written — unbounded without retention.
     ///
     /// # Returns
     /// The base offset (same as input, for API consistency).
@@ -1463,11 +1467,6 @@ impl Partition {
     ) -> PartitionResult<Offset> {
         if self.closed {
             return Err(PartitionError::Closed);
-        }
-
-        // O(1) dedup check: skip if we already have a blob at this offset.
-        if !self.blob_offsets.insert(base_offset.get()) {
-            return Ok(base_offset);
         }
 
         // Update the log end offset to be after this blob.
@@ -1624,6 +1623,156 @@ impl DurablePartitionConfig {
             .join(format!("topic-{}", self.topic_id.get()))
             .join(format!("partition-{}", self.partition_id.get()))
             .join("wal")
+    }
+}
+
+// -----------------------------------------------------------------------------
+// apply_shared_entry_to_cache (free function)
+// -----------------------------------------------------------------------------
+
+/// Applies a [`SharedEntry`] from shared WAL to an in-memory cache during recovery.
+///
+/// `SharedEntry` payloads contain serialized `PartitionCommand` data.
+/// For blob operations, only advances offset tracking and records the
+/// WAL index in the `BlobIndex`. Extracted as a free function so both
+/// `DurablePartition::open_with_shared_wal` and
+/// `PartitionRecoveryState::apply_entry` can call it without generic type games.
+fn apply_shared_entry_to_cache(
+    cache: &mut Partition,
+    blob_index: &mut BlobIndex,
+    entry: &SharedEntry,
+) -> Result<(), PartitionError> {
+    let data = entry.payload.clone();
+
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    let command =
+        PartitionCommand::decode(&data).ok_or_else(|| PartitionError::OffsetOutOfRange {
+            offset: Offset::new(0),
+            first: Offset::new(0),
+            last: Offset::new(0),
+        })?;
+
+    match command {
+        PartitionCommand::Append { records, .. } => {
+            cache.append(records)?;
+        }
+        PartitionCommand::AppendBlob {
+            record_count,
+            base_offset,
+            ..
+        } => {
+            cache.advance_blob_offset(base_offset, record_count)?;
+            blob_index.push(base_offset.get(), entry.index(), record_count);
+        }
+        PartitionCommand::AppendBlobBatch {
+            blobs, base_offset, ..
+        } => {
+            let mut current_offset = base_offset;
+            for batched in &blobs {
+                cache.advance_blob_offset(current_offset, batched.record_count)?;
+                blob_index.push(
+                    current_offset.get(),
+                    entry.index(),
+                    batched.record_count,
+                );
+                current_offset =
+                    Offset::new(current_offset.get() + u64::from(batched.record_count));
+            }
+        }
+        PartitionCommand::Truncate { from_offset } => {
+            cache.truncate(from_offset)?;
+        }
+        PartitionCommand::UpdateHighWatermark { high_watermark } => {
+            cache.set_high_watermark(high_watermark);
+        }
+    }
+
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// PartitionRecoveryState
+// -----------------------------------------------------------------------------
+
+/// Pre-built partition state for two-pass streaming WAL recovery.
+///
+/// Built incrementally by calling [`PartitionRecoveryState::apply_entry`]
+/// for each winning WAL entry in the streaming recovery callback. After all
+/// segments are processed, [`DurablePartition::open_with_recovery_state`]
+/// consumes this to initialize a partition without rescanning any entries.
+///
+/// Holds private types (`Partition`, `BlobIndex`) so must live in this module.
+pub struct PartitionRecoveryState {
+    cache: Partition,
+    blob_index: BlobIndex,
+    /// Number of entries applied (for logging).
+    entry_count: u64,
+    /// WAL index of the first entry (for logging).
+    first_entry_index: u64,
+    /// Raft log index of the last entry.
+    pub last_applied_index: u64,
+    /// WAL auto-counter of the last entry.
+    pub last_applied_wal_index: u64,
+    /// Term of the last entry.
+    pub last_applied_term: u64,
+    /// WAL index of the previous entry (for gap detection).
+    prev_entry_index: u64,
+    /// Number of non-contiguous index gaps detected (for logging).
+    gap_count: u64,
+}
+
+impl Default for PartitionRecoveryState {
+    /// Creates empty recovery state with placeholder partition config.
+    ///
+    /// `topic_id` / `partition_id` in `PartitionConfig` are `#[allow(dead_code)]`
+    /// and never read functionally, so zeros are safe here.
+    fn default() -> Self {
+        Self {
+            cache: Partition::new(PartitionConfig::new(
+                helix_core::TopicId::new(0),
+                helix_core::PartitionId::new(0),
+            )),
+            blob_index: BlobIndex::new(),
+            entry_count: 0,
+            first_entry_index: 0,
+            last_applied_index: 0,
+            last_applied_wal_index: 0,
+            last_applied_term: 0,
+            prev_entry_index: 0,
+            gap_count: 0,
+        }
+    }
+}
+
+impl PartitionRecoveryState {
+    /// Applies a single WAL entry to the recovery state.
+    ///
+    /// Called in the streaming recovery callback for each winning entry.
+    /// Never stores the entry itself: only updates the pre-built cache,
+    /// `BlobIndex`, and metadata fields. Peak memory stays `O(one_segment)`.
+    pub fn apply_entry(&mut self, entry: &SharedEntry) {
+        if let Err(e) =
+            apply_shared_entry_to_cache(&mut self.cache, &mut self.blob_index, entry)
+        {
+            warn!(
+                index = entry.index(),
+                error = %e,
+                "Failed to apply entry to recovery state during streaming recovery"
+            );
+        }
+        if self.entry_count == 0 {
+            self.first_entry_index = entry.index();
+        } else if entry.index() != self.prev_entry_index + 1 {
+            self.gap_count += 1;
+        }
+        self.prev_entry_index = entry.index();
+        self.last_applied_term = entry.term();
+        self.last_applied_index = entry.raft_index();
+        self.last_applied_wal_index = entry.index();
+        self.entry_count += 1;
     }
 }
 
@@ -1973,7 +2122,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
 
         for (i, entry) in recovered_entries.iter().enumerate() {
             if let Err(e) =
-                Self::apply_shared_entry_to_cache(&mut cache, &mut blob_index, entry)
+                apply_shared_entry_to_cache(&mut cache, &mut blob_index, entry)
             {
                 warn!(
                     index = entry.index(),
@@ -2072,6 +2221,86 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             last_applied_index,
             last_applied_wal_index,
             last_applied_term,
+            tiering,
+            tiered_segments: std::collections::HashSet::new(),
+            progress,
+        })
+    }
+
+    /// Opens a durable partition from pre-built streaming recovery state.
+    ///
+    /// Unlike [`open_with_shared_wal`](Self::open_with_shared_wal) which
+    /// iterates over a `Vec<SharedEntry>` accumulated in memory, this method
+    /// accepts state already built incrementally by the streaming recovery
+    /// callback — achieving O(one-segment-at-a-time) peak memory.
+    ///
+    /// # Errors
+    /// Returns an error if tiering or progress initialization fails.
+    #[allow(clippy::needless_pass_by_value)] // Consumes state for clean ownership.
+    pub fn open_with_recovery_state(
+        config: DurablePartitionConfig,
+        wal_handle: SharedWalHandle<S>,
+        state: PartitionRecoveryState,
+    ) -> Result<Self, DurablePartitionError> {
+        info!(
+            topic = config.topic_id.get(),
+            partition = config.partition_id.get(),
+            entries = state.entry_count,
+            "Opening durable partition with pre-built recovery state"
+        );
+
+        let mut cache = state.cache;
+
+        // Set high watermark from recovered state.
+        let recovered_hwm = cache.blob_log_end_offset();
+        cache.set_high_watermark(recovered_hwm);
+
+        info!(
+            entries = state.entry_count,
+            first_index = state.first_entry_index,
+            last_index = state.last_applied_index,
+            gap_count = state.gap_count,
+            recovered_hwm = %recovered_hwm,
+            "Recovery complete (streaming)"
+        );
+
+        let wal = WalBackend::Shared(wal_handle.clone());
+
+        let tiering = config.tiering.as_ref().map(|tiering_config| {
+            let segment_reader = WalSegmentReader::new_shared(wal_handle.clone());
+            let metadata_store = InMemoryMetadataStore::new();
+            let object_storage = SimulatedObjectStorage::new(42);
+            info!(
+                min_age_secs = tiering_config.min_age_secs,
+                max_concurrent = tiering_config.max_concurrent_uploads,
+                "Tiering enabled with shared WAL (simulated storage)"
+            );
+            TieringBackend::Simulated(IntegratedTieringManager::new(
+                object_storage,
+                metadata_store,
+                segment_reader,
+                tiering_config.clone(),
+            ))
+        });
+
+        let progress = config.progress.as_ref().map(|progress_config| {
+            let store = SimulatedProgressStore::new(42);
+            info!(
+                max_lease_duration_us = progress_config.max_lease_duration_us,
+                max_consumers = progress_config.max_consumers_per_group,
+                "Progress tracking enabled"
+            );
+            ProgressManager::new(store, progress_config.clone())
+        });
+
+        Ok(Self {
+            config,
+            wal,
+            cache,
+            blob_index: state.blob_index,
+            last_applied_index: state.last_applied_index,
+            last_applied_wal_index: state.last_applied_wal_index,
+            last_applied_term: state.last_applied_term,
             tiering,
             tiered_segments: std::collections::HashSet::new(),
             progress,
@@ -2637,35 +2866,42 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         Ok(result)
     }
 
-    /// Reads a single WAL entry by Raft index.
+    /// Reads a single WAL entry by WAL auto-counter (dedicated WAL) or by WAL
+    /// auto-counter (shared WAL).
     ///
-    /// Only supported for dedicated WAL (O(1) read by index). Returns `None`
-    /// for shared WAL (which doesn't support index-based lookup).
+    /// For dedicated WAL the WAL auto-counter equals the Raft log index.
+    /// For shared WAL the WAL auto-counter is a per-group sequential value
+    /// stored in `BlobIndex::wal_index`; it differs from the Raft log index.
+    ///
+    /// Use `read_wal_entry_by_raft_index` when you have a Raft log index and
+    /// need to look up an entry (e.g. for `prev_log_term` in catch-up).
     ///
     /// # Errors
     ///
     /// Returns an error if the WAL read fails.
     pub async fn read_wal_entry(
         &self,
-        raft_index: u64,
+        index: u64,
     ) -> Result<Option<Entry>, DurablePartitionError> {
         match &self.wal {
             WalBackend::Dedicated(wal) => {
-                let entry = wal.read(raft_index).await.map_err(|e| {
+                let entry = wal.read(index).await.map_err(|e| {
                     DurablePartitionError::WalRead {
-                        message: format!("failed to read index {raft_index}: {e}"),
+                        message: format!("failed to read index {index}: {e}"),
                     }
                 })?;
                 Ok(Some(entry))
             }
             WalBackend::Shared(handle) => {
-                let shared = handle.read_entry(raft_index).await;
+                // For shared WAL, `index` is the WAL auto-counter stored in
+                // BlobIndex. Use read_entry (auto-counter lookup) here.
+                let shared = handle.read_entry(index).await;
                 Ok(shared.map(|se| Entry {
                     header: EntryHeader {
                         crc: se.header.crc,
                         length: se.header.length,
                         term: se.header.term,
-                        index: se.header.index,
+                        index: se.header.raft_index,
                     },
                     payload: se.payload,
                 }))
@@ -2673,12 +2909,51 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         }
     }
 
-    /// Reads WAL entries sequentially from `start_index` up to `max_bytes`.
+    /// Reads a single WAL entry by Raft log index.
+    ///
+    /// For dedicated WAL this is identical to `read_wal_entry` (`raft_index` ==
+    /// WAL auto-counter). For shared WAL it searches by the `raft_index` field
+    /// stored in the entry header, which differs from the WAL auto-counter.
+    ///
+    /// Use this when you have a Raft log index (e.g. `prev_log_index` in
+    /// catch-up) and need to find the matching WAL entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL read fails.
+    pub async fn read_wal_entry_by_raft_index(
+        &self,
+        raft_index: u64,
+    ) -> Result<Option<Entry>, DurablePartitionError> {
+        match &self.wal {
+            WalBackend::Dedicated(wal) => {
+                // For dedicated WAL raft_index == WAL auto-counter.
+                let entry = wal.read(raft_index).await.map_err(|e| {
+                    DurablePartitionError::WalRead {
+                        message: format!("failed to read raft_index {raft_index}: {e}"),
+                    }
+                })?;
+                Ok(Some(entry))
+            }
+            WalBackend::Shared(handle) => {
+                let shared = handle.read_entry_by_raft_index(raft_index).await;
+                Ok(shared.map(|se| Entry {
+                    header: EntryHeader {
+                        crc: se.header.crc,
+                        length: se.header.length,
+                        term: se.header.term,
+                        index: se.header.raft_index,
+                    },
+                    payload: se.payload,
+                }))
+            }
+        }
+    }
+
+    /// Reads WAL entries by Raft index from `start_index` up to `max_bytes`.
     ///
     /// Reads from `start_index` to `last_applied_index`, bounded by total
     /// byte size. Always includes at least one entry if any exist in range.
-    ///
-    /// Only supported for dedicated WAL. Returns empty vec for shared WAL.
     ///
     /// # Errors
     ///
@@ -2720,8 +2995,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                 Ok(entries)
             }
             WalBackend::Shared(handle) => {
+                // SharedWal entries are keyed by WAL auto-counter, not raft_index.
+                // Use read_entries_by_raft_index to search by the raft_index field,
+                // and map raft_index → Entry.index so callers get Raft log indices.
                 let shared_entries = handle
-                    .read_entries_range(
+                    .read_entries_by_raft_index(
                         start_index,
                         self.last_applied_index,
                         max_bytes,
@@ -2734,7 +3012,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                             crc: se.header.crc,
                             length: se.header.length,
                             term: se.header.term,
-                            index: se.header.index,
+                            index: se.header.raft_index,
                         },
                         payload: se.payload,
                     })
@@ -2767,6 +3045,39 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                 // Shared WAL auto-syncs via background flush.
                 Ok(())
             }
+        }
+    }
+
+    /// Returns the compact state of the WAL: `(index, term)` of the last
+    /// applied entry.
+    ///
+    /// For dedicated WAL, this is the last entry deleted by retention.
+    /// For shared WAL, this is `(last_applied_index, last_applied_term)` —
+    /// the effective snapshot point used to fast-forward stuck followers
+    /// when their needed entries have been deleted by retention.
+    pub async fn wal_compact_state(&self) -> Option<(u64, u64)> {
+        match &self.wal {
+            WalBackend::Dedicated(wal) => wal.compact_state().await,
+            WalBackend::Shared(_) => {
+                if self.last_applied_index > 0 {
+                    Some((self.last_applied_index, self.last_applied_term))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Returns the WAL floor index (first available index).
+    ///
+    /// Returns `None` if there are no WAL segments (in-memory or empty).
+    pub async fn wal_floor(&self) -> Option<u64> {
+        match &self.wal {
+            WalBackend::Dedicated(wal) => {
+                let floor = wal.first_index().await;
+                if floor == 0 { None } else { Some(floor) }
+            }
+            WalBackend::Shared(_) => None,
         }
     }
 
@@ -2826,67 +3137,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                     num_blobs = blobs.len(),
                     "WAL_RECOVERY_BATCH: using idempotent append at offset"
                 );
-                let mut current_offset = base_offset;
-                for batched in &blobs {
-                    cache.advance_blob_offset(current_offset, batched.record_count)?;
-                    blob_index.push(
-                        current_offset.get(),
-                        entry.index(),
-                        batched.record_count,
-                    );
-                    current_offset =
-                        Offset::new(current_offset.get() + u64::from(batched.record_count));
-                }
-            }
-            PartitionCommand::Truncate { from_offset } => {
-                cache.truncate(from_offset)?;
-            }
-            PartitionCommand::UpdateHighWatermark { high_watermark } => {
-                cache.set_high_watermark(high_watermark);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Applies a `SharedEntry` from shared WAL to the cache during recovery.
-    ///
-    /// `SharedEntry` payloads contain serialized `PartitionCommand` data.
-    /// For blob operations, only advances offset tracking and records the
-    /// WAL index in the `BlobIndex`.
-    fn apply_shared_entry_to_cache(
-        cache: &mut Partition,
-        blob_index: &mut BlobIndex,
-        entry: &SharedEntry,
-    ) -> Result<(), PartitionError> {
-        let data = entry.payload.clone();
-
-        if data.is_empty() {
-            return Ok(());
-        }
-
-        let command =
-            PartitionCommand::decode(&data).ok_or_else(|| PartitionError::OffsetOutOfRange {
-                offset: Offset::new(0),
-                first: Offset::new(0),
-                last: Offset::new(0),
-            })?;
-
-        match command {
-            PartitionCommand::Append { records, .. } => {
-                cache.append(records)?;
-            }
-            PartitionCommand::AppendBlob {
-                record_count,
-                base_offset,
-                ..
-            } => {
-                cache.advance_blob_offset(base_offset, record_count)?;
-                blob_index.push(base_offset.get(), entry.index(), record_count);
-            }
-            PartitionCommand::AppendBlobBatch {
-                blobs, base_offset, ..
-            } => {
                 let mut current_offset = base_offset;
                 for batched in &blobs {
                     cache.advance_blob_offset(current_offset, batched.record_count)?;

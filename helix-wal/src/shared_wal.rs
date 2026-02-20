@@ -126,10 +126,28 @@ pub struct SharedWal<S: Storage> {
     group_index: HashMap<GroupId, BTreeMap<u64, SharedEntry>>,
     /// Lightweight index for evicted entries.
     ///
-    /// Maps `(group_id, raft_index) → segment_id`. Used to locate entries
-    /// on disk after their `SharedEntry` has been evicted from `group_index`.
-    /// Each entry costs ~16 bytes (vs ~56 bytes for the full `SharedEntry`).
-    evicted_index: HashMap<GroupId, BTreeMap<u64, crate::SegmentId>>,
+    /// Maps `group_id → (wal_counter → (segment_id, raft_index))`. Used to
+    /// locate entries on disk after their `SharedEntry` has been evicted from
+    /// `group_index`. The stored `raft_index` enables the retention check to
+    /// compare against Raft match indices without loading entries from disk.
+    /// Each entry costs ~24 bytes (vs ~56 bytes for the full `SharedEntry`).
+    evicted_index: HashMap<GroupId, BTreeMap<u64, (crate::SegmentId, u64)>>,
+}
+
+/// Per-group recovery metadata returned by [`SharedWal::recover_streaming`].
+///
+/// Contains the minimum state needed to initialize a Raft node after recovery:
+/// the last WAL index (auto-counter), the Raft index of that entry (for
+/// `compacted_index`), and its term. Payloads are never stored here.
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(clippy::struct_field_names)]
+pub struct GroupRecoveryState {
+    /// WAL auto-counter index of the last entry for this group.
+    pub last_wal_index: u64,
+    /// Raft term of the last entry.
+    pub last_term: u64,
+    /// Raft log index of the last entry (used as `compacted_index`).
+    pub last_raft_index: u64,
 }
 
 /// Per-group state for assertion checking.
@@ -188,8 +206,13 @@ impl<S: Storage> SharedWal<S> {
     /// # Panics
     ///
     /// Panics if `TigerStyle` assertions fail:
-    /// - Group-local indices must be sequential (1, 2, 3...)
-    /// - Term must be monotonically non-decreasing per group
+    /// - Group-local indices must be strictly increasing per group
+    ///
+    /// Note: Raft term is NOT required to be monotonically non-decreasing.
+    /// A new leader may commit `PREVIOUS_TERM` entries (entries proposed by
+    /// old leaders that were never committed), which can have lower terms than
+    /// the last committed entry. The data WAL stores committed entry data in
+    /// Raft index order, so only the auto-counter index is required to increase.
     ///
     /// # Errors
     /// Returns an error if the append fails.
@@ -211,13 +234,9 @@ impl<S: Storage> SharedWal<S> {
                 state.last_index,
                 index
             );
-            assert!(
-                term >= state.last_term,
-                "group {} term must be non-decreasing: last {}, got {}",
-                group_id,
-                state.last_term,
-                term
-            );
+            // Note: term is NOT asserted monotone here. A new Raft leader may
+            // commit PREVIOUS_TERM entries with lower terms than the last
+            // committed entry. See SharedWal doc comment for details.
         } else {
             // First entry for this group - index should be 1 or explicitly set.
             // We allow any starting index to support recovery scenarios.
@@ -250,8 +269,10 @@ impl<S: Storage> SharedWal<S> {
     /// all entries are written in a single syscall.
     ///
     /// Each entry must satisfy the same `TigerStyle` invariants as `append`:
-    /// - Per-group indices must be sequential
-    /// - Terms must be monotonically non-decreasing per group
+    /// - Per-group indices must be strictly increasing (auto-counter order)
+    ///
+    /// Raft term is NOT required to be monotonically non-decreasing. See
+    /// `append` for details on why `PREVIOUS_TERM` commits allow lower terms.
     ///
     /// # Errors
     ///
@@ -279,13 +300,7 @@ impl<S: Storage> SharedWal<S> {
                     state.last_index,
                     index
                 );
-                assert!(
-                    term >= state.last_term,
-                    "group {} term must be non-decreasing: last {}, got {}",
-                    group_id,
-                    state.last_term,
-                    term
-                );
+                // Note: term is NOT asserted monotone here. See append() doc.
             }
 
             // Update group state for subsequent entries in this batch.
@@ -390,12 +405,23 @@ impl<S: Storage> SharedWal<S> {
         self.group_truncated_after
             .insert(group_id, after_index);
 
-        // Update group state so next append expects after_index + 1.
-        // We preserve the term from the entry at after_index (or allow any term for new entries).
+        // Look up the term at the truncation point before mutating group_state.
+        // After truncation the leader may send entries at a term lower than the
+        // stale entries that were just removed, so last_term must be reset.
+        let term_at_truncation = self
+            .group_index
+            .get(&group_id)
+            .and_then(|btree| btree.get(&after_index))
+            .map_or(0, SharedEntry::term);
+
+        // Update group state so next append expects after_index + 1 and the
+        // term monotonicity check uses the term at the truncation point.
         if let Some(state) = self.group_state.get_mut(&group_id) {
             state.last_index = after_index;
-            // Note: We don't reset last_term because the new leader may use a higher term.
-            // The term monotonicity check will still work correctly.
+            // Reset last_term to the term at the truncation point. Keeping the
+            // stale (higher) last_term would cause append_batch to panic when the
+            // leader sends log entries at a lower term to replace the truncated ones.
+            state.last_term = term_at_truncation;
         }
 
         // Update durable index if it was beyond the truncation point.
@@ -517,6 +543,134 @@ impl<S: Storage> SharedWal<S> {
         Ok(by_group)
     }
 
+    /// Recovers state from the WAL using two-pass streaming to minimize peak memory.
+    ///
+    /// Unlike [`recover`](Self::recover) which accumulates all entries in memory,
+    /// this method processes one sealed segment at a time and calls `apply_fn`
+    /// for each winning entry without retaining any entry after the call returns.
+    ///
+    /// # Algorithm
+    ///
+    /// **Pass 1** (header-only, newest→oldest): Reads each segment file scanning
+    /// only 40-byte entry headers. Builds a `winner` map: for each
+    /// `(group_id, entry_index)` pair, records which segment is the latest write.
+    /// Memory cost: `O(N_unique_entries` × ~32 bytes).
+    ///
+    /// **Pass 2** (streaming, oldest→newest): Loads one segment at a time,
+    /// calls `apply_fn` only for winning entries, records them in `evicted_index`,
+    /// then drops the segment. Memory cost: `O(one_segment_at_a_time)`.
+    ///
+    /// After recovery, `group_index` contains only active-segment entries.
+    /// Historical entries are in `evicted_index`; reads fall back to disk via
+    /// [`read_entries_range_or_load`](Self::read_entries_range_or_load).
+    ///
+    /// # Errors
+    /// Returns an error if any segment file cannot be read or decoded.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a segment header cannot be parsed during the scan pass,
+    /// or if entry bytes are malformed (indicates storage corruption).
+    pub async fn recover_streaming<F>(
+        &mut self,
+        apply_fn: &mut F,
+    ) -> WalResult<HashMap<GroupId, GroupRecoveryState>>
+    where
+        F: FnMut(GroupId, &SharedEntry),
+    {
+        let sealed_ids = self.wal.sealed_segment_ids();
+
+        // Pass 1: Header-only scan, newest-to-oldest.
+        // winner[(group_id, entry_index)] = segment_id of the most recent write.
+        let mut winner: HashMap<(GroupId, u64), crate::SegmentId> = HashMap::new();
+        for &segment_id in sealed_ids.iter().rev() {
+            self.wal
+                .scan_sealed_segment_entry_headers(segment_id, |header_bytes| {
+                    // SharedEntry header layout (40 bytes total):
+                    // [crc:4][length:4][group_id:8][term:8][index:8][raft_index:8]
+                    debug_assert!(
+                        header_bytes.len()
+                            >= crate::shared_entry::SHARED_ENTRY_HEADER_SIZE
+                    );
+                    let group_id_raw = u64::from_le_bytes(
+                        header_bytes[8..16].try_into().expect("8 bytes"),
+                    );
+                    let index = u64::from_le_bytes(
+                        header_bytes[24..32].try_into().expect("8 bytes"),
+                    );
+                    let group_id = GroupId::new(group_id_raw);
+                    // First occurrence = newest segment (processing newest first).
+                    winner.entry((group_id, index)).or_insert(segment_id);
+                })
+                .await?;
+        }
+
+        // Pass 2: Stream segments oldest-to-newest, applying only winners.
+        let mut group_states: HashMap<GroupId, GroupRecoveryState> = HashMap::new();
+        for &segment_id in &sealed_ids {
+            let segment = self.wal.load_sealed_segment_for_recovery(segment_id).await?;
+            for entry in segment.entries() {
+                let key = (entry.group_id(), entry.index());
+                if winner.get(&key) != Some(&segment_id) {
+                    continue; // A later segment supersedes this entry.
+                }
+                // Winning entry: apply via callback (no clone stored).
+                apply_fn(entry.group_id(), entry);
+
+                // Record in evicted_index so reads fall back to disk.
+                // Store raft_index alongside segment_id for retention checks.
+                self.evicted_index
+                    .entry(entry.group_id())
+                    .or_default()
+                    .insert(entry.index(), (segment_id, entry.raft_index()));
+
+                // Track per-group recovery metadata.
+                let state = group_states.entry(entry.group_id()).or_default();
+                if entry.index() >= state.last_wal_index {
+                    state.last_wal_index = entry.index();
+                    state.last_term = entry.term();
+                    state.last_raft_index = entry.raft_index();
+                }
+            }
+            // segment is dropped here: payload Bytes lose their Arc ref
+            // to the loaded buffer, freeing the segment's raw data.
+        }
+
+        // Active segment: entries are already in memory; add to group_index.
+        for entry in self.wal.active_entries() {
+            apply_fn(entry.group_id(), entry);
+
+            self.group_index
+                .entry(entry.group_id())
+                .or_default()
+                .insert(entry.index(), entry.clone());
+
+            let state = group_states.entry(entry.group_id()).or_default();
+            if entry.index() >= state.last_wal_index {
+                state.last_wal_index = entry.index();
+                state.last_term = entry.term();
+                state.last_raft_index = entry.raft_index();
+            }
+        }
+
+        // Update group_state and group_durable from recovered metadata.
+        for (group_id, state) in &group_states {
+            self.group_state.insert(
+                *group_id,
+                GroupState {
+                    last_index: state.last_wal_index,
+                    last_term: state.last_term,
+                },
+            );
+            self.group_durable.insert(*group_id, state.last_wal_index);
+        }
+
+        // Clear truncation tracking — recovery represents the consistent state.
+        self.group_truncated_after.clear();
+
+        Ok(group_states)
+    }
+
     /// Returns entries for a specific group.
     ///
     /// Uses the per-group `BTreeMap` index, which returns entries in sorted
@@ -632,27 +786,29 @@ impl<S: Storage> SharedWal<S> {
     /// Returns `true` if the segment was evicted.
     pub fn evict_sealed_segment(&mut self, segment_id: crate::SegmentId) -> bool {
         // Step 1: Read entries from the WAL segment before eviction.
-        // This gives us the (group_id, index) pairs to build evicted_index.
-        let entry_mappings: Vec<(GroupId, u64)> =
+        // Collect (group_id, wal_counter, raft_index) for evicted_index.
+        let entry_mappings: Vec<(GroupId, u64, u64)> =
             if let Some(entries) = self.wal.sealed_segment_entries(segment_id) {
                 entries
-                    .map(|e| (e.group_id(), e.index()))
+                    .map(|e| (e.group_id(), e.index(), e.raft_index()))
                     .collect()
             } else {
                 return false; // Segment not found or already evicted.
             };
 
         // Step 2: Move entries from group_index to evicted_index.
-        for &(group_id, index) in &entry_mappings {
+        // Store raft_index alongside segment_id so the retention safety check
+        // can compare against Raft match indices without a disk read.
+        for &(group_id, index, raft_index) in &entry_mappings {
             // Remove from group_index.
             if let Some(btree) = self.group_index.get_mut(&group_id) {
                 btree.remove(&index);
             }
-            // Add to evicted_index.
+            // Add to evicted_index with (segment_id, raft_index).
             self.evicted_index
                 .entry(group_id)
                 .or_default()
-                .insert(index, segment_id);
+                .insert(index, (segment_id, raft_index));
         }
 
         // Step 3: Evict the underlying WAL segment.
@@ -685,59 +841,68 @@ impl<S: Storage> SharedWal<S> {
         self.wal.sealed_segment_infos()
     }
 
-    /// Returns `(group_id, max_index)` for all groups with entries in a segment.
+    /// Returns `(group_id, max_raft_index, max_wal_counter)` for all groups
+    /// with entries in a segment.
     ///
-    /// Scans both `group_index` (in-memory) and `evicted_index` to find
-    /// which groups have entries in the given segment and their maximum
-    /// group-level index. Used by the retention system to verify replication
-    /// safety before segment deletion.
+    /// Scans both `group_index` (in-memory) and `evicted_index` to find which
+    /// groups have entries in the given segment and their maximum indices.
+    ///
+    /// - `max_raft_index`: used by the retention system to verify all entries
+    ///   have been replicated (compare against Raft `match_index`).
+    /// - `max_wal_counter`: used to advance `BlobIndex` floor after deletion.
+    ///
+    /// Using `max_raft_index` for the replication check is essential because
+    /// WAL auto-counters and Raft log indices are different index spaces.
+    /// Comparing WAL counter against Raft `match_index` can allow premature
+    /// segment deletion when Raft no-ops advance `raft_index` beyond the WAL
+    /// counter, making it appear safe to delete segments that followers still
+    /// need for catch-up.
     #[must_use]
     pub fn groups_in_segment(
         &self,
         segment_id: crate::SegmentId,
-    ) -> Vec<(GroupId, u64)> {
-        let mut group_max: HashMap<GroupId, u64> = HashMap::new();
+    ) -> Vec<(GroupId, u64, u64)> {
+        // Track (max_raft_index, max_wal_counter) per group.
+        let mut group_max: HashMap<GroupId, (u64, u64)> = HashMap::new();
 
-        // Check in-memory group_index entries.
-        // We need to find entries whose WAL-level index falls within
-        // this segment's range.
-        if let Some(info) = self.wal.segment_info(segment_id) {
-            let seg_first = info.first_index;
-            let seg_last = info.last_index.unwrap_or(seg_first);
-
-            // Scan all groups for entries whose WAL index is in range.
-            // SharedEntry stores group-local indices, but the WAL assigns
-            // global indices — we use the entries directly from the WAL segment.
-            if let Some(entries) = self.wal.sealed_segment_entries(segment_id) {
-                for entry in entries {
-                    let gid = entry.group_id();
-                    let idx = entry.index();
-                    let cur = group_max.entry(gid).or_insert(0);
-                    if idx > *cur {
-                        *cur = idx;
-                    }
-                }
-            }
-
-            // Check evicted_index for entries that reference this segment.
-            for (gid, btree) in &self.evicted_index {
-                for (&idx, &sid) in btree {
-                    if sid == segment_id {
-                        let cur = group_max.entry(*gid).or_insert(0);
-                        if idx > *cur {
-                            *cur = idx;
-                        }
-                    }
-                }
-            }
-
-            // If we found entries from the WAL segment but not from
-            // in-memory/evicted indices (possible edge case), fall back
-            // to segment range info.
-            let _ = (seg_first, seg_last);
+        if self.wal.segment_info(segment_id).is_none() {
+            return Vec::new();
         }
 
-        group_max.into_iter().collect()
+        // In-memory path: entries still resident in sealed_segments.
+        // Use the actual raft_index() for the replication safety check.
+        if let Some(entries) = self.wal.sealed_segment_entries(segment_id) {
+            for entry in entries {
+                let gid = entry.group_id();
+                let wal_counter = entry.index();
+                let raft_index = entry.raft_index();
+                let cur = group_max.entry(gid).or_insert((0, 0));
+                if wal_counter > cur.1 {
+                    cur.0 = raft_index;
+                    cur.1 = wal_counter;
+                }
+            }
+        }
+
+        // Evicted path: entries moved to evicted_index after memory eviction.
+        // Stored raft_index avoids a disk read just for the replication check.
+        for (gid, btree) in &self.evicted_index {
+            for (&wal_counter, &(sid, raft_index)) in btree {
+                if sid != segment_id {
+                    continue;
+                }
+                let cur = group_max.entry(*gid).or_insert((0, 0));
+                if wal_counter > cur.1 {
+                    cur.0 = raft_index;
+                    cur.1 = wal_counter;
+                }
+            }
+        }
+
+        group_max
+            .into_iter()
+            .map(|(gid, (max_raft, max_wal))| (gid, max_raft, max_wal))
+            .collect()
     }
 
     /// Deletes a sealed segment from memory and disk.
@@ -754,7 +919,7 @@ impl<S: Storage> SharedWal<S> {
     ) -> WalResult<()> {
         // Clean up evicted_index entries referencing this segment.
         for btree in self.evicted_index.values_mut() {
-            btree.retain(|_, sid| *sid != segment_id);
+            btree.retain(|_, (sid, _raft_idx)| *sid != segment_id);
         }
         // Remove empty group entries.
         self.evicted_index.retain(|_, btree| !btree.is_empty());
@@ -815,7 +980,7 @@ impl<S: Storage> SharedWal<S> {
         // can't use Wal::read_entry_from_disk (which does positional
         // lookup). Instead, decode the segment and scan for the entry
         // matching both group_id and index.
-        if let Some(segment_id) = self
+        if let Some((segment_id, _raft_index)) = self
             .evicted_index
             .get(&group_id)
             .and_then(|btree| btree.get(&index).copied())
@@ -862,6 +1027,104 @@ impl<S: Storage> SharedWal<S> {
                 result.push(entry);
             }
             // Skip missing entries (gaps from NOOP skipping).
+        }
+
+        Ok(result)
+    }
+
+    /// Reads entries for a group with `raft_index` in the given range.
+    ///
+    /// Unlike `read_entries_range` which iterates by WAL auto-counter, this
+    /// filters entries by their `raft_index` field. Entries within a group are
+    /// stored in WAL-counter order, which also reflects `raft_index` order, so
+    /// the scan terminates early once `raft_index > end_raft_index`.
+    ///
+    /// Only checks in-memory entries. For evicted-segment fallback, use
+    /// `read_entries_by_raft_index_or_load`.
+    #[must_use]
+    pub fn read_entries_by_raft_index(
+        &self,
+        group_id: GroupId,
+        start_raft_index: u64,
+        end_raft_index: u64,
+        max_bytes: u64,
+    ) -> Vec<SharedEntry> {
+        let Some(btree) = self.group_index.get(&group_id) else {
+            return Vec::new();
+        };
+        let mut result = Vec::new();
+        let mut total_bytes = 0u64;
+        // Entries are in WAL-counter order. Since entries for a group are
+        // always appended in raft_index order, raft_indices are also
+        // monotonically increasing. Skip entries below start and stop at
+        // the first entry above end.
+        for entry in btree.values() {
+            let ri = entry.raft_index();
+            if ri < start_raft_index {
+                continue;
+            }
+            if ri > end_raft_index {
+                break;
+            }
+            let entry_size = entry.payload.len() as u64;
+            // Always include at least one entry.
+            if !result.is_empty() && total_bytes + entry_size > max_bytes {
+                break;
+            }
+            total_bytes += entry_size;
+            result.push(entry.clone());
+        }
+        result
+    }
+
+    /// Reads entries by `raft_index` range, falling back to disk for evicted
+    /// segments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a disk read fails.
+    pub async fn read_entries_by_raft_index_or_load(
+        &mut self,
+        group_id: GroupId,
+        start_raft_index: u64,
+        end_raft_index: u64,
+        max_bytes: u64,
+    ) -> WalResult<Vec<SharedEntry>> {
+        let mut result = Vec::new();
+        let mut total_bytes = 0u64;
+
+        // Collect (wal_counter, raft_index) for this group in WAL-counter order,
+        // which also reflects raft_index order. Stored raft_index avoids loading
+        // entries from disk just to filter by raft_index range.
+        let evicted: Vec<(u64, u64)> = self
+            .evicted_index
+            .get(&group_id)
+            .map(|btree| {
+                btree
+                    .iter()
+                    .map(|(&wc, &(_, ri))| (wc, ri))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for (wal_counter, raft_index) in evicted {
+            if raft_index < start_raft_index {
+                continue;
+            }
+            if raft_index > end_raft_index {
+                // Entries are in raft_index order; no more in range.
+                break;
+            }
+            let Some(entry) = self.read_or_load(group_id, wal_counter).await? else {
+                continue;
+            };
+            let entry_size = entry.payload.len() as u64;
+            // Always include at least one entry.
+            if !result.is_empty() && total_bytes + entry_size > max_bytes {
+                break;
+            }
+            total_bytes += entry_size;
+            result.push(entry);
         }
 
         Ok(result)
@@ -1285,6 +1548,107 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
         }
     }
 
+    /// Reads a single entry for this partition by Raft log index.
+    ///
+    /// Unlike `read_entry` which looks up by WAL auto-counter, this searches
+    /// by the `raft_index` field stored in each entry header.
+    ///
+    /// Falls back to disk reads for evicted segments.
+    pub async fn read_entry_by_raft_index(&self, raft_index: u64) -> Option<SharedEntry> {
+        let mut wal = self.inner.wal.lock().await;
+        // Fast path: scan in-memory entries for this group.
+        let entry = wal
+            .group_index
+            .get(&self.group_id)
+            .and_then(|btree| btree.values().find(|e| e.raft_index() == raft_index))
+            .cloned();
+        if entry.is_some() {
+            return entry;
+        }
+        // In-memory miss — scan evicted WAL counters in order, using stored
+        // raft_index to skip and early-terminate without disk reads.
+        let evicted: Vec<(u64, u64)> = wal
+            .evicted_index
+            .get(&self.group_id)
+            .map(|btree| {
+                btree
+                    .iter()
+                    .map(|(&wc, &(_, ri))| (wc, ri))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (wal_counter, stored_raft_index) in evicted {
+            if stored_raft_index < raft_index {
+                continue;
+            }
+            if stored_raft_index > raft_index {
+                break; // Past target; entry not present.
+            }
+            // stored_raft_index == raft_index: load from disk.
+            match wal.read_or_load(self.group_id, wal_counter).await {
+                Ok(Some(e)) => return Some(e),
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(
+                        group_id = %self.group_id,
+                        raft_index,
+                        error = %err,
+                        "Failed to read entry by raft_index from disk"
+                    );
+                    break;
+                }
+            }
+        }
+        None
+    }
+
+    /// Reads entries for this partition with `raft_index` in the given range.
+    ///
+    /// Unlike `read_entries_range` which iterates by WAL auto-counter, this
+    /// returns entries whose `raft_index` falls within `[start_raft_index,
+    /// end_raft_index]`. Always includes at least one entry if any exist.
+    ///
+    /// Falls back to disk reads for evicted segments.
+    pub async fn read_entries_by_raft_index(
+        &self,
+        start_raft_index: u64,
+        end_raft_index: u64,
+        max_bytes: u64,
+    ) -> Vec<SharedEntry> {
+        let mut wal = self.inner.wal.lock().await;
+        let result = wal.read_entries_by_raft_index(
+            self.group_id,
+            start_raft_index,
+            end_raft_index,
+            max_bytes,
+        );
+        if !result.is_empty() {
+            return result;
+        }
+        // In-memory returned nothing — try disk fallback.
+        match wal
+            .read_entries_by_raft_index_or_load(
+                self.group_id,
+                start_raft_index,
+                end_raft_index,
+                max_bytes,
+            )
+            .await
+        {
+            Ok(entries) => entries,
+            Err(e) => {
+                warn!(
+                    group_id = %self.group_id,
+                    start_raft_index,
+                    end_raft_index,
+                    error = %e,
+                    "Failed to read entries by raft_index from disk"
+                );
+                Vec::new()
+            }
+        }
+    }
+
     /// Returns the group ID for this handle.
     #[must_use]
     pub const fn group_id(&self) -> GroupId {
@@ -1568,6 +1932,37 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
         Ok(result)
     }
 
+    /// Recovers entries using streaming to bound peak memory usage.
+    ///
+    /// Calls `apply_fn` for each winning entry (last-write-wins across segments)
+    /// without accumulating entries in memory. See [`SharedWal::recover_streaming`]
+    /// for the full algorithm description.
+    ///
+    /// # Errors
+    /// Returns an error if recovery fails.
+    pub async fn recover_streaming<F>(
+        &self,
+        apply_fn: &mut F,
+    ) -> WalResult<HashMap<GroupId, GroupRecoveryState>>
+    where
+        F: FnMut(GroupId, &SharedEntry),
+    {
+        let result = {
+            let mut wal = self.inner.wal.lock().await;
+            wal.recover_streaming(apply_fn).await?
+        };
+
+        // Update group_last_index from recovered state.
+        {
+            let mut last_index = self.inner.group_last_index.write().await;
+            for (group_id, state) in &result {
+                last_index.insert(*group_id, state.last_wal_index);
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Returns the durable index for a specific group.
     ///
     /// Returns `None` if no entries have been synced for this group.
@@ -1652,11 +2047,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
         wal.sealed_segment_infos()
     }
 
-    /// Returns `(group_id, max_index)` for all groups with entries in a segment.
+    /// Returns `(group_id, max_raft_index, max_wal_counter)` for all groups
+    /// with entries in a segment.
     pub async fn groups_in_segment(
         &self,
         segment_id: crate::SegmentId,
-    ) -> Vec<(GroupId, u64)> {
+    ) -> Vec<(GroupId, u64, u64)> {
         let wal = self.inner.wal.lock().await;
         wal.groups_in_segment(segment_id)
     }
@@ -2010,6 +2406,38 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalPool<S> {
         Ok(all_entries)
     }
 
+    /// Recovers state using streaming to bound peak memory.
+    ///
+    /// Calls `apply_fn` for each winning entry across all WALs in the pool.
+    /// Unlike [`recover`](Self::recover), entries are never accumulated in memory:
+    /// each winning entry is delivered to `apply_fn` and then discarded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any WAL fails to recover.
+    pub async fn recover_streaming<F>(
+        &self,
+        apply_fn: &mut F,
+    ) -> WalResult<HashMap<GroupId, GroupRecoveryState>>
+    where
+        F: FnMut(GroupId, &SharedEntry),
+    {
+        let mut all_states: HashMap<GroupId, GroupRecoveryState> = HashMap::new();
+        for coordinator in &self.coordinators {
+            let states = coordinator.recover_streaming(apply_fn).await?;
+            // Merge: keep the state with higher last_wal_index per group.
+            // (Each group is assigned to exactly one WAL, so merging is a no-op
+            // in practice — but we handle it defensively.)
+            for (group_id, state) in states {
+                let entry = all_states.entry(group_id).or_default();
+                if state.last_wal_index > entry.last_wal_index {
+                    *entry = state;
+                }
+            }
+        }
+        Ok(all_states)
+    }
+
     /// Flushes all pending writes across all WALs in the pool.
     ///
     /// This triggers an immediate fsync on each WAL, making all buffered
@@ -2219,9 +2647,13 @@ mod tests {
         wal.append(p1, 1, 3, 0, Bytes::from("p1-3")).await.unwrap();
     }
 
+    /// Verifies that term decreases are accepted (PREVIOUS_TERM commit scenario).
+    ///
+    /// Previously this was a `should_panic` test asserting term monotonicity.
+    /// That assertion was wrong — Raft PREVIOUS_TERM commits legitimately produce
+    /// committed entries with lower terms than previously written entries.
     #[tokio::test]
-    #[should_panic(expected = "term must be non-decreasing")]
-    async fn test_shared_wal_asserts_term_monotonic() {
+    async fn test_shared_wal_allows_lower_term() {
         let temp_dir = tempfile::tempdir().unwrap();
         let config = SharedWalConfig::new(temp_dir.path());
 
@@ -2230,8 +2662,14 @@ mod tests {
         let p1 = GroupId::new(1);
 
         wal.append(p1, 5, 1, 0, Bytes::from("p1-1")).await.unwrap();
-        // Term goes backwards - should panic.
-        wal.append(p1, 3, 2, 0, Bytes::from("p1-2")).await.unwrap();
+        // Term goes backwards (PREVIOUS_TERM commit) - must not panic.
+        wal.append(p1, 3, 2, 0, Bytes::from("p1-2"))
+            .await
+            .expect("lower term must be accepted");
+        // Higher term entry after the lower one works too.
+        wal.append(p1, 6, 3, 0, Bytes::from("p1-3"))
+            .await
+            .expect("higher term after lower must be accepted");
     }
 
     #[tokio::test]
@@ -2363,6 +2801,87 @@ mod tests {
             assert_eq!(entries[3].payload.as_ref(), b"new-4");
             assert_eq!(entries[4].payload.as_ref(), b"new-5");
         }
+    }
+
+    /// Regression test: PREVIOUS_TERM commit after higher-term commit must not panic.
+    ///
+    /// This reproduces the production staging crash:
+    ///   "group group-94 term must be non-decreasing: last 340, got 233"
+    ///
+    /// Scenario: partition group has committed entries up to term 340. After a
+    /// restart, a new leader in term 341 commits entries that were PROPOSED in
+    /// term 233 but never committed (PREVIOUS_TERM entries from an old leader
+    /// that survived in the new leader's log). These entries have term=233, which
+    /// is lower than the last-written term=340. The WAL must accept them.
+    #[tokio::test]
+    async fn test_shared_wal_previous_term_commit_lower_term() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = SharedWalConfig::new(temp_dir.path());
+        let group = GroupId::new(94);
+
+        let mut wal = SharedWal::open(TokioStorage::new(), config).await.unwrap();
+
+        // Simulate a sequence of commits that includes terms going up to 340,
+        // matching the staging scenario (last committed entry in term 340).
+        wal.append(group, 100, 1, 50, Bytes::from("entry-1"))
+            .await
+            .unwrap();
+        wal.append(group, 233, 2, 51, Bytes::from("entry-2"))
+            .await
+            .unwrap();
+        wal.append(group, 340, 3, 100, Bytes::from("entry-3"))
+            .await
+            .unwrap();
+        // group_state: last_index=3, last_term=340
+
+        // After restart, new leader in term 341 commits a PREVIOUS_TERM entry
+        // (proposed in term 233, never committed). This entry has Raft index 101
+        // but term 233 — lower than the last committed term 340. Must not panic.
+        wal.append(group, 233, 4, 101, Bytes::from("previous-term-entry"))
+            .await
+            .expect("PREVIOUS_TERM commit with lower term must not panic");
+
+        // New leader's own entry at term 341 follows.
+        wal.append(group, 341, 5, 102, Bytes::from("new-leader-entry"))
+            .await
+            .expect("new leader entry at term 341 must succeed");
+    }
+
+    /// Regression test: truncating stale high-term entries then appending at a lower
+    /// term must not panic.  This is the Raft log-conflict-resolution path where a
+    /// follower has uncommitted entries at term T and a new leader rewrites them at
+    /// term T' < T.
+    #[tokio::test]
+    async fn test_shared_wal_truncate_then_append_lower_term() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = SharedWalConfig::new(temp_dir.path());
+        let p1 = GroupId::new(1);
+
+        let mut wal = SharedWal::open(TokioStorage::new(), config).await.unwrap();
+
+        // Write entries 1-5 escalating from term 1 to term 5 (simulating a
+        // follower that received entries from several successive leaders).
+        for i in 1..=5u64 {
+            wal.append(p1, i, i, 0, Bytes::from(format!("stale-{i}")))
+                .await
+                .unwrap();
+        }
+        // group-state: last_index=5, last_term=5
+
+        // New leader at term 3 wins, it truncates entries 4-5 (stale) and
+        // rewrites from index 4 at term 3 — which is LOWER than term 5.
+        wal.truncate_after(p1, 3);
+
+        // Must not panic.
+        wal.append(p1, 3, 4, 0, Bytes::from("leader-4"))
+            .await
+            .expect("append at lower term after truncation must succeed");
+        wal.append(p1, 3, 5, 0, Bytes::from("leader-5"))
+            .await
+            .expect("append at same term must succeed");
+        wal.append(p1, 4, 6, 0, Bytes::from("leader-6"))
+            .await
+            .expect("append at higher term must succeed");
     }
 
     #[tokio::test]

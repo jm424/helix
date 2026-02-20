@@ -44,11 +44,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use helix_core::{GroupId, LogIndex, NodeId, Offset, ProducerEpoch, ProducerId, SequenceNum, TermId};
+use helix_core::{GroupId, LogIndex, NodeId, Offset, PartitionId, ProducerEpoch, ProducerId, SequenceNum, TermId, TopicId};
 use helix_runtime::TransportService;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
+use crate::controller::ControllerCommand;
 use crate::vote_store::{LocalFileVoteStorage, VoteStore};
 
 use crate::error::ServerError;
@@ -125,6 +126,8 @@ pub async fn output_processor_task<
     vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
     router: Option<Arc<PartitionRouter>>,
     stats: Option<Arc<OutputProcessorStats>>,
+    node_id: Option<NodeId>,
+    leader_update_tx: Option<mpsc::UnboundedSender<ControllerCommand>>,
 ) {
     const DRAIN_BATCH_LIMIT: usize = 256;
 
@@ -166,6 +169,8 @@ pub async fn output_processor_task<
             vote_store.as_ref(),
             router.as_ref(),
             stats.as_ref(),
+            node_id,
+            leader_update_tx.as_ref(),
         )
         .await;
 
@@ -221,6 +226,8 @@ async fn process_message_batch<
     vote_store: Option<&Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
     router: Option<&Arc<PartitionRouter>>,
     stats: Option<&Arc<OutputProcessorStats>>,
+    node_id: Option<NodeId>,
+    leader_update_tx: Option<&mpsc::UnboundedSender<ControllerCommand>>,
 ) {
     // Separate sends from everything else.
     for grouped in msg_buf.drain(..) {
@@ -265,6 +272,8 @@ async fn process_message_batch<
             batcher_backpressure,
             vote_store,
             router,
+            node_id,
+            leader_update_tx,
         )
         .await;
 
@@ -300,6 +309,8 @@ async fn process_output<
     batcher_backpressure: Option<&Arc<BackpressureState>>,
     vote_store: Option<&Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
     router: Option<&Arc<PartitionRouter>>,
+    node_id: Option<NodeId>,
+    leader_update_tx: Option<&mpsc::UnboundedSender<ControllerCommand>>,
 ) -> u8 {
     match output {
         PartitionOutput::SendMessages { to, messages } => {
@@ -327,11 +338,11 @@ async fn process_output<
             1
         }
         PartitionOutput::BecameLeader => {
-            handle_became_leader(group_id, group_map).await;
+            handle_became_leader(group_id, group_map, node_id, leader_update_tx).await;
             2
         }
         PartitionOutput::SteppedDown => {
-            handle_stepped_down(group_id, group_map).await;
+            handle_stepped_down(group_id, group_map, leader_update_tx).await;
             2
         }
         PartitionOutput::VoteStateChanged { term, voted_for } => {
@@ -499,6 +510,61 @@ async fn handle_need_wal_entries<S: Storage + Clone + Send + Sync + 'static>(
             return;
         }
         Err(e) => {
+            // Check if the WAL floor has advanced past what the follower needs.
+            // Rather than parsing the error string, read the WAL floor directly:
+            // if floor > start_index, the read failed because those entries are
+            // past retention, not due to some other I/O error.
+            let storage_map = partition_storage.read().await;
+            let (wal_floor, compact_state) = if let Some(sl) = storage_map.get(&group_id) {
+                let floor = {
+                    let s = sl.read().await;
+                    s.wal_floor().await
+                };
+                let cs = {
+                    let s = sl.read().await;
+                    s.wal_compact_state().await
+                };
+                (floor, cs)
+            } else {
+                (None, None)
+            };
+            drop(storage_map);
+
+            if wal_floor.is_some_and(|floor| floor > start_index.get()) {
+                // WAL floor has advanced past the follower's position.
+                // Use InstallSnapshot to fast-forward the follower.
+                if let Some((compact_idx, compact_term)) = compact_state {
+                    let Ok(handle) = router.partition(group_id).await else {
+                        warn!(
+                            group = group_id.get(),
+                            "Cannot find partition actor for ProvideSnapshot"
+                        );
+                        return;
+                    };
+                    if let Err(send_err) = handle
+                        .provide_snapshot(
+                            follower_id,
+                            LogIndex::new(compact_idx),
+                            TermId::new(compact_term),
+                        )
+                        .await
+                    {
+                        warn!(
+                            group = group_id.get(),
+                            error = %send_err,
+                            "Failed to send ProvideSnapshot to partition actor"
+                        );
+                    }
+                    return;
+                }
+                warn!(
+                    group = group_id.get(),
+                    start = start_index.get(),
+                    floor = wal_floor,
+                    "WAL floor past follower next_index but no compact state; follower cannot catch up"
+                );
+                return;
+            }
             warn!(
                 group = group_id.get(),
                 error = %e,
@@ -512,9 +578,48 @@ async fn handle_need_wal_entries<S: Storage + Clone + Send + Sync + 'static>(
         warn!(
             group = group_id.get(),
             start = start_index.get(),
-            "No WAL entries found in range"
+            "No WAL entries found in range; attempting snapshot fallback"
         );
-        // Still send empty provide_entries to clear wal_read_pending.
+        // Sending empty provide_entries would leave wal_read_pending set but
+        // not advance next_index, causing NeedWalEntries to fire on every tick.
+        // Instead, use the compact state as a snapshot to fast-forward the
+        // follower past the missing entries.
+        let storage_map = partition_storage.read().await;
+        let compact_state = if let Some(sl) = storage_map.get(&group_id) {
+            let s = sl.read().await;
+            s.wal_compact_state().await
+        } else {
+            None
+        };
+        drop(storage_map);
+
+        if let Some((compact_idx, compact_term)) = compact_state {
+            let Ok(handle) = router.partition(group_id).await else {
+                warn!(group = group_id.get(), "Cannot find partition for snapshot");
+                return;
+            };
+            if let Err(e) = handle
+                .provide_snapshot(
+                    follower_id,
+                    LogIndex::new(compact_idx),
+                    TermId::new(compact_term),
+                )
+                .await
+            {
+                warn!(
+                    group = group_id.get(),
+                    error = %e,
+                    "Failed to send ProvideSnapshot for empty WAL"
+                );
+            }
+        } else {
+            warn!(
+                group = group_id.get(),
+                start = start_index.get(),
+                "No WAL entries and no compact state; follower cannot catch up"
+            );
+        }
+        return;
     }
 
     // Look up prev_log_term from the WAL if prev_log_index > 0.
@@ -524,7 +629,7 @@ async fn handle_need_wal_entries<S: Storage + Clone + Send + Sync + 'static>(
         let storage_map = partition_storage.read().await;
         let prev_term = if let Some(sl) = storage_map.get(&group_id) {
             let s = sl.read().await;
-            match s.read_wal_entry(prev_log_index.get()).await {
+            match s.read_wal_entry_by_raft_index(prev_log_index.get()).await {
                 Ok(Some(entry)) => {
                     let term = entry.term();
                     if term == 0 {
@@ -1035,8 +1140,14 @@ pub async fn extract_and_record_producer_state<S: Storage + Clone + Send + Sync 
     }
 }
 
-/// Handles `BecameLeader` output (logging only).
-async fn handle_became_leader(group_id: GroupId, group_map: &Arc<RwLock<GroupMap>>) {
+/// Handles `BecameLeader` output: logs and notifies the controller to update
+/// its leader tracking so the rebalancer can converge.
+async fn handle_became_leader(
+    group_id: GroupId,
+    group_map: &Arc<RwLock<GroupMap>>,
+    node_id: Option<NodeId>,
+    leader_update_tx: Option<&mpsc::UnboundedSender<ControllerCommand>>,
+) {
     let key = {
         let gm = group_map.read().await;
         gm.get_key(group_id)
@@ -1049,6 +1160,7 @@ async fn handle_became_leader(group_id: GroupId, group_map: &Arc<RwLock<GroupMap
             group = group_id.get(),
             "Became leader (actor mode)"
         );
+        notify_controller_leader_change(topic_id, partition_id, node_id, leader_update_tx, group_id);
     } else {
         info!(
             group = group_id.get(),
@@ -1057,8 +1169,13 @@ async fn handle_became_leader(group_id: GroupId, group_map: &Arc<RwLock<GroupMap
     }
 }
 
-/// Handles `SteppedDown` output (logging only).
-async fn handle_stepped_down(group_id: GroupId, group_map: &Arc<RwLock<GroupMap>>) {
+/// Handles `SteppedDown` output: logs and clears the controller's leader
+/// tracking so the rebalancer knows the partition has no current leader.
+async fn handle_stepped_down(
+    group_id: GroupId,
+    group_map: &Arc<RwLock<GroupMap>>,
+    leader_update_tx: Option<&mpsc::UnboundedSender<ControllerCommand>>,
+) {
     let key = {
         let gm = group_map.read().await;
         gm.get_key(group_id)
@@ -1071,10 +1188,35 @@ async fn handle_stepped_down(group_id: GroupId, group_map: &Arc<RwLock<GroupMap>
             group = group_id.get(),
             "Stepped down from leader (actor mode)"
         );
+        notify_controller_leader_change(topic_id, partition_id, None, leader_update_tx, group_id);
     } else {
         info!(
             group = group_id.get(),
             "Stepped down from leader for unknown group (actor mode)"
+        );
+    }
+}
+
+/// Sends an `UpdatePartitionLeader` command to the controller via the leader
+/// update channel. Called on both `BecameLeader` and `SteppedDown`.
+fn notify_controller_leader_change(
+    topic_id: TopicId,
+    partition_id: PartitionId,
+    leader: Option<NodeId>,
+    leader_update_tx: Option<&mpsc::UnboundedSender<ControllerCommand>>,
+    group_id: GroupId,
+) {
+    let Some(tx) = leader_update_tx else { return };
+    let cmd = ControllerCommand::UpdatePartitionLeader {
+        topic_id,
+        partition_id,
+        leader,
+    };
+    if let Err(e) = tx.send(cmd) {
+        warn!(
+            group = group_id.get(),
+            error = %e,
+            "Failed to send leader update to controller"
         );
     }
 }
@@ -1162,6 +1304,8 @@ mod tests {
             None, // No vote persistence in tests.
             None, // No router in tests.
             None, // No stats in tests.
+            None, // No node_id in tests.
+            None, // No leader_update_tx in tests.
         ));
 
         // Send BecameLeader output.
@@ -1213,6 +1357,8 @@ mod tests {
             None, // No vote persistence in tests.
             None, // No router in tests.
             None, // No stats in tests.
+            None, // No node_id in tests.
+            None, // No leader_update_tx in tests.
         ));
 
         // Send EntryCommitted output (no batch proposal, so just applies).
@@ -1313,6 +1459,8 @@ mod tests {
             None, // No vote persistence in tests.
             None, // No router in tests.
             None, // No stats in tests.
+            None, // No node_id in tests.
+            None, // No leader_update_tx in tests.
         ));
 
         // Create valid batch entry data.

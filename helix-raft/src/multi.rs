@@ -384,6 +384,67 @@ impl MultiRaft {
         Ok(())
     }
 
+    /// Creates a new Raft group with restored vote state and WAL commit position.
+    ///
+    /// Use this when recovering from persisted storage where both the vote state
+    /// and the committed log position are known from the data WAL. Setting
+    /// `commit_index` and `commit_term` initialises the Raft log's compacted
+    /// state so that `last_index()`, `last_term()`, and `is_up_to_date()` return
+    /// correct values, preventing a new leader from overwriting already-committed
+    /// entries at those indices on nodes that have a stale `last_applied`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The group already exists
+    /// - Maximum group count exceeded
+    /// - This node is not in the peer list
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_group_with_recovery_state(
+        &mut self,
+        group_id: GroupId,
+        peers: Vec<NodeId>,
+        term: TermId,
+        voted_for: Option<NodeId>,
+        observation_mode: bool,
+        commit_index: LogIndex,
+        commit_term: TermId,
+    ) -> Result<(), MultiRaftError> {
+        // Precondition: group doesn't exist.
+        if self.groups.contains_key(&group_id) {
+            return Err(MultiRaftError::GroupExists(group_id));
+        }
+
+        // Precondition: under limit.
+        if self.groups.len() >= GROUPS_PER_NODE_MAX {
+            return Err(MultiRaftError::TooManyGroups {
+                count: self.groups.len(),
+                max: GROUPS_PER_NODE_MAX,
+            });
+        }
+
+        // Precondition: this node is in the peer list.
+        if !peers.contains(&self.node_id) {
+            return Err(MultiRaftError::NodeNotInPeers {
+                node_id: self.node_id,
+                group_id,
+            });
+        }
+
+        // Use group_id as part of seed for deterministic but varied timeouts.
+        let config = RaftConfig::new(self.node_id, peers)
+            .with_random_seed(self.node_id.get() ^ group_id.get());
+        let node =
+            RaftNode::with_recovery_state(config, term, voted_for, observation_mode, commit_index, commit_term);
+
+        self.groups.insert(group_id, GroupInfo { node });
+
+        // Postcondition: group now exists.
+        debug_assert!(self.groups.contains_key(&group_id));
+
+        Ok(())
+    }
+
     /// Creates a new Raft group with restored vote state and custom tick configuration.
     ///
     /// Combines `create_group_with_config` and `create_group_with_state`.

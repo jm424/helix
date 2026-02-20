@@ -76,6 +76,9 @@ pub trait WalEntry: Sized + Clone + Send + Sync + std::fmt::Debug {
     /// Returns the log index of this entry.
     fn index(&self) -> u64;
 
+    /// Returns the Raft term of this entry.
+    fn term(&self) -> u64;
+
     /// Returns the payload length in bytes.
     fn payload_len(&self) -> u32;
 
@@ -343,6 +346,11 @@ impl WalEntry for Entry {
     fn index(&self) -> u64 {
         // Delegate to inherent method.
         Self::index(self)
+    }
+
+    fn term(&self) -> u64 {
+        // Delegate to inherent method.
+        Self::term(self)
     }
 
     fn payload_len(&self) -> u32 {

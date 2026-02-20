@@ -64,6 +64,8 @@ mod raft_dst;
 #[cfg(test)]
 mod shared_wal_dst;
 #[cfg(test)]
+mod snapshot_dst;
+#[cfg(test)]
 mod wal_dst;
 
 // Integration test modules (multi-component tests).

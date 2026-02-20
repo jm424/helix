@@ -13,9 +13,9 @@ use bloodhound::simulation::discrete::event::{ActorId, EventKind};
 use bytes::Bytes;
 use helix_core::{LogIndex, NodeId, TermId};
 use helix_raft::{
-    AppendEntriesRequest, AppendEntriesResponse, ClientRequest, LogEntry, Message, PreVoteRequest,
-    PreVoteResponse, RaftConfig, RaftNode, RaftOutput, RaftState, RequestVoteRequest,
-    RequestVoteResponse, TimeoutNowRequest,
+    AppendEntriesRequest, AppendEntriesResponse, ClientRequest, InstallSnapshotRequest,
+    InstallSnapshotResponse, LogEntry, Message, PreVoteRequest, PreVoteResponse, RaftConfig,
+    RaftNode, RaftOutput, RaftState, RequestVoteRequest, RequestVoteResponse, TimeoutNowRequest,
 };
 use tracing::{debug, info, trace, warn};
 
@@ -30,6 +30,8 @@ mod timer_ids {
 pub mod custom_events {
     /// Client request submission.
     pub const CLIENT_REQUEST: &str = "client_request";
+    /// Compact the in-memory Raft log, triggering `NeedEntries` for lagging followers.
+    pub const COMPACT_LOG: &str = "compact_log";
 }
 
 /// Network latency for message delivery (simulated).
@@ -155,6 +157,8 @@ pub struct NodeSnapshot {
     pub commit_index: u64,
     /// Last log index.
     pub last_log_index: u64,
+    /// First in-memory log index (0 = no compaction yet).
+    pub log_first_index: u64,
     /// Log entries: index -> term.
     pub log_terms: BTreeMap<u64, u64>,
     /// Whether the node is crashed.
@@ -181,8 +185,19 @@ pub struct PropertyState {
     pub applied_entries: BTreeMap<u64, Vec<AppliedEntry>>,
     /// Leaders observed per term: term -> set of node IDs.
     pub leaders_by_term: BTreeMap<u64, BTreeSet<u64>>,
+    /// Canonical committed log: index -> term, recorded at commit time.
+    ///
+    /// Populated when `CommitEntry` fires on any node, before compaction can
+    /// remove the entry from the in-memory log. Used by `LogMatching` and
+    /// `LeaderCompleteness` checks to verify entries that are no longer in
+    /// any node's in-memory window.
+    pub committed_log_terms: BTreeMap<u64, u64>,
     /// Total events processed (for debugging).
     pub events_processed: u64,
+    /// Number of `InstallSnapshot` messages sent by any leader.
+    ///
+    /// Tests can assert this is > 0 to prove the snapshot delivery path was exercised.
+    pub install_snapshots_sent: u64,
 }
 
 impl PropertyState {
@@ -238,6 +253,8 @@ mod message_tags {
     pub const APPEND_ENTRIES: u8 = 5;
     pub const APPEND_ENTRIES_RESPONSE: u8 = 6;
     pub const TIMEOUT_NOW: u8 = 7;
+    pub const INSTALL_SNAPSHOT: u8 = 8;
+    pub const INSTALL_SNAPSHOT_RESPONSE: u8 = 9;
 }
 
 /// Serialize a Raft message to bytes for network transmission.
@@ -318,9 +335,28 @@ fn serialize_message(msg: &Message) -> Vec<u8> {
             buf.extend_from_slice(&req.from.get().to_le_bytes());
             buf.extend_from_slice(&req.to.get().to_le_bytes());
         }
-        // InstallSnapshot messages are not used in basic Raft simulation tests yet.
-        Message::InstallSnapshot(_) | Message::InstallSnapshotResponse(_) => {
-            panic!("InstallSnapshot messages not yet supported in simulation")
+        Message::InstallSnapshot(req) => {
+            buf.push(message_tags::INSTALL_SNAPSHOT);
+            buf.extend_from_slice(&req.term.get().to_le_bytes());
+            buf.extend_from_slice(&req.leader_id.get().to_le_bytes());
+            buf.extend_from_slice(&req.to.get().to_le_bytes());
+            buf.extend_from_slice(&req.last_included_index.get().to_le_bytes());
+            buf.extend_from_slice(&req.last_included_term.get().to_le_bytes());
+            buf.extend_from_slice(&req.offset.to_le_bytes());
+            // Safe cast: snapshot data is bounded by message size limits.
+            #[allow(clippy::cast_possible_truncation)]
+            let data_len = req.data.len() as u32;
+            buf.extend_from_slice(&data_len.to_le_bytes());
+            buf.extend_from_slice(&req.data);
+            buf.push(u8::from(req.done));
+        }
+        Message::InstallSnapshotResponse(resp) => {
+            buf.push(message_tags::INSTALL_SNAPSHOT_RESPONSE);
+            buf.extend_from_slice(&resp.term.get().to_le_bytes());
+            buf.extend_from_slice(&resp.from.get().to_le_bytes());
+            buf.extend_from_slice(&resp.to.get().to_le_bytes());
+            buf.push(u8::from(resp.success));
+            buf.extend_from_slice(&resp.next_offset.to_le_bytes());
         }
     }
 
@@ -344,6 +380,8 @@ fn deserialize_message(data: &[u8]) -> Option<Message> {
         message_tags::APPEND_ENTRIES => deserialize_append_entries(payload),
         message_tags::APPEND_ENTRIES_RESPONSE => deserialize_append_entries_response(payload),
         message_tags::TIMEOUT_NOW => deserialize_timeout_now(payload),
+        message_tags::INSTALL_SNAPSHOT => deserialize_install_snapshot(payload),
+        message_tags::INSTALL_SNAPSHOT_RESPONSE => deserialize_install_snapshot_response(payload),
         _ => None,
     }
 }
@@ -509,6 +547,57 @@ fn deserialize_timeout_now(data: &[u8]) -> Option<Message> {
     Some(Message::TimeoutNow(TimeoutNowRequest::new(term, from, to)))
 }
 
+/// Deserialize an `InstallSnapshot` request.
+fn deserialize_install_snapshot(data: &[u8]) -> Option<Message> {
+    // Fixed fields: term(8)+leader(8)+to(8)+last_idx(8)+last_term(8)+offset(8)+data_len(4) = 52
+    // Plus at least the done(1) byte = 53 minimum.
+    if data.len() < 53 {
+        return None;
+    }
+    let term = TermId::new(u64::from_le_bytes(data[0..8].try_into().ok()?));
+    let leader_id = NodeId::new(u64::from_le_bytes(data[8..16].try_into().ok()?));
+    let to = NodeId::new(u64::from_le_bytes(data[16..24].try_into().ok()?));
+    let last_included_index = LogIndex::new(u64::from_le_bytes(data[24..32].try_into().ok()?));
+    let last_included_term = TermId::new(u64::from_le_bytes(data[32..40].try_into().ok()?));
+    let offset = u64::from_le_bytes(data[40..48].try_into().ok()?);
+    let data_len = u32::from_le_bytes(data[48..52].try_into().ok()?) as usize;
+    if data.len() < 53 + data_len {
+        return None;
+    }
+    let snapshot_data = Bytes::copy_from_slice(&data[52..52 + data_len]);
+    let done = data[52 + data_len] != 0;
+    Some(Message::InstallSnapshot(InstallSnapshotRequest::new(
+        term,
+        leader_id,
+        to,
+        last_included_index,
+        last_included_term,
+        offset,
+        snapshot_data,
+        done,
+    )))
+}
+
+/// Deserialize an `InstallSnapshot` response.
+fn deserialize_install_snapshot_response(data: &[u8]) -> Option<Message> {
+    // term(8)+from(8)+to(8)+success(1)+next_offset(8) = 33
+    if data.len() < 33 {
+        return None;
+    }
+    let term = TermId::new(u64::from_le_bytes(data[0..8].try_into().ok()?));
+    let from = NodeId::new(u64::from_le_bytes(data[8..16].try_into().ok()?));
+    let to = NodeId::new(u64::from_le_bytes(data[16..24].try_into().ok()?));
+    let success = data[24] != 0;
+    let next_offset = u64::from_le_bytes(data[25..33].try_into().ok()?);
+    Some(Message::InstallSnapshotResponse(InstallSnapshotResponse::new(
+        term,
+        from,
+        to,
+        success,
+        next_offset,
+    )))
+}
+
 /// Checkpoint state for `RaftActor`.
 ///
 /// Note: Fields are stored for future checkpoint/restore implementation.
@@ -617,6 +706,7 @@ impl RaftActor {
                     state: self.node.state(),
                     commit_index: self.node.commit_index().get(),
                     last_log_index: last,
+                    log_first_index: first,
                     log_terms,
                     crashed: self.crashed,
                 };
@@ -637,6 +727,11 @@ impl RaftActor {
                     data_hash: hash_data(data),
                 };
                 state.record_applied(self.node.node_id().get(), entry);
+                // Record canonical committed term before any compaction can remove it.
+                // Uses or_insert so the first node to commit wins; in a correct cluster
+                // all nodes insert the same value. A divergence here is itself a violation
+                // that StateMachineSafety will surface.
+                state.committed_log_terms.entry(index.get()).or_insert_with(|| term.get());
             }
         }
     }
@@ -705,19 +800,24 @@ impl RaftActor {
 
     /// Submits a client request to the Raft node.
     ///
-    /// Returns outputs to process if this node is the leader, None otherwise.
+    /// Returns true if this node accepted the request (is the leader).
     pub fn submit_request(&mut self, data: Bytes, ctx: &mut SimulationContext) -> bool {
         let request = ClientRequest::new(data, Bytes::new());
-        self.node
-            .handle_client_request(request)
-            .is_some_and(|outputs| {
-                self.process_outputs(outputs, ctx);
-                true
-            })
+        // Bind the output separately so the `self.node` borrow ends before
+        // `process_outputs` borrows `self` mutably for the apply step.
+        let maybe_outputs = self.node.handle_client_request(request);
+        maybe_outputs.is_some_and(|outputs| {
+            self.process_outputs(outputs, ctx);
+            true
+        })
     }
 
     /// Processes outputs from the Raft state machine.
-    fn process_outputs(&self, outputs: Vec<RaftOutput>, ctx: &mut SimulationContext) {
+    fn process_outputs(&mut self, outputs: Vec<RaftOutput>, ctx: &mut SimulationContext) {
+        // Collect extra messages produced by NeedEntries handling so we can
+        // send them after the outputs loop (avoids re-entrant borrow issues).
+        let mut extra_messages: Vec<Message> = Vec::new();
+
         for output in outputs {
             match output {
                 RaftOutput::SendMessage(msg) => {
@@ -756,18 +856,86 @@ impl RaftActor {
                         "vote state changed"
                     );
                 }
-                RaftOutput::NeedEntries { .. } => {
-                    // DST simulation doesn't have WAL-backed entries.
-                    // The in-memory log should always have entries.
-                    debug!(
-                        actor = %self.name,
-                        "NeedEntries (ignored in simulation)"
-                    );
+                RaftOutput::NeedEntries { follower_id, start_index, prev_log_index, max_bytes } => {
+                    let msgs =
+                        self.handle_need_entries(follower_id, start_index, prev_log_index, max_bytes);
+                    extra_messages.extend(msgs);
                 }
             }
         }
+
+        // Send any messages produced by NeedEntries handling.
+        for msg in &extra_messages {
+            self.send_raft_message(msg, ctx);
+        }
+
         // Report state after processing all outputs.
         self.report_state();
+    }
+
+    /// Handles a `NeedEntries` output from the leader.
+    ///
+    /// If `start_index` is below the in-memory log floor (compacted), sends a
+    /// snapshot to fast-forward the follower. Otherwise, provides entries from
+    /// the in-memory log directly (no WAL in simulation).
+    fn handle_need_entries(
+        &mut self,
+        follower_id: NodeId,
+        start_index: LogIndex,
+        prev_log_index: LogIndex,
+        max_bytes: u64,
+    ) -> Vec<Message> {
+        let log_first = self.node.log().first_index();
+        let needs_snapshot = log_first.get() > 0 && start_index < log_first;
+
+        let outputs = if needs_snapshot {
+            // start_index is below the compacted floor — send snapshot.
+            let snap_index = LogIndex::new(log_first.get().saturating_sub(1));
+            let snap_term = self.node.log().term_at(snap_index);
+            debug!(
+                actor = %self.name,
+                follower = follower_id.get(),
+                snap_index = snap_index.get(),
+                snap_term = snap_term.get(),
+                "NeedEntries: sending snapshot to lagging follower"
+            );
+            // Record the snapshot send for fidelity verification.
+            if let Some(ref property_state) = self.property_state {
+                if let Ok(mut state) = property_state.lock() {
+                    state.install_snapshots_sent += 1;
+                }
+            }
+            self.node.provide_snapshot(follower_id, snap_index, snap_term)
+        } else {
+            // Entries are in the in-memory log — provide them directly.
+            let entries = self.node.log().entries_from_limited(start_index, max_bytes);
+            let prev_log_term = if prev_log_index.get() == 0 {
+                TermId::new(0)
+            } else {
+                self.node.log().term_at(prev_log_index)
+            };
+            debug!(
+                actor = %self.name,
+                follower = follower_id.get(),
+                start_index = start_index.get(),
+                entries_count = entries.len(),
+                "NeedEntries: providing in-memory entries"
+            );
+            self.node.provide_entries(follower_id, prev_log_index, prev_log_term, entries)
+        };
+
+        // Extract only SendMessage outputs — other outputs (BecameLeader, etc.)
+        // are not expected from provide_snapshot/provide_entries.
+        outputs
+            .into_iter()
+            .filter_map(|out| {
+                if let RaftOutput::SendMessage(msg) = out {
+                    Some(msg)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Sends a Raft message to another actor using `PacketDelivery`.
@@ -928,6 +1096,17 @@ impl SimulatedActor for RaftActor {
                     } else {
                         debug!(actor = %self.name, "rejected client request (not leader)");
                     }
+                } else if name == custom_events::COMPACT_LOG {
+                    // Compact in-memory log. Works for both leader and follower.
+                    // After compaction, lagging followers receive NeedEntries on
+                    // the next heartbeat, which triggers snapshot delivery.
+                    let compacted = self.node.compact_log() || self.node.compact_log_follower();
+                    debug!(
+                        actor = %self.name,
+                        compacted,
+                        first_index = self.node.log().first_index().get(),
+                        "compact_log"
+                    );
                 }
             }
 

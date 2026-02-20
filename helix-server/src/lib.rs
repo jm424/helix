@@ -10,6 +10,8 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+/// Allocator statistics endpoint (jemalloc stats over TCP).
+pub mod alloc_stats;
 /// Kafka admin gRPC service (kafkaadmin.Resources on port 8090).
 pub mod admin_grpc;
 /// Controller partition for cluster metadata coordination.

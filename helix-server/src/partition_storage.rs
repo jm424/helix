@@ -48,7 +48,7 @@ use crate::error::{ServerError, ServerResult};
 use crate::producer_state::{PartitionProducerState, SequenceCheckResult};
 use crate::storage::{
     patch_kafka_base_offset, BlobFormat, DurablePartition, DurablePartitionConfig,
-    DurablePartitionError, Partition, PartitionCommand, PartitionConfig,
+    DurablePartitionError, Partition, PartitionCommand, PartitionConfig, PartitionRecoveryState,
 };
 #[cfg(feature = "s3")]
 use helix_tier::S3Config;
@@ -280,6 +280,86 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         let durable =
             DurablePartition::open_with_shared_wal(config, wal_handle, recovered_entries)?;
         // Initialize last_applied from recovered WAL state for proper idempotency.
+        let last_applied = LogIndex::new(durable.last_applied_index());
+        let last_applied_term = helix_core::TermId::new(durable.last_applied_term());
+        Ok(Self {
+            topic_id,
+            partition_id,
+            inner: PartitionStorageInner::Durable(Box::new(durable)),
+            last_applied,
+            last_applied_term,
+            producer_state: PartitionProducerState::new(),
+        })
+    }
+
+    /// Creates new durable partition storage from pre-built streaming recovery state.
+    ///
+    /// This is the memory-efficient path: instead of accumulating all recovered
+    /// `SharedEntry` objects, the caller built `state` incrementally via the
+    /// streaming recovery callback. O(one-segment) peak memory during recovery.
+    ///
+    /// # Errors
+    /// Returns an error if the partition cannot be opened.
+    #[cfg(feature = "s3")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_durable_with_shared_wal_state(
+        data_dir: &PathBuf,
+        topic_id: TopicId,
+        partition_id: PartitionId,
+        wal_handle: SharedWalHandle<S>,
+        state: PartitionRecoveryState,
+        object_storage_dir: Option<&PathBuf>,
+        s3_config: Option<&S3Config>,
+        tiering_config: Option<&TieringConfig>,
+    ) -> Result<Self, DurablePartitionError> {
+        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id);
+        if let Some(s3_cfg) = s3_config {
+            config = config.with_s3_config(s3_cfg.clone());
+        } else if let Some(object_dir) = object_storage_dir {
+            config = config.with_object_storage_dir(object_dir);
+        }
+        if let Some(tier_cfg) = tiering_config {
+            config = config.with_tiering(tier_cfg.clone());
+        }
+        let durable = DurablePartition::open_with_recovery_state(config, wal_handle, state)?;
+        let last_applied = LogIndex::new(durable.last_applied_index());
+        let last_applied_term = helix_core::TermId::new(durable.last_applied_term());
+        Ok(Self {
+            topic_id,
+            partition_id,
+            inner: PartitionStorageInner::Durable(Box::new(durable)),
+            last_applied,
+            last_applied_term,
+            producer_state: PartitionProducerState::new(),
+        })
+    }
+
+    /// Creates new durable partition storage from pre-built streaming recovery state.
+    ///
+    /// This is the memory-efficient path: instead of accumulating all recovered
+    /// `SharedEntry` objects, the caller built `state` incrementally via the
+    /// streaming recovery callback. O(one-segment) peak memory during recovery.
+    ///
+    /// # Errors
+    /// Returns an error if the partition cannot be opened.
+    #[cfg(not(feature = "s3"))]
+    pub fn new_durable_with_shared_wal_state(
+        data_dir: &PathBuf,
+        topic_id: TopicId,
+        partition_id: PartitionId,
+        wal_handle: SharedWalHandle<S>,
+        state: PartitionRecoveryState,
+        object_storage_dir: Option<&PathBuf>,
+        tiering_config: Option<&TieringConfig>,
+    ) -> Result<Self, DurablePartitionError> {
+        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id);
+        if let Some(object_dir) = object_storage_dir {
+            config = config.with_object_storage_dir(object_dir);
+        }
+        if let Some(tier_cfg) = tiering_config {
+            config = config.with_tiering(tier_cfg.clone());
+        }
+        let durable = DurablePartition::open_with_recovery_state(config, wal_handle, state)?;
         let last_applied = LogIndex::new(durable.last_applied_index());
         let last_applied_term = helix_core::TermId::new(durable.last_applied_term());
         Ok(Self {
@@ -957,6 +1037,51 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                 .map_err(|e| ServerError::Internal {
                     message: format!("WAL read failed: {e}"),
                 }),
+        }
+    }
+
+    /// Reads a single WAL entry by Raft log index.
+    ///
+    /// For shared WAL this searches by the `raft_index` field in the entry
+    /// header, which differs from the WAL auto-counter. Use this when you have
+    /// a Raft log index (e.g. `prev_log_index` during follower catch-up).
+    ///
+    /// Returns `None` for in-memory storage (no WAL).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the WAL read fails.
+    pub async fn read_wal_entry_by_raft_index(
+        &self,
+        raft_index: u64,
+    ) -> ServerResult<Option<helix_wal::Entry>> {
+        match &self.inner {
+            PartitionStorageInner::InMemory(_) => Ok(None),
+            PartitionStorageInner::Durable(p) => p
+                .read_wal_entry_by_raft_index(raft_index)
+                .await
+                .map_err(|e| ServerError::Internal {
+                    message: format!("WAL read failed: {e}"),
+                }),
+        }
+    }
+
+    /// Returns the compact state of the WAL: (index, term) of the last entry
+    /// deleted by retention. Returns `None` if no retention has run yet.
+    pub async fn wal_compact_state(&self) -> Option<(u64, u64)> {
+        match &self.inner {
+            PartitionStorageInner::InMemory(_) => None,
+            PartitionStorageInner::Durable(p) => p.wal_compact_state().await,
+        }
+    }
+
+    /// Returns the WAL floor index (first available index after retention).
+    ///
+    /// Returns `None` for in-memory storage or an empty WAL.
+    pub async fn wal_floor(&self) -> Option<u64> {
+        match &self.inner {
+            PartitionStorageInner::InMemory(_) => None,
+            PartitionStorageInner::Durable(p) => p.wal_floor().await,
         }
     }
 }

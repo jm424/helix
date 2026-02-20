@@ -13,7 +13,8 @@ use helix_core::{GroupId, LogIndex, NodeId, Offset, PartitionId, TermId};
 use helix_raft::multi::{MultiRaft, MultiRaftOutput};
 use helix_raft::RaftState;
 use helix_runtime::{BrokerHeartbeat, IncomingMessage, TransportService};
-use helix_wal::{SharedEntry, SharedWalPool, Storage};
+use helix_wal::{SharedWalPool, Storage};
+use crate::storage::PartitionRecoveryState;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, trace, warn};
 
@@ -155,7 +156,7 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
     vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
     shared_wal_pool: Option<Arc<SharedWalPool<S>>>,
     data_dir: Option<PathBuf>,
-    recovered_entries: Arc<RwLock<HashMap<GroupId, Vec<SharedEntry>>>>,
+    recovered_entries: Arc<RwLock<HashMap<GroupId, PartitionRecoveryState>>>,
     storage: S,
     local_retention_ms: Option<u64>,
     mut incoming_rx: mpsc::Receiver<IncomingMessage>,
@@ -176,6 +177,33 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
         partition_count = initial_partition_count,
         "Actor tick task started"
     );
+
+    // Recovery phase: create partition actors for all pre-existing assignments.
+    //
+    // After a restart, the controller state is replayed from the SharedWAL,
+    // restoring all topics and partition assignments. However, partition actors
+    // are NOT created during that replay because the tick task only creates them
+    // when it processes NEW AssignPartition commit entries — entries already
+    // committed before the restart are never re-emitted.
+    //
+    // Without this recovery step, every partition group this node is a replica
+    // of starts with no actor registered. The actor router returns None for
+    // those groups, Kafka metadata returns LEADER_NOT_AVAILABLE silently, and
+    // clients can never make progress on those partitions.
+    recover_partition_actors(
+        node_id,
+        &router,
+        &controller_state,
+        &partition_storage,
+        &group_map,
+        vote_store.as_ref(),
+        shared_wal_pool.as_ref(),
+        data_dir.as_ref(),
+        &recovered_entries,
+        &storage,
+        &output_tx,
+    )
+    .await;
 
     loop {
         tokio::select! {
@@ -322,9 +350,10 @@ pub async fn tick_task_controller<
     vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
     shared_wal_pool: Option<Arc<SharedWalPool<S>>>,
     data_dir: Option<PathBuf>,
-    recovered_entries: Arc<RwLock<HashMap<GroupId, Vec<SharedEntry>>>>,
+    recovered_entries: Arc<RwLock<HashMap<GroupId, PartitionRecoveryState>>>,
     storage: S,
     local_broker_heartbeats: Arc<RwLock<HashMap<NodeId, u64>>>,
+    mut leader_update_rx: mpsc::UnboundedReceiver<crate::controller::ControllerCommand>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
     let mut tick_interval =
@@ -385,6 +414,26 @@ pub async fn tick_task_controller<
                     &router,
                     &local_broker_heartbeats,
                 ).await;
+            }
+            Some(cmd) = leader_update_rx.recv() => {
+                // A data partition's leader changed. Propose UpdatePartitionLeader
+                // to the controller so the rebalancer can see the current leader
+                // and stop issuing redundant TransferLeadership commands.
+                //
+                // Only the controller leader proposes; followers see the committed
+                // entry via normal Raft replication.
+                let is_leader = {
+                    let mr = multi_raft.read().await;
+                    mr.group_state(CONTROLLER_GROUP_ID)
+                        .is_some_and(|s| s.state == RaftState::Leader)
+                };
+                if is_leader {
+                    let encoded = cmd.encode();
+                    let mut mr = multi_raft.write().await;
+                    if mr.propose(CONTROLLER_GROUP_ID, encoded).is_none() {
+                        warn!("Failed to propose UpdatePartitionLeader to controller");
+                    }
+                }
             }
         }
     }
@@ -565,7 +614,7 @@ pub async fn process_controller_outputs<
     vote_store: Option<&Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
     shared_wal_pool: Option<&Arc<SharedWalPool<S>>>,
     data_dir: Option<&PathBuf>,
-    recovered_entries: Option<&Arc<RwLock<HashMap<GroupId, Vec<SharedEntry>>>>>,
+    recovered_entries: Option<&Arc<RwLock<HashMap<GroupId, PartitionRecoveryState>>>>,
     storage: Option<&S>,
 ) {
     // Collect follow-up outputs for single-node processing.
@@ -1011,6 +1060,141 @@ pub async fn process_controller_outputs<
     }
 }
 
+/// Creates partition actors for all pre-existing assignments after a restart.
+///
+/// This is the recovery counterpart to the `AssignPartition` handling in
+/// `process_controller_outputs`. On a fresh start those entries are committed
+/// for the first time and the tick task creates actors as it processes them.
+/// After a restart the entries are already in the WAL — they won't appear as
+/// new commits, so actors would never get created without this recovery step.
+///
+/// This function is idempotent: it skips groups whose actor already exists in
+/// the router (the `add_partition_dynamic` call returns `false` in that case).
+#[allow(clippy::too_many_arguments)]
+async fn recover_partition_actors<S: Storage + Clone + Send + Sync + 'static>(
+    node_id: NodeId,
+    router: &Arc<super::router::PartitionRouter>,
+    controller_state: &Arc<RwLock<ControllerState>>,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
+    group_map: &Arc<RwLock<GroupMap>>,
+    vote_store: Option<&Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
+    shared_wal_pool: Option<&Arc<SharedWalPool<S>>>,
+    data_dir: Option<&PathBuf>,
+    recovered_entries: &Arc<RwLock<HashMap<GroupId, PartitionRecoveryState>>>,
+    storage: &S,
+    output_tx: &mpsc::Sender<super::partition_actor::GroupedOutput>,
+) {
+    // Snapshot the assignments under a short read lock, then release it before
+    // doing any async I/O below.
+    let assignments: Vec<(helix_core::TopicId, PartitionId, GroupId, Vec<NodeId>)> = {
+        let state = controller_state.read().await;
+        state
+            .partitions_for_node(node_id)
+            .into_iter()
+            .map(|(tid, pid, a)| (tid, pid, a.group_id, a.replicas.clone()))
+            .collect()
+    };
+
+    if assignments.is_empty() {
+        return;
+    }
+
+    info!(
+        node_id = node_id.get(),
+        count = assignments.len(),
+        "Recovering partition actors from controller state after restart"
+    );
+
+    let mut recovered = 0u32;
+
+    for (topic_id, partition_id, data_group_id, replicas) in assignments {
+        // Skip if the actor was already created (e.g., on a fresh start where
+        // AssignPartition commits arrive before this recovery path runs).
+        if router.partition(data_group_id).await.is_ok() {
+            continue;
+        }
+
+        // Look up persisted vote state so the Raft node resumes from the
+        // correct term and knows who it voted for.
+        let (term, voted_for, observation_mode) = vote_store
+            .and_then(|vs| vs.lock().ok())
+            .and_then(|store| {
+                store
+                    .state()
+                    .get_group(data_group_id)
+                    .map(|v| (v.term, v.voted_for, false))
+            })
+            .unwrap_or((helix_core::TermId::new(0), None, false));
+
+        // Update group map so that Kafka handlers can resolve topic+partition → group.
+        {
+            let mut gm = group_map.write().await;
+            gm.insert(topic_id, partition_id, data_group_id);
+        }
+
+        // Create (or reopen) durable partition storage.
+        let (commit_index, commit_term) = {
+            let mut ps_map = partition_storage.write().await;
+            if let std::collections::hash_map::Entry::Vacant(e) = ps_map.entry(data_group_id) {
+                let ps = create_partition_storage(
+                    topic_id,
+                    partition_id,
+                    data_group_id,
+                    shared_wal_pool,
+                    data_dir,
+                    Some(recovered_entries),
+                    Some(storage),
+                )
+                .await;
+                let ci = ps.last_applied();
+                let ct = ps.last_applied_term();
+                e.insert(Arc::new(RwLock::new(ps)));
+                (ci, ct)
+            } else if let Some(ps_lock) = ps_map.get(&data_group_id) {
+                let ps = ps_lock.read().await;
+                (ps.last_applied(), ps.last_applied_term())
+            } else {
+                (helix_core::LogIndex::new(0), helix_core::TermId::new(0))
+            }
+        };
+
+        // Spawn the partition actor with fully restored Raft state.
+        let partition_handle = super::actor_setup::create_partition_actor_with_state(
+            data_group_id,
+            node_id,
+            replicas,
+            term,
+            voted_for,
+            observation_mode,
+            commit_index,
+            commit_term,
+            output_tx.clone(),
+            super::partition_actor::PartitionActorConfig::default(),
+        );
+
+        if router
+            .add_partition_dynamic(data_group_id, partition_handle)
+            .await
+        {
+            info!(
+                topic = topic_id.get(),
+                partition = partition_id.get(),
+                group = data_group_id.get(),
+                term = term.get(),
+                commit_index = commit_index.get(),
+                "Recovered partition actor after restart"
+            );
+            recovered += 1;
+        }
+    }
+
+    info!(
+        node_id = node_id.get(),
+        recovered,
+        "Partition actor recovery complete"
+    );
+}
+
 /// Creates partition storage using the best available durability mode:
 /// 1. Shared WAL pool (when `shared_wal_pool` is set) — fsync amortization
 /// 2. Per-partition dedicated WAL (when `data_dir` is set) — simpler, one WAL per partition
@@ -1021,40 +1205,41 @@ async fn create_partition_storage<S: Storage + Clone + Send + Sync + 'static>(
     data_group_id: GroupId,
     shared_wal_pool: Option<&Arc<SharedWalPool<S>>>,
     data_dir: Option<&PathBuf>,
-    recovered_entries: Option<&Arc<RwLock<HashMap<GroupId, Vec<SharedEntry>>>>>,
+    recovered_entries: Option<&Arc<RwLock<HashMap<GroupId, PartitionRecoveryState>>>>,
     storage: Option<&S>,
 ) -> PartitionStorage<S> {
     // Mode 1: Shared WAL pool.
     if let (Some(pool), Some(dir)) = (shared_wal_pool, data_dir) {
         let wal_handle = pool.handle(data_group_id);
-        let recovered = if let Some(entries) = recovered_entries {
+        // Remove pre-built recovery state (Default = no prior history if absent).
+        let state = if let Some(entries) = recovered_entries {
             entries
                 .write()
                 .await
                 .remove(&data_group_id)
                 .unwrap_or_default()
         } else {
-            Vec::new()
+            PartitionRecoveryState::default()
         };
 
         #[cfg(feature = "s3")]
-        let result = PartitionStorage::new_durable_with_shared_wal(
+        let result = PartitionStorage::new_durable_with_shared_wal_state(
             dir,
             topic_id,
             partition_id,
             wal_handle,
-            recovered,
+            state,
             None, // object_storage_dir
             None, // s3_config
             None, // tiering_config
         );
         #[cfg(not(feature = "s3"))]
-        let result = PartitionStorage::new_durable_with_shared_wal(
+        let result = PartitionStorage::new_durable_with_shared_wal_state(
             dir,
             topic_id,
             partition_id,
             wal_handle,
-            recovered,
+            state,
             None, // object_storage_dir
             None, // tiering_config
         );
@@ -1539,12 +1724,17 @@ async fn process_retention<S: Storage + Clone + Send + Sync + 'static>(
                 }
 
                 // Check that ALL groups in this segment are fully replicated.
+                // groups_in_segment returns (group_id, max_raft_index, max_wal_counter).
+                // Use max_raft_index for the replication safety check — WAL auto-counters
+                // and Raft log indices are different spaces (no-ops advance raft_index but
+                // are not stored in SharedWal), so comparing WAL counter against Raft
+                // match_index can allow premature deletion.
                 let groups = coordinator.groups_in_segment(info.segment_id).await;
-                let all_replicated = groups.iter().all(|(gid, max_idx)| {
+                let all_replicated = groups.iter().all(|(gid, max_raft_idx, _max_wal_idx)| {
                     let min_rep = replicated_indices.get(gid).copied().unwrap_or(0);
                     // If min_rep is 0, this node is not leader for this group.
                     // We can't safely delete — skip this segment.
-                    min_rep > 0 && *max_idx <= min_rep
+                    min_rep > 0 && *max_raft_idx <= min_rep
                 });
 
                 if !all_replicated {
@@ -1559,12 +1749,13 @@ async fn process_retention<S: Storage + Clone + Send + Sync + 'static>(
                             "Retention: deleted shared WAL segment"
                         );
                         // Trim each affected partition's BlobIndex to free memory.
-                        // segments are deleted FIFO so max_idx+1 is safe as the new floor.
+                        // Use max_wal_counter (not raft_index) — BlobIndex is keyed by
+                        // WAL auto-counter, so max_wal_counter+1 is the new floor.
                         let storage = partition_storage.read().await;
-                        for (group_id, max_idx) in &groups {
+                        for (group_id, _max_raft_idx, max_wal_idx) in &groups {
                             if let Some(ps_lock) = storage.get(group_id) {
                                 let mut ps = ps_lock.write().await;
-                                ps.trim_blob_index(max_idx + 1);
+                                ps.trim_blob_index(max_wal_idx + 1);
                             }
                         }
                     }

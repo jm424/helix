@@ -38,6 +38,8 @@ pub struct SegmentInfo {
     pub first_index: u64,
     /// Last log index in this segment (None if empty).
     pub last_index: Option<u64>,
+    /// Term of the last entry in this segment (None if unknown or empty).
+    pub last_term: Option<u64>,
     /// Total size in bytes.
     pub size_bytes: u64,
     /// Number of entries.
@@ -135,6 +137,9 @@ pub struct Wal<S: Storage, E: WalEntry = Entry> {
     /// Last index guaranteed durable (survives crash).
     /// After `sync()` succeeds, `durable_index == last_index`.
     durable_index: Option<u64>,
+    /// Compact state: (index, term) of the last entry deleted by retention.
+    /// Used by the leader to construct `InstallSnapshot` for lagging followers.
+    compact_state: Option<(u64, u64)>,
     /// Bytes written since last sync.
     bytes_since_sync: u64,
     /// Sealed segments that were modified by truncation but not yet synced.
@@ -183,6 +188,7 @@ fn segment_info_from<E: WalEntry>(
         segment_id,
         first_index: segment.first_index(),
         last_index: segment.last_index(),
+        last_term: segment.last_term(),
         size_bytes: segment.size_bytes(),
         entry_count: segment.entry_count(),
         is_sealed: segment.is_sealed(),
@@ -313,6 +319,7 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
                             segment_id,
                             first_index: seg_header.first_index,
                             last_index: last_index_opt,
+                            last_term: None,
                             size_bytes: seg_size_bytes,
                             entry_count,
                             is_sealed: true,
@@ -403,6 +410,7 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
                 first_index,
                 last_index,
                 durable_index: last_index, // Recovered state is durable (survived crash)
+                compact_state: None,
                 bytes_since_sync: 0,
                 sealed_segments_pending_sync: Vec::new(),
                 cached_segment: None,
@@ -582,6 +590,7 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
             first_index,
             last_index,
             durable_index: last_index, // Recovered state is durable (survived crash)
+            compact_state: None,
             bytes_since_sync: 0,
             sealed_segments_pending_sync: Vec::new(),
             cached_segment: None,
@@ -613,6 +622,14 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
     #[must_use]
     pub const fn durable_index(&self) -> Option<u64> {
         self.durable_index
+    }
+
+    /// Returns the compact state: (index, term) of the last entry deleted by retention.
+    ///
+    /// Returns `None` if no segments have been deleted yet.
+    #[must_use]
+    pub const fn compact_state(&self) -> Option<(u64, u64)> {
+        self.compact_state
     }
 
     /// Returns true if the WAL is empty.
@@ -1213,6 +1230,66 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
         Segment::<E>::decode(data, self.config.segment_config)
     }
 
+    /// Scans entry headers of a sealed segment without loading payload bytes.
+    ///
+    /// Calls `visitor` with the raw header bytes for each entry in the segment.
+    /// The header bytes are exactly `E::HEADER_SIZE` bytes long. The visitor
+    /// can extract per-entry metadata (e.g., group ID, index) without the cost
+    /// of decoding or allocating entry payloads.
+    ///
+    /// Used by the two-pass streaming recovery in `SharedWal` to build a
+    /// winner map (last-write-wins deduplication) with O(N×32 bytes) memory
+    /// rather than O(N×payload) memory.
+    ///
+    /// # Errors
+    /// Returns an error if the segment file cannot be read.
+    pub async fn scan_sealed_segment_entry_headers<F>(
+        &self,
+        segment_id: SegmentId,
+        mut visitor: F,
+    ) -> WalResult<()>
+    where
+        F: FnMut(&[u8]),
+    {
+        use bytes::Buf as _;
+        let sealed =
+            self.sealed_segments
+                .get(&segment_id)
+                .ok_or_else(|| WalError::Io {
+                    operation: "scan_entry_headers",
+                    message: format!("segment {segment_id} not found"),
+                })?;
+
+        let file = self.storage.open(&sealed.path).await?;
+        let mut data = file.read_all().await?;
+
+        // Skip segment header.
+        if data.remaining() < SEGMENT_HEADER_SIZE {
+            return Ok(());
+        }
+        data.advance(SEGMENT_HEADER_SIZE);
+
+        // Scan entries: read header, skip payload, call visitor.
+        while data.remaining() >= E::HEADER_SIZE {
+            let (_, payload_len) = E::scan_header_info(&data.chunk()[..E::HEADER_SIZE]);
+
+            if payload_len > crate::limits::ENTRY_PAYLOAD_SIZE_BYTES_MAX {
+                break; // Corruption guard.
+            }
+
+            let entry_total = E::HEADER_SIZE + payload_len as usize;
+            if data.remaining() < entry_total {
+                break; // Torn write at end.
+            }
+
+            // Call visitor with raw header bytes (no payload allocation).
+            visitor(&data.chunk()[..E::HEADER_SIZE]);
+            data.advance(entry_total);
+        }
+
+        Ok(())
+    }
+
     /// Returns an iterator over entries in the active segment only.
     ///
     /// For non-global-index WALs where sealed segments are not resident,
@@ -1472,6 +1549,21 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
                 active.segment.id() != segment_id,
                 "cannot delete the active segment"
             );
+        }
+
+        // Capture compact state from the last entry of the segment being deleted.
+        // This allows the leader to construct InstallSnapshot for followers that
+        // are behind the WAL floor.
+        if let Some(sealed) = self.sealed_segments.get(&segment_id) {
+            if let Some(last_idx) = sealed.info.last_index {
+                let last_term = sealed.info.last_term.or_else(|| {
+                    sealed.segment.as_ref()
+                        .and_then(|seg| seg.read(last_idx).ok().map(WalEntry::term))
+                });
+                if let Some(term) = last_term {
+                    self.compact_state = Some((last_idx, term));
+                }
+            }
         }
 
         let Some(sealed) = self.sealed_segments.remove(&segment_id) else {
@@ -2073,5 +2165,108 @@ mod tests {
             .unwrap();
         assert_eq!(wal.sealed_segment_count(), 1);
         assert_eq!(wal.first_index(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_compact_state_none_before_deletion() {
+        // compact_state() must be None on a freshly opened WAL with no
+        // segments deleted yet.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = WalConfig::new(temp_dir.path())
+            .with_segment_config(crate::SegmentConfig::new().with_max_entries(3));
+
+        let mut wal: Wal<TokioStorage> = Wal::open(TokioStorage::new(), config).await.unwrap();
+
+        for i in 1..=6 {
+            let entry = Entry::new(1, i, Bytes::from(format!("data-{i}"))).unwrap();
+            wal.append(entry).await.unwrap();
+        }
+        wal.sync().await.unwrap();
+
+        assert!(
+            wal.compact_state().is_none(),
+            "compact_state must be None before any segment is deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_sets_compact_state() {
+        // After deleting a sealed segment, compact_state() should reflect
+        // the last index and term of the deleted segment.
+        // Use term=2 for the first segment and term=3 for the second so the
+        // assertion is unambiguous.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = WalConfig::new(temp_dir.path())
+            .with_segment_config(crate::SegmentConfig::new().with_max_entries(3));
+
+        let mut wal: Wal<TokioStorage> = Wal::open(TokioStorage::new(), config).await.unwrap();
+
+        // Indices 1-3: term 2.
+        for i in 1..=3 {
+            let entry = Entry::new(2, i, Bytes::from(format!("t2-{i}"))).unwrap();
+            wal.append(entry).await.unwrap();
+        }
+        // Indices 4-6: term 3 (forces a second sealed segment + active).
+        for i in 4..=6 {
+            let entry = Entry::new(3, i, Bytes::from(format!("t3-{i}"))).unwrap();
+            wal.append(entry).await.unwrap();
+        }
+        // One more to push segment 2 into sealed state.
+        let entry = Entry::new(3, 7, Bytes::from("t3-7")).unwrap();
+        wal.append(entry).await.unwrap();
+        wal.sync().await.unwrap();
+
+        let sealed_ids = wal.sealed_segment_ids();
+        assert!(sealed_ids.len() >= 2, "need at least two sealed segments");
+
+        // Delete the first sealed segment (indices 1-3, all term 2).
+        wal.delete_sealed_segment(sealed_ids[0]).await.unwrap();
+
+        // compact_state should now record (3, 2): index=3, term=2.
+        let cs = wal.compact_state();
+        assert!(cs.is_some(), "compact_state must be set after deletion");
+        let (compact_idx, compact_term) = cs.unwrap();
+        assert_eq!(compact_idx, 3, "compact_idx must be last index of deleted segment");
+        assert_eq!(compact_term, 2, "compact_term must match term of last entry in deleted segment");
+    }
+
+    #[tokio::test]
+    async fn test_compact_state_updates_on_successive_deletions() {
+        // Each deletion advances compact_state to the boundary of the newly
+        // deleted segment.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = WalConfig::new(temp_dir.path())
+            .with_segment_config(crate::SegmentConfig::new().with_max_entries(2));
+
+        let mut wal: Wal<TokioStorage> = Wal::open(TokioStorage::new(), config).await.unwrap();
+
+        // Append 7 entries across different terms:
+        // indices 1-2: term 1, indices 3-4: term 2, indices 5-6: term 3,
+        // index 7: term 3 (keeps active segment open).
+        for i in 1..=2u64 {
+            wal.append(Entry::new(1, i, Bytes::from("a")).unwrap()).await.unwrap();
+        }
+        for i in 3..=4u64 {
+            wal.append(Entry::new(2, i, Bytes::from("b")).unwrap()).await.unwrap();
+        }
+        for i in 5..=7u64 {
+            wal.append(Entry::new(3, i, Bytes::from("c")).unwrap()).await.unwrap();
+        }
+        wal.sync().await.unwrap();
+
+        let sealed_ids = wal.sealed_segment_ids();
+        assert!(sealed_ids.len() >= 2, "need at least two sealed segments");
+
+        // Delete first sealed segment (indices 1-2, term 1).
+        wal.delete_sealed_segment(sealed_ids[0]).await.unwrap();
+        let (idx, term) = wal.compact_state().expect("compact_state must be Some");
+        assert_eq!(idx, 2);
+        assert_eq!(term, 1);
+
+        // Delete second sealed segment (indices 3-4, term 2).
+        wal.delete_sealed_segment(sealed_ids[1]).await.unwrap();
+        let (idx, term) = wal.compact_state().expect("compact_state must be Some");
+        assert_eq!(idx, 4);
+        assert_eq!(term, 2);
     }
 }
