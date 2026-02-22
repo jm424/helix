@@ -34,7 +34,7 @@ use helix_core::{
 use helix_progress::{ProgressConfig, ProgressManager, SimulatedProgressStore};
 use helix_raft::multi::MultiRaft;
 use helix_runtime::{PeerInfo, TransportConfig, TransportError, TransportHandle, TransportService};
-use helix_tier::SimulatedObjectStorage;
+use helix_tier::{ObjectStorage, SimulatedObjectStorage, WalSegmentStoreAdapter};
 use helix_wal::{PoolConfig, SharedEntry, SharedWalPool, Storage, TokioStorage};
 use crate::storage::PartitionRecoveryState;
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -439,6 +439,70 @@ pub struct TopicMetadata {
     pub partition_count: i32,
 }
 
+/// Configures coordinator-level tiering on a `SharedWalPool`.
+///
+/// Selects the same object storage backend as per-partition tiering (S3 >
+/// filesystem > simulated), wraps it in a `WalSegmentStoreAdapter`, and
+/// calls `pool.configure_tiering()`. This enables the pool to upload and
+/// download shared WAL segments independent of per-partition tiering.
+///
+/// The `base_prefix` for the pool is derived from the S3 key prefix (or
+/// left empty for filesystem/simulated backends).
+async fn configure_pool_tiering<S: helix_wal::Storage + Clone + Send + Sync + 'static>(
+    pool: &SharedWalPool<S>,
+    node_id: u64,
+    object_storage_dir: Option<&std::path::PathBuf>,
+    #[cfg(feature = "s3")] s3_config: Option<&helix_tier::S3Config>,
+) {
+    // Each node must use its own S3 prefix so that segment files from different
+    // nodes (which share the same segment IDs but have different WAL content)
+    // do not overwrite each other in object storage.
+    let base_prefix = format!("node-{node_id}/");
+
+    #[cfg(feature = "s3")]
+    if let Some(cfg) = s3_config {
+        use helix_tier::S3ObjectStorage;
+        let store = S3ObjectStorage::new(cfg.clone())
+            .await
+            .expect("failed to create S3 object storage for pool tiering");
+        // S3ObjectStorage prepends key_prefix internally. Each coordinator's
+        // final S3 key will be:
+        //   key_prefix + "{pod_name}/shared/{pool_index}/{segment_id:08x}.wal"
+        let adapter: Arc<dyn helix_wal::WalSegmentStore> =
+            Arc::new(WalSegmentStoreAdapter::new(store));
+        pool.configure_tiering(adapter, base_prefix).await;
+        info!("SharedWalPool tiering configured with S3 backend");
+        return;
+    }
+
+    if let Some(dir) = object_storage_dir {
+        use helix_tier::{FilesystemConfig, FilesystemObjectStorage};
+        let fs_cfg = FilesystemConfig {
+            base_path: dir.clone(),
+            sync_on_write: false,
+            create_if_missing: true,
+        };
+        let store = FilesystemObjectStorage::new(fs_cfg)
+            .await
+            .expect("failed to create filesystem object storage for pool tiering");
+        let adapter: Arc<dyn helix_wal::WalSegmentStore> =
+            Arc::new(WalSegmentStoreAdapter::new(store));
+        pool.configure_tiering(adapter, base_prefix).await;
+        info!(
+            object_storage_dir = ?dir,
+            "SharedWalPool tiering configured with filesystem backend"
+        );
+        return;
+    }
+
+    // No real backend configured; use simulated (no-op uploads).
+    let store = SimulatedObjectStorage::new(0);
+    let adapter: Arc<dyn helix_wal::WalSegmentStore> =
+        Arc::new(WalSegmentStoreAdapter::new(store));
+    pool.configure_tiering(adapter, base_prefix).await;
+    info!("SharedWalPool tiering configured with simulated backend");
+}
+
 /// The Helix gRPC service backed by Multi-Raft.
 ///
 /// This provides a Raft-replicated implementation using the Multi-Raft
@@ -645,6 +709,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
     ///
     /// The caller is responsible for spawning the tick task if needed.
     /// Production constructors spawn the tick task; DST constructors don't.
+    #[allow(clippy::too_many_lines)] // Constructor with initialization logic.
     async fn new_internal(
         cluster_id: String,
         node_id: u64,
@@ -699,6 +764,26 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             let pool = SharedWalPool::open(storage.clone(), pool_config)
                 .await
                 .expect("Failed to open SharedWalPool");
+
+            // Configure coordinator-level tiering for filesystem backend if available.
+            if object_storage_dir.is_some() {
+                configure_pool_tiering(&pool, node_id.get(), object_storage_dir.as_ref(), #[cfg(feature = "s3")] None).await;
+
+                // Download any segments present in object storage but missing from local
+                // disk before replay. This recovers a pod that restarted on a new node with
+                // an empty local directory.
+                match pool.download_missing_segments().await {
+                    Ok(n) if n > 0 => info!(
+                        downloaded = n,
+                        "Downloaded missing shared WAL segments from object storage before replay"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => warn!(
+                        error = %e,
+                        "Failed to download missing shared WAL segments from object storage"
+                    ),
+                }
+            }
 
             // Streaming recovery: build pre-built states per group without
             // accumulating all entries in memory (fixes OOM on large WALs).
@@ -937,8 +1022,24 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                 let vote_file_path = dir.join("vote-state.bin");
                 let local_storage = Arc::new(LocalFileVoteStorage::new(vote_file_path));
 
-                // Use simulated object storage for S3 backup (can be upgraded to real S3 later).
-                let remote_storage = Arc::new(SimulatedObjectStorage::new(node_id.get()));
+                // Build remote storage for vote state backup.
+                // Uses S3 in production (when s3_config is set) so that vote state
+                // survives pod rescheduling to a new node. Falls back to simulated
+                // storage for DST and tests where no real object store is available.
+                #[cfg(feature = "s3")]
+                let remote_storage: Arc<dyn ObjectStorage> =
+                    if let Some(ref cfg) = s3_config {
+                        Arc::new(
+                            helix_tier::S3ObjectStorage::new(cfg.clone())
+                                .await
+                                .expect("failed to create S3 object storage for vote state"),
+                        )
+                    } else {
+                        Arc::new(SimulatedObjectStorage::new(node_id.get()))
+                    };
+                #[cfg(not(feature = "s3"))]
+                let remote_storage: Arc<dyn ObjectStorage> =
+                    Arc::new(SimulatedObjectStorage::new(node_id.get()));
 
                 // Load existing vote state or start fresh.
                 let load_result = VoteStore::<LocalFileVoteStorage>::load(
@@ -1035,6 +1136,27 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             let pool = SharedWalPool::open(storage.clone(), pool_config)
                 .await
                 .expect("Failed to open SharedWalPool");
+
+            // Configure coordinator-level tiering on the pool if tiering is enabled.
+            // Uses the same backend selection logic as per-partition tiering.
+            if tiering_config.is_some() {
+                configure_pool_tiering(&pool, node_id.get(), object_storage_dir.as_ref(), #[cfg(feature = "s3")] s3_config.as_ref()).await;
+
+                // Download any segments present in object storage but missing from local
+                // disk before replay. This recovers a pod that restarted on a new node with
+                // an empty local directory.
+                match pool.download_missing_segments().await {
+                    Ok(n) if n > 0 => info!(
+                        downloaded = n,
+                        "Downloaded missing shared WAL segments from object storage before replay (multi-node)"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => warn!(
+                        error = %e,
+                        "Failed to download missing shared WAL segments from object storage (multi-node)"
+                    ),
+                }
+            }
 
             // Streaming recovery: build pre-built states per group while
             // collecting controller entries separately (small, OK to clone).

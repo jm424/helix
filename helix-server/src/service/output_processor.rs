@@ -530,8 +530,14 @@ async fn handle_need_wal_entries<S: Storage + Clone + Send + Sync + 'static>(
             };
             drop(storage_map);
 
-            if wal_floor.is_some_and(|floor| floor > start_index.get()) {
-                // WAL floor has advanced past the follower's position.
+            // For dedicated WAL: wal_floor is Some(first_available_index).
+            // For shared WAL: wal_floor is always None (floor not separately tracked).
+            // In both cases, if entries cannot be served, use snapshot installation
+            // to fast-forward the follower. map_or(true, ...) means: when wal_floor
+            // is None (shared WAL), always attempt the compact_state snapshot path.
+            if wal_floor.is_none_or(|floor| floor > start_index.get()) {
+                // WAL floor has advanced past the follower's position (dedicated WAL),
+                // or entries are unavailable due to tiering (shared WAL).
                 // Use InstallSnapshot to fast-forward the follower.
                 if let Some((compact_idx, compact_term)) = compact_state {
                     let Ok(handle) = router.partition(group_id).await else {

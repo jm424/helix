@@ -648,6 +648,74 @@ impl ObjectStorage for SimulatedObjectStorage {
 }
 
 // -----------------------------------------------------------------------------
+// WalSegmentStoreAdapter
+// -----------------------------------------------------------------------------
+
+/// Adapts any [`ObjectStorage`] implementor to the [`helix_wal::WalSegmentStore`] trait.
+///
+/// `SharedWalCoordinator` requires a `WalSegmentStore` (defined in `helix-wal`)
+/// so that `helix-wal` does not take a dependency on `helix-tier`. This adapter
+/// bridges the two traits by converting `TierError` ↔ `WalError`.
+///
+/// # Example
+///
+/// ```ignore
+/// let storage = SimulatedObjectStorage::new(42);
+/// let adapter = Arc::new(WalSegmentStoreAdapter::new(storage));
+/// pool.configure_tiering(adapter, "helix/pod-0/".to_string()).await;
+/// ```
+pub struct WalSegmentStoreAdapter<T: ObjectStorage + 'static> {
+    inner: T,
+}
+
+impl<T: ObjectStorage + 'static> WalSegmentStoreAdapter<T> {
+    /// Creates a new adapter wrapping `storage`.
+    pub const fn new(storage: T) -> Self {
+        Self { inner: storage }
+    }
+}
+
+#[async_trait]
+impl<T: ObjectStorage + 'static> helix_wal::WalSegmentStore for WalSegmentStoreAdapter<T> {
+    async fn put(&self, key: &str, data: bytes::Bytes) -> helix_wal::WalResult<()> {
+        self.inner
+            .put(&ObjectKey::new(key), data)
+            .await
+            .map_err(|e| helix_wal::WalError::io("tier_put", e))
+    }
+
+    async fn get(&self, key: &str) -> helix_wal::WalResult<bytes::Bytes> {
+        self.inner
+            .get(&ObjectKey::new(key))
+            .await
+            .map_err(|e| match &e {
+                TierError::NotFound { .. } => {
+                    let segment_id =
+                        helix_wal::parse_segment_id_from_key(key).unwrap_or(0);
+                    helix_wal::WalError::SegmentNotFound { segment_id }
+                }
+                _ => helix_wal::WalError::io("tier_get", e),
+            })
+    }
+
+    async fn delete(&self, key: &str) -> helix_wal::WalResult<()> {
+        self.inner
+            .delete(&ObjectKey::new(key))
+            .await
+            .map_err(|e| helix_wal::WalError::io("tier_delete", e))
+    }
+
+    async fn list(&self, prefix: &str) -> helix_wal::WalResult<Vec<String>> {
+        let keys = self
+            .inner
+            .list(prefix)
+            .await
+            .map_err(|e| helix_wal::WalError::io("tier_list", e))?;
+        Ok(keys.into_iter().map(|k| k.as_str().to_string()).collect())
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
 

@@ -866,6 +866,17 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
 
         self.last_applied = index;
         self.last_applied_term = term;
+
+        // Notify tiering system that entries up to `index` are committed.
+        // For dedicated WAL: marks per-segment committed tracking in metadata store.
+        // For shared WAL: updates the coordinator's committed-WAL-index so the
+        // coordinator can determine when whole shared segments are safe to tier.
+        if let PartitionStorageInner::Durable(partition) = &self.inner {
+            // Fire-and-forget: tiering is best-effort. Ignore errors here;
+            // `process_tiering()` will retry on the next tick.
+            let _ = partition.on_entries_committed(index.get()).await;
+        }
+
         Ok(base_offset)
     }
 

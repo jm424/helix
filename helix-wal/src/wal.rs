@@ -1353,6 +1353,157 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
         }
     }
 
+    /// Writes raw segment bytes to the WAL directory and registers the segment.
+    ///
+    /// Used during startup recovery to restore segments downloaded from the
+    /// object store onto a new node (empty local disk). The bytes must be
+    /// a valid encoded segment (segment header + entries).
+    ///
+    /// After this call the segment is visible to `recover()` and future reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails or the segment bytes are invalid.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the restored segment's header `segment_id` does not match the provided `segment_id`.
+    pub async fn restore_segment_from_bytes(
+        &mut self,
+        segment_id: u64,
+        bytes: bytes::Bytes,
+    ) -> WalResult<()> {
+        use crate::segment::SegmentId;
+
+        let segment_id = SegmentId::new(segment_id);
+
+        // Skip if already registered.
+        if self.sealed_segments.contains_key(&segment_id) {
+            return Ok(());
+        }
+
+        // Write bytes to disk at the canonical path.
+        let path = self.segment_path(segment_id);
+        let file = self.storage.open(&path).await?;
+        file.write_at(0, &bytes[..]).await?;
+
+        // Decode segment header to build SegmentInfo.
+        let (seg_header, entry_count, last_index_opt, seg_size_bytes) =
+            crate::segment::Segment::<E>::decode_info(bytes, self.config.segment_config)?;
+
+        assert_eq!(
+            seg_header.segment_id,
+            segment_id,
+            "restored segment_id mismatch"
+        );
+
+        if segment_id >= self.next_segment_id {
+            self.next_segment_id = segment_id.next();
+        }
+
+        let info = SegmentInfo {
+            segment_id,
+            first_index: seg_header.first_index,
+            last_index: last_index_opt,
+            last_term: None,
+            size_bytes: seg_size_bytes,
+            entry_count,
+            is_sealed: true,
+            sealed_at_secs: Some(unix_now_secs()),
+        };
+
+        self.sealed_segments.insert(
+            segment_id,
+            SealedSegment {
+                segment: None, // Not resident; loaded on demand during recovery.
+                info,
+                path,
+            },
+        );
+
+        debug!(
+            segment_id = segment_id.get(),
+            first_index = seg_header.first_index,
+            last_index = ?last_index_opt,
+            "Restored segment from object store"
+        );
+
+        Ok(())
+    }
+
+    /// Registers a segment that has already been written to disk.
+    ///
+    /// Unlike [`restore_segment_from_bytes`], this does NOT write any data to
+    /// disk. Use this when the disk write has already been performed outside
+    /// the WAL lock to keep expensive I/O off the hot lock path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the segment header cannot be decoded.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the segment ID encoded in the segment header does not match
+    /// the `segment_id` argument.
+    pub fn register_restored_segment(
+        &mut self,
+        segment_id: u64,
+        path: PathBuf,
+        bytes: bytes::Bytes,
+    ) -> WalResult<()> {
+        use crate::segment::SegmentId;
+
+        let segment_id = SegmentId::new(segment_id);
+
+        // Skip if already registered (idempotent).
+        if self.sealed_segments.contains_key(&segment_id) {
+            return Ok(());
+        }
+
+        // Decode segment header to build SegmentInfo (no I/O).
+        let (seg_header, entry_count, last_index_opt, seg_size_bytes) =
+            crate::segment::Segment::<E>::decode_info(bytes, self.config.segment_config)?;
+
+        assert_eq!(
+            seg_header.segment_id,
+            segment_id,
+            "restored segment_id mismatch"
+        );
+
+        if segment_id >= self.next_segment_id {
+            self.next_segment_id = segment_id.next();
+        }
+
+        let info = SegmentInfo {
+            segment_id,
+            first_index: seg_header.first_index,
+            last_index: last_index_opt,
+            last_term: None,
+            size_bytes: seg_size_bytes,
+            entry_count,
+            is_sealed: true,
+            sealed_at_secs: Some(unix_now_secs()),
+        };
+
+        self.sealed_segments.insert(
+            segment_id,
+            SealedSegment {
+                segment: None, // Not resident; loaded on demand.
+                info,
+                path,
+            },
+        );
+
+        debug!(
+            segment_id = segment_id.get(),
+            first_index = seg_header.first_index,
+            last_index = ?last_index_opt,
+            "Registered pre-written segment in WAL index"
+        );
+
+        Ok(())
+    }
+
     // -------------------------------------------------------------------------
     // Segment Eviction
     // -------------------------------------------------------------------------

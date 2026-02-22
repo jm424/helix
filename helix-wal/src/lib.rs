@@ -40,6 +40,7 @@ mod buffered;
 mod entry;
 mod error;
 mod segment;
+mod segment_store;
 mod shared_entry;
 mod shared_wal;
 mod storage;
@@ -49,6 +50,7 @@ pub use buffered::{BufferedWal, BufferedWalConfig};
 pub use entry::{Entry, EntryHeader, WalEntry, ENTRY_HEADER_SIZE};
 pub use error::{WalError, WalResult};
 pub use segment::{Segment, SegmentConfig, SegmentHeader, SegmentId, SEGMENT_HEADER_SIZE};
+pub use segment_store::{parse_segment_id_from_key, NoopSegmentStore, WalSegmentStore};
 pub use shared_entry::{SharedEntry, SharedEntryHeader, SHARED_ENTRY_HEADER_SIZE};
 pub use shared_wal::{
     CoordinatorConfig, DurableAck, PoolConfig, SharedWal, SharedWalConfig, SharedWalCoordinator,

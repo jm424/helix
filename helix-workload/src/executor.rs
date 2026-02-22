@@ -249,6 +249,10 @@ pub struct RealClusterConfig {
     /// receives one line: `allocated=N active=N resident=N retained=N`.
     /// `None` disables the stats servers.
     pub alloc_stats_base_port: Option<u16>,
+    /// Number of shared WALs to use for fsync amortization (1-16).
+    /// `None` uses the server default (4). Override for tests that need
+    /// shared-WAL-specific tiering verification.
+    pub shared_wal_count: Option<u32>,
 }
 
 impl Default for RealClusterConfig {
@@ -269,6 +273,7 @@ impl Default for RealClusterConfig {
             log_level: String::from("info"),
             local_retention_ms: None,
             alloc_stats_base_port: None,
+            shared_wal_count: None,
         }
     }
 }
@@ -449,6 +454,17 @@ impl RealClusterBuilder {
         self
     }
 
+    /// Sets the number of shared WALs used for fsync amortization.
+    ///
+    /// Must be in range `1..=16`. `None` (the default) lets the server choose (4).
+    /// Set this in tests that verify shared-WAL-specific behaviour such as
+    /// coordinator-level tiering or `download_missing_segments` recovery.
+    #[must_use]
+    pub const fn with_shared_wal_count(mut self, count: u32) -> Self {
+        self.config.shared_wal_count = Some(count);
+        self
+    }
+
     /// Builds and starts the cluster.
     ///
     /// # Errors
@@ -579,9 +595,8 @@ impl RealCluster {
 
             if let Some(ref s3) = config.s3_config {
                 cmd.arg("--s3-bucket").arg(&s3.bucket);
-                // Each node gets a unique prefix to avoid conflicts.
-                cmd.arg("--s3-prefix")
-                    .arg(format!("{}node-{}/", s3.prefix, node_id));
+                // Per-node isolation is handled server-side (node-{id}/ prefix).
+                cmd.arg("--s3-prefix").arg(&s3.prefix);
                 cmd.arg("--s3-region").arg(&s3.region);
                 if let Some(ref endpoint) = s3.endpoint {
                     cmd.arg("--s3-endpoint").arg(endpoint);
@@ -603,6 +618,11 @@ impl RealCluster {
             if let Some(base) = config.alloc_stats_base_port {
                 let stats_port = base + u16::try_from(node_id).unwrap_or(0);
                 cmd.arg("--alloc-stats-port").arg(stats_port.to_string());
+            }
+
+            // Pass shared WAL count if configured.
+            if let Some(count) = config.shared_wal_count {
+                cmd.arg("--shared-wal-count").arg(count.to_string());
             }
 
             // Suppress stdout; configure stderr based on test log mode.
@@ -784,6 +804,26 @@ impl RealCluster {
         Ok(())
     }
 
+    /// Wipes a node's local data directory.
+    ///
+    /// Simulates the node being rescheduled to a new host with an empty local
+    /// disk. The node must already be stopped (via [`kill_node`](Self::kill_node))
+    /// before calling this. After wiping, call [`restart_node`](Self::restart_node)
+    /// to start the node with an empty data directory; if tiering is configured,
+    /// the node will download missing WAL segments from object storage on startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be removed or recreated.
+    pub fn wipe_node_data_dir(&self, node_id: u64) -> Result<(), ExecutorError> {
+        let node_dir = self.config.data_dir.join(format!("node-{node_id}"));
+        if node_dir.exists() {
+            std::fs::remove_dir_all(&node_dir).map_err(ExecutorError::SpawnFailed)?;
+        }
+        std::fs::create_dir_all(&node_dir).map_err(ExecutorError::SpawnFailed)?;
+        Ok(())
+    }
+
     /// Restarts a previously killed node.
     ///
     /// # Errors
@@ -856,8 +896,8 @@ impl RealCluster {
 
         if let Some(ref s3) = self.config.s3_config {
             cmd.arg("--s3-bucket").arg(&s3.bucket);
-            cmd.arg("--s3-prefix")
-                .arg(format!("{}node-{}/", s3.prefix, node_id));
+            // Per-node isolation is handled server-side (node-{id}/ prefix).
+            cmd.arg("--s3-prefix").arg(&s3.prefix);
             cmd.arg("--s3-region").arg(&s3.region);
             if let Some(ref endpoint) = s3.endpoint {
                 cmd.arg("--s3-endpoint").arg(endpoint);
@@ -874,6 +914,11 @@ impl RealCluster {
         if let Some(base) = self.config.alloc_stats_base_port {
             let stats_port = base + u16::try_from(node_id).unwrap_or(0);
             cmd.arg("--alloc-stats-port").arg(stats_port.to_string());
+        }
+
+        // Pass shared WAL count if configured.
+        if let Some(count) = self.config.shared_wal_count {
+            cmd.arg("--shared-wal-count").arg(count.to_string());
         }
 
         cmd.stdout(Stdio::null()).envs(std::env::vars());

@@ -114,7 +114,13 @@ pub async fn tick_task<S: Storage + Clone + Send + Sync + 'static>(
                 ).await;
             }
             _ = tiering_interval.tick() => {
-                process_tiering(&partition_storage).await;
+                // Spawn tiering in a background task so S3 uploads never block
+                // Raft ticks. Uploads can take seconds per segment; running them
+                // inline would freeze the tick loop and trigger election timeouts.
+                let ps = Arc::clone(&partition_storage);
+                tokio::spawn(async move {
+                    process_tiering(&ps, None::<&Arc<SharedWalPool<S>>>).await;
+                });
             }
         }
     }
@@ -227,8 +233,14 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
                 ).await;
             }
             _ = tiering_interval.tick() => {
-                // Process tiering for all durable partitions.
-                process_tiering(&partition_storage).await;
+                // Spawn tiering in a background task so S3 uploads never block
+                // Raft ticks, peer message processing, or heartbeats. Segment
+                // uploads can take seconds and must not hold the tick loop.
+                let ps = Arc::clone(&partition_storage);
+                let pool = shared_wal_pool.clone();
+                tokio::spawn(async move {
+                    process_tiering(&ps, pool.as_ref()).await;
+                });
             }
             _ = retention_interval.tick() => {
                 // Delete old WAL segments that have been replicated.
@@ -660,18 +672,26 @@ pub async fn process_controller_outputs<
                 if index.get() > last_persisted {
                     if let Some(pool) = shared_wal_pool {
                         let handle = pool.handle(CONTROLLER_GROUP_ID);
-                        if let Err(e) = handle
+                        match handle
                             .append_nowait(term.get(), index.get(), metadata.clone())
                             .await
                         {
-                            error!(
-                                index = index.get(),
-                                error = %e,
-                                "Failed to persist controller entry to SharedWAL"
-                            );
-                        } else {
-                            CONTROLLER_LAST_PERSISTED_INDEX
-                                .store(index.get(), std::sync::atomic::Ordering::Relaxed);
+                            Err(e) => {
+                                error!(
+                                    index = index.get(),
+                                    error = %e,
+                                    "Failed to persist controller entry to SharedWAL"
+                                );
+                            }
+                            Ok(wal_index) => {
+                                CONTROLLER_LAST_PERSISTED_INDEX
+                                    .store(index.get(), std::sync::atomic::Ordering::Relaxed);
+                                // Mark this WAL entry committed so the coordinator knows
+                                // this group has consumed through wal_index. Without this,
+                                // controller segments never become eligible for S3 tiering
+                                // and are lost on every pod restart (ephemeral disk wipe).
+                                handle.update_committed_wal_index(wal_index);
+                            }
                         }
                     }
                 }
@@ -1549,19 +1569,21 @@ async fn process_outputs<S: Storage + Clone + Send + Sync + 'static>(
     }
 }
 
-/// Processes tiering for all durable partitions.
+/// Processes tiering for all durable partitions and the shared WAL pool.
 ///
-/// This function iterates over all partition storage and performs tiering
-/// operations for those with tiering enabled:
-/// 1. Registers newly sealed segments with the tiering manager
-/// 2. Uploads eligible segments to object storage (S3/filesystem)
+/// This function:
+/// 1. Registers newly sealed segments with the tiering manager for dedicated WAL partitions
+/// 2. Uploads eligible dedicated WAL segments to object storage (S3/filesystem)
+/// 3. Uploads eligible shared WAL segments via `SharedWalPool::process_tiering()`
 ///
 /// # Arguments
 ///
 /// * `partition_storage` - Map of group ID to partition storage
+/// * `shared_wal_pool` - Optional shared WAL pool for coordinator-level tiering
 #[allow(clippy::significant_drop_tightening)]
 async fn process_tiering<S: Storage + Clone + Send + Sync + 'static>(
     partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
+    shared_wal_pool: Option<&Arc<SharedWalPool<S>>>,
 ) {
     // Collect group IDs of partitions with tiering enabled.
     // Note: We hold the outer read lock while checking has_tiering() on each partition.
@@ -1577,6 +1599,12 @@ async fn process_tiering<S: Storage + Clone + Send + Sync + 'static>(
         }
         groups
     };
+
+    // Process shared WAL coordinator tiering (uploads + local deletion of tiered segments).
+    // This runs independently of whether any dedicated-WAL partitions have tiering enabled.
+    if let Some(pool) = shared_wal_pool {
+        pool.process_tiering().await;
+    }
 
     if tiering_groups.is_empty() {
         return;

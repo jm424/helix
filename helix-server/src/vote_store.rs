@@ -542,10 +542,10 @@ pub struct LoadResult {
 
 impl<L: VoteStorage + 'static> VoteStore<L> {
     /// Creates a new vote store and starts the background upload worker.
-    pub fn new<R: ObjectStorage + 'static>(
+    pub fn new(
         node_id: NodeId,
         local: Arc<L>,
-        remote: Arc<R>,
+        remote: Arc<dyn ObjectStorage>,
         state: VoteState,
     ) -> (Self, VoteStoreHandle) {
         let (upload_tx, upload_rx) = mpsc::unbounded_channel();
@@ -573,10 +573,10 @@ impl<L: VoteStorage + 'static> VoteStore<L> {
     /// # Errors
     ///
     /// Returns an error if neither local nor remote storage can be read.
-    pub async fn load<R: ObjectStorage>(
+    pub async fn load(
         node_id: NodeId,
         local: &L,
-        remote: &R,
+        remote: &dyn ObjectStorage,
     ) -> VoteStoreResult<LoadResult> {
         // Try local first
         if let Some(data) = local.read()? {

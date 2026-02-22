@@ -72,6 +72,7 @@ pub use metadata::{
 pub use s3::{S3Config, S3ConfigError, S3ObjectStorage, S3StorageClass};
 pub use storage::{
     ObjectKey, ObjectStorage, ObjectStorageFaultConfig, SegmentReader, SimulatedObjectStorage,
+    WalSegmentStoreAdapter,
 };
 
 /// Tiering configuration limits.

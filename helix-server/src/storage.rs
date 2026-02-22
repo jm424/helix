@@ -211,8 +211,8 @@ use helix_tier::{
 #[cfg(feature = "s3")]
 use helix_tier::{S3Config, S3ObjectStorage};
 use helix_wal::{
-    BufferedWal, BufferedWalConfig, Entry, EntryHeader, SegmentId, SharedEntry, SharedWalHandle,
-    Storage, TokioStorage, WalConfig,
+    BufferedWal, BufferedWalConfig, Entry, EntryHeader, SegmentConfig, SegmentId, SharedEntry,
+    SharedWalHandle, Storage, TokioStorage, WalConfig,
 };
 use tracing::{debug, info, warn};
 
@@ -436,6 +436,26 @@ impl<S: Storage + Clone + 'static> TieringBackend<S> {
             Self::Filesystem(m) => m.evict_with_progress(safe_offset).await,
             #[cfg(feature = "s3")]
             Self::S3(m) => m.evict_with_progress(safe_offset).await,
+        }
+    }
+
+    /// Returns the location of a segment (Local, Both, Remote, or None if unknown).
+    ///
+    /// Used by retention to verify a segment is confirmed in object storage before
+    /// deleting it locally.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata store query fails.
+    pub async fn get_location(
+        &self,
+        segment_id: SegmentId,
+    ) -> TierResult<Option<helix_tier::SegmentLocation>> {
+        match self {
+            Self::Simulated(m) => m.get_location(segment_id).await,
+            Self::Filesystem(m) => m.get_location(segment_id).await,
+            #[cfg(feature = "s3")]
+            Self::S3(m) => m.get_location(segment_id).await,
         }
     }
 }
@@ -1528,6 +1548,11 @@ pub struct DurablePartitionConfig {
     /// Only deletes segments whose entries have been fully replicated.
     /// `None` means retention is disabled (segments kept forever).
     pub local_retention_ms: Option<u64>,
+    /// Optional WAL segment configuration override.
+    ///
+    /// When `Some`, overrides the default segment size / entry limits.
+    /// Primarily used in tests to force segment rotation with small entry counts.
+    pub segment_config: Option<SegmentConfig>,
 }
 
 #[allow(dead_code)] // Used in tests and will be used in service.rs integration.
@@ -1547,6 +1572,7 @@ impl DurablePartitionConfig {
             #[cfg(feature = "s3")]
             s3_config: None,
             local_retention_ms: None,
+            segment_config: None,
         }
     }
 
@@ -1614,6 +1640,15 @@ impl DurablePartitionConfig {
     #[must_use]
     pub const fn with_local_retention_ms(mut self, ms: u64) -> Self {
         self.local_retention_ms = Some(ms);
+        self
+    }
+
+    /// Overrides the WAL segment configuration.
+    ///
+    /// Primarily used in tests to force segment rotation with small entry counts.
+    #[must_use]
+    pub const fn with_segment_config(mut self, config: SegmentConfig) -> Self {
+        self.segment_config = Some(config);
         self
     }
 
@@ -1872,7 +1907,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             config.flush_interval
         };
 
-        let wal_config = WalConfig::new(&wal_dir);
+        let base_wal_config = WalConfig::new(&wal_dir);
+        let wal_config = if let Some(sc) = config.segment_config {
+            base_wal_config.with_segment_config(sc)
+        } else {
+            base_wal_config
+        };
         let buffered_config =
             BufferedWalConfig::new(wal_config).with_flush_interval(effective_flush_interval);
 
@@ -2936,7 +2976,15 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                 Ok(Some(entry))
             }
             WalBackend::Shared(handle) => {
-                let shared = handle.read_entry_by_raft_index(raft_index).await;
+                let shared =
+                    handle
+                        .read_entry_by_raft_index(raft_index)
+                        .await
+                        .map_err(|e| DurablePartitionError::WalRead {
+                            message: format!(
+                                "failed to read raft_index {raft_index}: {e}"
+                            ),
+                        })?;
                 Ok(shared.map(|se| Entry {
                     header: EntryHeader {
                         crc: se.header.crc,
@@ -2998,13 +3046,18 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                 // SharedWal entries are keyed by WAL auto-counter, not raft_index.
                 // Use read_entries_by_raft_index to search by the raft_index field,
                 // and map raft_index → Entry.index so callers get Raft log indices.
+                // Returns Err if a required segment was locally deleted by tiering
+                // (callers should use snapshot installation in that case).
                 let shared_entries = handle
                     .read_entries_by_raft_index(
                         start_index,
                         self.last_applied_index,
                         max_bytes,
                     )
-                    .await;
+                    .await
+                    .map_err(|e| DurablePartitionError::WalRead {
+                        message: format!("shared WAL read_entries_by_raft_index failed: {e}"),
+                    })?;
                 let entries = shared_entries
                     .into_iter()
                     .map(|se| Entry {
@@ -3281,14 +3334,33 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         &self,
         committed_index: u64,
     ) -> Result<u32, DurablePartitionError> {
+        // For shared WAL: update the coordinator's committed-WAL-index so the
+        // coordinator can determine when an entire segment is safe to tier.
+        // The `last_applied_wal_index` is the WAL auto-counter of the most
+        // recently committed entry for this partition.
+        if let WalBackend::Shared(handle) = &self.wal {
+            handle.update_committed_wal_index(self.last_applied_wal_index);
+        }
+
         let Some(tiering) = &self.tiering else {
             return Ok(0);
         };
 
+        // For shared WAL, the per-segment committed tracking below compares
+        // `segment_last_index` (a WAL auto-counter) against `committed_index`
+        // (a Raft index). These are different index spaces and must not be
+        // compared. Skip the per-segment marking for shared WAL — tiering
+        // eligibility is managed at the coordinator level.
+        if matches!(&self.wal, WalBackend::Shared(_)) {
+            return Ok(0);
+        }
+
+        // --- Dedicated WAL path ---
+
         // Read WAL state.
         let sealed_ids = match &self.wal {
             WalBackend::Dedicated(wal) => wal.sealed_segment_ids().await,
-            WalBackend::Shared(handle) => handle.sealed_segment_ids().await,
+            WalBackend::Shared(_) => unreachable!("handled above"),
         };
 
         // Collect segments to commit.
@@ -3296,11 +3368,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
         for segment_id in sealed_ids.iter().take(100) {
             let info_opt = match &self.wal {
                 WalBackend::Dedicated(wal) => wal.segment_info(*segment_id).await,
-                WalBackend::Shared(handle) => handle.segment_info(*segment_id).await,
+                WalBackend::Shared(_) => unreachable!("handled above"),
             };
 
             if let Some(info) = info_opt {
-                // Check if all entries in this segment are committed.
+                // For dedicated WAL, segment_last_index IS the Raft index, so
+                // this comparison is valid.
                 let segment_last_index = info.last_index.unwrap_or(info.first_index);
                 if segment_last_index <= committed_index {
                     segments_to_commit.push((*segment_id, segment_last_index));
@@ -3310,7 +3383,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
 
         let mut committed_count = 0u32;
 
-        // Mark segments as committed without holding the lock.
         for (segment_id, segment_last_index) in segments_to_commit {
             if let Err(e) = tiering.mark_committed(segment_id).await {
                 warn!(
@@ -3636,6 +3708,24 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
 
         let mut deleted = 0u32;
         for segment_id in &to_delete {
+            // Safety guard — do not delete a segment that has not been confirmed
+            // in object storage. Without this, a pod restart on a new node (empty
+            // local disk) cannot recover from S3 because the segment is already gone.
+            if let Some(tiering) = &self.tiering {
+                let location = tiering.get_location(*segment_id).await.unwrap_or(None);
+                let is_in_s3 = matches!(
+                    location,
+                    Some(helix_tier::SegmentLocation::Both | helix_tier::SegmentLocation::Remote)
+                );
+                if !is_in_s3 {
+                    debug!(
+                        segment_id = segment_id.get(),
+                        "Retention: skipping deletion — segment not yet confirmed in object storage"
+                    );
+                    continue;
+                }
+            }
+
             match wal.delete_sealed_segment(*segment_id).await {
                 Ok(()) => {
                     deleted += 1;

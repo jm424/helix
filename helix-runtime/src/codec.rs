@@ -717,6 +717,10 @@ fn decode_message_payload(buf: &mut &[u8]) -> CodecResult<Message> {
             Message::AppendEntriesResponse(decode_append_entries_response(buf)?)
         }
         TAG_TIMEOUT_NOW => Message::TimeoutNow(decode_timeout_now(buf)?),
+        TAG_INSTALL_SNAPSHOT => Message::InstallSnapshot(decode_install_snapshot(buf)?),
+        TAG_INSTALL_SNAPSHOT_RESPONSE => {
+            Message::InstallSnapshotResponse(decode_install_snapshot_response(buf)?)
+        }
         _ => return Err(CodecError::UnknownMessageType { tag }),
     };
 

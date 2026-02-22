@@ -30,7 +30,7 @@
 //! ```
 
 use bytes::Bytes;
-use helix_workload::{RealCluster, RealExecutor, WorkloadExecutor};
+use helix_workload::{RealCluster, RealExecutor, TieringTestConfig, WorkloadExecutor};
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{BaseConsumer, Consumer};
 use std::collections::{HashMap, HashSet};
@@ -303,6 +303,26 @@ fn delete_s3_bucket(bucket: &str) {
         .args(["s3", "rb", "--force", &format!("s3://{bucket}")])
         .output();
     eprintln!("[S3] Deleted bucket: {bucket}");
+}
+
+/// Count `.wal` files recursively under `dir` (bounded by known directory depth).
+fn count_wal_files_in_dir(dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| {
+            let p = e.path();
+            if p.is_dir() {
+                count_wal_files_in_dir(&p)
+            } else if p.extension().and_then(|x| x.to_str()) == Some("wal") {
+                1
+            } else {
+                0
+            }
+        })
+        .sum()
 }
 
 /// List objects in an S3 bucket.
@@ -902,4 +922,278 @@ async fn test_filesystem_tiering() {
     drop(cluster);
     let _ = std::fs::remove_dir_all(tier_dir);
     let _ = std::fs::remove_dir_all(data_dir);
+}
+
+// =============================================================================
+// Test: Shared WAL Tiering + Single-Node Empty-Disk Recovery
+// =============================================================================
+
+/// Tests that shared WAL segments are uploaded to S3, local copies are deleted to
+/// free disk space, and a node whose local disk is wiped can recover from S3.
+///
+/// This is the primary end-to-end test for shared WAL tiering.
+/// It exercises three code paths that unit tests cannot cover:
+///
+/// 1. **Upload path**: `SharedWalCoordinator::tier_eligible_sealed_segments()`
+///    is called by the tick task once enough entries have been committed across
+///    all groups sharing a WAL shard.  S3 objects under `shared/` prove it ran.
+///
+/// 2. **Recovery path**: After wiping node 1's local WAL directory and
+///    restarting it, `SharedWalPool::download_missing_segments()` is called
+///    during startup to restore segments from S3 before Raft replay.  The
+///    subsequent Raft `AppendEntries` catch-up fills the gap between the last
+///    tiered index and the current committed index on nodes 2/3, so the
+///    restarted node rejoins the cluster as a full voting member.
+///
+/// 3. **Local deletion + S3 read fallback**: After tiering, local segment
+///    copies are deleted to reclaim disk space.  Phase 7 asserts that the on-disk
+///    `.wal` file count stays within the active-segments bound.  The Phase 4
+///    Raft catch-up implicitly validates the S3 read fallback: nodes 2/3 serve
+///    `AppendEntries` for segments whose local files were deleted, triggering
+///    `SharedWalHandle::restore_from_s3()` transparently.
+///
+/// # Note on message count
+///
+/// The default shared WAL segment size is 4 MiB.  Each `SharedEntry` has a
+/// 40-byte header; with ~30 byte payloads per message the total per entry is
+/// ~70 bytes, requiring ~60 000 entries to fill one segment.  We write 80 000
+/// messages so that at least one full segment is sealed and eligible for
+/// tiering, with a second segment starting to absorb additional writes.
+#[tokio::test]
+#[ignore = "requires `LocalStack` and helix-server with S3 feature"]
+#[allow(clippy::too_many_lines)] // Multi-phase E2E test requires more than 100 lines.
+async fn test_shared_wal_tiering_and_recovery() {
+    let test_name = current_test_name();
+    let run_start = Instant::now();
+    eprintln!("[E2E_START] test={test_name}");
+    let _heartbeat = ProgressHeartbeat::start(test_name.clone(), run_start);
+
+    require_localstack();
+    require_helix_binary();
+
+    let bucket = "helix-shared-wal-tiering-test";
+    create_s3_bucket(bucket);
+
+    eprintln!("\n=== Shared WAL Tiering + Recovery Test ===\n");
+
+    // Start cluster with shared WAL + S3 tiering.
+    // tier_min_age_secs=0 bypasses the age gate so segments are eligible
+    // for upload immediately after they are sealed and committed.
+    // local_retention_ms=2000 evicts local segments shortly after tiering,
+    // ensuring the recovery path is exercised (rather than using local data).
+    eprintln!("Starting 3-node cluster with shared WAL (count=2) + LocalStack S3 tiering...");
+    let mut cluster = RealCluster::builder()
+        .nodes(3)
+        .base_port(19392)
+        .raft_base_port(50400)
+        .binary_path(helix_binary_path())
+        .data_dir(e2e_data_dir("/tmp/helix-shared-wal-tiering-test"))
+        .log_level(e2e_server_log_level())
+        .with_localstack_tiering(bucket)
+        .with_tiering_config(TieringTestConfig { min_age_secs: 0 })
+        .local_retention_ms(2_000)
+        .with_shared_wal_count(2)
+        .topic("shared-wal-test", 1)
+        .build()
+        .expect("failed to start cluster");
+
+    let executor = RealExecutor::new(&cluster).expect("failed to create executor");
+    executor
+        .wait_ready(Duration::from_secs(30))
+        .await
+        .expect("cluster not ready");
+    cluster
+        .wait_for_leader("shared-wal-test", 0, Duration::from_secs(30))
+        .await
+        .expect("no leader");
+
+    let topic = "shared-wal-test";
+    let partition = 0;
+
+    // Phase 1: Write enough messages to fill at least one 4 MiB shared WAL segment.
+    // ~60 000 entries x ~70 bytes/entry = ~4.2 MB per segment.
+    let message_count = env_usize("HELIX_TIERING_MESSAGE_COUNT", 80_000);
+    eprintln!("\nPhase 1: Writing {message_count} messages to fill a shared WAL segment...");
+    let acknowledged =
+        send_messages(&executor, topic, partition, message_count, "swal-msg").await;
+    eprintln!("  Acknowledged: {} messages", acknowledged.len());
+    log_ack_offset_summary(&acknowledged);
+    assert_eq!(
+        acknowledged.len(),
+        message_count,
+        "Expected {message_count} acknowledged messages, got {}",
+        acknowledged.len()
+    );
+
+    // Capture the data directory path for Phase 7 local file counting.
+    let data_dir_string = e2e_data_dir("/tmp/helix-shared-wal-tiering-test");
+    let data_dir_path = std::path::Path::new(&data_dir_string);
+
+    // Phase 2: Wait for tiering ticks + local retention eviction.
+    // Tiering runs every ~5 s; we wait 20 s to allow:
+    //   - Multiple tiering ticks to upload all sealed segments.
+    //   - The 2 s local retention window to expire and evict local copies.
+    eprintln!("\nPhase 2: Waiting for tiering + local eviction...");
+    cluster
+        .wait_for_tiering_duration(Duration::from_secs(20))
+        .await;
+
+    // Verify that shared WAL objects are present in S3.
+    // Each coordinator stores segments at:
+    //   {s3_prefix}node-{N}/shared/{pool_index}/{segment_id:08x}.wal
+    let all_objects = list_s3_objects(bucket, "helix/segments/");
+    eprintln!("  Total S3 objects: {}", all_objects.len());
+    for obj in &all_objects {
+        eprintln!("    - {obj}");
+    }
+    let shared_wal_objects: Vec<&String> = all_objects
+        .iter()
+        .filter(|key| key.contains("/shared/"))
+        .collect();
+    eprintln!(
+        "  Shared WAL objects: {}",
+        shared_wal_objects.len()
+    );
+    assert!(
+        !shared_wal_objects.is_empty(),
+        "Expected at least one shared WAL segment in S3 under '/shared/' prefix, found none. \
+         Check that tier_min_age_secs=0 is set and that enough messages were written to \
+         seal a segment."
+    );
+
+    // Phase 7: Confirm that local copies of tiered segments were deleted from disk.
+    //
+    // With local_retention_ms=2_000 and the tiering tick running every 5s,
+    // delete_tiered_local_segments() runs continuously while Phase 1 writes.
+    // By the time Phase 1 finishes (~240s), sealed segments that were tiered
+    // to S3 have already had their local copies removed.
+    //
+    // Invariant: only the currently-active (unsealed) WAL segment per coordinator
+    // remains on disk.  Upper bound = node_count × shared_wal_count = 3 × 2 = 6.
+    // Without local deletion, sealed segments pile up pushing the count above 6.
+    eprintln!("\nPhase 7: Verifying local segment deletion after tiering...");
+    let local_wal_count: usize = (1u32..=3)
+        .map(|id| count_wal_files_in_dir(&data_dir_path.join(format!("node-{id}"))))
+        .sum();
+    // One active segment per coordinator is the expected maximum.
+    let active_segment_max = 3usize * 2usize; // node_count × shared_wal_count
+    eprintln!(
+        "  Local .wal files: {} (max expected: {}, S3 tiered: {})",
+        local_wal_count,
+        active_segment_max,
+        shared_wal_objects.len(),
+    );
+    assert!(
+        !shared_wal_objects.is_empty(),
+        "No shared WAL segments in S3 — tiering did not run, cannot verify local deletion."
+    );
+    assert!(
+        local_wal_count <= active_segment_max,
+        "Expected at most {active_segment_max} local .wal files (one active segment per \
+         coordinator) after tiering deletion, found {local_wal_count}. \
+         S3 has {} tiered segments that should have been deleted locally.",
+        shared_wal_objects.len(),
+    );
+    eprintln!(
+        "  Verified: {} tiered segments absent from local disk, {} active segments remain",
+        shared_wal_objects.len(),
+        local_wal_count,
+    );
+
+    // Phase 3: Kill node 1 and wipe its entire data directory.
+    // This simulates a pod being rescheduled to a new host with an empty disk.
+    eprintln!("\nPhase 3: Killing node 1 and wiping its data directory...");
+    cluster.kill_node(1).expect("kill node 1 failed");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    cluster
+        .wipe_node_data_dir(1)
+        .expect("wipe node 1 data dir failed");
+    eprintln!("  Node 1 data directory wiped");
+
+    // Phase 4: Restart node 1 with an empty local disk.
+    // On startup the server calls SharedWalPool::download_missing_segments()
+    // before replaying the WAL, downloading all tiered segments from S3.
+    // After replay, Raft catches up the untiered gap via AppendEntries from
+    // nodes 2/3 (which still have the recent entries in their active segments).
+    eprintln!("\nPhase 4: Restarting node 1 (S3 recovery path)...");
+    cluster.restart_node(1).expect("restart node 1 failed");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let executor = RealExecutor::new(&cluster).expect("failed to create executor after restart");
+    executor
+        .wait_ready(Duration::from_secs(60))
+        .await
+        .expect("cluster not ready after node 1 restart");
+    cluster
+        .wait_for_leader(topic, partition, Duration::from_secs(60))
+        .await
+        .expect("no leader after node 1 restart");
+
+    // Phase 5: Confirm cluster health by writing a few more messages.
+    eprintln!("\nPhase 5: Writing post-recovery messages to confirm cluster is functional...");
+    let post_recovery_messages = 100usize;
+    let post_acknowledged = send_messages(
+        &executor,
+        topic,
+        partition,
+        post_recovery_messages,
+        "post-recovery",
+    )
+    .await;
+    eprintln!("  Post-recovery acknowledged: {}", post_acknowledged.len());
+    assert_eq!(
+        post_acknowledged.len(),
+        post_recovery_messages,
+        "Cluster not functional after node 1 recovery"
+    );
+
+    // Phase 6: Read all messages back and verify correctness.
+    eprintln!("\nPhase 6: Verifying all messages...");
+    let all_acknowledged: Vec<(u64, bytes::Bytes)> = acknowledged
+        .iter()
+        .chain(post_acknowledged.iter())
+        .cloned()
+        .collect();
+
+    let end_offset = fetch_end_offset(
+        executor.bootstrap_servers(),
+        topic,
+        partition,
+        Duration::from_secs(20),
+    );
+    let poll_target = end_offset.max(all_acknowledged.len() as u64);
+    let max_messages = u32::try_from(poll_target).unwrap_or(u32::MAX);
+    eprintln!(
+        "  Poll target: {} messages (end_offset={}, acknowledged={})",
+        max_messages,
+        end_offset,
+        all_acknowledged.len()
+    );
+    let received = executor
+        .poll(topic, partition, 0, max_messages)
+        .await
+        .expect("poll failed");
+    eprintln!("  Received: {} messages", received.len());
+
+    let (matched, lost, corrupted) = verify_messages(&all_acknowledged, &received);
+
+    eprintln!("\n=== Results ===");
+    eprintln!("  Matched: {matched}");
+    eprintln!("  Lost: {}", lost.len());
+    eprintln!("  Corrupted: {}", corrupted.len());
+
+    assert!(lost.is_empty(), "Lost messages after shared WAL recovery: {lost:?}");
+    assert!(corrupted.is_empty(), "Corrupted messages: {corrupted:?}");
+    assert_eq!(matched, all_acknowledged.len());
+
+    eprintln!("\nPASSED: Shared WAL tiering + local deletion + S3 fallback + single-node empty-disk recovery");
+    eprintln!(
+        "[E2E_DONE] test={} elapsed={}s",
+        test_name,
+        run_start.elapsed().as_secs()
+    );
+
+    // Cleanup.
+    drop(cluster);
+    delete_s3_bucket(bucket);
 }

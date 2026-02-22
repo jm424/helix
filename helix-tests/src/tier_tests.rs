@@ -48,15 +48,18 @@
 
 use bloodhound::buggify;
 use bytes::Bytes;
-use helix_core::{PartitionId, Record, TopicId};
+use helix_core::{GroupId, PartitionId, Record, TopicId};
 use helix_server::storage::{DurablePartition, DurablePartitionConfig};
 use helix_tier::{
     InMemoryMetadataStore, IntegratedTieringManager, MetadataStoreFaultConfig, ObjectKey,
     ObjectStorage, ObjectStorageFaultConfig, SegmentLocation, SegmentMetadata, SegmentReader,
     SimulatedObjectStorage, TierError, TierResult, TieringConfig, TieringManager,
+    WalSegmentStoreAdapter,
 };
 use helix_wal::TokioStorage;
-use helix_wal::{Entry, SegmentConfig, SegmentId, Wal, WalConfig};
+use helix_wal::{
+    Entry, PoolConfig, SegmentConfig, SegmentId, SharedWalPool, Wal, WalConfig, WalSegmentStore,
+};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -3574,4 +3577,295 @@ async fn test_concurrent_tier_same_segment() {
             );
         }
     }
+}
+
+// ============================================================================
+// Tests: Shared WAL Tiering Eligibility
+// ============================================================================
+
+/// Tests that a shared WAL segment is uploaded when both groups have committed
+/// past their entries in that segment.
+///
+/// Verifies the core tiering invariant: a segment is only tiered once every group
+/// that wrote entries into it has committed through Raft consensus.
+#[tokio::test]
+async fn test_shared_wal_tiering_both_groups_committed() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    // Small segment limit (3 entries) forces rotation after 4 writes.
+    let mut pool_config = PoolConfig::new(temp_dir.path(), 1);
+    pool_config.coordinator_config = pool_config
+        .coordinator_config
+        .with_segment_config(SegmentConfig::new().with_max_entries(3));
+
+    let pool = SharedWalPool::open(TokioStorage::new(), pool_config)
+        .await
+        .unwrap();
+
+    // In-memory simulated S3.
+    let store: Arc<dyn WalSegmentStore> =
+        Arc::new(WalSegmentStoreAdapter::new(SimulatedObjectStorage::new(0)));
+    pool.configure_tiering(store, "pod0/".to_string()).await;
+
+    let g1 = GroupId::new(1);
+    let g2 = GroupId::new(2);
+    let h1 = pool.handle(g1);
+    let h2 = pool.handle(g2);
+
+    // Write 2 entries for g1 and 1 for g2 → segment 0 reaches 3 entries and seals.
+    // Then write one more for g1 to open segment 1 (active), confirming rotation happened.
+    let ack1 = h1.append_auto(1, 1, Bytes::from("g1-entry-1")).await.unwrap();
+    let ack2 = h1.append_auto(1, 2, Bytes::from("g1-entry-2")).await.unwrap();
+    let ack3 = h2.append_auto(1, 1, Bytes::from("g2-entry-1")).await.unwrap();
+    // 4th write triggers rotation — goes into active segment 1.
+    let _ = h1.append_auto(1, 3, Bytes::from("g1-entry-3")).await.unwrap();
+    pool.flush().await.unwrap();
+
+    // Verify segment 0 is sealed.
+    let coordinator = &pool.coordinators()[0];
+    let sealed_ids = coordinator.sealed_segment_ids().await;
+    assert_eq!(sealed_ids.len(), 1, "Exactly one sealed segment expected");
+
+    // Both groups commit past their last entry in segment 0.
+    h1.update_committed_wal_index(ack2.index);
+    h2.update_committed_wal_index(ack3.index);
+
+    // Tiering should upload segment 0.
+    let tiered = coordinator.tier_eligible_sealed_segments().await;
+    assert_eq!(tiered, 1, "Segment 0 must be tiered when both groups have committed");
+    assert!(
+        coordinator.is_tiered(sealed_ids[0].get()),
+        "Segment must appear in the tiered set after upload"
+    );
+
+    // Suppress unused-variable warning for ack1 (used to confirm index sequence).
+    let _ = ack1;
+    pool.shutdown().await.unwrap();
+}
+
+/// Tests that a segment is NOT uploaded when one group has not yet committed.
+///
+/// Even if group 1 has committed, group 2's uncommitted entries must block
+/// tiering to prevent data loss on pod restart.
+#[tokio::test]
+async fn test_shared_wal_tiering_one_group_uncommitted_blocks() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    let mut pool_config = PoolConfig::new(temp_dir.path(), 1);
+    pool_config.coordinator_config = pool_config
+        .coordinator_config
+        .with_segment_config(SegmentConfig::new().with_max_entries(3));
+
+    let pool = SharedWalPool::open(TokioStorage::new(), pool_config)
+        .await
+        .unwrap();
+
+    let store: Arc<dyn WalSegmentStore> =
+        Arc::new(WalSegmentStoreAdapter::new(SimulatedObjectStorage::new(0)));
+    pool.configure_tiering(store, "pod0/".to_string()).await;
+
+    let g1 = GroupId::new(1);
+    let g2 = GroupId::new(2);
+    let h1 = pool.handle(g1);
+    let h2 = pool.handle(g2);
+
+    let ack2 = h1.append_auto(1, 1, Bytes::from("g1-e1")).await.unwrap();
+    let _ = h1.append_auto(1, 2, Bytes::from("g1-e2")).await.unwrap();
+    let _ = h2.append_auto(1, 1, Bytes::from("g2-e1")).await.unwrap();
+    let _ = h1.append_auto(1, 3, Bytes::from("g1-e3")).await.unwrap();
+    pool.flush().await.unwrap();
+
+    // Only g1 commits — g2 never reports a committed WAL index.
+    h1.update_committed_wal_index(ack2.index);
+
+    let coordinator = &pool.coordinators()[0];
+    let tiered = coordinator.tier_eligible_sealed_segments().await;
+    assert_eq!(
+        tiered, 0,
+        "Segment 0 must NOT be tiered — g2 has not committed its entries"
+    );
+
+    pool.shutdown().await.unwrap();
+}
+
+// ============================================================================
+// Test: Startup Recovery from Object Storage
+// ============================================================================
+
+/// Tests that a pod restarted with an empty local disk can recover segments
+/// from the object store before replaying WAL state.
+///
+/// Simulates the startup recovery flow:
+/// 1. Write and tier a segment on "pod A" (populated S3).
+/// 2. Open a new empty pool directory ("pod B" / new node).
+/// 3. Call `download_missing_segments()` before recovery.
+/// 4. Verify the segment is present locally and marked as tiered.
+#[tokio::test]
+async fn test_shared_wal_startup_downloads_missing_segments() {
+    // Shared in-memory object store — persists across pool instances.
+    let simulated_store = SimulatedObjectStorage::new(0);
+    let store: Arc<dyn WalSegmentStore> =
+        Arc::new(WalSegmentStoreAdapter::new(simulated_store));
+
+    const PREFIX: &str = "pod0/";
+    let segment_0_id: u64;
+
+    // Phase 1: write entries, tier one segment, then let the pool go out of scope
+    // (simulates a pod restart — the tempdir is dropped and local disk is gone).
+    {
+        let write_dir = tempfile::tempdir().unwrap();
+        let mut pool_config = PoolConfig::new(write_dir.path(), 1);
+        pool_config.coordinator_config = pool_config
+            .coordinator_config
+            .with_segment_config(SegmentConfig::new().with_max_entries(3));
+
+        let pool = SharedWalPool::open(TokioStorage::new(), pool_config)
+            .await
+            .unwrap();
+        pool.configure_tiering(store.clone(), PREFIX.to_string()).await;
+
+        let g1 = GroupId::new(1);
+        let h1 = pool.handle(g1);
+
+        // Write 4 entries: segment 0 seals at 3, segment 1 starts at 4.
+        let _ = h1.append_auto(1, 1, Bytes::from("e1")).await.unwrap();
+        let _ = h1.append_auto(1, 2, Bytes::from("e2")).await.unwrap();
+        let ack3 = h1.append_auto(1, 3, Bytes::from("e3")).await.unwrap();
+        let _ = h1.append_auto(1, 4, Bytes::from("e4")).await.unwrap();
+        pool.flush().await.unwrap();
+
+        // Commit g1 past its last entry in segment 0, then tier it.
+        h1.update_committed_wal_index(ack3.index);
+        let coordinator = &pool.coordinators()[0];
+        let tiered = coordinator.tier_eligible_sealed_segments().await;
+        assert_eq!(tiered, 1, "Phase 1: one segment must be uploaded");
+
+        let sealed = coordinator.sealed_segment_ids().await;
+        segment_0_id = sealed[0].get();
+
+        pool.shutdown().await.unwrap();
+    } // write_dir dropped — local WAL files deleted.
+
+    // Phase 2: open a brand-new pool directory (empty disk, like a new K8s node).
+    {
+        let new_dir = tempfile::tempdir().unwrap();
+        let pool_config = PoolConfig::new(new_dir.path(), 1);
+
+        let pool = SharedWalPool::open(TokioStorage::new(), pool_config)
+            .await
+            .unwrap();
+        pool.configure_tiering(store.clone(), PREFIX.to_string()).await;
+
+        // download_missing_segments() should fetch the tiered segment from S3.
+        let downloaded = pool.download_missing_segments().await.unwrap();
+        assert!(
+            downloaded > 0,
+            "Must download at least one segment from object storage on empty-disk restart"
+        );
+
+        // The coordinator should now have the segment on local disk and marked as tiered.
+        let coordinator = &pool.coordinators()[0];
+        let local_ids: Vec<u64> = coordinator
+            .sealed_segment_ids()
+            .await
+            .iter()
+            .map(|id| id.get())
+            .collect();
+        assert!(
+            local_ids.contains(&segment_0_id),
+            "Downloaded segment {segment_0_id} should be present in local WAL"
+        );
+        assert!(
+            coordinator.is_tiered(segment_0_id),
+            "Downloaded segment should be marked as tiered so retention won't re-delete it"
+        );
+
+        pool.shutdown().await.unwrap();
+    }
+}
+
+// ============================================================================
+// Tests: Retention Safety Guard
+// ============================================================================
+
+/// Tests that retention does not delete a segment that has not been confirmed
+/// in object storage, even when all other criteria are met.
+///
+/// Core safety invariant: no local deletion unless the object store has a copy.
+#[tokio::test]
+async fn test_retention_skips_untiered_segment() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    // Small segment limit to force rotation with a handful of records.
+    let config =
+        DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
+            .with_tiering(TieringConfig::for_testing())
+            .with_segment_config(SegmentConfig::new().with_max_entries(3));
+
+    let mut partition = DurablePartition::open(TokioStorage::new(), config)
+        .await
+        .unwrap();
+
+    // Write 4 records: seals segment 0 (3 records), keeps 1 in active segment 1.
+    // Flush after each write so the BufferedWal writes to disk immediately and
+    // segment rotation is visible via sealed_segment_ids().
+    for i in 0..4u32 {
+        let records = vec![Record::new(Bytes::from(format!("record-{i}")))];
+        partition.append(records).await.unwrap();
+        partition.sync().await.unwrap();
+    }
+
+    // Register and commit the sealed segment, but intentionally skip tiering
+    // so the segment is NOT present in S3.
+    let registered = partition.check_and_register_sealed_segments().await.unwrap();
+    assert_eq!(registered, 1, "Should register 1 sealed segment");
+    let _ = partition.on_entries_committed(u64::MAX).await.unwrap();
+    // `tier_eligible_segments()` intentionally NOT called — segment stays local-only.
+
+    // Retention with 0ms threshold (all segments age-eligible) and full replication.
+    let deleted = partition.run_retention(u64::MAX, 0).await.unwrap();
+    assert_eq!(
+        deleted, 0,
+        "Retention must not delete a segment that is not yet confirmed in object storage"
+    );
+}
+
+/// Tests that retention deletes a segment after it has been confirmed in S3.
+///
+/// Exercises the full tiering pipeline: register → commit → tier → retain.
+/// Once a segment is in S3 (`Both` or `Remote`), retention may reclaim local disk.
+#[tokio::test]
+async fn test_retention_deletes_tiered_segment() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    let config =
+        DurablePartitionConfig::new(temp_dir.path(), TopicId::new(1), PartitionId::new(0))
+            .with_tiering(TieringConfig::for_testing())
+            .with_segment_config(SegmentConfig::new().with_max_entries(3));
+
+    let mut partition = DurablePartition::open(TokioStorage::new(), config)
+        .await
+        .unwrap();
+
+    // Write 4 records to create 1 sealed segment.
+    // Flush after each write so the BufferedWal writes to disk and
+    // segment rotation is visible via sealed_segment_ids().
+    for i in 0..4u32 {
+        let records = vec![Record::new(Bytes::from(format!("record-{i}")))];
+        partition.append(records).await.unwrap();
+        partition.sync().await.unwrap();
+    }
+
+    // Full tiering pipeline: register → commit → upload.
+    let _ = partition.check_and_register_sealed_segments().await.unwrap();
+    let _ = partition.on_entries_committed(u64::MAX).await.unwrap();
+    let tiered = partition.tier_eligible_segments().await.unwrap();
+    assert_eq!(tiered, 1, "Should tier exactly 1 sealed segment");
+
+    // Now retention should be permitted to delete the confirmed-in-S3 segment.
+    let deleted = partition.run_retention(u64::MAX, 0).await.unwrap();
+    assert_eq!(
+        deleted, 1,
+        "Retention should delete the segment that has been confirmed in object storage"
+    );
 }

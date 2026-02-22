@@ -493,7 +493,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "s3")]
         let s3_config = args.s3_bucket.as_ref().map(|bucket| {
             let mut config = S3Config::new(bucket.clone());
-            config.key_prefix = args.s3_prefix.clone();
+            config.key_prefix.clone_from(&args.s3_prefix);
             if let Some(region) = &args.s3_region {
                 config.region = Some(region.clone());
             }
