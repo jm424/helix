@@ -241,6 +241,24 @@ pub struct UpdateTopicConfigRequest {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UpdateTopicConfigResponse {}
+/// GetEndOffsets returns the high watermark (log end offset) for each partition
+/// of a topic. Used by streaming-admin to reset consumer group offsets.
+///
+/// The topic_id field is the Kafka topic name as known to streaming-admin
+/// (e.g. "helix_helix-staging-s2-64_normal_6e12"). Keys in the response are
+/// decimal partition numbers as strings ("0", "1", ...).
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetEndOffsetsRequest {
+    #[prost(string, tag = "1")]
+    pub topic_id: ::prost::alloc::string::String,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetEndOffsetsResponse {
+    #[prost(map = "string, uint64", tag = "1")]
+    pub offsets: ::std::collections::HashMap<::prost::alloc::string::String, u64>,
+}
 /// Generated client implementations.
 pub mod resources_client {
     #![allow(unused_variables, dead_code, missing_docs, clippy::let_unit_value)]
@@ -659,6 +677,31 @@ pub mod resources_client {
                 .insert(GrpcMethod::new("kafkaadmin.Resources", "UpdateTopicConfig"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn get_end_offsets(
+            &mut self,
+            request: impl tonic::IntoRequest<super::GetEndOffsetsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetEndOffsetsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/kafkaadmin.Resources/GetEndOffsets",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("kafkaadmin.Resources", "GetEndOffsets"));
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -757,6 +800,13 @@ pub mod resources_server {
             request: tonic::Request<super::UpdateTopicConfigRequest>,
         ) -> std::result::Result<
             tonic::Response<super::UpdateTopicConfigResponse>,
+            tonic::Status,
+        >;
+        async fn get_end_offsets(
+            &self,
+            request: tonic::Request<super::GetEndOffsetsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::GetEndOffsetsResponse>,
             tonic::Status,
         >;
     }
@@ -1432,6 +1482,52 @@ pub mod resources_server {
                     let fut = async move {
                         let inner = inner.0;
                         let method = UpdateTopicConfigSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/kafkaadmin.Resources/GetEndOffsets" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetEndOffsetsSvc<T: Resources>(pub Arc<T>);
+                    impl<
+                        T: Resources,
+                    > tonic::server::UnaryService<super::GetEndOffsetsRequest>
+                    for GetEndOffsetsSvc<T> {
+                        type Response = super::GetEndOffsetsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::GetEndOffsetsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as Resources>::get_end_offsets(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let inner = inner.0;
+                        let method = GetEndOffsetsSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

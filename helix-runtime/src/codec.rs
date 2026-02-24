@@ -46,6 +46,12 @@ const TAG_TIMEOUT_NOW: u8 = 6;
 const TAG_GROUP_MESSAGE_BATCH: u8 = 7;
 const TAG_INSTALL_SNAPSHOT: u8 = 8;
 const TAG_INSTALL_SNAPSHOT_RESPONSE: u8 = 9;
+/// Compact wire format for `AppendEntries` heartbeats (no log entries).
+///
+/// At production scale (600+ Raft groups per node), a standard `GroupMessageBatch`
+/// costs 61 bytes per heartbeat. This format factors out the shared `leader_id`
+/// and `to` fields, reducing the per-group cost to 40 bytes (a ~34% savings).
+const TAG_COALESCED_HEARTBEATS: u8 = 10;
 
 /// Codec errors.
 #[derive(Debug, Error)]
@@ -734,6 +740,171 @@ fn decode_message_payload(buf: &mut &[u8]) -> CodecResult<Message> {
 pub fn is_group_batch(data: &[u8]) -> bool {
     // Need at least 5 bytes: 4 (length) + 1 (tag).
     data.len() >= 5 && data[4] == TAG_GROUP_MESSAGE_BATCH
+}
+
+// =============================================================================
+// Coalesced Heartbeat Codec
+// =============================================================================
+
+/// Encodes a coalesced batch of Raft heartbeats.
+///
+/// Heartbeats are `AppendEntries` with no entries. At production scale (600+
+/// Raft groups per node), each tick generates one heartbeat per leader group per
+/// peer. This format factors out the shared `leader_id` and `to` fields, reducing
+/// the per-group wire cost from 61 bytes to 40 bytes — a ~34% saving.
+///
+/// Wire format:
+/// - 4 bytes: total length (u32 LE, excluding the 4-byte header)
+/// - 1 byte:  tag (`TAG_COALESCED_HEARTBEATS` = 10)
+/// - 8 bytes: `leader_id` (shared across all groups in this batch)
+/// - 8 bytes: `to` (destination node, shared across all groups)
+/// - 4 bytes: group count (u32 LE)
+/// - Per group (40 bytes each):
+///   - 8 bytes: `group_id`
+///   - 8 bytes: `term`
+///   - 8 bytes: `prev_log_index`
+///   - 8 bytes: `prev_log_term`
+///   - 8 bytes: `leader_commit`
+///
+/// # Errors
+///
+/// Returns an error if the batch is too large.
+pub fn encode_coalesced_heartbeats(
+    leader_id: NodeId,
+    to: NodeId,
+    messages: &[GroupMessage],
+) -> CodecResult<Bytes> {
+    // 4 (len) + 1 (tag) + 8 (leader_id) + 8 (to) + 4 (count) + N * 40 (per group)
+    let capacity = 25 + messages.len() * 40;
+    let mut buf = BytesMut::with_capacity(capacity);
+
+    buf.put_u32_le(0); // length placeholder
+
+    buf.put_u8(TAG_COALESCED_HEARTBEATS);
+    buf.put_u64_le(leader_id.get());
+    buf.put_u64_le(to.get());
+
+    // Safe cast: group count is bounded by practical partition limits.
+    #[allow(clippy::cast_possible_truncation)]
+    buf.put_u32_le(messages.len() as u32);
+
+    for gm in messages {
+        buf.put_u64_le(gm.group_id.get());
+        // Caller must pre-filter to AppendEntries heartbeats only.
+        if let Message::AppendEntries(req) = &gm.message {
+            debug_assert!(req.entries.is_empty(), "coalesced heartbeat must have no entries");
+            buf.put_u64_le(req.term.get());
+            buf.put_u64_le(req.prev_log_index.get());
+            buf.put_u64_le(req.prev_log_term.get());
+            buf.put_u64_le(req.leader_commit.get());
+        } else {
+            // Defensive: caller violated the contract. Encode zeros so the
+            // receiver decodes a harmless zero-term heartbeat rather than garbage.
+            debug_assert!(false, "encode_coalesced_heartbeats: non-AppendEntries message");
+            buf.put_u64_le(0);
+            buf.put_u64_le(0);
+            buf.put_u64_le(0);
+            buf.put_u64_le(0);
+        }
+    }
+
+    // Fill in length (excluding the 4-byte header).
+    // Safe cast: message size is bounded by MAX_MESSAGE_SIZE which fits in u32.
+    #[allow(clippy::cast_possible_truncation)]
+    let len = (buf.len() - 4) as u32;
+    if len > MAX_MESSAGE_SIZE {
+        return Err(CodecError::MessageTooLarge { size: len, max: MAX_MESSAGE_SIZE });
+    }
+
+    buf[0..4].copy_from_slice(&len.to_le_bytes());
+    Ok(buf.freeze())
+}
+
+/// Decodes a coalesced heartbeat batch from bytes.
+///
+/// Reconstructs each entry as a `GroupMessage` containing an `AppendEntries`
+/// heartbeat (no log entries), ready for dispatch to partition actors.
+///
+/// # Errors
+///
+/// Returns an error if the data is malformed or incomplete.
+///
+/// # Panics
+///
+/// Panics if the decoded message count doesn't match the expected count (indicates a bug).
+pub fn decode_coalesced_heartbeats(data: &[u8]) -> CodecResult<(Vec<GroupMessage>, usize)> {
+    if data.len() < 4 {
+        return Err(CodecError::InsufficientData { need: 4, have: data.len() });
+    }
+
+    let len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+
+    // Safe cast: len is bounded by MAX_MESSAGE_SIZE which fits in u32.
+    #[allow(clippy::cast_possible_truncation)]
+    let len_u32 = len as u32;
+    if len > MAX_MESSAGE_SIZE as usize {
+        return Err(CodecError::MessageTooLarge { size: len_u32, max: MAX_MESSAGE_SIZE });
+    }
+
+    let total_len = 4 + len;
+    if data.len() < total_len {
+        return Err(CodecError::InsufficientData { need: total_len, have: data.len() });
+    }
+
+    let payload = &data[4..total_len];
+    // Minimum: 1 (tag) + 8 (leader_id) + 8 (to) + 4 (count) = 21 bytes.
+    if payload.len() < 21 {
+        return Err(CodecError::InsufficientData { need: 21, have: payload.len() });
+    }
+
+    let tag = payload[0];
+    if tag != TAG_COALESCED_HEARTBEATS {
+        return Err(CodecError::UnknownMessageType { tag });
+    }
+
+    let mut buf = &payload[1..];
+    ensure_remaining(buf, 20)?; // leader_id (8) + to (8) + count (4)
+
+    let leader_id = NodeId::new((&mut buf).get_u64_le());
+    let to = NodeId::new((&mut buf).get_u64_le());
+    let count = (&mut buf).get_u32_le() as usize;
+
+    // Each group entry: group_id (8) + term (8) + prev_log_index (8) + prev_log_term (8)
+    // + leader_commit (8) = 40 bytes.
+    ensure_remaining(buf, count * 40)?;
+
+    let mut messages = Vec::with_capacity(count);
+    for _ in 0..count {
+        let group_id = GroupId::new((&mut buf).get_u64_le());
+        let term = TermId::new((&mut buf).get_u64_le());
+        let prev_log_index = LogIndex::new((&mut buf).get_u64_le());
+        let prev_log_term = TermId::new((&mut buf).get_u64_le());
+        let leader_commit = LogIndex::new((&mut buf).get_u64_le());
+
+        messages.push(GroupMessage::new(
+            group_id,
+            Message::AppendEntries(AppendEntriesRequest::heartbeat(
+                term,
+                leader_id,
+                to,
+                prev_log_index,
+                prev_log_term,
+                leader_commit,
+            )),
+        ));
+    }
+
+    assert_eq!(messages.len(), count);
+    Ok((messages, total_len))
+}
+
+/// Checks if the given data starts with a coalesced heartbeats tag.
+///
+/// Used by the transport layer to select the appropriate decoder.
+#[must_use]
+pub fn is_coalesced_heartbeats(data: &[u8]) -> bool {
+    // Need at least 5 bytes: 4 (length) + 1 (tag).
+    data.len() >= 5 && data[4] == TAG_COALESCED_HEARTBEATS
 }
 
 // =============================================================================
@@ -1487,5 +1658,150 @@ mod tests {
         // Too short.
         assert!(!is_transfer_message(&[0, 1, 2, 3]));
         assert!(!is_transfer_message(&[]));
+    }
+
+    // =========================================================================
+    // Coalesced Heartbeat Codec Tests
+    // =========================================================================
+
+    #[test]
+    fn test_encode_decode_coalesced_heartbeats_empty() {
+        let leader_id = NodeId::new(1);
+        let to = NodeId::new(2);
+        let messages: Vec<GroupMessage> = vec![];
+
+        let encoded = encode_coalesced_heartbeats(leader_id, to, &messages).unwrap();
+        assert!(is_coalesced_heartbeats(&encoded));
+
+        let (decoded, consumed) = decode_coalesced_heartbeats(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.len(), 0);
+    }
+
+    #[test]
+    fn test_encode_decode_coalesced_heartbeats_single() {
+        use helix_core::GroupId;
+
+        let leader_id = NodeId::new(1);
+        let to = NodeId::new(2);
+        let messages = vec![GroupMessage::new(
+            GroupId::new(42),
+            Message::AppendEntries(AppendEntriesRequest::heartbeat(
+                TermId::new(5),
+                leader_id,
+                to,
+                LogIndex::new(10),
+                TermId::new(4),
+                LogIndex::new(8),
+            )),
+        )];
+
+        let encoded = encode_coalesced_heartbeats(leader_id, to, &messages).unwrap();
+        assert!(is_coalesced_heartbeats(&encoded));
+        assert!(!is_group_batch(&encoded));
+
+        let (decoded, consumed) = decode_coalesced_heartbeats(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].group_id.get(), 42);
+
+        if let Message::AppendEntries(req) = &decoded[0].message {
+            assert!(req.is_heartbeat());
+            assert_eq!(req.term.get(), 5);
+            assert_eq!(req.leader_id.get(), 1);
+            assert_eq!(req.to.get(), 2);
+            assert_eq!(req.prev_log_index.get(), 10);
+            assert_eq!(req.prev_log_term.get(), 4);
+            assert_eq!(req.leader_commit.get(), 8);
+        } else {
+            panic!("Expected AppendEntries");
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_coalesced_heartbeats_many() {
+        use helix_core::GroupId;
+
+        let leader_id = NodeId::new(1);
+        let to = NodeId::new(3);
+        let count = 512usize;
+        let messages: Vec<GroupMessage> = (0..count)
+            .map(|i| {
+                GroupMessage::new(
+                    GroupId::new(i as u64 + 1),
+                    Message::AppendEntries(AppendEntriesRequest::heartbeat(
+                        TermId::new(10),
+                        leader_id,
+                        to,
+                        LogIndex::new(i as u64 * 100),
+                        TermId::new(9),
+                        LogIndex::new(i as u64 * 100),
+                    )),
+                )
+            })
+            .collect();
+
+        let encoded = encode_coalesced_heartbeats(leader_id, to, &messages).unwrap();
+        assert!(is_coalesced_heartbeats(&encoded));
+
+        // Verify compact size: 4 + 1 + 8 + 8 + 4 + 512*40 = 25 + 20480 = 20505 bytes.
+        // Regular GroupMessageBatch would be 9 + 512*61 = 31241 bytes.
+        assert_eq!(encoded.len(), 25 + count * 40);
+
+        let (decoded, consumed) = decode_coalesced_heartbeats(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.len(), count);
+
+        for (i, gm) in decoded.iter().enumerate() {
+            assert_eq!(gm.group_id.get(), i as u64 + 1);
+            if let Message::AppendEntries(req) = &gm.message {
+                assert!(req.is_heartbeat());
+                assert_eq!(req.term.get(), 10);
+                assert_eq!(req.prev_log_index.get(), i as u64 * 100);
+            } else {
+                panic!("Expected AppendEntries at index {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_is_coalesced_heartbeats() {
+        use helix_core::GroupId;
+
+        let leader_id = NodeId::new(1);
+        let to = NodeId::new(2);
+
+        let encoded = encode_coalesced_heartbeats(
+            leader_id,
+            to,
+            &[GroupMessage::new(
+                GroupId::new(1),
+                Message::AppendEntries(AppendEntriesRequest::heartbeat(
+                    TermId::new(1),
+                    leader_id,
+                    to,
+                    LogIndex::new(0),
+                    TermId::new(0),
+                    LogIndex::new(0),
+                )),
+            )],
+        )
+        .unwrap();
+        assert!(is_coalesced_heartbeats(&encoded));
+
+        // Regular batch should not match.
+        let batch =
+            encode_group_batch(&[GroupMessage::new(GroupId::new(1), make_request_vote())]).unwrap();
+        assert!(!is_coalesced_heartbeats(&batch));
+
+        // Too short.
+        assert!(!is_coalesced_heartbeats(&[0, 1, 2, 3]));
+        assert!(!is_coalesced_heartbeats(&[]));
+    }
+
+    #[test]
+    fn test_coalesced_heartbeats_insufficient_data() {
+        let result = decode_coalesced_heartbeats(&[0, 1]);
+        assert!(matches!(result, Err(CodecError::InsufficientData { .. })));
     }
 }

@@ -45,6 +45,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use helix_core::{GroupId, LogIndex, NodeId, Offset, PartitionId, ProducerEpoch, ProducerId, SequenceNum, TermId, TopicId};
+use helix_raft::{multi::GroupMessage, Message};
 use helix_runtime::TransportService;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
@@ -229,11 +230,26 @@ async fn process_message_batch<
     node_id: Option<NodeId>,
     leader_update_tx: Option<&mpsc::UnboundedSender<ControllerCommand>>,
 ) {
-    // Separate sends from everything else.
+    // Separate sends from everything else, merging all messages for the same peer.
+    //
+    // Without merging: N_groups × N_peers send_batch() calls per drain cycle.
+    // At production scale (600 partitions × 2 peers = 1,200 calls/cycle at 20 ticks/s =
+    // 24,000 calls/s), this saturates the per-peer mpsc queue (MAX_PENDING_MESSAGES=1000)
+    // causing "send queue full" drops and TCP tx-buffer growth on the receiver side.
+    //
+    // With merging: always N_peers send_batch() calls per drain cycle regardless of group
+    // count — reducing 1,200 calls to 2 for a 3-node cluster.
+    //
+    // Peer count is tiny (cluster_size - 1), so the linear scan is O(1) in practice.
     for grouped in msg_buf.drain(..) {
         let GroupedOutput { group_id, output } = grouped;
         match output {
-            PartitionOutput::SendMessages { to, messages } => sends.push((to, messages)),
+            PartitionOutput::SendMessages { to, messages } => {
+                match sends.iter().position(|(t, _)| *t == to) {
+                    Some(i) => sends[i].1.extend(messages),
+                    None => sends.push((to, messages)),
+                }
+            }
             other => non_sends.push(GroupedOutput {
                 group_id,
                 output: other,
@@ -242,10 +258,25 @@ async fn process_message_batch<
     }
 
     // Phase 1: Process all sends (cheap, unblocks followers).
+    //
+    // Heartbeats (AppendEntries with no entries) are sent via the compact coalesced
+    // format, saving ~34% bytes per heartbeat. Non-heartbeat messages (AppendEntries
+    // with entries, responses, vote requests, etc.) use the standard batch format.
     let send_phase_start = std::time::Instant::now();
-    let send_count = sends.len();
+    let mut send_call_count: u64 = 0;
     for (to, messages) in sends.drain(..) {
-        handle_send_messages(to, &messages, transport_handle).await;
+        let (heartbeats, non_heartbeats): (Vec<GroupMessage>, Vec<GroupMessage>) = messages
+            .into_iter()
+            .partition(|gm| matches!(&gm.message, Message::AppendEntries(r) if r.is_heartbeat()));
+
+        if !heartbeats.is_empty() {
+            handle_send_heartbeat_batch(to, heartbeats, transport_handle).await;
+            send_call_count += 1;
+        }
+        if !non_heartbeats.is_empty() {
+            handle_send_messages(to, &non_heartbeats, transport_handle).await;
+            send_call_count += 1;
+        }
     }
     if let Some(s) = stats {
         #[allow(clippy::cast_possible_truncation)]
@@ -254,7 +285,7 @@ async fn process_message_batch<
             std::sync::atomic::Ordering::Relaxed,
         );
         s.send_messages_count
-            .fetch_add(send_count as u64, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(send_call_count, std::sync::atomic::Ordering::Relaxed);
     }
 
     // Phase 2: Process non-sends in order (commits, leadership, votes, WAL entries).
@@ -435,7 +466,7 @@ fn report_output_processor_stats(
 /// Handles `SendMessages` output by sending via transport.
 async fn handle_send_messages<T: TransportService>(
     to: helix_core::NodeId,
-    messages: &[helix_raft::multi::GroupMessage],
+    messages: &[GroupMessage],
     transport_handle: Option<&T>,
 ) {
     let Some(transport) = transport_handle else {
@@ -459,6 +490,30 @@ async fn handle_send_messages<T: TransportService>(
             to = to.get(),
             count = messages.len(),
             "Sent messages to peer"
+        );
+    }
+}
+
+/// Sends a coalesced heartbeat batch to a peer using the compact wire format.
+async fn handle_send_heartbeat_batch<T: TransportService>(
+    to: helix_core::NodeId,
+    messages: Vec<GroupMessage>,
+    transport_handle: Option<&T>,
+) {
+    let Some(transport) = transport_handle else {
+        debug!(
+            to = to.get(),
+            count = messages.len(),
+            "Would send heartbeat batch (no transport configured)"
+        );
+        return;
+    };
+
+    if let Err(e) = transport.send_heartbeat_batch(to, messages).await {
+        debug!(
+            to = to.get(),
+            error = %e,
+            "Failed to send heartbeat batch to peer (will retry)"
         );
     }
 }

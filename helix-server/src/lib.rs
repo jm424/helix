@@ -16,6 +16,8 @@ pub mod alloc_stats;
 pub mod admin_grpc;
 /// Controller partition for cluster metadata coordination.
 pub mod controller;
+/// Dedicated Raft groups for Kafka consumer group offset storage.
+pub mod offset_group;
 mod error;
 /// Group ID mapping for topic/partition to Raft group.
 pub mod group_map;

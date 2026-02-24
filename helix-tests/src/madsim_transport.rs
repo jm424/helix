@@ -30,8 +30,9 @@ use async_trait::async_trait;
 use helix_core::NodeId;
 use helix_raft::multi::GroupMessage;
 use helix_runtime::{
-    decode_broker_heartbeat, decode_group_batch, encode_broker_heartbeat, encode_group_batch,
-    BrokerHeartbeat, TransportResult, TransportService,
+    decode_broker_heartbeat, decode_coalesced_heartbeats, decode_group_batch,
+    encode_broker_heartbeat, encode_coalesced_heartbeats, encode_group_batch,
+    is_coalesced_heartbeats, BrokerHeartbeat, TransportResult, TransportService,
 };
 use tokio::sync::mpsc;
 use tracing::{trace, warn};
@@ -431,6 +432,81 @@ impl TransportService for MadSimTransport {
                     heartbeat: decoded_heartbeat,
                 });
                 // Ignore send errors (receiver might be dropped).
+                let _ = mailbox.send(msg).await;
+            }
+        });
+
+        Ok(())
+    }
+
+    async fn send_heartbeat_batch(
+        &self,
+        to: NodeId,
+        messages: Vec<GroupMessage>,
+    ) -> TransportResult<()> {
+        let from = self.node_id;
+        let network_state = self.network_state.clone();
+        let shared_mailboxes = self.shared_mailboxes.clone();
+
+        // Serialize/deserialize round-trip through the coalesced heartbeat codec,
+        // then decode back to GroupMessages and deliver as a Raft batch.
+        let encoded = match encode_coalesced_heartbeats(from, to, &messages) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!(
+                    from = from.get(),
+                    to = to.get(),
+                    error = %e,
+                    "Failed to encode coalesced heartbeats, dropping"
+                );
+                return Ok(());
+            }
+        };
+
+        debug_assert!(
+            is_coalesced_heartbeats(&encoded),
+            "encoded coalesced heartbeats must be detectable"
+        );
+
+        let decoded_messages = match decode_coalesced_heartbeats(&encoded) {
+            Ok((msgs, _consumed)) => msgs,
+            Err(e) => {
+                warn!(
+                    from = from.get(),
+                    to = to.get(),
+                    error = %e,
+                    "Failed to decode coalesced heartbeats, dropping"
+                );
+                return Ok(());
+            }
+        };
+
+        madsim::task::spawn(async move {
+            let latency = {
+                let state = network_state.lock().expect("lock poisoned");
+                state.effective_latency(to)
+            };
+            madsim::time::sleep(latency).await;
+
+            let is_partitioned = {
+                let state = network_state.lock().expect("lock poisoned");
+                state.is_partitioned(from, to)
+            };
+
+            if is_partitioned {
+                trace!(
+                    from = from.get(),
+                    to = to.get(),
+                    "Coalesced heartbeats dropped due to partition"
+                );
+                return;
+            }
+
+            if let Some(mailbox) = shared_mailboxes.get(&to) {
+                let msg = IncomingMessage::Raft(RaftMessage {
+                    from,
+                    messages: decoded_messages,
+                });
                 let _ = mailbox.send(msg).await;
             }
         });

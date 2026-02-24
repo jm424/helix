@@ -4,7 +4,7 @@
 //! injection. These hold only `Arc`-cloned references so the `E2ECluster`
 //! owner can inject faults on the main task without contention.
 
-#![cfg(test)]
+#![cfg(all(test, madsim))]
 
 use std::sync::Arc;
 use std::time::Duration;

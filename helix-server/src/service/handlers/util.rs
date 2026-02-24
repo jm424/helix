@@ -1,5 +1,7 @@
 //! Utility methods for the Helix service.
 
+use std::collections::HashMap;
+
 use helix_core::{NodeId, PartitionId};
 use helix_runtime::TransportService;
 use helix_wal::Storage;
@@ -94,6 +96,41 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
         self.get_leader(topic, partition)
             .await
             .is_some_and(|leader| leader == self.node_id)
+    }
+
+    /// Returns the high watermark for every partition of a topic.
+    ///
+    /// Returns `None` if the topic does not exist. Partitions for which this
+    /// node has no local storage (e.g. not a replica) are omitted from the map.
+    /// The map key is the partition number as a decimal string.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `partition_count` is negative or exceeds 256 (invariants
+    /// enforced by the controller when topics are created).
+    pub async fn get_topic_end_offsets(
+        &self,
+        topic: &str,
+    ) -> Option<HashMap<String, u64>> {
+        let topic_meta = self.get_topic(topic).await?;
+
+        assert!(topic_meta.partition_count >= 0, "partition_count must be non-negative");
+        assert!(topic_meta.partition_count <= 256, "partition_count exceeds limit");
+
+        #[allow(clippy::cast_sign_loss)]
+        let partition_count = topic_meta.partition_count as u32;
+        let mut offsets = HashMap::with_capacity(partition_count as usize);
+
+        for partition in 0..partition_count {
+            #[allow(clippy::cast_possible_wrap)]
+            if let Some((_start, _end, hwm)) =
+                self.get_partition_offsets(topic, partition as i32).await
+            {
+                offsets.insert(partition.to_string(), hwm);
+            }
+        }
+
+        Some(offsets)
     }
 
     /// Gets partition info for a topic/partition.

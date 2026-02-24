@@ -225,7 +225,7 @@ impl crate::madsim_scenarios::FaultInjectable for E2ECluster {
 // Handle Creators (test-only)
 // ============================================================================
 
-#[cfg(test)]
+#[cfg(all(test, madsim))]
 impl E2ECluster {
     /// Creates a fault injector handle that can be moved into a spawned task.
     /// Implements `FaultInjectable` using only `Arc`-cloned state.

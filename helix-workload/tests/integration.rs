@@ -731,7 +731,10 @@ async fn test_multi_partition_node_failure() {
     // Restart node 2.
     println!("=== Restarting node 2 ===");
     cluster.restart_node(2).expect("failed to restart node 2");
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Wait 15s: Raft needs to converge AND the rebalancer (10s interval) needs
+    // one full cycle to transfer any leaders back to node 2 before Phase 3 starts.
+    // 5s was too short — rebalance transfers could fire mid-Phase-3.
+    tokio::time::sleep(Duration::from_secs(15)).await;
 
     // Phase 3: Writes after recovery.
     println!("=== Phase 3: 200 messages after recovery ===");

@@ -1,6 +1,6 @@
 //! Topic management handlers for the Helix service.
 
-use helix_core::PartitionId;
+use helix_core::{NodeId, PartitionId, TopicId};
 use helix_raft::multi::MultiRaftOutput;
 use helix_raft::RaftState;
 use tokio::sync::oneshot;
@@ -11,9 +11,10 @@ use helix_wal::Storage;
 
 use crate::controller::{ControllerCommand, CONTROLLER_GROUP_ID};
 use crate::error::{ServerError, ServerResult};
+use crate::offset_group::{offset_group_id, OffsetGroupCommand};
 use crate::partition_storage::PartitionStorage;
 
-use super::super::{HelixService, PendingControllerProposal, TopicMetadata};
+use super::super::{HelixService, PendingControllerProposal, PendingOffsetProposal, TopicMetadata};
 
 impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixService<S, T> {
     /// Creates a topic with the specified number of partitions.
@@ -301,6 +302,8 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     self.data_dir.as_ref(),
                     Some(&self.recovered_entries),
                     Some(&self.storage),
+                    &self.offset_group_states,
+                    &self.pending_offset_proposals,
                 )
                 .await;
             }
@@ -429,6 +432,79 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
         state.topic_exists(topic)
     }
 
+    /// Commits a Kafka consumer group offset via the dedicated offset Raft group.
+    ///
+    /// Routes the commit to the offset group that owns `consumer_group_id` based
+    /// on `xxh3(consumer_group_id) % OFFSET_GROUP_COUNT` and waits for the
+    /// proposal to commit. The offset is applied to the in-memory
+    /// `offset_group_states` on every node that processes the entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotController` if this node is not the target offset group's leader.
+    /// Returns `Internal` on timeout or channel failure.
+    pub async fn commit_offset_via_group(
+        &self,
+        consumer_group_id: String,
+        topic_id: TopicId,
+        partition_id: PartitionId,
+        offset: u64,
+        timestamp_ms: u64,
+        metadata: String,
+    ) -> ServerResult<()> {
+        const OFFSET_COMMIT_TIMEOUT_MS: u64 = 5_000;
+
+        let target_group = offset_group_id(&consumer_group_id);
+        let cmd = OffsetGroupCommand::CommitOffset {
+            group: consumer_group_id.clone(),
+            topic_id,
+            partition_id,
+            offset,
+            timestamp_ms,
+            metadata,
+        };
+        let encoded = cmd.encode();
+
+        let (result_tx, result_rx) = oneshot::channel();
+
+        let proposed_index = {
+            let mut mr = self.multi_raft.write().await;
+            let Some((_outputs, index)) = mr.propose_with_index(target_group, encoded) else {
+                let hint = mr
+                    .group_state(target_group)
+                    .and_then(|s| s.leader_id)
+                    .map(NodeId::get);
+                drop(mr);
+                return Err(ServerError::NotController { controller_hint: hint });
+            };
+            drop(mr);
+            index
+        };
+
+        {
+            let mut proposals = self.pending_offset_proposals.write().await;
+            proposals.push(PendingOffsetProposal {
+                offset_group_id: target_group,
+                log_index: proposed_index,
+                result_tx,
+            });
+        }
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(OFFSET_COMMIT_TIMEOUT_MS),
+            result_rx,
+        )
+        .await
+        .map_err(|_| ServerError::Internal {
+            message: format!(
+                "timeout waiting for OffsetCommit entry (group={consumer_group_id})"
+            ),
+        })?
+        .map_err(|_| ServerError::Internal {
+            message: "offset proposal channel closed".to_string(),
+        })?
+    }
+
     /// Deletes a topic through the controller partition (multi-node mode).
     ///
     /// This proposes a `DeleteTopic` command to the controller Raft group and
@@ -444,6 +520,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
     ///
     /// Panics in single-node actor mode if internal actor output channels are
     /// unexpectedly unavailable during immediate output processing.
+    #[allow(clippy::too_many_lines)] // Delete flow: propose + wait for commit + poll for removal.
     pub async fn delete_topic_via_controller(&self, name: String) -> ServerResult<()> {
         const DELETE_TIMEOUT_MS: u64 = 30_000;
         const POLL_INTERVAL_MS: u64 = 50;
@@ -514,6 +591,8 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     self.data_dir.as_ref(),
                     Some(&self.recovered_entries),
                     Some(&self.storage),
+                    &self.offset_group_states,
+                    &self.pending_offset_proposals,
                 )
                 .await;
             }

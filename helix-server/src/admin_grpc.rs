@@ -21,6 +21,7 @@ use crate::generated_admin::{
     CreateTopicRequest, CreateTopicResponse, DeleteConsumerGroupsRequest,
     DeleteConsumerGroupsResponse, DeleteTopicRequest, DeleteTopicResponse,
     DescribeTopicRequest, DescribeTopicResponse, DescribeTopicsRequest, DescribeTopicsResponse,
+    GetEndOffsetsRequest, GetEndOffsetsResponse,
     GetHealthRequest, GetHealthResponse, GetTopicStateRequest, GetTopicStateResponse,
     GetTopicStatesRequest, GetTopicStatesResponse, ListTopicConfigsRequest,
     ListTopicConfigsResponse, ListTopicsRequest, ListTopicsResponse,
@@ -324,6 +325,26 @@ impl Resources for AdminService {
         let req = request.into_inner();
         info!(topic = %req.topic_name, "Admin UpdateTopicConfig (no-op stub)");
         Ok(Response::new(UpdateTopicConfigResponse {}))
+    }
+
+    async fn get_end_offsets(
+        &self,
+        request: Request<GetEndOffsetsRequest>,
+    ) -> Result<Response<GetEndOffsetsResponse>, Status> {
+        let topic_id = request.into_inner().topic_id;
+
+        assert!(!topic_id.is_empty(), "topic_id must not be empty");
+
+        debug!(topic = %topic_id, "Admin GetEndOffsets");
+
+        // topic_id from streaming-admin IS the Kafka topic name in helix.
+        let Some(offsets) = self.service.get_topic_end_offsets(&topic_id).await else {
+            return Err(Status::not_found(format!("topic '{topic_id}' not found")));
+        };
+
+        assert!(offsets.len() <= 256, "partition count exceeds limit");
+
+        Ok(Response::new(GetEndOffsetsResponse { offsets }))
     }
 }
 

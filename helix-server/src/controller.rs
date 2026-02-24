@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use helix_core::{GroupId, NodeId, PartitionId, TopicId};
 
+
 /// Controller partition group ID (always 0).
 pub const CONTROLLER_GROUP_ID: GroupId = GroupId::new(0);
 
@@ -178,6 +179,7 @@ impl ControllerCommand {
     ///
     /// Returns `None` if the data is invalid or incomplete.
     #[must_use]
+    #[allow(clippy::too_many_lines)] // One arm per command type; each is simple.
     pub fn decode(data: &Bytes) -> Option<Self> {
         if data.is_empty() {
             return None;
@@ -334,7 +336,11 @@ pub struct ControllerState {
     assignments: HashMap<(TopicId, PartitionId), PartitionAssignment>,
     /// Next topic ID to allocate.
     next_topic_id: u64,
-    /// Next group ID to allocate (starts at 1, since 0 is controller).
+    /// Next group ID to allocate.
+    /// Next Raft group ID to allocate for a data partition.
+    ///
+    /// Starts at 1 for fresh clusters. Offset groups use a high fixed range
+    /// (`OFFSET_GROUP_ID_BASE` = 1,000,000) that is never reached by this counter.
     next_group_id: u64,
     /// Last heartbeat timestamp (ms) for each broker.
     /// Brokers that miss heartbeats are considered dead and excluded from metadata.
@@ -350,7 +356,9 @@ impl ControllerState {
             topics_by_id: HashMap::new(),
             assignments: HashMap::new(),
             next_topic_id: 1,
-            next_group_id: 1, // 0 is reserved for controller partition.
+            // Data partitions start at group 1. Offset groups use a high fixed
+            // range (OFFSET_GROUP_ID_BASE = 1_000_000) that never collides.
+            next_group_id: 1,
             broker_heartbeats: HashMap::new(),
         }
     }
@@ -611,6 +619,7 @@ impl ControllerState {
     pub fn record_heartbeat(&mut self, node_id: NodeId, timestamp_ms: u64) {
         self.broker_heartbeats.insert(node_id, timestamp_ms);
     }
+
 }
 
 // -----------------------------------------------------------------------------
@@ -734,7 +743,7 @@ mod tests {
             .get_assignment(topic.topic_id, PartitionId::new(0))
             .unwrap();
         assert_eq!(assignment.replicas.len(), 2);
-        assert_eq!(assignment.group_id.get(), 1); // First data group.
+        assert_eq!(assignment.group_id.get(), 1); // First data group (offset groups use high fixed IDs).
     }
 
     #[test]

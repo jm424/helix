@@ -35,13 +35,13 @@ use kafka_protocol::{
 };
 use tracing::{debug, error, info, warn};
 
-use helix_core::{ConsumerGroupId, Offset, PartitionId, TopicId};
-use helix_progress::ProgressStore;
+use helix_core::{PartitionId, TopicId};
 use helix_runtime::TransportService;
 use helix_wal::Storage;
 
 use super::codec::{self, DecodedRequest};
 use super::error::{KafkaError, KafkaResult};
+use crate::offset_group::{offset_group_id, offset_group_index};
 use crate::service::HelixService;
 
 /// Supported API versions.
@@ -146,7 +146,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
             x if x == ApiKey::Produce as i16 => self.handle_produce(request).await,
             x if x == ApiKey::Fetch as i16 => self.handle_fetch(request).await,
             x if x == ApiKey::ListOffsets as i16 => self.handle_list_offsets(request).await,
-            x if x == ApiKey::FindCoordinator as i16 => self.handle_find_coordinator(request),
+            x if x == ApiKey::FindCoordinator as i16 => self.handle_find_coordinator(request).await,
             x if x == ApiKey::OffsetCommit as i16 => self.handle_offset_commit(request).await,
             x if x == ApiKey::OffsetFetch as i16 => self.handle_offset_fetch(request).await,
             x if x == ApiKey::CreateTopics as i16 => self.handle_create_topics(request).await,
@@ -1031,7 +1031,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
     }
 
     /// Handle `FindCoordinator` request.
-    fn handle_find_coordinator(&self, request: &DecodedRequest) -> KafkaResult<BytesMut> {
+    async fn handle_find_coordinator(&self, request: &DecodedRequest) -> KafkaResult<BytesMut> {
         let mut body = request.body.clone();
         let find_coordinator_request =
             FindCoordinatorRequest::decode(&mut body, request.api_version)
@@ -1040,27 +1040,70 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
         let key = find_coordinator_request.key.to_string();
         debug!(key = %key, "Finding coordinator");
 
-        let mut response = FindCoordinatorResponse::default();
+        // Route to the offset group leader for this consumer group so that
+        // OffsetCommit is always directed to the correct group's leader.
+        //
+        // Returns (node_id, host, port, error_code). When the leader is unknown
+        // we return COORDINATOR_NOT_AVAILABLE (15) so the client backs off and
+        // retries FindCoordinator rather than hammering a non-leader node with
+        // OffsetCommit requests that all return NOT_COORDINATOR (16).
+        let (coordinator_node_id, coordinator_host, coordinator_port, coordinator_error_code) = {
+            let target_group = offset_group_id(&key);
+            let mr = self.service.multi_raft.read().await;
+            let leader_id = mr
+                .group_state(target_group)
+                .and_then(|s| s.leader_id);
+            drop(mr);
 
-        // Safe cast: NodeId (u64) fits in i32 for reasonable cluster sizes.
-        #[allow(clippy::cast_possible_truncation)]
-        let node_id = self.service.node_id().get() as i32;
+            let self_node_id = self.service.node_id();
+            #[allow(clippy::cast_possible_truncation)]
+            match leader_id {
+                Some(leader) if leader != self_node_id => {
+                    // Leader is a remote node — return their Kafka address.
+                    self.service.get_node_address(leader).map_or_else(
+                        || {
+                            // Leader known by ID but address not yet in peer table.
+                            // Return COORDINATOR_NOT_AVAILABLE; client retries.
+                            (self_node_id.get() as i32, self.host.clone(), self.port, 15i16)
+                        },
+                        |addr| {
+                            // addr is "host:port" — split from the right to handle IPv6.
+                            let (host, port) = addr.rsplit_once(':').unwrap_or((addr, "9092"));
+                            let port_i32 = port.parse::<i32>().unwrap_or(9092);
+                            (leader.get() as i32, host.to_owned(), port_i32, 0i16)
+                        },
+                    )
+                }
+                Some(_) => {
+                    // Self is the leader — advertise self.
+                    (self_node_id.get() as i32, self.host.clone(), self.port, 0i16)
+                }
+                None => {
+                    // Leader unknown (election in progress or node just restarted).
+                    // Return COORDINATOR_NOT_AVAILABLE (15) so the client backs off
+                    // and retries rather than treating this node as coordinator.
+                    (self_node_id.get() as i32, self.host.clone(), self.port, 15i16)
+                }
+            }
+        };
+
+        let mut response = FindCoordinatorResponse::default();
 
         if request.api_version >= 3 {
             // v3+ uses the coordinators array; legacy fields are removed.
             let mut coordinator = Coordinator::default();
             coordinator.key = find_coordinator_request.key;
-            coordinator.node_id = BrokerId(node_id);
-            coordinator.host = StrBytes::from_string(self.host.clone());
-            coordinator.port = self.port;
-            coordinator.error_code = 0;
+            coordinator.node_id = BrokerId(coordinator_node_id);
+            coordinator.host = StrBytes::from_string(coordinator_host);
+            coordinator.port = coordinator_port;
+            coordinator.error_code = coordinator_error_code;
             response.coordinators.push(coordinator);
         } else {
             // v0-v2 uses top-level fields.
-            response.error_code = 0;
-            response.node_id = BrokerId(node_id);
-            response.host = StrBytes::from_string(self.host.clone());
-            response.port = self.port;
+            response.error_code = coordinator_error_code;
+            response.node_id = BrokerId(coordinator_node_id);
+            response.host = StrBytes::from_string(coordinator_host);
+            response.port = coordinator_port;
         }
 
         codec::encode_response(
@@ -1080,7 +1123,6 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
         let group_id = offset_commit_request.group_id.to_string();
         debug!(group_id = %group_id, "OffsetCommit request");
 
-        let group_id_hashed = ConsumerGroupId::new(HelixService::<S, T>::hash_string(&group_id));
         let current_time_us = HelixService::<S, T>::current_time_us();
 
         let mut response = OffsetCommitResponse::default();
@@ -1122,29 +1164,35 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
                 let partition_id = PartitionId::new(partition.partition_index as u64);
                 // Safe cast: committed_offset validated to be non-negative.
                 #[allow(clippy::cast_sign_loss)]
-                let offset = Offset::new(partition.committed_offset as u64);
+                let offset_value = partition.committed_offset as u64;
+
+                // Use current_time_us converted to ms for the controller entry.
+                let timestamp_ms = current_time_us / 1_000;
+
+                // Pass through client metadata (e.g. libstreaming inflight state).
                 let metadata = partition
                     .committed_metadata
                     .as_ref()
-                    .map(std::string::ToString::to_string);
-                let leader_epoch = partition.committed_leader_epoch;
+                    .map_or_else(String::new, std::string::ToString::to_string);
 
                 match self
                     .service
-                    .progress_manager
-                    .commit_offset_kafka(
-                        group_id_hashed,
+                    .commit_offset_via_group(
+                        group_id.clone(),
                         meta.topic_id,
                         partition_id,
-                        offset,
+                        offset_value,
+                        timestamp_ms,
                         metadata,
-                        leader_epoch,
-                        current_time_us,
                     )
                     .await
                 {
                     Ok(()) => {
                         partition_response.error_code = 0;
+                    }
+                    Err(crate::error::ServerError::NotController { .. }) => {
+                        // Client should call FindCoordinator and retry on the leader.
+                        partition_response.error_code = 16; // NOT_COORDINATOR
                     }
                     Err(e) => {
                         warn!(
@@ -1174,6 +1222,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
 
     /// Handle `OffsetFetch` request.
     #[allow(clippy::too_many_lines)] // Request decoding + two response paths are handled together.
+    #[allow(clippy::significant_drop_tightening)] // state lock is read throughout the topic loop.
     async fn handle_offset_fetch(&self, request: &DecodedRequest) -> KafkaResult<BytesMut> {
         let mut body = request.body.clone();
         let offset_fetch_request = OffsetFetchRequest::decode(&mut body, request.api_version)
@@ -1182,104 +1231,86 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
         let group_id = offset_fetch_request.group_id.to_string();
         debug!(group_id = %group_id, "OffsetFetch request");
 
-        let group_id_hashed = ConsumerGroupId::new(HelixService::<S, T>::hash_string(&group_id));
-
         let mut response = OffsetFetchResponse::default();
         response.error_code = 0;
 
-        // If topics is None, return all known committed offsets for the group.
+        // Route reads to the correct offset group state for this consumer group.
+        // Each node holds the full offset state for all groups locally — no
+        // cross-node coordination needed for reads.
+        // Safe: offset_group_index returns 0..2, always fits in usize.
+        #[allow(clippy::cast_possible_truncation)]
+        let slot = offset_group_index(&group_id) as usize;
+
         if offset_fetch_request.topics.is_none() {
-            let group = self
-                .service
-                .progress_manager
-                .store()
-                .get_group(group_id_hashed)
-                .await;
-
-            let group = match group {
-                Ok(Some(group)) => group,
-                Ok(None) => {
-                    return codec::encode_response(
-                        request.api_key,
-                        request.api_version,
-                        request.correlation_id,
-                        &response,
-                    );
-                }
-                Err(e) => {
-                    warn!(group_id = %group_id, error = %e, "OffsetFetch group lookup failed");
-                    response.error_code = 1; // UNKNOWN_SERVER_ERROR
-                    return codec::encode_response(
-                        request.api_key,
-                        request.api_version,
-                        request.correlation_id,
-                        &response,
-                    );
-                }
-            };
-
+            // Return all known committed offsets for the group.
             let topic_name_by_id = self.topic_name_by_id().await;
             let mut topics_map: HashMap<String, OffsetFetchResponseTopic> = HashMap::new();
 
-            for (partition_key, progress) in group.partitions {
-                let Some(kafka_commit) = progress.kafka_commit.as_ref() else {
+            let offset_state = self.service.offset_group_states[slot].read().await;
+            for ((_, topic_id, partition_id), (offset, metadata)) in
+                offset_state.get_all_for_group(&group_id)
+            {
+                let Some(topic_name) = topic_name_by_id.get(topic_id) else {
                     continue;
                 };
-
-                let Some(topic_name) = topic_name_by_id.get(&partition_key.topic_id) else {
-                    continue;
-                };
-
                 let entry = topics_map.entry(topic_name.clone()).or_insert_with(|| {
-                    let mut topic_response = OffsetFetchResponseTopic::default();
-                    topic_response.name = kafka_protocol::messages::TopicName(
-                        StrBytes::from_string(topic_name.clone()),
-                    );
-                    topic_response
+                    let mut t = OffsetFetchResponseTopic::default();
+                    t.name = kafka_protocol::messages::TopicName(StrBytes::from_string(
+                        topic_name.clone(),
+                    ));
+                    t
                 });
-
                 let mut partition_response = OffsetFetchResponsePartition::default();
                 // Safe cast: partition_id is bounded by configured partition count.
                 #[allow(clippy::cast_possible_truncation)]
                 {
-                    partition_response.partition_index = partition_key.partition_id.get() as i32;
+                    partition_response.partition_index = partition_id.get() as i32;
                 }
-
+                // Safe cast: offset fits in i64 for reasonable usage.
                 #[allow(clippy::cast_possible_wrap)]
                 {
-                    partition_response.committed_offset = kafka_commit.offset.get() as i64;
+                    partition_response.committed_offset = *offset as i64;
                 }
-                partition_response.committed_leader_epoch = kafka_commit.leader_epoch;
-                partition_response.metadata = kafka_commit
-                    .metadata
-                    .as_ref()
-                    .map(|m: &String| StrBytes::from_string(m.clone()));
+                partition_response.metadata = if metadata.is_empty() {
+                    None
+                } else {
+                    Some(StrBytes::from_string(metadata.clone()))
+                };
                 partition_response.error_code = 0;
                 entry.partitions.push(partition_response);
             }
+            drop(offset_state);
 
             response.topics = topics_map.into_values().collect();
         } else if let Some(ref topics) = offset_fetch_request.topics {
-            // Return "no committed offset" for each requested topic/partition.
+            // Fetch specific partitions.
+            let ctrl_state = self.service.controller_state.read().await;
+            let offset_state = self.service.offset_group_states[slot].read().await;
+
             for topic in topics {
                 let mut topic_response = OffsetFetchResponseTopic::default();
                 topic_response.name = topic.name.clone();
 
                 let topic_name = topic.name.to_string();
-                let topic_meta = self.service.get_topic(&topic_name).await;
+                let topic_meta = ctrl_state
+                    .get_topic(&topic_name)
+                    .map(|t| (t.topic_id, t.partition_count));
 
                 for partition in &topic.partition_indexes {
                     let mut partition_response = OffsetFetchResponsePartition::default();
                     partition_response.partition_index = *partition;
 
-                    let Some(meta) = topic_meta.as_ref() else {
+                    let Some((topic_id, partition_count)) = topic_meta else {
                         partition_response.committed_offset = -1;
                         partition_response.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
                         topic_response.partitions.push(partition_response);
                         continue;
                     };
 
-                    if *partition < 0 || *partition >= meta.partition_count {
+                    // Safe cast: partition_count is u32 bounded by 256.
+                    #[allow(clippy::cast_possible_wrap)]
+                    let partition_count_i32 = partition_count as i32;
+                    if *partition < 0 || *partition >= partition_count_i32 {
                         partition_response.committed_offset = -1;
                         partition_response.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
                         topic_response.partitions.push(partition_response);
@@ -1290,45 +1321,24 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
                     #[allow(clippy::cast_sign_loss)]
                     let partition_id = PartitionId::new(*partition as u64);
 
-                    match self
-                        .service
-                        .progress_manager
-                        .fetch_committed_kafka(group_id_hashed, meta.topic_id, partition_id)
-                        .await
+                    let committed =
+                        offset_state.get(&group_id, topic_id, partition_id);
+                    // Safe cast: offset fits in i64 for reasonable usage.
+                    #[allow(clippy::cast_possible_wrap)]
                     {
-                        Ok(Some(commit)) => {
-                            // Safe cast: offset fits in i64 for reasonable usage.
-                            #[allow(clippy::cast_possible_wrap)]
-                            {
-                                partition_response.committed_offset = commit.offset.get() as i64;
-                            }
-                            partition_response.committed_leader_epoch = commit.leader_epoch;
-                            partition_response.metadata = commit
-                                .metadata
-                                .as_ref()
-                                .map(|m| StrBytes::from_string(m.clone()));
-                            partition_response.error_code = 0;
-                        }
-                        Ok(None) => {
-                            partition_response.committed_offset = -1;
-                            partition_response.committed_leader_epoch = -1;
-                            partition_response.metadata = None;
-                            partition_response.error_code = 0;
-                        }
-                        Err(e) => {
-                            warn!(
-                                group_id = %group_id,
-                                topic = %topic_name,
-                                partition = *partition,
-                                error = %e,
-                                "OffsetFetch failed"
-                            );
-                            partition_response.committed_offset = -1;
-                            partition_response.committed_leader_epoch = -1;
-                            partition_response.metadata = None;
-                            partition_response.error_code = 1; // UNKNOWN_SERVER_ERROR
-                        }
+                        // -1 signals "no committed offset" in the Kafka protocol.
+                        partition_response.committed_offset =
+                            committed.map_or(-1_i64, |(o, _)| o as i64);
                     }
+                    partition_response.committed_leader_epoch = -1;
+                    partition_response.metadata = committed.and_then(|(_, meta)| {
+                        if meta.is_empty() {
+                            None
+                        } else {
+                            Some(StrBytes::from_string(meta.to_string()))
+                        }
+                    });
+                    partition_response.error_code = 0;
 
                     topic_response.partitions.push(partition_response);
                 }
@@ -1983,8 +1993,73 @@ mod tests {
         R::decode(&mut bytes, api_version).unwrap()
     }
 
+    // Note: The full commit→Raft→state path is covered by E2E tests. Here we test
+    // (a) the OffsetFetch handler reads from offset_group_states (seeded directly), and
+    // (b) the OffsetCommit handler returns NOT_COORDINATOR (16) when no offset
+    //     Raft group is configured (new_for_test mode).
     #[tokio::test]
-    async fn test_offset_commit_fetch_next_to_read_with_metadata() {
+    async fn test_offset_fetch_reads_from_offset_group_state() {
+        use crate::controller::ControllerCommand;
+        use crate::offset_group::offset_group_index;
+        use helix_core::PartitionId;
+
+        let storage = SimulatedStorage::new(42);
+        let service: HelixService<SimulatedStorage> =
+            HelixService::new_for_test("test-cluster".to_string(), 1, storage).await;
+
+        // Seed topic into controller_state so OffsetFetch can resolve topic_id.
+        // Seed committed offset into the correct offset_group_states slot.
+        {
+            let mut state = service.controller_state.write().await;
+            let cluster_nodes = vec![NodeId::new(1)];
+            let _follow_ups = state.apply(
+                &ControllerCommand::CreateTopic {
+                    name: "test-topic".to_string(),
+                    partition_count: 1,
+                    replication_factor: 1,
+                },
+                &cluster_nodes,
+            );
+        }
+
+        // Seed the committed offset directly into the offset group state.
+        {
+            let slot = offset_group_index("group-1") as usize;
+            let mut offset_state = service.offset_group_states[slot].write().await;
+            offset_state.offsets.insert(
+                ("group-1".to_string(), TopicId::new(1), PartitionId::new(0)),
+                (42, String::new()),
+            );
+        }
+
+        let handler = KafkaHandler::new(Arc::new(service), "127.0.0.1".to_string(), 9092, false, 1);
+
+        // Fetch committed offset.
+        let mut fetch_topic = OffsetFetchRequestTopic::default();
+        fetch_topic.name = TopicName(StrBytes::from_string("test-topic".to_string()));
+        fetch_topic.partition_indexes = vec![0];
+
+        let mut fetch_request = OffsetFetchRequest::default();
+        fetch_request.group_id = GroupId(StrBytes::from_string("group-1".to_string()));
+        fetch_request.topics = Some(vec![fetch_topic]);
+
+        let fetch_decoded = build_decoded_request(ApiKey::OffsetFetch as i16, 6, 1, &fetch_request);
+        let fetch_resp = handler.handle_request(&fetch_decoded).await.unwrap();
+        let fetch_resp: OffsetFetchResponse =
+            decode_response(ApiKey::OffsetFetch as i16, 6, fetch_resp);
+
+        assert_eq!(fetch_resp.topics.len(), 1);
+        assert_eq!(fetch_resp.topics[0].partitions.len(), 1);
+        let partition = &fetch_resp.topics[0].partitions[0];
+        assert_eq!(partition.error_code, 0);
+        assert_eq!(partition.committed_offset, 42);
+        // leader_epoch and metadata are not stored in the Raft-replicated path.
+        assert_eq!(partition.committed_leader_epoch, -1);
+        assert_eq!(partition.metadata, None);
+    }
+
+    #[tokio::test]
+    async fn test_offset_commit_returns_not_coordinator_without_offset_group() {
         let storage = SimulatedStorage::new(42);
         let service: HelixService<SimulatedStorage> =
             HelixService::new_for_test("test-cluster".to_string(), 1, storage).await;
@@ -2003,12 +2078,11 @@ mod tests {
 
         let handler = KafkaHandler::new(Arc::new(service), "127.0.0.1".to_string(), 9092, false, 1);
 
-        // Commit offset 42 with metadata.
+        // Commit request: new_for_test has no offset Raft group configured, so this
+        // must return NOT_COORDINATOR (error code 16).
         let mut commit_partition = OffsetCommitRequestPartition::default();
         commit_partition.partition_index = 0;
         commit_partition.committed_offset = 42;
-        commit_partition.committed_leader_epoch = 3;
-        commit_partition.committed_metadata = Some(StrBytes::from_string("meta".to_string()));
 
         let mut commit_topic = OffsetCommitRequestTopic::default();
         commit_topic.name = TopicName(StrBytes::from_string("test-topic".to_string()));
@@ -2029,32 +2103,8 @@ mod tests {
 
         assert_eq!(commit_resp.topics.len(), 1);
         assert_eq!(commit_resp.topics[0].partitions.len(), 1);
-        assert_eq!(commit_resp.topics[0].partitions[0].error_code, 0);
-
-        // Fetch committed offset and metadata.
-        let mut fetch_topic = OffsetFetchRequestTopic::default();
-        fetch_topic.name = TopicName(StrBytes::from_string("test-topic".to_string()));
-        fetch_topic.partition_indexes = vec![0];
-
-        let mut fetch_request = OffsetFetchRequest::default();
-        fetch_request.group_id = GroupId(StrBytes::from_string("group-1".to_string()));
-        fetch_request.topics = Some(vec![fetch_topic]);
-
-        let fetch_decoded = build_decoded_request(ApiKey::OffsetFetch as i16, 6, 2, &fetch_request);
-        let fetch_resp = handler.handle_request(&fetch_decoded).await.unwrap();
-        let fetch_resp: OffsetFetchResponse =
-            decode_response(ApiKey::OffsetFetch as i16, 6, fetch_resp);
-
-        assert_eq!(fetch_resp.topics.len(), 1);
-        assert_eq!(fetch_resp.topics[0].partitions.len(), 1);
-        let partition = &fetch_resp.topics[0].partitions[0];
-        assert_eq!(partition.error_code, 0);
-        assert_eq!(partition.committed_offset, 42);
-        assert_eq!(partition.committed_leader_epoch, 3);
-        assert_eq!(
-            partition.metadata,
-            Some(StrBytes::from_string("meta".to_string()))
-        );
+        // NOT_COORDINATOR = 16: no offset Raft group in new_for_test mode.
+        assert_eq!(commit_resp.topics[0].partitions[0].error_code, 16);
     }
 
     #[test]

@@ -21,6 +21,9 @@ use tracing::{debug, error, info, trace, warn};
 use crate::vote_store::{LocalFileVoteStorage, VoteStore};
 
 use crate::controller::{ControllerCommand, ControllerState, CONTROLLER_GROUP_ID};
+use crate::offset_group::{
+    is_offset_group, offset_group_slot, OffsetGroupCommand, OffsetGroupState,
+};
 
 /// Last Raft index persisted for the controller partition (group 0) in the `SharedWAL`.
 ///
@@ -31,12 +34,23 @@ use crate::controller::{ControllerCommand, ControllerState, CONTROLLER_GROUP_ID}
 /// of the last recovered entry).
 pub static CONTROLLER_LAST_PERSISTED_INDEX: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+/// Last Raft index persisted per offset group (slot 0 = group 1, slot 1 = group 2, slot 2 = group 3).
+///
+/// Mirrors `CONTROLLER_LAST_PERSISTED_INDEX` for the three offset Raft groups. Set during
+/// WAL recovery; checked before each `SharedWAL` append to skip already-persisted entries.
+pub static OFFSET_GROUP_LAST_PERSISTED: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
 use crate::error::ServerError;
 use crate::group_map::GroupMap;
 use crate::partition_storage::PartitionStorage;
 use super::{
     output_processor::extract_and_record_producer_state, PendingControllerProposal,
-    PendingProposal, TICK_INTERVAL_MS,
+    PendingOffsetProposal, PendingProposal, TICK_INTERVAL_MS,
 };
 
 /// Interval for sending broker heartbeats to the controller (in milliseconds).
@@ -119,7 +133,7 @@ pub async fn tick_task<S: Storage + Clone + Send + Sync + 'static>(
                 // inline would freeze the tick loop and trigger election timeouts.
                 let ps = Arc::clone(&partition_storage);
                 tokio::spawn(async move {
-                    process_tiering(&ps, None::<&Arc<SharedWalPool<S>>>).await;
+                    process_tiering(&ps, None::<&Arc<SharedWalPool<S>>>, None).await;
                 });
             }
         }
@@ -165,6 +179,8 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
     recovered_entries: Arc<RwLock<HashMap<GroupId, PartitionRecoveryState>>>,
     storage: S,
     local_retention_ms: Option<u64>,
+    offset_group_states: Vec<Arc<RwLock<OffsetGroupState>>>,
+    pending_offset_proposals: Arc<RwLock<Vec<PendingOffsetProposal>>>,
     mut incoming_rx: mpsc::Receiver<IncomingMessage>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
@@ -239,7 +255,7 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
                 let ps = Arc::clone(&partition_storage);
                 let pool = shared_wal_pool.clone();
                 tokio::spawn(async move {
-                    process_tiering(&ps, pool.as_ref()).await;
+                    process_tiering(&ps, pool.as_ref(), local_retention_ms).await;
                 });
             }
             _ = retention_interval.tick() => {
@@ -260,18 +276,21 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
                         warn!("Received single message in actor mode, expected batch");
                     }
                     IncomingMessage::Batch(group_messages) => {
-                        // Split messages: controller messages go to MultiRaft,
+                        // Split messages: controller + offset group messages go to MultiRaft,
                         // data partition messages go to partition actors.
                         let (controller_msgs, data_msgs): (Vec<_>, Vec<_>) = group_messages
                             .into_iter()
-                            .partition(|gm| gm.group_id == CONTROLLER_GROUP_ID);
+                            .partition(|gm| {
+                                gm.group_id == CONTROLLER_GROUP_ID
+                                    || is_offset_group(gm.group_id)
+                            });
 
-                        // Step controller messages through MultiRaft and process ALL outputs.
+                        // Step controller/offset messages through MultiRaft and process outputs.
                         // This includes BecameLeader, CommitEntry, etc. - not just SendMessages.
                         if !controller_msgs.is_empty() {
                             trace!(
                                 count = controller_msgs.len(),
-                                "Received controller messages in tick_task_actor"
+                                "Received controller/offset messages in tick_task_actor"
                             );
                             let outputs = {
                                 let mut mr = multi_raft.write().await;
@@ -279,10 +298,10 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
                             };
                             trace!(
                                 output_count = outputs.len(),
-                                "Processed controller messages, got outputs"
+                                "Processed controller/offset messages, got outputs"
                             );
 
-                            // Process all controller outputs including BecameLeader, CommitEntry.
+                            // Process all controller and offset group outputs.
                             process_controller_outputs(
                                 &outputs,
                                 &multi_raft,
@@ -300,6 +319,8 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
                                 data_dir.as_ref(),
                                 Some(&recovered_entries),
                                 Some(&storage),
+                                &offset_group_states,
+                                &pending_offset_proposals,
                             ).await;
                         }
 
@@ -365,6 +386,8 @@ pub async fn tick_task_controller<
     recovered_entries: Arc<RwLock<HashMap<GroupId, PartitionRecoveryState>>>,
     storage: S,
     local_broker_heartbeats: Arc<RwLock<HashMap<NodeId, u64>>>,
+    offset_group_states: Vec<Arc<RwLock<OffsetGroupState>>>,
+    pending_offset_proposals: Arc<RwLock<Vec<PendingOffsetProposal>>>,
     mut leader_update_rx: mpsc::UnboundedReceiver<crate::controller::ControllerCommand>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
@@ -396,7 +419,7 @@ pub async fn tick_task_controller<
                     mr.tick()
                 };
 
-                // Process controller-related outputs only.
+                // Process controller and offset group outputs.
                 process_controller_outputs(
                     &outputs,
                     &multi_raft,
@@ -414,15 +437,17 @@ pub async fn tick_task_controller<
                     data_dir.as_ref(),
                     Some(&recovered_entries),
                     Some(&storage),
+                    &offset_group_states,
+                    &pending_offset_proposals,
                 ).await;
             }
             _ = rebalance_interval.tick() => {
                 // Leader rebalancing: move partition leaders to their preferred
-                // replicas (replicas[0]). Only runs on the controller leader.
+                // replicas (replicas[0]). Decentralized — all nodes run this,
+                // each acting only on partitions where it is the actual Raft leader.
                 rebalance_partition_leaders(
-                    &multi_raft,
+                    node_id,
                     &controller_state,
-                    &cluster_nodes,
                     &router,
                     &local_broker_heartbeats,
                 ).await;
@@ -453,42 +478,32 @@ pub async fn tick_task_controller<
     info!("Controller tick task stopped");
 }
 
-/// Rebalances partition leaders to their preferred replicas.
+/// Rebalances partition leaders to their preferred replicas (decentralized).
 ///
-/// Iterates all partition assignments. For each partition where the current
-/// leader differs from the preferred leader (`replicas[0]`), sends a
-/// `TransferLeadership` command to the partition actor. Rate-limited to
+/// Each node runs this independently. For each data partition where this node
+/// is the **actual Raft leader** but not the preferred replica (`replicas[0]`),
+/// it initiates a `TransferLeadership` to the preferred node. Rate-limited to
 /// `MAX_TRANSFERS_PER_CYCLE` per invocation.
 ///
-/// Only runs when this node is the controller leader. Follows the Kafka
-/// `auto.leader.rebalance` pattern.
-/// Nodes muted from rebalance after a failed leadership transfer.
+/// This decentralized approach avoids the two bugs of the old controller-leader-only
+/// design: (1) stale `assignment.leader` cache on controller followers, and (2)
+/// `router.partition()` returning only the local actor, making transfers a no-op
+/// when the actual leader is on another node. Since Raft guarantees at most one
+/// leader per term, only the actual leader initiates the transfer — no double-transfer
+/// risk.
 ///
-/// Tracks `(node_id, mute_until_ms)`. When a transfer to a node fails
-/// (e.g., target is dead), the node is muted for one rebalance interval
-/// to avoid retrying immediately. Same pattern as Redpanda's
-/// `leadership_transfer_backoff`.
+/// Nodes are muted after a failed leadership transfer for one rebalance interval
+/// to avoid rapid retries. Same pattern as Redpanda's `leadership_transfer_backoff`.
 static REBALANCE_MUTED: std::sync::LazyLock<
     tokio::sync::Mutex<HashMap<NodeId, u64>>,
 > = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
 
 async fn rebalance_partition_leaders(
-    multi_raft: &Arc<RwLock<MultiRaft>>,
+    node_id: NodeId,
     controller_state: &Arc<RwLock<ControllerState>>,
-    cluster_nodes: &[NodeId],
     router: &Arc<super::router::PartitionRouter>,
     local_broker_heartbeats: &Arc<RwLock<HashMap<NodeId, u64>>>,
 ) {
-    // Only the controller leader should rebalance.
-    let is_controller_leader = {
-        let mr = multi_raft.read().await;
-        mr.group_state(CONTROLLER_GROUP_ID)
-            .is_some_and(|s| s.state == RaftState::Leader)
-    };
-    if !is_controller_leader {
-        return;
-    }
-
     // Get current time for broker liveness checks.
     #[allow(clippy::cast_possible_truncation)]
     let now_ms = std::time::SystemTime::now()
@@ -519,15 +534,18 @@ async fn rebalance_partition_leaders(
         muted.keys().copied().collect()
     };
 
-    // Collect imbalanced partitions: preferred leader != actual leader.
-    let imbalanced: Vec<(GroupId, NodeId)> = {
+    // Phase 1 (sync, lock held briefly): collect candidates where this node is NOT
+    // the preferred replica, the preferred is alive, and the preferred is not muted.
+    // We rely on live Raft state (Phase 2) rather than stale controller-cached leader
+    // to decide whether a transfer is needed.
+    let candidates: Vec<(GroupId, NodeId)> = {
         let state = controller_state.read().await;
         state
             .all_assignments()
             .filter_map(|(_, assignment)| {
                 let preferred = *assignment.replicas.first()?;
-                // Skip if already the leader.
-                if assignment.leader == Some(preferred) {
+                // Skip if we are already the preferred replica — no transfer needed.
+                if preferred == node_id {
                     return None;
                 }
                 // Skip if preferred leader is not alive (check both sources).
@@ -536,16 +554,43 @@ async fn rebalance_partition_leaders(
                 if !alive {
                     return None;
                 }
-                // Skip if the target node is muted from a recent
-                // failed transfer attempt.
+                // Skip if the target node is muted from a recent failed transfer attempt.
                 if muted_nodes.contains(&preferred) {
+                    return None;
+                }
+                // Skip the controller partition (group 0).
+                if assignment.group_id == CONTROLLER_GROUP_ID {
                     return None;
                 }
                 Some((assignment.group_id, preferred))
             })
-            .take(MAX_TRANSFERS_PER_CYCLE)
             .collect()
     };
+
+    if candidates.is_empty() {
+        return;
+    }
+
+    // Phase 2 (async, no lock held): keep only partitions where this node is the
+    // actual Raft leader. Only the actual leader can initiate a transfer — this
+    // eliminates the stale-cache problem where controller-side assignment.leader
+    // is only updated on the controller leader and lags for ~2/3 of leader changes.
+    let mut imbalanced: Vec<(GroupId, NodeId)> = Vec::new();
+    for (group_id, preferred) in candidates {
+        if imbalanced.len() >= MAX_TRANSFERS_PER_CYCLE {
+            break;
+        }
+        if let Ok(handle) = router.partition(group_id).await {
+            if matches!(handle.leader_id().await, Ok(Some(actual_leader)) if actual_leader == node_id) {
+                // This node is the actual Raft leader and not the preferred
+                // replica — initiate a transfer.
+                imbalanced.push((group_id, preferred));
+            }
+            // Otherwise: not the leader (someone else is, or no leader yet).
+            // That node's rebalancer will handle it.
+        }
+        // else: actor not yet started — skip for this cycle.
+    }
 
     if imbalanced.is_empty() {
         return;
@@ -553,16 +598,10 @@ async fn rebalance_partition_leaders(
 
     info!(
         count = imbalanced.len(),
-        total_partitions = cluster_nodes.len(),
         "Rebalancing partition leaders"
     );
 
     for (group_id, preferred) in &imbalanced {
-        // Skip the controller partition (group 0).
-        if *group_id == CONTROLLER_GROUP_ID {
-            continue;
-        }
-
         match router.partition(*group_id).await {
             Ok(handle) => {
                 if let Err(e) = handle.transfer_leadership(*preferred).await {
@@ -628,6 +667,8 @@ pub async fn process_controller_outputs<
     data_dir: Option<&PathBuf>,
     recovered_entries: Option<&Arc<RwLock<HashMap<GroupId, PartitionRecoveryState>>>>,
     storage: Option<&S>,
+    offset_group_states: &[Arc<RwLock<OffsetGroupState>>],
+    pending_offset_proposals: &Arc<RwLock<Vec<PendingOffsetProposal>>>,
 ) {
     // Collect follow-up outputs for single-node processing.
     // For single-node clusters, propose() returns CommitEntry immediately,
@@ -643,6 +684,66 @@ pub async fn process_controller_outputs<
                 metadata,
                 ..
             } => {
+                if let Some(slot) = offset_group_slot(*group_id) {
+                    // Offset group commit: decode, apply, persist to WAL, notify waiters.
+                    // Empty payload = Raft no-op entry (e.g. leader election); skip silently.
+                    if metadata.is_empty() {
+                        continue;
+                    }
+                    let Some(cmd) = OffsetGroupCommand::decode(metadata) else {
+                        warn!(
+                            index = index.get(),
+                            group_id = group_id.get(),
+                            "Failed to decode offset group command"
+                        );
+                        continue;
+                    };
+
+                    {
+                        let mut state = offset_group_states[slot].write().await;
+                        state.apply(&cmd, index.get(), term.get());
+                    }
+
+                    // Persist to SharedWAL (skip already-recovered entries).
+                    let last_persisted = OFFSET_GROUP_LAST_PERSISTED[slot]
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if index.get() > last_persisted {
+                        if let Some(pool) = shared_wal_pool {
+                            let handle = pool.handle(*group_id);
+                            match handle
+                                .append_nowait(term.get(), index.get(), metadata.clone())
+                                .await
+                            {
+                                Err(e) => error!(
+                                    index = index.get(),
+                                    slot,
+                                    error = %e,
+                                    "Failed to persist offset entry to SharedWAL"
+                                ),
+                                Ok(wal_index) => {
+                                    OFFSET_GROUP_LAST_PERSISTED[slot].store(
+                                        index.get(),
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    handle.update_committed_wal_index(wal_index);
+                                }
+                            }
+                        }
+                    }
+
+                    // Notify any pending offset proposals for this (group, index).
+                    {
+                        let mut proposals = pending_offset_proposals.write().await;
+                        if let Some(pos) = proposals.iter().position(|p| {
+                            p.offset_group_id == *group_id && p.log_index == *index
+                        }) {
+                            let proposal = proposals.swap_remove(pos);
+                            let _ = proposal.result_tx.send(Ok(()));
+                        }
+                    }
+                    continue;
+                }
+
                 // Only process controller partition commits.
                 if *group_id != CONTROLLER_GROUP_ID {
                     // Data partition commits are handled by OutputProcessor in actor mode.
@@ -650,8 +751,16 @@ pub async fn process_controller_outputs<
                 }
 
                 // Controller commands are non-blob; metadata is the full command.
+                // Empty metadata = Raft no-op entry (leader election); skip silently.
+                if metadata.is_empty() {
+                    continue;
+                }
                 let Some(cmd) = ControllerCommand::decode(metadata) else {
-                    warn!(index = index.get(), "Failed to decode controller command");
+                    warn!(
+                        index = index.get(),
+                        metadata_len = metadata.len(),
+                        "Failed to decode controller command"
+                    );
                     continue;
                 };
 
@@ -865,40 +974,45 @@ pub async fn process_controller_outputs<
             MultiRaftOutput::BecameLeader { group_id } => {
                 if *group_id == CONTROLLER_GROUP_ID {
                     info!("Became controller leader (actor mode)");
+                } else if is_offset_group(*group_id) {
+                    info!(group_id = group_id.get(), "Became offset group leader");
                 }
                 // Ignore data partition leader changes - handled by OutputProcessor.
             }
             MultiRaftOutput::SteppedDown { group_id } => {
                 if *group_id == CONTROLLER_GROUP_ID {
                     info!("Stepped down from controller leader (actor mode)");
+                } else if is_offset_group(*group_id) {
+                    info!(group_id = group_id.get(), "Stepped down from offset group leader");
                 }
                 // Ignore data partition step downs - handled by OutputProcessor.
             }
             MultiRaftOutput::SendMessages { to, messages } => {
-                // Filter to only send controller partition messages.
-                // Data partition messages are sent by OutputProcessor.
-                let controller_messages: Vec<_> = messages
+                // Send controller and offset group messages; data partition messages go via OutputProcessor.
+                let managed_messages: Vec<_> = messages
                     .iter()
-                    .filter(|m| m.group_id == CONTROLLER_GROUP_ID)
+                    .filter(|m| {
+                        m.group_id == CONTROLLER_GROUP_ID || is_offset_group(m.group_id)
+                    })
                     .cloned()
                     .collect();
 
-                if !controller_messages.is_empty() {
+                if !managed_messages.is_empty() {
                     if let Err(e) = transport_handle
-                        .send_batch(*to, controller_messages.clone())
+                        .send_batch(*to, managed_messages.clone())
                         .await
                     {
                         error!(
                             to = to.get(),
-                            count = controller_messages.len(),
+                            count = managed_messages.len(),
                             error = %e,
-                            "Failed to send controller messages to peer (actor mode)"
+                            "Failed to send controller/offset messages to peer (actor mode)"
                         );
                     } else {
                         debug!(
                             to = to.get(),
-                            count = controller_messages.len(),
-                            "Sent controller messages to peer (actor mode)"
+                            count = managed_messages.len(),
+                            "Sent controller/offset messages to peer (actor mode)"
                         );
                     }
                 }
@@ -908,21 +1022,21 @@ pub async fn process_controller_outputs<
                 term,
                 voted_for,
             } => {
-                if *group_id == CONTROLLER_GROUP_ID {
+                if *group_id == CONTROLLER_GROUP_ID || is_offset_group(*group_id) {
                     debug!(
                         group = group_id.get(),
                         term = term.get(),
                         voted_for = ?voted_for.map(helix_core::NodeId::get),
-                        "Controller vote state changed (actor mode)"
+                        "Controller/offset group vote state changed (actor mode)"
                     );
-                    // Persist controller vote state.
+                    // Persist vote state.
                     if let Some(vs) = vote_store {
                         if let Ok(mut store) = vs.lock() {
                             if let Err(e) = store.save(*group_id, *term, *voted_for) {
                                 error!(
                                     group = group_id.get(),
                                     error = %e,
-                                    "Failed to persist controller vote state"
+                                    "Failed to persist vote state"
                                 );
                             }
                         }
@@ -1584,6 +1698,7 @@ async fn process_outputs<S: Storage + Clone + Send + Sync + 'static>(
 async fn process_tiering<S: Storage + Clone + Send + Sync + 'static>(
     partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
     shared_wal_pool: Option<&Arc<SharedWalPool<S>>>,
+    local_retention_ms: Option<u64>,
 ) {
     // Collect group IDs of partitions with tiering enabled.
     // Note: We hold the outer read lock while checking has_tiering() on each partition.
@@ -1603,7 +1718,7 @@ async fn process_tiering<S: Storage + Clone + Send + Sync + 'static>(
     // Process shared WAL coordinator tiering (uploads + local deletion of tiered segments).
     // This runs independently of whether any dedicated-WAL partitions have tiering enabled.
     if let Some(pool) = shared_wal_pool {
-        pool.process_tiering().await;
+        pool.process_tiering(local_retention_ms).await;
     }
 
     if tiering_groups.is_empty() {
@@ -1727,6 +1842,13 @@ async fn process_retention<S: Storage + Clone + Send + Sync + 'static>(
     // --- Shared WAL retention ---
     if let Some(pool) = shared_wal_pool {
         for coordinator in pool.coordinators() {
+            // When tiering is configured, the tiering path owns local deletion
+            // (file-only, after local_retention_ms). The retention path only
+            // handles the no-tiering case (full delete, no S3 fallback needed).
+            if coordinator.has_tiering().await {
+                continue;
+            }
+
             let infos = coordinator.sealed_segment_infos().await;
             if infos.is_empty() {
                 continue;

@@ -63,6 +63,26 @@ pub trait TransportService: Send + Sync + Clone + 'static {
     /// the underlying transport fails.
     async fn send_heartbeat(&self, to: NodeId, heartbeat: &BrokerHeartbeat) -> TransportResult<()>;
 
+    /// Sends a coalesced batch of Raft heartbeats (`AppendEntries` with no entries) to a peer.
+    ///
+    /// Uses a compact wire format that factors out the shared `leader_id`, reducing
+    /// the per-group byte cost by ~34% compared to a standard `GroupMessageBatch`.
+    /// All messages must be `AppendEntries` heartbeats; non-heartbeats are ignored.
+    ///
+    /// # Arguments
+    ///
+    /// * `to` - The destination node ID
+    /// * `messages` - Group messages, each carrying an `AppendEntries` with no entries
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the peer is unknown, the send queue is full, or encoding fails.
+    async fn send_heartbeat_batch(
+        &self,
+        to: NodeId,
+        messages: Vec<GroupMessage>,
+    ) -> TransportResult<()>;
+
     /// Returns the node ID of this transport.
     fn node_id(&self) -> NodeId;
 }

@@ -42,6 +42,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::controller::{ControllerState, BROKER_HEARTBEAT_TIMEOUT_MS, CONTROLLER_GROUP_ID};
 use crate::group_map::GroupMap;
+use crate::offset_group::{
+    is_offset_group, offset_group_slot, OFFSET_GROUP_COUNT, OFFSET_GROUP_COUNT_USIZE,
+    OFFSET_GROUP_ID_BASE,
+};
 use crate::partition_storage::PartitionStorage;
 use crate::vote_store::{LocalFileVoteStorage, VoteState, VoteStore};
 
@@ -109,6 +113,19 @@ pub struct PendingProposal {
 ///
 /// Used for controller commands like `CreateTopic`, `DeleteTopic`, etc.
 pub struct PendingControllerProposal {
+    /// The Raft log index of the proposed entry.
+    pub log_index: helix_core::LogIndex,
+    /// Channel to send notification when the entry is committed.
+    pub result_tx: oneshot::Sender<crate::error::ServerResult<()>>,
+}
+
+/// A pending offset-group proposal waiting for Raft commit.
+///
+/// Used for `OffsetGroupCommand::CommitOffset` proposals routed through
+/// one of the N=3 dedicated offset Raft groups.
+pub struct PendingOffsetProposal {
+    /// The offset group that received this proposal.
+    pub offset_group_id: GroupId,
     /// The Raft log index of the proposed entry.
     pub log_index: helix_core::LogIndex,
     /// Channel to send notification when the entry is committed.
@@ -598,10 +615,19 @@ pub struct HelixService<
     /// Backpressure state for actor-based flow control.
     #[allow(dead_code)]
     pub(crate) actor_backpressure: Option<Arc<batcher::BackpressureState>>,
+    /// Output processor performance stats (multi-node actor mode only).
+    pub(crate) output_processor_stats: Option<Arc<OutputProcessorStats>>,
     /// Vote store for persisting Raft vote state (multi-node only).
     /// Uses Arc<Mutex> for thread-safe access from tick tasks.
     #[allow(dead_code)] // Used by tick tasks for vote persistence.
     pub(crate) vote_store: Option<Arc<Mutex<VoteStore<LocalFileVoteStorage>>>>,
+    /// Per-offset-group in-memory state (len = `OFFSET_GROUP_COUNT`).
+    pub(crate) offset_group_states: Vec<Arc<RwLock<crate::offset_group::OffsetGroupState>>>,
+    /// Pending proposals across all offset groups.
+    pub(crate) pending_offset_proposals: Arc<RwLock<Vec<PendingOffsetProposal>>>,
+    /// Snapshot stores, one per offset group (None in test/DST mode).
+    #[allow(dead_code)]
+    pub(crate) offset_snapshot_stores: Vec<Option<Arc<crate::offset_group::OffsetSnapshotStore>>>,
     /// Local disk retention in milliseconds.
     /// `None` means retention is disabled (segments kept forever).
     pub(crate) local_retention_ms: Option<u64>,
@@ -855,7 +881,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             actor_shutdown_tx: None,
             controller_shutdown_tx: None,
             actor_backpressure: None,
+            output_processor_stats: None,
             vote_store: None, // Single-node mode doesn't persist vote state.
+            offset_group_states: (0..OFFSET_GROUP_COUNT_USIZE)
+                .map(|_| Arc::new(RwLock::new(crate::offset_group::OffsetGroupState::new())))
+                .collect(),
+            pending_offset_proposals: Arc::new(RwLock::new(Vec::new())),
+            offset_snapshot_stores: vec![None; OFFSET_GROUP_COUNT_USIZE],
             local_retention_ms: None,
         };
 
@@ -1102,6 +1134,16 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
         let progress_config = ProgressConfig::for_testing();
         let progress_manager = Arc::new(ProgressManager::new(progress_store, progress_config));
 
+        // Initialize per-offset-group state (populated by WAL recovery below).
+        let offset_group_states_vec: Vec<Arc<RwLock<crate::offset_group::OffsetGroupState>>> =
+            (0..OFFSET_GROUP_COUNT_USIZE)
+                .map(|_| Arc::new(RwLock::new(crate::offset_group::OffsetGroupState::new())))
+                .collect();
+        // (commit_index, commit_term) per offset group; populated during WAL recovery.
+        let mut offset_commit_indices = [(0u64, 0u64); OFFSET_GROUP_COUNT_USIZE];
+        let pending_offset_proposals: Arc<RwLock<Vec<PendingOffsetProposal>>> =
+            Arc::new(RwLock::new(Vec::new()));
+
         // Initialize SharedWalPool if data_dir is set.
         // Also returns the highest committed controller Raft index and term seen
         // in the WAL, so the controller group can be created with correct state.
@@ -1159,13 +1201,17 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             }
 
             // Streaming recovery: build pre-built states per group while
-            // collecting controller entries separately (small, OK to clone).
+            // collecting controller entries and offset group entries separately.
             let mut controller_entries_raw: Vec<SharedEntry> = Vec::new();
+            let mut offset_entries_raw: Vec<Vec<SharedEntry>> =
+                vec![Vec::new(); OFFSET_GROUP_COUNT_USIZE];
             let mut data_partition_states: HashMap<GroupId, PartitionRecoveryState> =
                 HashMap::new();
             pool.recover_streaming(&mut |group_id, entry| {
                 if group_id == CONTROLLER_GROUP_ID {
                     controller_entries_raw.push(entry.clone());
+                } else if let Some(slot) = offset_group_slot(group_id) {
+                    offset_entries_raw[slot].push(entry.clone());
                 } else {
                     data_partition_states
                         .entry(group_id)
@@ -1227,6 +1273,47 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                 (max_raft_index, max_raft_term)
             };
 
+            // Replay offset group entries into per-group state machines.
+            // Track the max raft_index/term per group for correct Raft recovery state.
+            for (slot, entries) in offset_entries_raw.into_iter().enumerate() {
+                let mut max_raft_index = 0u64;
+                let mut max_raft_term = 0u64;
+                let mut count = 0u64;
+                let mut state = offset_group_states_vec[slot].write().await;
+                for entry in entries {
+                    if entry.header.raft_index > max_raft_index {
+                        max_raft_index = entry.header.raft_index;
+                        max_raft_term = entry.header.term;
+                    }
+                    if let Some(cmd) =
+                        crate::offset_group::OffsetGroupCommand::decode(&entry.payload)
+                    {
+                        state.apply(&cmd, entry.header.raft_index, entry.header.term);
+                        count += 1;
+                    } else {
+                        warn!(
+                            slot,
+                            raft_index = entry.header.raft_index,
+                            "Failed to decode offset group entry during recovery"
+                        );
+                    }
+                }
+                drop(state);
+                offset_commit_indices[slot] = (max_raft_index, max_raft_term);
+                // Guard: skip re-persisting recovered entries in tick task.
+                tick::OFFSET_GROUP_LAST_PERSISTED[slot]
+                    .store(max_raft_index, std::sync::atomic::Ordering::Relaxed);
+                if count > 0 {
+                    info!(
+                        slot,
+                        replayed = count,
+                        max_raft_index,
+                        max_raft_term,
+                        "Replayed offset group state from SharedWAL"
+                    );
+                }
+            }
+
             (
                 Some(Arc::new(pool)),
                 Arc::new(RwLock::new(data_partition_states)),
@@ -1279,6 +1366,46 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             }
         }
 
+        // Create offset groups for consumer group offset storage (IDs 1_000_000–1_000_002).
+        // Each group covers a hash bucket: offset_group_id(consumer_group) routes to one of these.
+        for i in 0..OFFSET_GROUP_COUNT {
+            let gid = GroupId::new(OFFSET_GROUP_ID_BASE.get() + i);
+            // Safe: i is in [0, OFFSET_GROUP_COUNT), always fits in usize.
+            #[allow(clippy::cast_possible_truncation)]
+            let slot = i as usize;
+            let offset_vote = initial_vote_state.get_group(gid);
+            let (term, voted_for) =
+                offset_vote.map_or((TermId::new(0), None), |v| (v.term, v.voted_for));
+            let (commit_index_val, commit_term_val) = offset_commit_indices[slot];
+            let commit_index = LogIndex::new(commit_index_val);
+            let commit_term = TermId::new(commit_term_val);
+
+            let create_result = multi_raft.write().await.create_group_with_recovery_state(
+                gid,
+                cluster_nodes.clone(),
+                term,
+                voted_for,
+                recovered_from_remote,
+                commit_index,
+                commit_term,
+            );
+
+            match create_result {
+                Ok(()) => {
+                    info!(
+                        group_id = gid.get(),
+                        term = term.get(),
+                        commit_index = commit_index.get(),
+                        commit_term = commit_term.get(),
+                        "Created offset partition with restored state"
+                    );
+                }
+                Err(e) => {
+                    error!(error = %e, group_id = gid.get(), "Failed to create offset partition");
+                }
+            }
+        }
+
         let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
 
         // Create batch pending proposals map.
@@ -1311,10 +1438,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             Arc::clone(&recovered_entries),
             storage.clone(),
             local_retention_ms,
+            offset_group_states_vec.clone(),
+            Arc::clone(&pending_offset_proposals),
         )
         .await;
 
-        // Spawn controller tick task (handles controller partition via MultiRaft).
+        // Spawn controller tick task (handles controller + offset partitions via MultiRaft).
         let controller_shutdown_tx = {
             let (tx, rx) = mpsc::channel(1);
             tokio::spawn(tick::tick_task_controller(
@@ -1334,6 +1463,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                 Arc::clone(&recovered_entries),
                 storage.clone(),
                 Arc::clone(&local_broker_heartbeats),
+                offset_group_states_vec.clone(),
+                Arc::clone(&pending_offset_proposals),
                 actor_handles.leader_update_rx,
                 rx,
             ));
@@ -1384,7 +1515,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             actor_shutdown_tx: Some(actor_handles.shutdown_tx),
             controller_shutdown_tx: Some(controller_shutdown_tx),
             actor_backpressure: Some(actor_handles.backpressure),
+            output_processor_stats: Some(actor_handles.output_processor_stats),
             vote_store,
+            offset_group_states: offset_group_states_vec,
+            pending_offset_proposals,
+            offset_snapshot_stores: vec![None; OFFSET_GROUP_COUNT_USIZE],
             local_retention_ms,
         })
     }
@@ -1565,7 +1700,13 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             actor_shutdown_tx: None,
             controller_shutdown_tx: None,
             actor_backpressure: None,
+            output_processor_stats: None,
             vote_store: None,
+            offset_group_states: (0..OFFSET_GROUP_COUNT_USIZE)
+                .map(|_| Arc::new(RwLock::new(crate::offset_group::OffsetGroupState::new())))
+                .collect(),
+            pending_offset_proposals: Arc::new(RwLock::new(Vec::new())),
+            offset_snapshot_stores: vec![None; OFFSET_GROUP_COUNT_USIZE],
             local_retention_ms: None,
         }
     }
@@ -1620,6 +1761,12 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
     #[must_use]
     pub const fn actor_router(&self) -> Option<&Arc<router::PartitionRouter>> {
         self.actor_router.as_ref()
+    }
+
+    /// Returns the output processor stats, if running in actor mode.
+    #[must_use]
+    pub const fn output_processor_stats(&self) -> Option<&Arc<OutputProcessorStats>> {
+        self.output_processor_stats.as_ref()
     }
 
     /// Ticks all Raft groups and returns outputs.
@@ -1924,6 +2071,22 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             }
         }
 
+        // Create offset groups (IDs 1–3) for DST. No vote/WAL recovery in DST mode.
+        let offset_group_states_vec: Vec<Arc<RwLock<crate::offset_group::OffsetGroupState>>> =
+            (0..OFFSET_GROUP_COUNT_USIZE)
+                .map(|_| Arc::new(RwLock::new(crate::offset_group::OffsetGroupState::new())))
+                .collect();
+        let pending_offset_proposals_dst: Arc<RwLock<Vec<PendingOffsetProposal>>> =
+            Arc::new(RwLock::new(Vec::new()));
+        for i in 0..OFFSET_GROUP_COUNT {
+            let gid = GroupId::new(OFFSET_GROUP_ID_BASE.get() + i);
+            let result = multi_raft.write().await.create_group(gid, cluster_nodes.clone());
+            match result {
+                Ok(()) => info!(group_id = gid.get(), "Created offset partition for DST"),
+                Err(e) => error!(error = %e, group_id = gid.get(), "Failed to create offset partition"),
+            }
+        }
+
         // Create progress manager.
         let progress_store = SimulatedProgressStore::new(node_id.get());
         let progress_config = ProgressConfig::for_testing();
@@ -1953,12 +2116,12 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     .await
                     .expect("Failed to open SharedWalPool");
 
-                // Streaming recovery for DST: controller entries are not replayed
-                // here (DST does not test crash recovery of controller state).
+                // Streaming recovery for DST: controller and offset entries are not replayed
+                // here (DST does not test crash recovery of controller/offset state).
                 let mut data_partition_states: HashMap<GroupId, PartitionRecoveryState> =
                     HashMap::new();
                 pool.recover_streaming(&mut |group_id, entry| {
-                    if group_id != CONTROLLER_GROUP_ID {
+                    if group_id != CONTROLLER_GROUP_ID && !is_offset_group(group_id) {
                         data_partition_states
                             .entry(group_id)
                             .or_default()
@@ -2012,6 +2175,8 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             Arc::clone(&recovered_entries),
             storage.clone(),
             None, // local_retention_ms — set after service creation.
+            offset_group_states_vec.clone(),
+            Arc::clone(&pending_offset_proposals_dst),
         )
         .await;
 
@@ -2035,6 +2200,8 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                 Arc::clone(&recovered_entries),
                 storage.clone(),
                 Arc::clone(&local_broker_heartbeats),
+                offset_group_states_vec.clone(),
+                Arc::clone(&pending_offset_proposals_dst),
                 actor_handles.leader_update_rx,
                 rx,
             ));
@@ -2086,7 +2253,11 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             actor_shutdown_tx: Some(actor_handles.shutdown_tx),
             controller_shutdown_tx: Some(controller_shutdown_tx),
             actor_backpressure: Some(actor_handles.backpressure),
+            output_processor_stats: Some(actor_handles.output_processor_stats),
             vote_store,
+            offset_group_states: offset_group_states_vec,
+            pending_offset_proposals: pending_offset_proposals_dst,
+            offset_snapshot_stores: vec![None; OFFSET_GROUP_COUNT_USIZE],
             local_retention_ms: None,
         }
     }

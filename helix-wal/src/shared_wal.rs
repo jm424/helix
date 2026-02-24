@@ -1249,7 +1249,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{oneshot, Mutex, Notify, RwLock};
+use tokio::sync::{oneshot, watch, Mutex, Notify, RwLock};
 use tracing::error;
 
 use crate::segment_store::WalSegmentStore;
@@ -1587,6 +1587,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
     /// Returns `true` if the segment was successfully restored, `false` if
     /// tiering is not configured, the segment is not confirmed in S3, or the
     /// download fails.
+    ///
+    /// Coordinator-level deduplication ensures at most one concurrent download
+    /// per `segment_id`, preventing the `O_TRUNC` race that causes
+    /// "segment header too small" errors when multiple partition actors in the
+    /// same WAL pool simultaneously request the same segment.
+    #[allow(clippy::too_many_lines)]
     async fn restore_from_s3(&self, segment_id: u64) -> bool {
         // Only attempt if the segment is confirmed in S3.
         let is_tiered = self
@@ -1619,14 +1625,74 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
         // Key format must match tier_eligible_sealed_segments().
         let key = format!("{prefix}{segment_id:08x}.wal");
 
+        // Phase 0: Coordinator-level deduplication.
+        //
+        // Multiple partition actors in the same WAL pool share physical WAL
+        // segments.  Without this guard, each actor independently calls
+        // restore_from_s3 for the same segment_id and all race to
+        // tokio::fs::write, which uses O_CREAT|O_WRONLY|O_TRUNC.
+        // The second writer truncates the file to 0 bytes mid-read by the
+        // first, causing "segment header too small".
+        //
+        // Solution: the first caller to arrive registers a watch channel in
+        // restore_in_progress and does the actual download.  Subsequent callers
+        // for the same segment_id find the entry and wait on the channel.
+        // watch::Receiver::wait_for checks the current value on arrival, so
+        // late subscribers that arrive after send(Some(_)) return immediately.
+        let tx = {
+            let mut in_progress = self.inner.restore_in_progress.lock().await;
+            if let Some(tx) = in_progress.get(&segment_id) {
+                // Another handle is already restoring this segment; wait.
+                let mut rx = tx.subscribe();
+                drop(in_progress);
+                // wait_for returns immediately if the value already matches.
+                let _ = rx.wait_for(Option::is_some).await;
+                return *rx.borrow() == Some(true);
+            }
+            // We are the designated restorer for this segment.
+            let (tx, _rx) = watch::channel(None::<bool>);
+            let tx = Arc::new(tx);
+            in_progress.insert(segment_id, Arc::clone(&tx));
+            tx
+        };
+
         // Phase 1: S3 download — no WAL lock held.
         let bytes = match store.get(&key).await {
             Ok(b) => b,
             Err(e) => {
                 warn!(segment_id, error = %e, "S3 fallback download failed");
+                self.inner.finish_restore(&tx, segment_id, false).await;
                 return false;
             }
         };
+
+        // Validate: a header-only (32-byte) or empty file in S3 is corrupt.
+        // Registering it would cause "segment header too small" errors on every
+        // subsequent read of that segment.  Reject early so the caller falls
+        // through to returning None, which surfaces as a BlobIndex miss rather
+        // than a confusing WAL decode error.
+        if bytes.len() <= crate::segment::SEGMENT_HEADER_SIZE {
+            warn!(
+                segment_id,
+                bytes = bytes.len(),
+                key = %key,
+                "S3 fallback: refusing corrupt/empty segment (header-only or truncated)"
+            );
+            self.inner.finish_restore(&tx, segment_id, false).await;
+            return false;
+        }
+
+        // Belt-and-suspenders: if the segment was registered by a very late
+        // concurrent caller that arrived after our map insertion (impossible
+        // under the current deduplication logic, but kept for safety), skip
+        // the write to avoid a redundant O_TRUNC.
+        {
+            let wal = self.inner.wal.lock().await;
+            if wal.segment_info(crate::SegmentId::new(segment_id)).is_some() {
+                self.inner.finish_restore(&tx, segment_id, true).await;
+                return true;
+            }
+        }
 
         // Phase 2: Write segment file to disk WITHOUT holding the WAL lock.
         //
@@ -1648,13 +1714,14 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
                 error = %e,
                 "S3 fallback: failed to write segment file to disk"
             );
+            self.inner.finish_restore(&tx, segment_id, false).await;
             return false;
         }
 
         // Phase 3: Register segment in WAL index under WAL lock.
         // This is now a fast in-memory-only operation (header decode + HashMap insert).
         let mut wal = self.inner.wal.lock().await;
-        match wal.register_restored_segment(segment_id, seg_path, bytes) {
+        let succeeded = match wal.register_restored_segment(segment_id, seg_path, bytes) {
             Ok(()) => {
                 info!(segment_id, key = %key, "S3 fallback: segment restored from object store");
                 true
@@ -1667,7 +1734,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
                 );
                 false
             }
-        }
+        };
+        drop(wal);
+
+        // Phase 4: Notify waiters and remove from in-flight map.
+        self.inner.finish_restore(&tx, segment_id, succeeded).await;
+        succeeded
     }
 
     /// Reads a specific entry by Raft index for this partition.
@@ -2119,6 +2191,12 @@ struct CoordinatorInner<S: Storage> {
     /// Fully-qualified S3/store key prefix for this coordinator's segments.
     /// Format: `{pod_prefix}shared/{pool_index}/`
     store_prefix: std::sync::RwLock<String>,
+    /// In-flight S3 segment restores, keyed by `segment_id`.
+    ///
+    /// Ensures at most one download+write happens per segment at a time.
+    /// Other handles that need the same segment wait for the in-progress
+    /// restore to complete rather than racing to write the same file.
+    restore_in_progress: Mutex<HashMap<u64, Arc<watch::Sender<Option<bool>>>>>,
 }
 
 impl<S: Storage> CoordinatorInner<S> {
@@ -2137,6 +2215,26 @@ impl<S: Storage> CoordinatorInner<S> {
         if wal_index > *entry {
             *entry = wal_index;
         }
+    }
+
+    /// Removes `segment_id` from the in-flight restore map and notifies all
+    /// waiters of the outcome.
+    ///
+    /// Called by the designated restorer on every return path from
+    /// `restore_from_s3`.  The `watch` channel ensures subscribers that arrive
+    /// after this call return immediately rather than hanging.
+    async fn finish_restore(
+        &self,
+        tx: &watch::Sender<Option<bool>>,
+        segment_id: u64,
+        succeeded: bool,
+    ) {
+        {
+            let mut in_progress = self.restore_in_progress.lock().await;
+            in_progress.remove(&segment_id);
+        }
+        // Wakes all current and future subscribers.
+        let _ = tx.send(Some(succeeded));
     }
 }
 
@@ -2204,6 +2302,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
             committed_wal_index: std::sync::RwLock::new(HashMap::new()),
             tiered_segments: std::sync::RwLock::new(HashSet::new()),
             store_prefix: std::sync::RwLock::new(String::new()),
+            restore_in_progress: Mutex::new(HashMap::new()),
         });
 
         // Spawn flush task.
@@ -2466,6 +2565,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
         *self.inner.store_prefix.write().expect("store_prefix poisoned") = store_prefix;
     }
 
+    /// Returns `true` if object-store tiering has been configured for this coordinator.
+    pub async fn has_tiering(&self) -> bool {
+        self.inner.segment_store.lock().await.is_some()
+    }
+
     /// Reports that `group_id` has committed all WAL entries up to and
     /// including `wal_index` (the auto-counter index, not the Raft index).
     ///
@@ -2482,8 +2586,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
     async fn is_segment_tierable(&self, segment_id: crate::SegmentId) -> bool {
         let groups = self.groups_in_segment(segment_id).await;
         if groups.is_empty() {
-            // Empty segment — treat as tierable (nothing to commit).
-            return true;
+            // No groups found means either the segment has 0 entries (corrupt /
+            // not yet recovered into evicted_index) or all its groups' entries
+            // have already been cleaned from group_index/evicted_index after
+            // deletion.  In either case we must NOT tier: if the segment is
+            // truly empty we should never upload it; if group state is
+            // temporarily unavailable we should wait until it is.
+            return false;
         }
         // Snapshot committed indices so the guard is dropped before the loop.
         let committed: HashMap<GroupId, u64> = self
@@ -2563,6 +2672,34 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
                 }
             };
 
+            // Guard: never upload empty or corrupt data to S3.
+            //
+            // A valid segment must have:
+            //   1. More than the 32-byte segment header (i.e. at least one entry).
+            //   2. entry_count > 0 according to segment metadata.
+            //
+            // The `bytes.len() <= SEGMENT_HEADER_SIZE` check catches:
+            //   - Truncated files shorter than 32 bytes (disk corruption).
+            //   - Files that are exactly 32 bytes (header only, 0 entries).
+            //     Previously the guard used `<` which let exactly-32-byte
+            //     segments through (32 < 32 = false) — fixed here to `<=`.
+            //
+            // The entry_count check adds a second layer: even if bytes look
+            // large enough, skip segments the WAL metadata says have 0 entries.
+            let entry_count = self
+                .segment_info(segment_id)
+                .await
+                .map_or(0, |info| info.entry_count);
+            if bytes.len() <= crate::segment::SEGMENT_HEADER_SIZE || entry_count == 0 {
+                warn!(
+                    segment_id = segment_id.get(),
+                    bytes = bytes.len(),
+                    entry_count,
+                    "Refusing to tier empty or undersized segment (possible file corruption)"
+                );
+                continue;
+            }
+
             let key = format!("{}{:08x}.wal", prefix, segment_id.get());
             match store.put(&key, bytes).await {
                 Ok(()) => {
@@ -2594,19 +2731,30 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
 
     /// Deletes locally-tiered segments from disk.
     ///
-    /// Only deletes segments that are already confirmed in the object store
-    /// (i.e., present in `tiered_segments`).
+    /// Only deletes segments that are:
+    /// 1. Already confirmed in the object store (`tiered_segments`), AND
+    /// 2. Older than `min_local_age_secs` since sealing (respects local retention).
+    ///
+    /// Without the age gate, tiering would delete segments seconds after upload,
+    /// making every consumer read older than the active segment hit S3 — even
+    /// when local retention is configured to keep data for hours.
     ///
     /// Returns the number of segments deleted.
     ///
     /// # Panics
     ///
     /// Panics if an internal lock is poisoned.
-    pub async fn delete_tiered_local_segments(&self) -> u32 {
-        let sealed_ids = self.sealed_segment_ids().await;
+    pub async fn delete_tiered_local_segments(&self, min_local_age_secs: Option<u64>) -> u32 {
+        let sealed_infos = self.sealed_segment_infos().await;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let mut deleted: u32 = 0;
 
-        for segment_id in sealed_ids {
+        for info in sealed_infos {
+            let segment_id = info.segment_id;
+
             let is_tiered = self
                 .inner
                 .tiered_segments
@@ -2616,6 +2764,17 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
 
             if !is_tiered {
                 continue;
+            }
+
+            // Respect local retention: don't delete until the segment is old enough.
+            // If the seal time is unknown, skip deletion to be safe.
+            if let Some(min_age_secs) = min_local_age_secs {
+                let age_secs = info
+                    .sealed_at_secs
+                    .map_or(0, |t| now_secs.saturating_sub(t));
+                if age_secs < min_age_secs {
+                    continue;
+                }
             }
 
             // Use file-only deletion to preserve evicted_index so that
@@ -2745,6 +2904,20 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
                     continue;
                 }
             };
+
+            // Validate: refuse to restore empty or header-only segments from S3.
+            // A corrupt S3 object (e.g. uploaded when only a 32-byte header
+            // existed) must not be registered in the WAL — doing so would cause
+            // "segment header too small" errors on every read of that segment.
+            if bytes.len() <= crate::segment::SEGMENT_HEADER_SIZE {
+                warn!(
+                    segment_id,
+                    key = %key,
+                    bytes = bytes.len(),
+                    "Skipping corrupt/empty segment from S3 (header-only or truncated)"
+                );
+                continue;
+            }
 
             // Write to WAL directory.
             match self.restore_segment_from_bytes(*segment_id, bytes).await {
@@ -3248,16 +3421,19 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalPool<S> {
     ///
     /// For each coordinator:
     /// 1. Uploads eligible sealed segments to the object store.
-    /// 2. Deletes locally-tiered segments from disk. Deletion preserves
-    ///    `evicted_index` so reads can transparently fall back to S3 via
-    ///    `restore_from_s3()` in the handle's read methods.
+    /// 2. Deletes locally-tiered segments that have also aged past
+    ///    `local_retention_ms` (if set). Deletion preserves `evicted_index`
+    ///    so reads can transparently fall back to S3 via `restore_from_s3()`.
     ///
     /// Call this periodically (e.g., every 5 seconds) from the server's
     /// background tick task.
-    pub async fn process_tiering(&self) {
+    pub async fn process_tiering(&self, local_retention_ms: Option<u64>) {
+        let min_local_age_secs = local_retention_ms.map(|ms| ms / 1000);
         for coordinator in &self.coordinators {
             coordinator.tier_eligible_sealed_segments().await;
-            coordinator.delete_tiered_local_segments().await;
+            coordinator
+                .delete_tiered_local_segments(min_local_age_secs)
+                .await;
         }
     }
 

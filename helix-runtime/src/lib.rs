@@ -42,9 +42,10 @@ mod transport;
 mod transport_trait;
 
 pub use codec::{
-    decode_broker_heartbeat, decode_group_batch, decode_message, decode_transfer_message,
-    encode_broker_heartbeat, encode_group_batch, encode_message, encode_transfer_message,
-    is_broker_heartbeat, is_group_batch, is_transfer_message, BrokerHeartbeat, CodecError,
+    decode_broker_heartbeat, decode_coalesced_heartbeats, decode_group_batch, decode_message,
+    decode_transfer_message, encode_broker_heartbeat, encode_coalesced_heartbeats,
+    encode_group_batch, encode_message, encode_transfer_message, is_broker_heartbeat,
+    is_coalesced_heartbeats, is_group_batch, is_transfer_message, BrokerHeartbeat, CodecError,
     CodecResult,
 };
 pub use config::{ConfigError, PeerConfig, ServerConfig, TimingConfig};

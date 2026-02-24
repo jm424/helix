@@ -917,7 +917,6 @@ struct PartitionActorShared {
     /// each tick/output for the retention system to read lock-free.
     min_replicated_index: Arc<AtomicU64>,
     batcher_stats: Option<Arc<super::BatcherStats>>,
-    #[allow(dead_code)]
     global_backpressure:
         Option<Arc<super::batcher::BackpressureState>>,
     /// Idempotent producer state maintained by the actor.
@@ -1122,6 +1121,28 @@ impl PartitionActorShared {
         }
     }
 
+    /// Decrements the global batcher backpressure counters for a
+    /// batch that was rejected before reaching the output processor.
+    ///
+    /// The output processor decrements backpressure on commit, but
+    /// rejection paths (not-leader, quorum-lost, Raft rejection) never
+    /// reach the output processor. Without this decrement the
+    /// `pending_requests` counter leaks on every rejection until the
+    /// server restarts, eventually saturating the limit (2000) and
+    /// blocking all new produce requests.
+    fn release_global_backpressure(&self, batch_info: &BatchProposalInfo) {
+        if let Some(bp) = &self.global_backpressure {
+            bp.pending_requests.fetch_sub(
+                u64::from(batch_info.batch_size),
+                Ordering::Relaxed,
+            );
+            bp.pending_bytes.fetch_sub(
+                u64::from(batch_info.batch_bytes),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
     async fn handle_propose_batch(
         &mut self,
         metadata: Bytes,
@@ -1137,6 +1158,7 @@ impl PartitionActorShared {
                     .leader_id()
                     .map(NodeId::get),
             };
+            self.release_global_backpressure(&batch_info);
             for result_tx in batch_info.result_txs {
                 let _ = result_tx.send(Err(err.clone()));
             }
@@ -1151,6 +1173,7 @@ impl PartitionActorShared {
                 topic: "unknown".to_string(),
                 partition: 0,
             };
+            self.release_global_backpressure(&batch_info);
             for result_tx in batch_info.result_txs {
                 let _ = result_tx.send(Err(err.clone()));
             }
@@ -1191,6 +1214,7 @@ impl PartitionActorShared {
             let err = ServerError::Internal {
                 message: "Raft rejected proposal".to_string(),
             };
+            self.release_global_backpressure(&batch_info);
             for result_tx in batch_info.result_txs {
                 let _ = result_tx.send(Err(err.clone()));
             }

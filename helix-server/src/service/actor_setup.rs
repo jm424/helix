@@ -48,13 +48,14 @@ use crate::vote_store::{LocalFileVoteStorage, VoteStore};
 use crate::group_map::GroupMap;
 use crate::partition_storage::PartitionStorage;
 
+use crate::offset_group::OffsetGroupState;
 use super::batcher::{self, BackpressureState, BatcherConfig, BatcherHandle};
 use super::output_processor::{self, OutputProcessorConfig};
 use super::partition_actor::{
     spawn_partition_actor_shared, GroupedOutput, PartitionActorConfig, PartitionActorHandle,
 };
 use super::router::PartitionRouter;
-use super::{BatchPendingProposal, BatcherStats};
+use super::{BatchPendingProposal, BatcherStats, PendingOffsetProposal};
 
 /// Configuration for actor-based service setup.
 #[derive(Debug, Clone, Default)]
@@ -264,6 +265,8 @@ pub async fn setup_multi_partition<
     recovered_entries: Arc<RwLock<HashMap<GroupId, PartitionRecoveryState>>>,
     storage: S,
     local_retention_ms: Option<u64>,
+    offset_group_states: Vec<Arc<RwLock<OffsetGroupState>>>,
+    pending_offset_proposals: Arc<RwLock<Vec<PendingOffsetProposal>>>,
 ) -> ActorSetupHandles {
     let group_count = initial_groups.len();
 
@@ -356,6 +359,8 @@ pub async fn setup_multi_partition<
         recovered_entries,
         storage,
         local_retention_ms,
+        offset_group_states,
+        pending_offset_proposals,
         incoming_rx,
         shutdown_rx,
     ));

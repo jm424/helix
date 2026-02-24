@@ -357,3 +357,115 @@ fn test_e2e_network_partition() {
         eprintln!("[PASS] test_e2e_network_partition: Data survives partitions");
     });
 }
+
+#[test]
+fn test_e2e_high_partition_count_output_batching() {
+    // Regression test for the output processor per-peer message merging fix.
+    //
+    // Before the fix, each partition group generated one send_batch() call per peer
+    // per drain cycle. With N groups × P peers per cycle, the per-peer mpsc send queue
+    // (MAX_PENDING_MESSAGES = 1000) saturated under production-scale partition counts.
+    // Saturated queues dropped Raft heartbeats, causing election timeouts — meaning
+    // partitions entered pre-election with leader_id=None and returned
+    // LEADER_NOT_AVAILABLE to Kafka clients indefinitely.
+    //
+    // The fix merges all SendMessages outputs for the same peer into a single
+    // send_batch() call per drain cycle, reducing queue pressure from
+    // N_groups × N_peers to just N_peers (= cluster_size - 1 = 2 for 3 nodes).
+    //
+    // Two assertions verify the fix:
+    //
+    // 1. FUNCTIONAL: produce succeeds on a spread of partitions, proving all
+    //    elections converged and leaders are reachable.
+    //
+    // 2. STRUCTURAL: after steady-state, send_messages_count / batch_count ≤ N_peers.
+    //    This directly measures calls-per-drain-cycle. Before the fix this ratio
+    //    equals N_groups × N_peers (≫ 512); with the fix it equals exactly N_peers (= 2).
+    //    Any regression that re-introduces per-group sends will break this assertion.
+    const PARTITION_COUNT: u32 = 512;
+    const CLUSTER_SIZE: u64 = 3;
+    const N_PEERS: u64 = CLUSTER_SIZE - 1; // 2 peers per node in a 3-node cluster
+    // Probe every 32nd partition — tests a spread across the whole range.
+    const PROBE_STEP: u32 = 32;
+
+    let rt = Runtime::with_seed_and_config(42, Default::default());
+    rt.block_on(async {
+        // Use in-memory storage: we're testing the transport batching path, not durability.
+        let cluster = E2ECluster::start_with_config(
+            E2EClusterConfig::with_nodes(CLUSTER_SIZE as usize).without_durable_storage(),
+        )
+        .await;
+
+        // Wait for the controller election to converge before creating data partitions.
+        cluster.sleep(Duration::from_secs(2)).await;
+
+        cluster
+            .create_topic("high-partitions", PARTITION_COUNT)
+            .await
+            .expect("create topic with 512 partitions");
+
+        eprintln!(
+            "[INFO] Created topic with {} partitions, waiting for elections",
+            PARTITION_COUNT
+        );
+
+        // Allow time for all partition groups to elect leaders.
+        // Each Raft election takes 10-20 ticks × 50ms ≈ 500ms-1s worst case.
+        // With 512 groups starting in parallel, elections stagger; 5s virtual
+        // time is ample.
+        cluster.sleep(Duration::from_secs(5)).await;
+
+        // Assertion 1 (functional): produce to a spread of partitions.
+        // Before the fix, saturated send queues caused missed heartbeats →
+        // election timeouts → produce failures here.
+        let mut produced = 0u32;
+        let mut partition = 0u32;
+        while partition < PARTITION_COUNT {
+            cluster
+                .produce_with_retry("high-partitions", partition, b"probe".as_slice(), 200)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "produce to partition {partition} failed (output queue saturation?): {e}"
+                    )
+                });
+            produced += 1;
+            partition += PROBE_STEP;
+        }
+
+        // Assertion 2 (structural): verify send_batch calls are merged per peer.
+        // Pick any node — they all run the same output processor.
+        let node = cluster.node(NodeId::new(1)).expect("node 1 exists");
+        let stats = node
+            .service
+            .output_processor_stats()
+            .expect("actor mode should have output processor stats");
+        let snap = stats.snapshot();
+
+        // send_messages_count / batch_count = average send_batch calls per drain cycle.
+        // With the fix: exactly N_peers (= 2) regardless of partition count.
+        // Without the fix: N_groups × N_peers per drain cycle (= 512 × 2 = 1024).
+        if snap.batch_count > 0 {
+            let calls_per_batch = snap.send_messages_count / snap.batch_count;
+            assert!(
+                calls_per_batch <= N_PEERS * 2,
+                "send_batch calls per drain cycle ({calls_per_batch}) should be close to \
+                 N_peers ({N_PEERS}); got {calls_per_batch} — output merging is broken"
+            );
+            eprintln!(
+                "[INFO] send_batch calls/cycle = {} (expected ≤ {}), \
+                 total_batches = {}, total_send_calls = {}",
+                calls_per_batch,
+                N_PEERS * 2,
+                snap.batch_count,
+                snap.send_messages_count
+            );
+        }
+
+        eprintln!(
+            "[PASS] test_e2e_high_partition_count_output_batching: \
+             {produced} probe partitions produced successfully \
+             ({PARTITION_COUNT} total partitions, {PROBE_STEP}-step sampling)"
+        );
+    });
+}

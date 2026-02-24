@@ -8,14 +8,27 @@
 //! - **Outbound**: Connections initiated to other peers for sending messages
 //! - **Inbound**: Connections accepted from other peers for receiving messages
 //!
-//! Each peer maintains a single bidirectional connection. The node with the
-//! lower `NodeId` initiates the connection to avoid duplicate connections.
+//! Each peer has **two dedicated outbound connections** on the same port:
+//! - **Heartbeat connection**: carries only `CoalescedHeartbeats` and
+//!   `BrokerHeartbeat` frames. Small queue (64 entries), never blocked by
+//!   data traffic.
+//! - **Data connection(s)**: carries `GroupMessageBatch` and `InstallSnapshot`
+//!   frames. Full queue (1000 entries). Phase B will expand this to N
+//!   connections sharded by `group_id % N` for throughput parallelism.
+//!
+//! The separation guarantees that a large `AppendEntries` payload cannot
+//! delay heartbeats, preventing spurious leader elections under load.
+//! This is a stronger guarantee than Redpanda's approach (which uses the
+//! same connection pool for all traffic, relying on scheduling groups).
+//!
+//! All connections dial the **same peer port** — the accept loop handles
+//! multiple simultaneous connections from the same peer.
 //!
 //! # Connection Lifecycle
 //!
 //! 1. Transport starts listening on the configured address
-//! 2. Outbound connections are established lazily on first send
-//! 3. Connections are automatically reconnected on failure
+//! 2. Outbound connections (heartbeat + data) are established on startup
+//! 3. Each connection is automatically reconnected independently on failure
 //! 4. Messages are buffered briefly if connection is pending
 
 use std::collections::HashMap;
@@ -37,9 +50,9 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::codec::{
-    decode_broker_heartbeat, decode_group_batch, decode_message, encode_broker_heartbeat,
-    encode_group_batch, encode_message, is_broker_heartbeat, is_group_batch, BrokerHeartbeat,
-    CodecError,
+    decode_broker_heartbeat, decode_coalesced_heartbeats, decode_group_batch, decode_message,
+    encode_broker_heartbeat, encode_coalesced_heartbeats, encode_group_batch, encode_message,
+    is_broker_heartbeat, is_coalesced_heartbeats, is_group_batch, BrokerHeartbeat, CodecError,
 };
 use crate::transport_trait::TransportService;
 
@@ -81,8 +94,24 @@ const TCP_KEEPALIVE_CNT: u32 = 5;
 /// so both code paths (idle vs. data-pending) have the same ~30s bound.
 const TCP_USER_TIMEOUT_SECS: u64 = TCP_KEEPALIVE_SECS + TCP_KEEPALIVE_SECS * TCP_KEEPALIVE_CNT as u64;
 
-/// Maximum pending messages per peer.
+/// Maximum pending messages per peer data connection.
 const MAX_PENDING_MESSAGES: usize = 1000;
+
+/// Maximum pending frames on the dedicated heartbeat connection.
+///
+/// Coalesced heartbeat frames are tiny (~25B header + 40B/group). A small
+/// queue is intentional: it prevents heartbeat buildup while keeping memory
+/// overhead negligible. If the peer is unreachable, 64 stale heartbeats are
+/// far less than the 1000 stale data messages that would pile up otherwise.
+const MAX_PENDING_HEARTBEATS: usize = 64;
+
+/// Number of data TCP connections per peer.
+///
+/// Phase A: 1 — heartbeat/data isolation with minimal connection count.
+/// Phase B: bump to 8 to shard data traffic by `group_id % N` for
+/// throughput parallelism at high partition counts (matching Redpanda's
+/// default `rpc_client_connections_per_shard`).
+const N_DATA_CONNECTIONS: usize = 1;
 
 /// Transport errors.
 #[derive(Debug, Error)]
@@ -153,6 +182,8 @@ enum OutgoingData {
     Batch(Bytes),
     /// A broker heartbeat to send.
     Heartbeat(Bytes),
+    /// A coalesced batch of Raft heartbeats (`AppendEntries` with no entries).
+    CoalescedHeartbeats(Bytes),
 }
 
 /// Configuration for a peer node.
@@ -200,13 +231,23 @@ impl TransportConfig {
     }
 }
 
-/// State of a peer connection.
+/// State of a peer's outbound connections.
+///
+/// Each peer has two dedicated TCP connections:
+/// - `heartbeat_sender`: carries only `CoalescedHeartbeats` / `BrokerHeartbeat`.
+///   Small queue; guaranteed never to be blocked by data traffic.
+/// - `data_senders`: carries `GroupMessageBatch` and `InstallSnapshot`.
+///   Currently one connection (Phase A); Phase B expands to N connections
+///   sharded by `group_id % N`.
 struct PeerConnection {
     /// The peer's address (stored for reconnection).
     #[allow(dead_code)]
     addr: String,
-    /// Sender for outbound data.
-    sender: mpsc::Sender<OutgoingData>,
+    /// Dedicated sender for heartbeat frames only.
+    heartbeat_sender: mpsc::Sender<OutgoingData>,
+    /// Sender(s) for data frames (`GroupMessageBatch`, `InstallSnapshot`).
+    /// `data_senders.len() == N_DATA_CONNECTIONS`.
+    data_senders: Vec<mpsc::Sender<OutgoingData>>,
 }
 
 /// Handle to interact with the transport.
@@ -237,7 +278,8 @@ impl TransportHandle {
         let peers = self.peers.read().await;
         let conn = peers.get(&to).ok_or(TransportError::UnknownPeer(to))?;
 
-        conn.sender
+        // Single messages have no group_id; use data connection 0.
+        conn.data_senders[0]
             .try_send(OutgoingData::Single(message))
             .map_err(|_| TransportError::QueueFull(to))
     }
@@ -263,15 +305,38 @@ impl TransportHandle {
             return Err(TransportError::Shutdown);
         }
 
-        // Encode the batch upfront to catch codec errors early.
-        let encoded = encode_group_batch(&messages)?;
-
         let peers = self.peers.read().await;
         let conn = peers.get(&to).ok_or(TransportError::UnknownPeer(to))?;
 
-        conn.sender
-            .try_send(OutgoingData::Batch(encoded))
-            .map_err(|_| TransportError::QueueFull(to))
+        if conn.data_senders.len() == 1 {
+            // Phase A fast path: one data connection, encode once.
+            let encoded = encode_group_batch(&messages)?;
+            conn.data_senders[0]
+                .try_send(OutgoingData::Batch(encoded))
+                .map_err(|_| TransportError::QueueFull(to))
+        } else {
+            // Phase B: shard by group_id to preserve per-group ordering across
+            // N connections. Same group_id always maps to the same connection.
+            let n = conn.data_senders.len();
+            let mut shards: Vec<Vec<GroupMessage>> = vec![Vec::new(); n];
+            for gm in messages {
+                // N_DATA_CONNECTIONS is a small compile-time constant; truncation
+                // on 32-bit targets is harmless since group_id % 8 fits in usize.
+                #[allow(clippy::cast_possible_truncation)]
+                let shard = gm.group_id.get() as usize % n;
+                shards[shard].push(gm);
+            }
+            for (i, shard_messages) in shards.into_iter().enumerate() {
+                if shard_messages.is_empty() {
+                    continue;
+                }
+                let encoded = encode_group_batch(&shard_messages)?;
+                conn.data_senders[i]
+                    .try_send(OutgoingData::Batch(encoded))
+                    .map_err(|_| TransportError::QueueFull(to))?;
+            }
+            Ok(())
+        }
     }
 
     /// Sends a broker heartbeat to a peer.
@@ -301,8 +366,45 @@ impl TransportHandle {
         let peers = self.peers.read().await;
         let conn = peers.get(&to).ok_or(TransportError::UnknownPeer(to))?;
 
-        conn.sender
+        // Broker heartbeats go on the dedicated heartbeat connection so they
+        // can never be delayed by large data frames.
+        conn.heartbeat_sender
             .try_send(OutgoingData::Heartbeat(encoded))
+            .map_err(|_| TransportError::QueueFull(to))
+    }
+
+    /// Sends a coalesced batch of Raft heartbeats to a peer.
+    ///
+    /// Uses the compact coalesced wire format (TAG 10) which factors out the shared
+    /// `leader_id`, saving ~34% bytes per heartbeat vs. a standard `GroupMessageBatch`.
+    ///
+    /// # Errors
+    /// Returns an error if the peer is unknown, the send queue is full, or encoding fails.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn send_heartbeat_batch(
+        &self,
+        to: NodeId,
+        messages: Vec<GroupMessage>,
+    ) -> TransportResult<()> {
+        // Precondition: can't send to self.
+        debug_assert!(to != self.node_id, "cannot send heartbeat batch to self");
+
+        if messages.is_empty() {
+            return Ok(());
+        }
+
+        if *self.shutdown.lock().await {
+            return Err(TransportError::Shutdown);
+        }
+
+        let encoded = encode_coalesced_heartbeats(self.node_id, to, &messages)?;
+
+        let peers = self.peers.read().await;
+        let conn = peers.get(&to).ok_or(TransportError::UnknownPeer(to))?;
+
+        // Coalesced Raft heartbeats go on the dedicated heartbeat connection.
+        conn.heartbeat_sender
+            .try_send(OutgoingData::CoalescedHeartbeats(encoded))
             .map_err(|_| TransportError::QueueFull(to))
     }
 
@@ -332,6 +434,15 @@ impl TransportService for TransportHandle {
     async fn send_heartbeat(&self, to: NodeId, heartbeat: &BrokerHeartbeat) -> TransportResult<()> {
         // Delegate to the inherent method.
         Self::send_heartbeat(self, to, heartbeat).await
+    }
+
+    async fn send_heartbeat_batch(
+        &self,
+        to: NodeId,
+        messages: Vec<GroupMessage>,
+    ) -> TransportResult<()> {
+        // Delegate to the inherent method.
+        Self::send_heartbeat_batch(self, to, messages).await
     }
 
     fn node_id(&self) -> NodeId {
@@ -428,28 +539,42 @@ impl Transport {
         Ok(handle)
     }
 
-    /// Initializes a connection to a peer.
+    /// Initializes connections to a peer: one heartbeat + `N_DATA_CONNECTIONS` data.
+    ///
+    /// All connections dial the same `addr`. The accept loop on the peer side
+    /// handles multiple simultaneous connections from the same source on one port.
     async fn init_peer_connection(&self, peer_id: NodeId, addr: String) {
-        let (tx, rx) = mpsc::channel(MAX_PENDING_MESSAGES);
-
-        {
-            let mut peers = self.peers.write().await;
-            peers.insert(
-                peer_id,
-                PeerConnection {
-                    addr: addr.clone(),
-                    sender: tx,
-                },
-            );
-        }
-
-        // Spawn the sender task.
-        let shutdown = Arc::clone(&self.shutdown);
         let node_id = self.config.node_id;
 
+        // Heartbeat connection: small queue, never carries data frames.
+        let (hb_tx, hb_rx) = mpsc::channel(MAX_PENDING_HEARTBEATS);
+        let hb_shutdown = Arc::clone(&self.shutdown);
+        let hb_addr = addr.clone();
         tokio::spawn(async move {
-            Self::sender_loop(node_id, peer_id, addr, rx, shutdown).await;
+            Self::sender_loop(node_id, peer_id, hb_addr, hb_rx, hb_shutdown).await;
         });
+
+        // Data connection(s): full-size queue each.
+        let mut data_senders = Vec::with_capacity(N_DATA_CONNECTIONS);
+        for _ in 0..N_DATA_CONNECTIONS {
+            let (tx, rx) = mpsc::channel(MAX_PENDING_MESSAGES);
+            let shutdown = Arc::clone(&self.shutdown);
+            let data_addr = addr.clone();
+            tokio::spawn(async move {
+                Self::sender_loop(node_id, peer_id, data_addr, rx, shutdown).await;
+            });
+            data_senders.push(tx);
+        }
+
+        let mut peers = self.peers.write().await;
+        peers.insert(
+            peer_id,
+            PeerConnection {
+                addr,
+                heartbeat_sender: hb_tx,
+                data_senders,
+            },
+        );
     }
 
     /// Loop that accepts incoming connections.
@@ -622,7 +747,9 @@ impl Transport {
                     Err(e) => Err(e.into()),
                 }
             }
-            OutgoingData::Batch(bytes) | OutgoingData::Heartbeat(bytes) => {
+            OutgoingData::Batch(bytes)
+            | OutgoingData::Heartbeat(bytes)
+            | OutgoingData::CoalescedHeartbeats(bytes) => {
                 Self::send_bytes(stream, bytes).await
             }
         };
@@ -632,6 +759,9 @@ impl Transport {
                     OutgoingData::Single(m) => format!("single:{:?}", std::mem::discriminant(m)),
                     OutgoingData::Batch(b) => format!("batch:{} bytes", b.len()),
                     OutgoingData::Heartbeat(_) => "heartbeat".to_string(),
+                    OutgoingData::CoalescedHeartbeats(b) => {
+                        format!("coalesced_heartbeats:{} bytes", b.len())
+                    }
                 };
                 debug!(msg = %msg_desc, "Sent data");
                 true
@@ -797,6 +927,38 @@ impl Transport {
                                 buffer_len = buffer.len(),
                                 buffer_hex = %hex_dump,
                                 "Failed to decode batch"
+                            );
+                            return Err(e.into());
+                        }
+                    }
+                } else if is_coalesced_heartbeats(&buffer) {
+                    match decode_coalesced_heartbeats(&buffer) {
+                        Ok((messages, consumed)) => {
+                            debug!(count = messages.len(), "Received coalesced heartbeats");
+
+                            // Deliver as a regular Batch — tick.rs handles them identically.
+                            let incoming = IncomingMessage::Batch(messages);
+                            if incoming_tx.send(incoming).await.is_err() {
+                                return Ok(());
+                            }
+
+                            let _ = buffer.split_to(consumed);
+                        }
+                        Err(CodecError::InsufficientData { .. }) => {
+                            break;
+                        }
+                        Err(e) => {
+                            let hex_dump: String = buffer
+                                .iter()
+                                .take(64)
+                                .map(|b| format!("{b:02x}"))
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            error!(
+                                error = %e,
+                                buffer_len = buffer.len(),
+                                buffer_hex = %hex_dump,
+                                "Failed to decode coalesced heartbeats"
                             );
                             return Err(e.into());
                         }

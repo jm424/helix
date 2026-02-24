@@ -23,6 +23,7 @@ service Resources {
   rpc ListUsableBrokerIds(ListUsableBrokerIdsRequest) returns (ListUsableBrokerIdsResponse);
   rpc ListTopicConfigs(ListTopicConfigsRequest) returns (ListTopicConfigsResponse);
   rpc UpdateTopicConfig(UpdateTopicConfigRequest) returns (UpdateTopicConfigResponse);
+  rpc GetEndOffsets(GetEndOffsetsRequest) returns (GetEndOffsetsResponse);
 }
 
 message CreateTopicRequest {
@@ -145,3 +146,16 @@ message UpdateTopicConfigRequest {
   map<string, string> config = 2;
 }
 message UpdateTopicConfigResponse {}
+
+// GetEndOffsets returns the high watermark (log end offset) for each partition
+// of a topic. Used by streaming-admin to reset consumer group offsets.
+//
+// The topic_id field is the Kafka topic name as known to streaming-admin
+// (e.g. "helix_helix-staging-s2-64_normal_6e12"). Keys in the response are
+// decimal partition numbers as strings ("0", "1", ...).
+message GetEndOffsetsRequest {
+  string topic_id = 1;
+}
+message GetEndOffsetsResponse {
+  map<string, uint64> offsets = 1;
+}
