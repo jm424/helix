@@ -1790,10 +1790,10 @@ impl RaftNode {
         }
 
         let trailing = self.config.log_trailing_entries;
-        let log_len = self.log.len();
+        let max_bytes = self.config.log_trailing_bytes_max;
 
-        // Nothing to compact if the log is small enough.
-        if log_len <= trailing {
+        // Nothing to compact if both limits are satisfied.
+        if self.log.len() <= trailing && self.log.bytes_used() <= max_bytes {
             return false;
         }
 
@@ -1806,12 +1806,15 @@ impl RaftNode {
             .min()
             .unwrap_or(LogIndex::new(0));
 
-        // Hard cap: never keep more than trailing_window entries behind
+        // Entry-count hard cap: never keep more than trailing entries behind
         // commit_index, even if a follower is lagging (WAL fallback).
-        let hard_cap = self
-            .commit_index
-            .get()
-            .saturating_sub(trailing);
+        let entry_hard_cap = self.commit_index.get().saturating_sub(trailing);
+
+        // Bytes hard cap: compact far enough to bring log bytes under limit.
+        let bytes_hard_cap = self.log.compact_index_for_bytes_limit(max_bytes);
+
+        // Use the stricter of the two hard caps.
+        let hard_cap = entry_hard_cap.max(bytes_hard_cap);
 
         // Compact to the max of (min_match, hard_cap) — keep entries
         // that followers need, but enforce the hard cap.
@@ -1839,16 +1842,24 @@ impl RaftNode {
     /// Returns true if any entries were removed.
     pub fn compact_log_follower(&mut self) -> bool {
         let trailing = self.config.log_trailing_entries;
-        let log_len = self.log.len();
+        let max_bytes = self.config.log_trailing_bytes_max;
 
-        if log_len <= trailing {
+        // Nothing to compact if both limits are satisfied.
+        if self.log.len() <= trailing && self.log.bytes_used() <= max_bytes {
             return false;
         }
 
-        let compact_to = self
-            .last_applied
-            .get()
-            .saturating_sub(trailing);
+        // Entry-count cap.
+        let entry_cap = self.last_applied.get().saturating_sub(trailing);
+
+        // Bytes cap.
+        let bytes_cap = self.log.compact_index_for_bytes_limit(max_bytes);
+
+        // Use the stricter of the two caps.
+        let compact_to = entry_cap.max(bytes_cap);
+
+        // Never compact past last_applied.
+        let compact_to = compact_to.min(self.last_applied.get());
 
         let log_first = self.log.first_index().get();
         if log_first == 0 || compact_to < log_first {

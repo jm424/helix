@@ -483,14 +483,30 @@ impl PartitionActorHandle {
 
     /// Sends a tick to the partition actor.
     ///
+    /// Uses `try_send` so it never blocks the caller. If the actor's command
+    /// channel is full (actor is temporarily behind), the tick is silently
+    /// dropped — Raft tolerates missed ticks via its election-timeout mechanism
+    /// and will retry on the next scheduled tick interval.
+    ///
+    /// # Why non-blocking matters
+    ///
+    /// The tick loop calls `tick_all()` across all partition actors. If any
+    /// actor is transiently backed up (e.g., blocked draining its output queue),
+    /// a blocking `send().await` would stall the entire tick loop. With
+    /// `try_send`, the tick loop always completes promptly regardless of
+    /// individual actor load.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the actor has shut down.
-    pub async fn tick(&self) -> Result<(), PartitionError> {
-        self.tx
-            .send(PartitionCommand::Tick)
-            .await
-            .map_err(|_| PartitionError::ActorShutdown)
+    /// Returns an error only if the actor has shut down (channel disconnected).
+    /// A full channel (tick dropped) is not an error.
+    pub fn tick(&self) -> Result<(), PartitionError> {
+        match self.tx.try_send(PartitionCommand::Tick) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
+            // Closed variant name varies by tokio/madsim version; catch remaining.
+            Err(_) => Err(PartitionError::ActorShutdown),
+        }
     }
 
     /// Sends a Raft message to the partition actor.
@@ -756,7 +772,7 @@ pub fn spawn_partition_actor_shared(
         shared_output_tx,
         PartitionBatchConfig::default(),
         None,
-        None,
+        super::batcher::BackpressureState::noop(),
     )
 }
 
@@ -770,7 +786,7 @@ pub fn spawn_partition_actor_shared_with_batch_config(
     shared_output_tx: mpsc::Sender<GroupedOutput>,
     batch_config: PartitionBatchConfig,
     batcher_stats: Option<Arc<super::BatcherStats>>,
-    global_backpressure: Option<Arc<super::batcher::BackpressureState>>,
+    global_backpressure: Arc<super::batcher::BackpressureState>,
 ) -> PartitionActorHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(config.channel_buffer_size);
     let handle = PartitionActorHandle::new(cmd_tx, group_id);
@@ -917,8 +933,7 @@ struct PartitionActorShared {
     /// each tick/output for the retention system to read lock-free.
     min_replicated_index: Arc<AtomicU64>,
     batcher_stats: Option<Arc<super::BatcherStats>>,
-    global_backpressure:
-        Option<Arc<super::batcher::BackpressureState>>,
+    global_backpressure: Arc<super::batcher::BackpressureState>,
     /// Idempotent producer state maintained by the actor.
     ///
     /// Rebuilt from committed entries (including `PREVIOUS_TERM`) on
@@ -1131,16 +1146,14 @@ impl PartitionActorShared {
     /// server restarts, eventually saturating the limit (2000) and
     /// blocking all new produce requests.
     fn release_global_backpressure(&self, batch_info: &BatchProposalInfo) {
-        if let Some(bp) = &self.global_backpressure {
-            bp.pending_requests.fetch_sub(
-                u64::from(batch_info.batch_size),
-                Ordering::Relaxed,
-            );
-            bp.pending_bytes.fetch_sub(
-                u64::from(batch_info.batch_bytes),
-                Ordering::Relaxed,
-            );
-        }
+        self.global_backpressure.pending_requests.fetch_sub(
+            u64::from(batch_info.batch_size),
+            Ordering::Relaxed,
+        );
+        self.global_backpressure.pending_bytes.fetch_sub(
+            u64::from(batch_info.batch_bytes),
+            Ordering::Relaxed,
+        );
     }
 
     async fn handle_propose_batch(
@@ -1512,8 +1525,8 @@ impl PartitionActorShared {
             blobs,
             base_offset,
         };
-        let command_data = command.encode();
-        let request = ClientRequest::new(command_data, Bytes::new());
+        let (command_meta, command_payload) = command.encode_split();
+        let request = ClientRequest::new(command_meta, command_payload);
         let Some(outputs) =
             self.raft_node.handle_client_request(request)
         else {
@@ -1692,12 +1705,13 @@ impl PartitionActorShared {
     /// before any new proposals arrive. Without tracking their offsets,
     /// the first new proposal would reuse `base_offset=0`, violating
     /// `BlobIndex` monotonicity.
-    fn advance_offset_from_committed(&mut self, data: &Bytes) {
-        if data.is_empty() {
+    fn advance_offset_from_committed(&mut self, metadata: &Bytes, payload: &Bytes) {
+        if metadata.is_empty() {
             return;
         }
-        // Use the canonical decoder to handle all encode formats.
-        let Some(cmd) = StoragePartitionCommand::decode(data) else {
+        let Some(cmd) =
+            StoragePartitionCommand::decode_split(metadata.clone(), payload.clone())
+        else {
             return;
         };
         let end_offset = match &cmd {
@@ -1732,11 +1746,13 @@ impl PartitionActorShared {
     /// dedup window and `next_expected` are fully populated before any
     /// new sequence checks run (gated by `offset_seeded`).
     #[allow(clippy::cast_sign_loss)]
-    fn record_producer_state_from_committed(&mut self, data: &Bytes) {
-        if data.is_empty() {
+    fn record_producer_state_from_committed(&mut self, metadata: &Bytes, payload: &Bytes) {
+        if metadata.is_empty() {
             return;
         }
-        let Some(cmd) = StoragePartitionCommand::decode(data) else {
+        let Some(cmd) =
+            StoragePartitionCommand::decode_split(metadata.clone(), payload.clone())
+        else {
             return;
         };
         match cmd {
@@ -1833,24 +1849,8 @@ impl PartitionActorShared {
 
                     // Advance next_base_offset and record producer state
                     // from committed entries (including PREVIOUS_TERM).
-                    // Reconstitute full data for decode (encode_split
-                    // metadata alone is incomplete).
-                    {
-                        let data = if payload.is_empty() {
-                            metadata.clone()
-                        } else {
-                            let mut buf = BytesMut::with_capacity(
-                                metadata.len() + payload.len(),
-                            );
-                            buf.extend_from_slice(&metadata);
-                            buf.extend_from_slice(&payload);
-                            buf.freeze()
-                        };
-                        self.advance_offset_from_committed(&data);
-                        self.record_producer_state_from_committed(
-                            &data,
-                        );
-                    }
+                    self.advance_offset_from_committed(&metadata, &payload);
+                    self.record_producer_state_from_committed(&metadata, &payload);
 
                     if let Some(reply) =
                         self.pending_proposals.remove(&index)
@@ -2277,6 +2277,7 @@ impl PartitionActor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::batcher::BackpressureState;
     use helix_core::NodeId;
     use helix_raft::RaftConfig;
 
@@ -2337,7 +2338,7 @@ mod tests {
             PartitionActorConfig::default(),
         );
         for _ in 0..20 {
-            handle.tick().await.unwrap();
+            handle.tick().unwrap();
         }
         let output = tokio::time::timeout(
             std::time::Duration::from_millis(100),
@@ -2405,7 +2406,7 @@ mod tests {
             is_leader_cache: Arc::new(AtomicBool::new(false)),
             min_replicated_index: Arc::new(AtomicU64::new(0)),
             batcher_stats: None,
-            global_backpressure: None,
+            global_backpressure: BackpressureState::noop(),
             producer_state: PartitionProducerState::new(),
             ticks_without_commit: 0,
         };
@@ -2538,5 +2539,67 @@ mod tests {
         assert_eq!(patched, data);
         // Tracker should NOT advance for non-blob commands.
         assert_eq!(actor.next_base_offset, Offset::new(500));
+    }
+
+    /// Verify that `tick()` does not block when the actor's command channel is
+    /// full, and does not return an error (a full channel is not a failure —
+    /// the tick is silently dropped and Raft retries on the next interval).
+    ///
+    /// This is the regression test for the tick-loop deadlock: if `tick()` had
+    /// used blocking `send().await`, a single backed-up actor would have stalled
+    /// the entire `tick_all()` call, starving heartbeats and eventually freezing
+    /// the output processor.
+    #[tokio::test]
+    async fn test_tick_does_not_block_when_channel_full() {
+        // Create a channel with capacity 1 so it fills immediately.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<PartitionCommand>(1);
+
+        // Pre-fill the channel so the next send would block with send().await.
+        tx.try_send(PartitionCommand::Tick).expect("first send must succeed");
+        assert_eq!(rx.try_recv().is_ok(), true, "sanity: channel has one item");
+
+        // Re-fill after draining so it's full again.
+        tx.try_send(PartitionCommand::Tick).expect("refill must succeed");
+
+        let handle = PartitionActorHandle {
+            tx,
+            group_id: GroupId::new(1),
+            is_leader_cache: Arc::new(AtomicBool::new(false)),
+            blob_end_offset_cache: Arc::new(AtomicU64::new(0)),
+            min_replicated_index: Arc::new(AtomicU64::new(0)),
+        };
+
+        // tick() must return Ok(()) immediately without blocking, even though
+        // the channel is full (the second tick is silently dropped).
+        let result = handle.tick();
+        assert!(result.is_ok(), "tick() on a full channel must return Ok, got: {result:?}");
+
+        // The channel still holds the pre-filled message (the dropped tick
+        // doesn't add a second one).
+        assert!(rx.try_recv().is_ok(), "pre-filled message is still there");
+        assert!(rx.try_recv().is_err(), "no extra message was added");
+    }
+
+    /// Verify that `tick()` returns `Err(ActorShutdown)` only when the channel
+    /// is disconnected (actor has stopped), not when the channel is merely full.
+    #[test]
+    fn test_tick_returns_error_only_on_disconnect() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<PartitionCommand>(1);
+        let handle = PartitionActorHandle {
+            tx,
+            group_id: GroupId::new(1),
+            is_leader_cache: Arc::new(AtomicBool::new(false)),
+            blob_end_offset_cache: Arc::new(AtomicU64::new(0)),
+            min_replicated_index: Arc::new(AtomicU64::new(0)),
+        };
+
+        // Drop the receiver to simulate actor shutdown.
+        drop(rx);
+
+        let result = handle.tick();
+        assert!(
+            matches!(result, Err(PartitionError::ActorShutdown)),
+            "tick() on a disconnected channel must return ActorShutdown, got: {result:?}"
+        );
     }
 }

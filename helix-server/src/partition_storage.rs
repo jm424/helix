@@ -47,8 +47,9 @@ fn extract_payload_preview(blob: &Bytes) -> String {
 use crate::error::{ServerError, ServerResult};
 use crate::producer_state::{PartitionProducerState, SequenceCheckResult};
 use crate::storage::{
-    patch_kafka_base_offset, BlobFormat, DurablePartition, DurablePartitionConfig,
-    DurablePartitionError, Partition, PartitionCommand, PartitionConfig, PartitionRecoveryState,
+    patch_kafka_base_offset, BlobFormat, DurablePartition,
+    DurablePartitionConfig, DurablePartitionError, Partition, PartitionCommand, PartitionConfig,
+    PartitionRecoveryState,
 };
 #[cfg(feature = "s3")]
 use helix_tier::S3Config;
@@ -499,7 +500,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         &mut self,
         index: LogIndex,
         term: helix_core::TermId,
-        data: &Bytes,
+        metadata: &Bytes,
+        payload: &Bytes,
     ) -> ServerResult<Option<Offset>> {
         // Skip if already applied.
         if index <= self.last_applied {
@@ -513,8 +515,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
             return Ok(None);
         }
 
-        // Skip empty entries (e.g., no-op entries).
-        if data.is_empty() {
+        // Skip empty entries (e.g., Raft no-op entries).
+        if metadata.is_empty() {
             debug!(
                 topic = %self.topic_id,
                 partition = %self.partition_id,
@@ -525,9 +527,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
             return Ok(None);
         }
 
-        let command = PartitionCommand::decode(data).ok_or_else(|| ServerError::Internal {
-            message: "failed to decode partition command".to_string(),
-        })?;
+        let command =
+            PartitionCommand::decode_split(metadata.clone(), payload.clone())
+                .ok_or_else(|| ServerError::Internal {
+                    message: "failed to decode partition command".to_string(),
+                })?;
 
         let base_offset = match &mut self.inner {
             PartitionStorageInner::InMemory(partition) => match command {
@@ -668,7 +672,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         &mut self,
         index: LogIndex,
         term: helix_core::TermId,
-        data: &Bytes,
+        metadata: &Bytes,
+        payload: &Bytes,
     ) -> ServerResult<Option<Offset>> {
         // Skip if already applied.
         if index <= self.last_applied {
@@ -682,8 +687,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
             return Ok(None);
         }
 
-        // Skip empty entries (e.g., no-op entries).
-        if data.is_empty() {
+        // Skip empty entries (e.g., Raft no-op entries).
+        if metadata.is_empty() {
             debug!(
                 topic = %self.topic_id,
                 partition = %self.partition_id,
@@ -694,9 +699,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
             return Ok(None);
         }
 
-        let command = PartitionCommand::decode(data).ok_or_else(|| ServerError::Internal {
-            message: "failed to decode partition command".to_string(),
-        })?;
+        let command =
+            PartitionCommand::decode_split(metadata.clone(), payload.clone())
+                .ok_or_else(|| ServerError::Internal {
+                    message: "failed to decode partition command".to_string(),
+            })?;
 
         let base_offset = match &mut self.inner {
             PartitionStorageInner::InMemory(partition) => match command {
@@ -842,10 +849,23 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
             },
             PartitionStorageInner::Durable(partition) => {
                 // Unified WAL write path: one Raft commit = one WAL entry.
-                // Write the raw encoded command bytes as a single entry, then
-                // decode and apply to the in-memory cache separately.
+                // When payload is empty, metadata IS the encode() bytes (non-blob or
+                // single-path commands).
+                // When payload is non-empty we must re-encode from the decoded command
+                // rather than concatenating metadata||payload. The encode_split() format
+                // for AppendBlobBatch with N>1 blobs puts all blob headers first then
+                // all blob bytes; encode() interleaves each blob's header with its data.
+                // metadata||payload and encode() are only identical for N==1. Re-encoding
+                // from the already-decoded `command` produces the correct WAL format so
+                // that WAL recovery (decode_owned) and apply_command_to_cache both work.
+                let wal_data = if payload.is_empty() {
+                    metadata.clone()
+                } else {
+                    command.encode()
+                };
+
                 partition
-                    .write_wal_entry(index.get(), term.get(), data.clone())
+                    .write_wal_entry(index.get(), term.get(), wal_data.clone())
                     .await
                     .map_err(|e| ServerError::Internal {
                         message: format!("failed to write WAL entry: {e}"),
@@ -857,7 +877,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
                 // looks up by auto-counter.
                 let wal_index = partition.last_applied_wal_index();
                 partition
-                    .apply_command_to_cache(wal_index, data)
+                    .apply_command_to_cache(wal_index, &wal_data)
                     .map_err(|e| ServerError::Internal {
                         message: format!("failed to apply to cache: {e}"),
                     })?

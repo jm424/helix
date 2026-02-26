@@ -196,22 +196,18 @@ impl PartitionRouter {
                 .collect()
         };
 
-        // Collect all send futures.
-        let send_futures: Vec<_> = handles
-            .into_iter()
-            .map(|(group_id, handle)| async move {
-                if let Err(e) = handle.tick().await {
-                    warn!(
-                        group_id = group_id.get(),
-                        error = %e,
-                        "Failed to tick partition"
-                    );
-                }
-            })
-            .collect();
-
-        // Execute all ticks in parallel.
-        futures::future::join_all(send_futures).await;
+        // Tick each actor. tick() is non-blocking (try_send): a full channel
+        // means the actor is temporarily behind and the tick is silently dropped.
+        // This loop never blocks, so the tick task always makes forward progress.
+        for (group_id, handle) in handles {
+            if let Err(e) = handle.tick() {
+                warn!(
+                    group_id = group_id.get(),
+                    error = %e,
+                    "Failed to tick partition"
+                );
+            }
+        }
     }
 
     /// Routes a Raft message to the appropriate partition actor.
@@ -431,6 +427,37 @@ mod tests {
         collected.sort_unstable();
 
         assert_eq!(collected, ids);
+
+        router.shutdown().await;
+    }
+
+    /// Verify that `tick_all()` completes promptly even when actor command
+    /// channels are full. This is the regression test for the tick-loop
+    /// deadlock: a backed-up actor must not stall the entire tick broadcast.
+    #[tokio::test]
+    async fn test_tick_all_does_not_block_when_actor_channels_full() {
+        let mut router = PartitionRouter::new();
+
+        // Use capacity=1 so the channel fills after a single pending command.
+        let small_config = PartitionActorConfig { channel_buffer_size: 1, ..Default::default() };
+        for i in 1..=3 {
+            let group_id = GroupId::new(i);
+            let raft_node = create_test_raft_node(i, vec![1, 2, 3]);
+            let (handle, _output_rx) = spawn_partition_actor(group_id, raft_node, small_config);
+            // Fill the command channel so the actor cannot accept any more commands.
+            handle.tick().expect("first tick into empty channel must succeed");
+            router.add_partition(group_id, handle);
+        }
+
+        // tick_all() must complete without blocking, even though all actor
+        // command channels are at capacity (try_send drops the tick silently).
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            router.tick_all(),
+        )
+        .await;
+
+        assert!(result.is_ok(), "tick_all() must not block when actor channels are full");
 
         router.shutdown().await;
     }

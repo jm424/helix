@@ -4,7 +4,7 @@ use helix_core::NodeId;
 
 use crate::limits::{
     CLUSTER_SIZE_MAX, ELECTION_TICK_DEFAULT, ELECTION_TICK_MAX, ELECTION_TICK_MIN,
-    HEARTBEAT_TICK_DEFAULT, LOG_TRAILING_ENTRIES_DEFAULT,
+    HEARTBEAT_TICK_DEFAULT, LOG_TRAILING_BYTES_MAX_DEFAULT, LOG_TRAILING_ENTRIES_DEFAULT,
 };
 
 /// Configuration for a Raft node.
@@ -48,8 +48,15 @@ pub struct RaftConfig {
     ///
     /// After compaction, this many recent entries are kept in-memory for
     /// fast follower catch-up. Entries older than the window are served
-    /// from the WAL. At ~1 KB per entry, 10K entries ≈ 10 MB.
+    /// from the WAL. This is a secondary limit; see `log_trailing_bytes_max`.
     pub log_trailing_entries: u64,
+
+    /// Maximum bytes of entries to retain in the in-memory Raft log.
+    ///
+    /// Enforced independently of `log_trailing_entries`. Whichever limit is
+    /// stricter drives compaction. Prevents OOM when individual entries are
+    /// large (e.g. multi-blob batches at high throughput).
+    pub log_trailing_bytes_max: u64,
 }
 
 impl RaftConfig {
@@ -76,6 +83,7 @@ impl RaftConfig {
             // Use node_id as seed by default for determinism.
             random_seed: node_id.get(),
             log_trailing_entries: LOG_TRAILING_ENTRIES_DEFAULT,
+            log_trailing_bytes_max: LOG_TRAILING_BYTES_MAX_DEFAULT,
         }
     }
 
@@ -137,6 +145,13 @@ impl RaftConfig {
     #[must_use]
     pub const fn with_log_trailing_entries(mut self, entries: u64) -> Self {
         self.log_trailing_entries = entries;
+        self
+    }
+
+    /// Sets the maximum bytes of entries to retain in the in-memory Raft log.
+    #[must_use]
+    pub const fn with_log_trailing_bytes_max(mut self, bytes: u64) -> Self {
+        self.log_trailing_bytes_max = bytes;
         self
     }
 

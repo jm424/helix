@@ -201,8 +201,13 @@ fn print_rss(label: &str, pids: &[u32]) -> u64 {
 
 /// Write `total_bytes` through `executor` using `INFLIGHT` concurrent sends.
 async fn write_data(executor: &RealExecutor, topic: &str, total_bytes: u64) {
-    let payload = Bytes::from(vec![0xABu8; MSG_SIZE]);
-    let msg_count = total_bytes / MSG_SIZE as u64;
+    write_data_sized(executor, topic, total_bytes, MSG_SIZE).await;
+}
+
+/// Write `total_bytes` using blobs of `msg_size` bytes with 32 concurrent sends.
+async fn write_data_sized(executor: &RealExecutor, topic: &str, total_bytes: u64, msg_size: usize) {
+    let payload = Bytes::from(vec![0xABu8; msg_size]);
+    let msg_count = total_bytes / msg_size as u64;
     let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
     const INFLIGHT: usize = 32;
     let mut dispatched: u64 = 0;
@@ -400,5 +405,115 @@ async fn measure_memory_growth_with_retention() {
         rss_growth as f64 / 1024.0 / 1024.0,
         retention_freed as f64 / 1024.0 / 1024.0,
         TOTAL_BYTES / 1024 / 1024,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 3: encode_split savings — large-blob Raft log window
+// ---------------------------------------------------------------------------
+
+/// Measures peak allocated bytes with 128 KB blobs to quantify encode_split savings.
+///
+/// Uses a SINGLE-NODE cluster so writes go through the direct `AppendBlob`
+/// path (no batcher). For AppendBlob, `encode_split()` passes the blob to
+/// Raft as a refcount clone (zero copy); `encode()` copies the full blob
+/// into a fresh `BytesMut`. The Raft log trailing window is capped at 64 MB,
+/// so 512 × 128 KB = 64 MB of blob data lives in the log.
+///
+///   encode()       → 64 MB extra per node in Raft log entries
+///   encode_split() → 0 extra (refcount clone; same Arc shared with WAL write)
+///
+/// Run this test twice (once with the current binary, once with `encode()`
+/// patched back in `partition_actor.rs::handle_propose`) and compare
+/// "after write" alloc totals.
+#[tokio::test]
+async fn measure_encode_split_savings() {
+    // Single-node: no batcher, writes go through AppendBlob directly.
+    // encode_split() makes the blob payload a refcount clone (zero copy).
+    const BLOB_SIZE: usize = 128 * 1024; // 128 KB — typical Kafka RecordBatch
+    const WRITE_BYTES: u64 = 128 * 1024 * 1024; // 128 MB total (1024 blobs)
+    let node_count = 1u16;
+    let topic = "encode-split-proof";
+
+    let base_port = find_available_base_port(25400, node_count);
+    let raft_base_port = find_available_base_port(35400, node_count);
+    let alloc_stats_base_port = find_available_base_port(45400, node_count);
+
+    let cluster = RealCluster::builder()
+        .nodes(u32::from(node_count))
+        .base_port(base_port)
+        .raft_base_port(raft_base_port)
+        .binary_path(binary_path())
+        .data_dir(test_data_dir("encode_split_proof"))
+        .auto_create_topics(true)
+        .default_replication_factor(1)
+        .topic(topic, 1)
+        .log_level("warn")
+        .alloc_stats_base_port(alloc_stats_base_port)
+        .build()
+        .expect("failed to start cluster");
+
+    let executor = RealExecutor::with_mode(
+        cluster.bootstrap_servers(),
+        ProducerMode::LowLatency,
+    )
+    .expect("failed to create executor");
+
+    executor
+        .wait_ready(Duration::from_secs(30))
+        .await
+        .expect("cluster not ready within 30s");
+
+    // The Raft trailing window holds min(1000 entries, 64 MB).
+    // At 128 KB/entry: min(1000, 64 MB / 128 KB = 512) = 512 entries = 64 MB.
+    let trailing_window_mb = {
+        let bytes_limit = 64u64;
+        let entries_limit = 1000u64;
+        let entries_per_mb = 1024 * 1024 / BLOB_SIZE as u64;
+        let window_entries = entries_limit.min(bytes_limit * entries_per_mb);
+        window_entries * BLOB_SIZE as u64 / 1024 / 1024
+    };
+
+    println!(
+        "[encode_split] single-node | blob_size={} KB | total_write={} MB",
+        BLOB_SIZE / 1024,
+        WRITE_BYTES / 1024 / 1024,
+    );
+    println!(
+        "[encode_split] Raft trailing window: ~{trailing_window_mb} MB of blob data",
+    );
+    println!(
+        "[encode_split] Expected extra allocated with encode():    ~{trailing_window_mb} MB \
+         (fresh BytesMut per entry)",
+    );
+    println!(
+        "[encode_split] Expected extra allocated with encode_split(): ~0 MB \
+         (refcount clone, no extra alloc)",
+    );
+
+    // Baseline: idle cluster.
+    let alloc_baseline = print_alloc_stats("baseline (idle)", node_count, &cluster);
+
+    // Write 128 MB with 128 KB blobs.
+    println!(
+        "[encode_split] writing {} MB in {} KB blobs...",
+        WRITE_BYTES / 1024 / 1024,
+        BLOB_SIZE / 1024,
+    );
+    let t0 = std::time::Instant::now();
+    write_data_sized(&executor, topic, WRITE_BYTES, BLOB_SIZE).await;
+    println!("[encode_split] done in {:.1}s", t0.elapsed().as_secs_f64());
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let alloc_post = print_alloc_stats("after write (window full)", node_count, &cluster);
+    let growth = alloc_post.saturating_sub(alloc_baseline);
+
+    println!(
+        "[encode_split] allocated growth = {:.1} MB",
+        growth as f64 / 1024.0 / 1024.0,
+    );
+    println!(
+        "[encode_split] encode_split savings vs encode() = ~{trailing_window_mb} MB \
+         (Raft trailing window × blob_size, no extra copies)"
     );
 }

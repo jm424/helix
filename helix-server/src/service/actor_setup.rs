@@ -37,8 +37,9 @@ use std::sync::{Arc, Mutex};
 use helix_core::{GroupId, LogIndex, NodeId};
 use helix_raft::{RaftConfig, RaftNode};
 use helix_runtime::{IncomingMessage, TransportService};
+use std::sync::atomic::Ordering;
 use tokio::sync::{mpsc, RwLock};
-use tracing::info;
+use tracing::{info, warn};
 
 use helix_wal::{SharedWalPool, Storage};
 use crate::storage::PartitionRecoveryState;
@@ -52,7 +53,8 @@ use crate::offset_group::OffsetGroupState;
 use super::batcher::{self, BackpressureState, BatcherConfig, BatcherHandle};
 use super::output_processor::{self, OutputProcessorConfig};
 use super::partition_actor::{
-    spawn_partition_actor_shared, GroupedOutput, PartitionActorConfig, PartitionActorHandle,
+    spawn_partition_actor_shared_with_batch_config,
+    GroupedOutput, PartitionActorConfig, PartitionActorHandle, PartitionBatchConfig,
 };
 use super::router::PartitionRouter;
 use super::{BatchPendingProposal, BatcherStats, PendingOffsetProposal};
@@ -135,26 +137,30 @@ pub async fn setup_single_partition<
     let (output_tx, output_rx) =
         output_processor::create_output_channel(config.output_processor_config);
 
+    // Create batcher stats and backpressure FIRST so the partition actor can
+    // share the same Arc and correctly decrement counters on rejection paths.
+    let batcher_stats = Arc::new(BatcherStats::default());
+    let (batcher_handle, batcher_rx, backpressure) = batcher::create_batcher();
+
     // Create the Raft node for this partition.
     let raft_config = RaftConfig::new(node_id, cluster_nodes);
     let raft_node = RaftNode::new(raft_config);
 
-    // Spawn the partition actor with shared output channel.
-    let partition_handle = spawn_partition_actor_shared(
+    // Spawn the partition actor with shared output channel and backpressure.
+    let partition_handle = spawn_partition_actor_shared_with_batch_config(
         group_id,
         raft_node,
         config.partition_actor_config,
         output_tx.clone(),
+        PartitionBatchConfig::default(),
+        None,
+        Arc::clone(&backpressure),
     );
 
     // Build the router with this single partition.
     let mut router = PartitionRouter::with_capacity(1, 0);
     router.add_partition(group_id, partition_handle.clone());
     let router = Arc::new(router);
-
-    // Create batcher stats and backpressure state.
-    let batcher_stats = Arc::new(BatcherStats::default());
-    let (batcher_handle, batcher_rx, backpressure) = batcher::create_batcher();
 
     // Spawn the batcher task (actor mode).
     tokio::spawn(batcher::batcher_task_actor(
@@ -279,6 +285,14 @@ pub async fn setup_multi_partition<
     let (leader_update_tx, leader_update_rx) =
         mpsc::unbounded_channel::<crate::controller::ControllerCommand>();
 
+    // Create batcher stats and backpressure state FIRST so partition actors can
+    // share the same Arc and correctly decrement counters on rejection paths
+    // (not-leader, quorum-lost, Raft-rejected).  Without this wiring,
+    // `release_global_backpressure` is a no-op and pending_bytes leaks until the
+    // 100MB ceiling is hit, causing all new produces to be rejected.
+    let batcher_stats = Arc::new(BatcherStats::default());
+    let (batcher_handle, batcher_rx, backpressure) = batcher::create_batcher();
+
     // Create partition actors for each initial group.
     let mut router = PartitionRouter::with_capacity(group_count, 0);
     let mut partition_handles = HashMap::with_capacity(group_count);
@@ -288,12 +302,15 @@ pub async fn setup_multi_partition<
         let raft_config = RaftConfig::new(node_id, replicas);
         let raft_node = RaftNode::new(raft_config);
 
-        // Spawn the partition actor with shared output channel.
-        let handle = spawn_partition_actor_shared(
+        // Spawn the partition actor with shared output channel and backpressure.
+        let handle = spawn_partition_actor_shared_with_batch_config(
             group_id,
             raft_node,
             config.partition_actor_config,
             output_tx.clone(),
+            PartitionBatchConfig::default(),
+            None,
+            Arc::clone(&backpressure),
         );
 
         router.add_partition(group_id, handle.clone());
@@ -301,10 +318,6 @@ pub async fn setup_multi_partition<
     }
 
     let router = Arc::new(router);
-
-    // Create batcher stats and backpressure state.
-    let batcher_stats = Arc::new(BatcherStats::default());
-    let (batcher_handle, batcher_rx, backpressure) = batcher::create_batcher();
 
     // Spawn the batcher task (actor mode).
     tokio::spawn(batcher::batcher_task_actor(
@@ -336,6 +349,22 @@ pub async fn setup_multi_partition<
         Some(leader_update_tx),
     ));
 
+    // Spawn the output processor watchdog.
+    //
+    // The output processor must make forward progress as long as there are
+    // active partitions: the tick loop generates heartbeat outputs every
+    // ~100ms, so `batch_count` should increment continuously. If it stalls
+    // for WATCHDOG_STALL_SECS with active partitions, the output processor
+    // is deadlocked — panic to trigger pod restart and S3-based WAL recovery.
+    //
+    // Note: does not fire in a genuinely idle cluster (no partitions, or
+    // partitions with no peers and no produces generating outputs).
+    spawn_output_processor_watchdog(
+        Arc::clone(&output_processor_stats),
+        Arc::clone(&router),
+        node_id,
+    );
+
     // Create shutdown channel for tick task.
     let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
@@ -361,6 +390,7 @@ pub async fn setup_multi_partition<
         local_retention_ms,
         offset_group_states,
         pending_offset_proposals,
+        Arc::clone(&backpressure),
         incoming_rx,
         shutdown_rx,
     ));
@@ -414,11 +444,20 @@ pub fn create_partition_actor(
     replicas: Vec<NodeId>,
     output_tx: mpsc::Sender<GroupedOutput>,
     config: PartitionActorConfig,
+    backpressure: Arc<BackpressureState>,
 ) -> PartitionActorHandle {
     let raft_config = RaftConfig::new(node_id, replicas);
     let raft_node = RaftNode::new(raft_config);
 
-    spawn_partition_actor_shared(group_id, raft_node, config, output_tx)
+    spawn_partition_actor_shared_with_batch_config(
+        group_id,
+        raft_node,
+        config,
+        output_tx,
+        PartitionBatchConfig::default(),
+        None,
+        backpressure,
+    )
 }
 
 /// Creates a partition actor with restored vote state and recovery metadata.
@@ -439,6 +478,7 @@ pub fn create_partition_actor_with_state(
     commit_term: helix_core::TermId,
     output_tx: mpsc::Sender<GroupedOutput>,
     config: PartitionActorConfig,
+    backpressure: Arc<BackpressureState>,
 ) -> PartitionActorHandle {
     let raft_config = RaftConfig::new(node_id, replicas);
     let raft_node = RaftNode::with_recovery_state(
@@ -450,7 +490,15 @@ pub fn create_partition_actor_with_state(
         commit_term,
     );
 
-    spawn_partition_actor_shared(group_id, raft_node, config, output_tx)
+    spawn_partition_actor_shared_with_batch_config(
+        group_id,
+        raft_node,
+        config,
+        output_tx,
+        PartitionBatchConfig::default(),
+        None,
+        backpressure,
+    )
 }
 
 #[cfg(test)]
@@ -557,7 +605,7 @@ mod tests {
 
         // Tick multiple times to trigger election.
         for _ in 0..20 {
-            let _ = partition.tick().await;
+            let _ = partition.tick();
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
@@ -607,13 +655,83 @@ mod tests {
             replicas,
             output_tx,
             PartitionActorConfig::default(),
+            batcher::BackpressureState::noop(),
         );
 
         // Verify the handle works.
-        let tick_result = handle.tick().await;
+        let tick_result = handle.tick();
         assert!(tick_result.is_ok());
 
         // Shutdown.
         let _ = handle.shutdown().await;
     }
+}
+
+/// Spawns a watchdog task that panics if the output processor stops making
+/// progress while partitions are active.
+///
+/// The output processor must drain its channel continuously: tick-driven
+/// heartbeats generate outputs every ~100ms, so `batch_count` in the stats
+/// should increment regularly. If it stalls for `STALL_SECS` while there are
+/// active partitions, the output processor has deadlocked — panic to force a
+/// pod restart so S3-backed WAL recovery restores state cleanly.
+///
+/// # False-positive risk
+///
+/// This does NOT fire in a legitimately idle cluster where there are no peers
+/// to send heartbeats to and no active produces generating committed-entry
+/// outputs. For a 3-node cluster with at least one active follower, forward
+/// progress is guaranteed as long as the tick loop is running.
+pub(super) fn spawn_output_processor_watchdog(
+    stats: Arc<super::OutputProcessorStats>,
+    router: Arc<PartitionRouter>,
+    node_id: NodeId,
+) {
+    // Check every CHECK_INTERVAL_SECS. Panic after STALL_CHECKS consecutive
+    // checks with no batch_count progress while partitions exist.
+    const CHECK_INTERVAL_SECS: u64 = 10;
+    const STALL_CHECKS: u64 = 3; // 30s total stall before panic.
+
+    tokio::spawn(async move {
+        let mut last_batch_count: u64 = 0;
+        let mut stall_checks: u64 = 0;
+
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(CHECK_INTERVAL_SECS)).await;
+
+            let partition_count = router.partition_count().await;
+            if partition_count == 0 {
+                // Nothing to watch — cluster is not yet initialized.
+                stall_checks = 0;
+                continue;
+            }
+
+            let current = stats.batch_count.load(Ordering::Relaxed);
+            if current == last_batch_count {
+                stall_checks += 1;
+                if stall_checks >= STALL_CHECKS {
+                    // batch_count has not advanced for STALL_CHECKS × CHECK_INTERVAL_SECS
+                    // seconds with active partitions. The output processor is deadlocked.
+                    panic!(
+                        "Output processor watchdog: no progress for {}s with {} active partitions \
+                         (node_id={}, batch_count={}). Deadlock detected — forcing restart.",
+                        CHECK_INTERVAL_SECS * STALL_CHECKS,
+                        partition_count,
+                        node_id.get(),
+                        current,
+                    );
+                }
+                warn!(
+                    node_id = node_id.get(),
+                    stall_checks,
+                    partition_count,
+                    batch_count = current,
+                    "Output processor watchdog: no progress this interval"
+                );
+            } else {
+                stall_checks = 0;
+                last_batch_count = current;
+            }
+        }
+    });
 }

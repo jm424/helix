@@ -351,17 +351,8 @@ async fn process_output<
         PartitionOutput::EntryCommitted {
             index, term, metadata, payload, batch_notify,
         } => {
-            let data = if payload.is_empty() {
-                metadata
-            } else {
-                let mut buf =
-                    bytes::BytesMut::with_capacity(metadata.len() + payload.len());
-                buf.extend_from_slice(&metadata);
-                buf.extend_from_slice(&payload);
-                buf.freeze()
-            };
             handle_entry_committed(
-                group_id, index, term, &data, batch_notify,
+                group_id, index, term, &metadata, &payload, batch_notify,
                 partition_storage, group_map, batch_pending_proposals,
                 batcher_stats, batcher_backpressure, router,
             )
@@ -781,7 +772,8 @@ async fn handle_entry_committed<S: Storage + Clone + Send + Sync + 'static>(
     group_id: GroupId,
     index: LogIndex,
     term: TermId,
-    data: &bytes::Bytes,
+    metadata: &bytes::Bytes,
+    payload: &bytes::Bytes,
     batch_notify: Option<BatchNotifyInfo>,
     partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
     group_map: &Arc<RwLock<GroupMap>>,
@@ -843,26 +835,16 @@ async fn handle_entry_committed<S: Storage + Clone + Send + Sync + 'static>(
         let base_offset = if let Some(
             PartitionCommand::AppendBlobBatch { base_offset, .. }
             | PartitionCommand::AppendBlob { base_offset, .. },
-        ) = PartitionCommand::decode(data)
+        ) = PartitionCommand::decode_split(metadata.clone(), payload.clone())
         {
             base_offset
         } else {
             warn!(
                 group = group_id.get(),
                 index = index.get(),
-                "Failed to extract base_offset from command, falling back to storage"
+                "Failed to extract base_offset from command"
             );
-            // Fallback to storage for backwards compatibility with old commands.
-            let ps_lock = {
-                let storage = partition_storage.read().await;
-                storage.get(&group_id).cloned()
-            };
-            if let Some(ps_lock) = ps_lock {
-                let ps = ps_lock.read().await;
-                ps.blob_log_end_offset()
-            } else {
-                Offset::new(0)
-            }
+            Offset::new(0)
         };
 
         debug!(
@@ -880,7 +862,7 @@ async fn handle_entry_committed<S: Storage + Clone + Send + Sync + 'static>(
             };
             if let Some(ps_lock) = ps_lock {
                 let mut ps = ps_lock.write().await;
-                ps.apply_entry_async(index, term, data).await
+                ps.apply_entry_async(index, term, metadata, payload).await
             } else {
                 Err(ServerError::PartitionNotFound {
                     topic: topic_id.get().to_string(),
@@ -1047,7 +1029,7 @@ async fn handle_entry_committed<S: Storage + Clone + Send + Sync + 'static>(
 
         let apply_result = {
             let mut ps = ps_lock.write().await;
-            ps.apply_entry_async(index, term, data).await
+            ps.apply_entry_async(index, term, metadata, payload).await
         };
 
         if let Err(e) = apply_result {
@@ -1060,7 +1042,7 @@ async fn handle_entry_committed<S: Storage + Clone + Send + Sync + 'static>(
             );
         } else {
             // Extract and record producer state from the entry data.
-            extract_and_record_producer_state(data, base_offset, group_id, partition_storage).await;
+            extract_and_record_producer_state(metadata, payload, base_offset, group_id, partition_storage).await;
 
             // Update cached blob end offset for batcher lock-free reads.
             if let Some(r) = router {
@@ -1114,13 +1096,16 @@ async fn handle_entry_committed<S: Storage + Clone + Send + Sync + 'static>(
 /// - `AppendBlob` with `KafkaRecordBatch`: Single blob with producer info in header
 /// - `AppendBlobBatch`: Multiple blobs, each with producer info in header
 pub async fn extract_and_record_producer_state<S: Storage + Clone + Send + Sync + 'static>(
-    data: &Bytes,
+    metadata: &Bytes,
+    payload: &Bytes,
     base_offset: Offset,
     group_id: GroupId,
     partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
 ) {
     // Decode the partition command to access blob data.
-    let Some(command) = PartitionCommand::decode(data) else {
+    let Some(command) =
+        PartitionCommand::decode_split(metadata.clone(), payload.clone())
+    else {
         return;
     };
 

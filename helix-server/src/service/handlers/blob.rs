@@ -129,7 +129,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             format: BlobFormat::KafkaRecordBatch,
             base_offset,
         };
-        let command_data = command.encode();
+        let (cmd_meta, cmd_payload) = command.encode_split();
 
         if is_multi_node {
             // Multi-node: propose, register pending proposal, wait for commit notification.
@@ -143,7 +143,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                 let mut mr = self.multi_raft.write().await;
 
                 let (outputs, idx) =
-                    mr.propose_with_index(group_id, command_data)
+                    mr.propose_with_index_split(group_id, cmd_meta, cmd_payload)
                         .ok_or_else(|| ServerError::NotLeader {
                             topic: topic.to_string(),
                             partition,
@@ -211,7 +211,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
 
             let outputs = {
                 let mut mr = self.multi_raft.write().await;
-                mr.propose(group_id, command_data)
+                mr.propose_split(group_id, cmd_meta, cmd_payload)
             };
 
             info!(
@@ -234,24 +234,6 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                         payload,
                     } = output
                     {
-                        // Reconstitute data (single-node legacy path).
-                        let entry_data = if payload.is_empty() {
-                            metadata.clone()
-                        } else {
-                            let mut buf = bytes::BytesMut::with_capacity(
-                                metadata.len() + payload.len(),
-                            );
-                            buf.extend_from_slice(metadata);
-                            buf.extend_from_slice(payload);
-                            buf.freeze()
-                        };
-                        info!(
-                            commit_group_id = gid.get(),
-                            expected_group_id = group_id.get(),
-                            index = index.get(),
-                            data_len = entry_data.len(),
-                            "Processing CommitEntry"
-                        );
                         if *gid == group_id {
                             let ps_lock = {
                                 let storage = self.partition_storage.read().await;
@@ -259,7 +241,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                             };
                             if let Some(ps_lock) = ps_lock {
                                 let mut ps = ps_lock.write().await;
-                                ps.apply_entry_async(*index, *term, &entry_data)
+                                ps.apply_entry_async(*index, *term, metadata, payload)
                                     .await
                                     .map_err(|e| ServerError::Internal {
                                         message: format!("failed to apply: {e}"),
@@ -428,7 +410,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                 format: BlobFormat::KafkaRecordBatch,
                 base_offset,
             };
-            let command_data = command.encode();
+            let (cmd_meta, cmd_payload) = command.encode_split();
 
             let (result_tx, result_rx) = oneshot::channel();
 
@@ -438,7 +420,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             let (proposed_index, messages_to_send) = {
                 let mut mr = self.multi_raft.write().await;
                 let (outputs, idx) =
-                    mr.propose_with_index(group_id, command_data)
+                    mr.propose_with_index_split(group_id, cmd_meta, cmd_payload)
                         .ok_or_else(|| ServerError::NotLeader {
                             topic: topic.to_string(),
                             partition,
@@ -523,11 +505,11 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                 format: BlobFormat::KafkaRecordBatch,
                 base_offset,
             };
-            let command_data = command.encode();
+            let (cmd_meta, cmd_payload) = command.encode_split();
 
             let outputs = {
                 let mut mr = self.multi_raft.write().await;
-                mr.propose(group_id, command_data)
+                mr.propose_split(group_id, cmd_meta, cmd_payload)
             };
 
             // Apply any committed entries (single-node: immediate commit).
@@ -541,17 +523,6 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                         payload,
                     } = output
                     {
-                        // Reconstitute data (single-node legacy path).
-                        let entry_data = if payload.is_empty() {
-                            metadata.clone()
-                        } else {
-                            let mut buf = bytes::BytesMut::with_capacity(
-                                metadata.len() + payload.len(),
-                            );
-                            buf.extend_from_slice(metadata);
-                            buf.extend_from_slice(payload);
-                            buf.freeze()
-                        };
                         if *gid == group_id {
                             let ps_lock = {
                                 let storage = self.partition_storage.read().await;
@@ -559,7 +530,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                             };
                             if let Some(ps_lock) = ps_lock {
                                 let mut ps = ps_lock.write().await;
-                                ps.apply_entry_async(*index, *term, &entry_data)
+                                ps.apply_entry_async(*index, *term, metadata, payload)
                                     .await
                                     .map_err(|e| ServerError::Internal {
                                         message: format!("failed to apply: {e}"),

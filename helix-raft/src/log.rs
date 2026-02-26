@@ -67,6 +67,8 @@ pub struct RaftLog {
     compacted_index: u64,
     /// Term at `compacted_index` (recovered commit term).
     compacted_term: u64,
+    /// Total bytes of all entries currently in the log (metadata + payload).
+    bytes_used: u64,
 }
 
 impl RaftLog {
@@ -78,6 +80,7 @@ impl RaftLog {
             first_index: 0,
             compacted_index: 0,
             compacted_term: 0,
+            bytes_used: 0,
         }
     }
 
@@ -94,6 +97,7 @@ impl RaftLog {
             first_index: 0,
             compacted_index: index,
             compacted_term: term,
+            bytes_used: 0,
         }
     }
 
@@ -110,6 +114,39 @@ impl RaftLog {
         #[allow(clippy::cast_possible_truncation)]
         let len = self.entries.len() as u64;
         len
+    }
+
+    /// Returns the total bytes of all entries currently in the log.
+    #[must_use]
+    pub const fn bytes_used(&self) -> u64 {
+        self.bytes_used
+    }
+
+    /// Returns the log index to compact to in order to bring total bytes
+    /// under `max_bytes`.
+    ///
+    /// Scans entries from the front, accumulating their bytes until the
+    /// remaining log would fit within `max_bytes`. Returns 0 if already
+    /// within the limit or the log is empty.
+    ///
+    /// The caller must still apply the usual guards (never compact past
+    /// `last_applied`, respect follower `match_index`, etc.).
+    #[must_use]
+    pub fn compact_index_for_bytes_limit(&self, max_bytes: u64) -> u64 {
+        if self.bytes_used <= max_bytes || self.entries.is_empty() {
+            return 0;
+        }
+        let mut to_remove = self.bytes_used - max_bytes;
+        let mut compact_to: u64 = 0;
+        for entry in &self.entries {
+            let entry_bytes = (entry.metadata.len() + entry.payload.len()) as u64;
+            compact_to = entry.index.get();
+            if to_remove <= entry_bytes {
+                break;
+            }
+            to_remove -= entry_bytes;
+        }
+        compact_to
     }
 
     /// Returns the first log index, or 0 if empty.
@@ -222,6 +259,7 @@ impl RaftLog {
             );
         }
 
+        self.bytes_used += (entry.metadata.len() + entry.payload.len()) as u64;
         self.entries.push(entry);
     }
 
@@ -279,6 +317,7 @@ impl RaftLog {
 
         if last_to_keep.get() < self.first_index {
             // Truncate all entries, but preserve compacted state.
+            self.bytes_used = 0;
             self.entries.clear();
             if self.compacted_index > 0 {
                 self.first_index = self.compacted_index + 1;
@@ -292,6 +331,11 @@ impl RaftLog {
         #[allow(clippy::cast_possible_truncation)]
         let keep_count = (last_to_keep.get() - self.first_index + 1) as usize;
         if keep_count < self.entries.len() {
+            let removed_bytes: u64 = self.entries[keep_count..]
+                .iter()
+                .map(|e| (e.metadata.len() + e.payload.len()) as u64)
+                .sum();
+            self.bytes_used = self.bytes_used.saturating_sub(removed_bytes);
             self.entries.truncate(keep_count);
         }
     }
@@ -312,6 +356,7 @@ impl RaftLog {
                 self.compacted_index = last.index.get();
                 self.compacted_term = last.term.get();
             }
+            self.bytes_used = 0;
             self.entries.clear();
             self.first_index = last_to_remove.get() + 1;
             return;
@@ -334,6 +379,11 @@ impl RaftLog {
         self.compacted_term = last_removed.term.get();
 
         // Remove the prefix.
+        let removed_bytes: u64 = self.entries[..remove_count]
+            .iter()
+            .map(|e| (e.metadata.len() + e.payload.len()) as u64)
+            .sum();
+        self.bytes_used = self.bytes_used.saturating_sub(removed_bytes);
         self.entries.drain(..remove_count);
         self.first_index = last_to_remove.get() + 1;
     }

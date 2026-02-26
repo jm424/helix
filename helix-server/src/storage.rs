@@ -826,27 +826,39 @@ impl PartitionCommand {
                 meta.put_u32_le(blob_len);
                 (meta.freeze(), blob.clone())
             }
-            // Single-blob batch: same split optimization.
-            Self::AppendBlobBatch { blobs, base_offset } if blobs.len() == 1 => {
-                let batched = &blobs[0];
-                // Metadata: type(1) + base_offset(8) + blob_count(4)
-                //   + record_count(4) + format(1) + blob_len(4) = 22
-                let mut meta = BytesMut::with_capacity(22);
+            // N-blob batch (N >= 1): header in metadata, all blob data in payload.
+            //
+            // Metadata: type(1) + base_offset(8) + blob_count(4)
+            //   + [record_count(4) + format(1) + blob_len(4)] × N  = 13 + 9N bytes
+            // Payload: blob_data_0 || blob_data_1 || ... || blob_data_{N-1}
+            //
+            // For N == 1 this produces the same 22-byte header as the old
+            // single-blob path, so old WAL entries decode correctly.
+            Self::AppendBlobBatch { blobs, base_offset } => {
+                let header_size = 13 + 9 * blobs.len();
+                let mut meta = BytesMut::with_capacity(header_size);
                 meta.put_u8(4);
                 meta.put_u64_le(base_offset.get());
-                meta.put_u32_le(1); // blob_count
-                meta.put_u32_le(batched.record_count);
-                let format_byte = match batched.format {
-                    BlobFormat::Raw => 0u8,
-                    BlobFormat::KafkaRecordBatch => 1u8,
-                };
-                meta.put_u8(format_byte);
                 #[allow(clippy::cast_possible_truncation)]
-                let blob_len = batched.blob.len() as u32;
-                meta.put_u32_le(blob_len);
-                (meta.freeze(), batched.blob.clone())
+                meta.put_u32_le(blobs.len() as u32);
+                for batched in blobs {
+                    meta.put_u32_le(batched.record_count);
+                    let format_byte = match batched.format {
+                        BlobFormat::Raw => 0u8,
+                        BlobFormat::KafkaRecordBatch => 1u8,
+                    };
+                    meta.put_u8(format_byte);
+                    #[allow(clippy::cast_possible_truncation)]
+                    meta.put_u32_le(batched.blob.len() as u32);
+                }
+                let total_payload: usize = blobs.iter().map(|b| b.blob.len()).sum();
+                let mut payload = BytesMut::with_capacity(total_payload);
+                for batched in blobs {
+                    payload.put_slice(&batched.blob);
+                }
+                (meta.freeze(), payload.freeze())
             }
-            // Multi-blob or non-blob: fall back to combined encode.
+            // Non-blob commands: full encode in metadata, empty payload.
             _ => (self.encode(), Bytes::new()),
         }
     }
@@ -892,9 +904,13 @@ impl PartitionCommand {
                     base_offset,
                 })
             }
-            // Type 4: AppendBlobBatch (single-blob) with split payload.
+            // Type 4: AppendBlobBatch (N blobs) with split payload.
+            //
+            // Metadata layout: type(1) + base_offset(8) + blob_count(4)
+            //   + [record_count(4) + format(1) + blob_len(4)] × N  = 13 + 9N bytes
+            // Payload: blob_data_0 || ... || blob_data_{N-1}
             4 => {
-                if metadata.len() < 22 {
+                if metadata.len() < 13 {
                     return None;
                 }
                 let base_offset = Offset::new(u64::from_le_bytes(
@@ -902,27 +918,40 @@ impl PartitionCommand {
                 ));
                 let blob_count = u32::from_le_bytes(
                     metadata[9..13].try_into().ok()?,
-                );
-                if blob_count != 1 {
-                    return None; // Multi-blob should not have split payload.
+                ) as usize;
+                if blob_count == 0 {
+                    return None;
                 }
-                let record_count = u32::from_le_bytes(
-                    metadata[13..17].try_into().ok()?,
-                );
-                let format = match metadata[17] {
-                    0 => BlobFormat::Raw,
-                    1 => BlobFormat::KafkaRecordBatch,
-                    _ => return None,
-                };
-                // blob_len at metadata[18..22] — we trust payload.len().
-                Some(Self::AppendBlobBatch {
-                    blobs: vec![BatchedBlob {
-                        blob: payload,
-                        record_count,
-                        format,
-                    }],
-                    base_offset,
-                })
+                let expected_meta_len = 13 + 9 * blob_count;
+                if metadata.len() < expected_meta_len {
+                    return None;
+                }
+                let mut blobs = Vec::with_capacity(blob_count);
+                let mut payload_offset: usize = 0;
+                for i in 0..blob_count {
+                    let off = 13 + 9 * i;
+                    let record_count = u32::from_le_bytes(
+                        metadata[off..off + 4].try_into().ok()?,
+                    );
+                    let format = match metadata[off + 4] {
+                        0 => BlobFormat::Raw,
+                        1 => BlobFormat::KafkaRecordBatch,
+                        _ => return None,
+                    };
+                    let blob_len = u32::from_le_bytes(
+                        metadata[off + 5..off + 9].try_into().ok()?,
+                    ) as usize;
+                    if payload_offset + blob_len > payload.len() {
+                        return None;
+                    }
+                    let blob = payload.slice(payload_offset..payload_offset + blob_len);
+                    payload_offset += blob_len;
+                    blobs.push(BatchedBlob { blob, record_count, format });
+                }
+                if payload_offset != payload.len() {
+                    return None; // Unexpected trailing bytes in payload.
+                }
+                Some(Self::AppendBlobBatch { blobs, base_offset })
             }
             _ => None,
         }
@@ -2828,8 +2857,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             return Ok(None);
         }
 
-        let command =
-            PartitionCommand::decode(data).ok_or_else(|| DurablePartitionError::CacheUpdate {
+        let command = PartitionCommand::decode(data)
+            .or_else(|| {
+                let (meta, payload) = unframe_from_wal(data.clone());
+                PartitionCommand::decode_split(meta, payload)
+            })
+            .ok_or_else(|| DurablePartitionError::CacheUpdate {
                 message: "failed to decode partition command".to_string(),
             })?;
 
@@ -4270,6 +4303,79 @@ mod tests {
         // Read with larger max_bytes - should get more.
         let read_blobs = partition.read_blobs(Offset::new(0), 100);
         assert!(read_blobs.len() > 1);
+    }
+
+    #[test]
+    fn test_encode_split_multi_blob_roundtrip() {
+        // Verify that encode_split for N>1 blobs puts headers in metadata
+        // and concatenated data in payload, and decode_split reconstructs
+        // the original command identically.
+        let blob1 = Bytes::from(vec![0xAAu8; 800_000]);
+        let blob2 = Bytes::from(vec![0xBBu8; 750_000]);
+        let base_offset = Offset::new(100);
+        let cmd = PartitionCommand::AppendBlobBatch {
+            blobs: vec![
+                BatchedBlob {
+                    blob: blob1.clone(),
+                    record_count: 3,
+                    format: BlobFormat::KafkaRecordBatch,
+                },
+                BatchedBlob {
+                    blob: blob2.clone(),
+                    record_count: 2,
+                    format: BlobFormat::Raw,
+                },
+            ],
+            base_offset,
+        };
+
+        let (meta, payload) = cmd.encode_split();
+
+        // Payload must be non-empty (zero-copy for multi-blob).
+        assert!(!payload.is_empty(), "multi-blob encode_split must use payload");
+        // Metadata must be just the header, not the full blobs.
+        let expected_header = 13 + 9 * 2; // 13 + 9N for N=2
+        assert_eq!(meta.len(), expected_header, "metadata should be header only");
+        // Payload is concatenated blob data.
+        assert_eq!(payload.len(), blob1.len() + blob2.len());
+
+        // Round-trip via decode_split.
+        let decoded = PartitionCommand::decode_split(meta, payload).unwrap();
+        match decoded {
+            PartitionCommand::AppendBlobBatch { blobs, base_offset: decoded_offset } => {
+                assert_eq!(decoded_offset, base_offset);
+                assert_eq!(blobs.len(), 2);
+                assert_eq!(blobs[0].blob, blob1);
+                assert_eq!(blobs[0].record_count, 3);
+                assert_eq!(blobs[0].format, BlobFormat::KafkaRecordBatch);
+                assert_eq!(blobs[1].blob, blob2);
+                assert_eq!(blobs[1].record_count, 2);
+                assert_eq!(blobs[1].format, BlobFormat::Raw);
+            }
+            _ => panic!("wrong command type after decode_split"),
+        }
+
+        // Also verify single-blob batch still uses the same path correctly.
+        let cmd1 = PartitionCommand::AppendBlobBatch {
+            blobs: vec![BatchedBlob {
+                blob: blob1.clone(),
+                record_count: 5,
+                format: BlobFormat::KafkaRecordBatch,
+            }],
+            base_offset,
+        };
+        let (meta1, payload1) = cmd1.encode_split();
+        assert_eq!(meta1.len(), 22, "single-blob header must be 22 bytes");
+        assert_eq!(payload1, blob1);
+        let decoded1 = PartitionCommand::decode_split(meta1, payload1).unwrap();
+        match decoded1 {
+            PartitionCommand::AppendBlobBatch { blobs, .. } => {
+                assert_eq!(blobs.len(), 1);
+                assert_eq!(blobs[0].blob, blob1);
+                assert_eq!(blobs[0].record_count, 5);
+            }
+            _ => panic!("wrong command type for single-blob batch"),
+        }
     }
 
     #[test]

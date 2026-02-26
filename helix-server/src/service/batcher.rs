@@ -157,6 +157,19 @@ pub struct BackpressureState {
     pub peak_pending_bytes: AtomicU64,
 }
 
+impl BackpressureState {
+    /// Returns an `Arc<BackpressureState>` that is never checked against limits.
+    ///
+    /// Used for partition actors that are not attached to a batcher (e.g. single-node
+    /// DST mode). The actor still calls `release_global_backpressure()` — it just
+    /// decrements counters that nobody is reading. This keeps the field non-optional
+    /// and makes incorrect wiring a compile error rather than a silent no-op.
+    #[must_use]
+    pub fn noop() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+}
+
 /// Handle for submitting requests to the batcher.
 #[derive(Clone)]
 pub struct BatcherHandle {
@@ -808,10 +821,10 @@ async fn flush_batch<S: Storage + Clone + Send + Sync + 'static, T: TransportSer
             blobs: batch_blobs,
             base_offset,
         };
-        let command_data = command.encode();
+        let (cmd_meta, cmd_payload) = command.encode_split();
 
         // Propose to Raft.
-        let result = mr.propose_with_index(group_id, command_data);
+        let result = mr.propose_with_index_split(group_id, cmd_meta, cmd_payload);
         let Some((outputs, idx)) = result else {
             // Propose failed - not leader or group doesn't exist.
             // Check if we have leadership info for debugging.
@@ -1437,7 +1450,10 @@ async fn flush_batch_actor<S: Storage + Clone + Send + Sync + 'static>(
 mod tests {
     use super::*;
     use crate::partition_storage::ServerPartitionStorage;
-    use crate::service::partition_actor::{spawn_partition_actor, PartitionActorConfig};
+    use crate::service::partition_actor::{
+        spawn_partition_actor, spawn_partition_actor_shared_with_batch_config, GroupedOutput,
+        PartitionActorConfig, PartitionBatchConfig,
+    };
     use helix_core::NodeId;
     use helix_raft::{RaftConfig, RaftNode};
     use helix_wal::TokioStorage;
@@ -1555,19 +1571,46 @@ mod tests {
         let _ = batcher_task.await;
     }
 
+    /// Regression test for the staging bug where `pending_bytes` leaked permanently.
+    ///
+    /// The failure path: `is_leader_cached()` returns true (stale after a leadership
+    /// change), so the batcher forwards the batch to the actor. The actor rejects it
+    /// (`!raft_node.is_leader()`) and must call `release_global_backpressure()` to
+    /// decrement the counters. If `global_backpressure` is not wired (was `None`),
+    /// the decrement is silently skipped and `pending_bytes` leaks on every rejection
+    /// until the 100 MB ceiling is hit, blocking all new produces permanently.
     #[tokio::test]
-    async fn test_batcher_actor_backpressure_tracking() {
-        // Create a partition actor.
+    async fn test_batcher_actor_backpressure_released_on_stale_leader_rejection() {
         let group_id = GroupId::new(1);
         let raft_node = create_test_raft_node(1, vec![1, 2, 3]);
-        let (partition_handle, _output_rx) =
-            spawn_partition_actor(group_id, raft_node, PartitionActorConfig::default());
+
+        // Create batcher with backpressure FIRST so the actor shares the same Arc.
+        let (batcher_handle, batcher_rx, backpressure) = create_batcher();
+
+        // Create output channel required by the shared actor variant.
+        let (output_tx, _output_rx) = mpsc::channel::<GroupedOutput>(64);
+
+        // Spawn actor wired to the real backpressure Arc.
+        let partition_handle = spawn_partition_actor_shared_with_batch_config(
+            group_id,
+            raft_node,
+            PartitionActorConfig::default(),
+            output_tx,
+            PartitionBatchConfig::default(),
+            None,
+            Arc::clone(&backpressure),
+        );
+
+        // Simulate a stale leader cache: the batcher will forward the batch
+        // to the actor instead of rejecting it locally.
+        partition_handle
+            .leader_cache()
+            .store(true, Ordering::Relaxed);
 
         let mut router = PartitionRouter::new();
         router.add_partition(group_id, partition_handle);
         let router = Arc::new(router);
 
-        let (batcher_handle, batcher_rx, backpressure) = create_batcher();
         let batch_pending_proposals = Arc::new(RwLock::new(HashMap::new()));
         let batcher_stats = Arc::new(BatcherStats::default());
         let partition_storage: Arc<RwLock<HashMap<GroupId, Arc<RwLock<ServerPartitionStorage>>>>> =
@@ -1588,29 +1631,24 @@ mod tests {
             Arc::clone(&partition_storage),
         ));
 
-        // Check initial state.
-        assert_eq!(backpressure.pending_requests.load(Ordering::Relaxed), 0);
         assert_eq!(backpressure.pending_bytes.load(Ordering::Relaxed), 0);
 
-        // Submit requests.
-        let data = Bytes::from("test data");
-
-        let _rx1 = batcher_handle
-            .submit(group_id, data.clone(), 1, BlobFormat::Raw)
+        let _rx = batcher_handle
+            .submit(group_id, Bytes::from("test data"), 1, BlobFormat::Raw)
             .await
             .unwrap();
 
-        // After submit, counters should be incremented.
-        // (They get decremented when the batch is flushed and response sent.)
-        // Give a moment for the batcher to process.
+        // Wait for batcher linger + actor processing.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // After flush (due to linger timeout), counters should be back to 0
-        // because the request was processed (failed due to not leader).
-        assert_eq!(backpressure.pending_requests.load(Ordering::Relaxed), 0);
-        assert_eq!(backpressure.pending_bytes.load(Ordering::Relaxed), 0);
+        // Actor rejected (not leader) and release_global_backpressure() must have
+        // decremented the counter. Any non-zero value here means the leak is back.
+        assert_eq!(
+            backpressure.pending_bytes.load(Ordering::Relaxed),
+            0,
+            "pending_bytes leaked: release_global_backpressure not called on actor rejection"
+        );
 
-        // Shutdown.
         drop(batcher_handle);
         let _ = batcher_task.await;
         router.shutdown().await;

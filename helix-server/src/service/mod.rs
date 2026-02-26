@@ -614,7 +614,7 @@ pub struct HelixService<
     pub(crate) controller_shutdown_tx: Option<mpsc::Sender<()>>,
     /// Backpressure state for actor-based flow control.
     #[allow(dead_code)]
-    pub(crate) actor_backpressure: Option<Arc<batcher::BackpressureState>>,
+    pub(crate) actor_backpressure: Arc<batcher::BackpressureState>,
     /// Output processor performance stats (multi-node actor mode only).
     pub(crate) output_processor_stats: Option<Arc<OutputProcessorStats>>,
     /// Vote store for persisting Raft vote state (multi-node only).
@@ -880,7 +880,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             actor_output_tx: None,
             actor_shutdown_tx: None,
             controller_shutdown_tx: None,
-            actor_backpressure: None,
+            actor_backpressure: batcher::BackpressureState::noop(),
             output_processor_stats: None,
             vote_store: None, // Single-node mode doesn't persist vote state.
             offset_group_states: (0..OFFSET_GROUP_COUNT_USIZE)
@@ -1028,8 +1028,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             transport_config = transport_config.with_peer(peer.node_id, peer.addr.clone());
         }
 
+        // Create transport but do NOT start it yet (don't open the TCP port).
+        // Starting the listener before S3 recovery and WAL replay completes causes
+        // peers to connect and queue up Raft messages that go unread for several
+        // minutes, triggering TCP_USER_TIMEOUT reconnect loops on every rolling deploy.
+        // The port opens after recovery is complete, just before the service loop starts.
         let (transport, incoming_rx) = helix_runtime::Transport::new(transport_config);
-        let transport_handle = transport.start().await?;
 
         let multi_raft = Arc::new(RwLock::new(MultiRaft::new(node_id)));
         let partition_storage: GenericPartitionStorageMap<S> =
@@ -1230,19 +1234,63 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
 
             // Replay controller entries into ControllerState immediately.
             // This restores topics and partition assignments after a pod restart.
-            // Also capture the highest committed Raft index and its term so the
-            // controller Raft group can be initialised with correct compacted
-            // state, preventing log divergence after restart.
+            // Also capture the highest CONTIGUOUS committed Raft index and its
+            // term so the controller Raft group can be initialised with correct
+            // compacted state, preventing log divergence after restart.
+            //
+            // We use max_contiguous (not max_raft_index) to handle WAL holes
+            // created when `append_nowait` writes are lost on an unclean
+            // shutdown. If index N is missing but N+1 exists, using
+            // max_raft_index as the guard would cause the persistence path to
+            // skip re-writing N when the leader re-delivers it (N > max
+            // evaluates to false), making the hole permanent. Using
+            // max_contiguous lets the guard pass for any index > max_contiguous,
+            // so the hole is filled when the leader catches us up.
             let (ctl_commit_index, ctl_commit_term) = {
+                // Compute max_contiguous: the highest N where all indices
+                // from min_raft_index..=N are present (no gaps).
+                // Entries below min_raft_index were committed and tiered to S3.
+                let (max_contiguous_index, max_contiguous_term) = {
+                    let mut sorted: Vec<u64> = controller_entries_raw
+                        .iter()
+                        .map(|e| e.header.raft_index)
+                        .collect();
+                    sorted.sort_unstable();
+                    sorted.dedup();
+                    if sorted.is_empty() {
+                        (0u64, 0u64)
+                    } else {
+                        let min_ri = sorted[0];
+                        // Start cursor one below min_ri so the first entry
+                        // advances it to min_ri (tiered entries < min_ri are
+                        // known committed; we treat them as part of the floor).
+                        let mut last_contiguous = min_ri.saturating_sub(1);
+                        let terms: std::collections::HashMap<u64, u64> =
+                            controller_entries_raw
+                                .iter()
+                                .map(|e| (e.header.raft_index, e.header.term))
+                                .collect();
+                        for idx in sorted {
+                            if idx == last_contiguous + 1 {
+                                last_contiguous = idx;
+                            } else {
+                                // Gap detected; stop at the last contiguous index.
+                                break;
+                            }
+                        }
+                        let term = terms.get(&last_contiguous).copied().unwrap_or(0);
+                        (last_contiguous, term)
+                    }
+                };
+
                 let mut state = controller_state.write().await;
                 let mut count = 0u64;
-                let mut max_raft_index = 0u64;
-                let mut max_raft_term = 0u64;
+                let max_raft_index = controller_entries_raw
+                    .iter()
+                    .map(|e| e.header.raft_index)
+                    .max()
+                    .unwrap_or(0);
                 for entry in &controller_entries_raw {
-                    if entry.header.raft_index > max_raft_index {
-                        max_raft_index = entry.header.raft_index;
-                        max_raft_term = entry.header.term;
-                    }
                     if let Some(cmd) =
                         crate::controller::ControllerCommand::decode(&entry.payload)
                     {
@@ -1260,31 +1308,60 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                 drop(state);
                 // Tell tick tasks to skip WAL writes for entries at or
                 // below this index — they're already persisted.
+                // Use max_contiguous so holes above it are re-filled by
+                // leader catch-up.
                 tick::CONTROLLER_LAST_PERSISTED_INDEX
-                    .store(max_raft_index, std::sync::atomic::Ordering::Relaxed);
+                    .store(max_contiguous_index, std::sync::atomic::Ordering::Relaxed);
                 if count > 0 {
                     info!(
                         replayed = count,
+                        max_contiguous_index,
+                        max_contiguous_term,
                         max_raft_index,
-                        max_raft_term,
+                        wal_holes = max_raft_index.saturating_sub(max_contiguous_index),
                         "Replayed controller state from SharedWAL"
                     );
                 }
-                (max_raft_index, max_raft_term)
+                (max_contiguous_index, max_contiguous_term)
             };
 
             // Replay offset group entries into per-group state machines.
-            // Track the max raft_index/term per group for correct Raft recovery state.
+            // Use max_contiguous (not max_raft_index) for the same reason as
+            // the controller: holes above max_contiguous must be re-fillable
+            // by leader catch-up, not masked by the persistence guard.
             for (slot, entries) in offset_entries_raw.into_iter().enumerate() {
-                let mut max_raft_index = 0u64;
-                let mut max_raft_term = 0u64;
+                // Compute max_contiguous for this offset group.
+                let (max_contiguous_index, max_contiguous_term) = {
+                    let mut sorted: Vec<u64> =
+                        entries.iter().map(|e| e.header.raft_index).collect();
+                    sorted.sort_unstable();
+                    sorted.dedup();
+                    if sorted.is_empty() {
+                        (0u64, 0u64)
+                    } else {
+                        let min_ri = sorted[0];
+                        let mut last_contiguous = min_ri.saturating_sub(1);
+                        let terms: std::collections::HashMap<u64, u64> = entries
+                            .iter()
+                            .map(|e| (e.header.raft_index, e.header.term))
+                            .collect();
+                        for idx in sorted {
+                            if idx == last_contiguous + 1 {
+                                last_contiguous = idx;
+                            } else {
+                                break;
+                            }
+                        }
+                        let term = terms.get(&last_contiguous).copied().unwrap_or(0);
+                        (last_contiguous, term)
+                    }
+                };
+
+                let max_raft_index =
+                    entries.iter().map(|e| e.header.raft_index).max().unwrap_or(0);
                 let mut count = 0u64;
                 let mut state = offset_group_states_vec[slot].write().await;
                 for entry in entries {
-                    if entry.header.raft_index > max_raft_index {
-                        max_raft_index = entry.header.raft_index;
-                        max_raft_term = entry.header.term;
-                    }
                     if let Some(cmd) =
                         crate::offset_group::OffsetGroupCommand::decode(&entry.payload)
                     {
@@ -1299,16 +1376,19 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                     }
                 }
                 drop(state);
-                offset_commit_indices[slot] = (max_raft_index, max_raft_term);
+                offset_commit_indices[slot] = (max_contiguous_index, max_contiguous_term);
                 // Guard: skip re-persisting recovered entries in tick task.
+                // Use max_contiguous so holes above it are re-filled on catch-up.
                 tick::OFFSET_GROUP_LAST_PERSISTED[slot]
-                    .store(max_raft_index, std::sync::atomic::Ordering::Relaxed);
+                    .store(max_contiguous_index, std::sync::atomic::Ordering::Relaxed);
                 if count > 0 {
                     info!(
                         slot,
                         replayed = count,
+                        max_contiguous_index,
+                        max_contiguous_term,
                         max_raft_index,
-                        max_raft_term,
+                        wal_holes = max_raft_index.saturating_sub(max_contiguous_index),
                         "Replayed offset group state from SharedWAL"
                     );
                 }
@@ -1412,6 +1492,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
         let batch_pending_proposals: BatchPendingProposalMap =
             Arc::new(RwLock::new(HashMap::new()));
 
+        // S3 recovery and WAL replay are complete. Open the transport port now so
+        // peers can connect and send Raft messages to a node that is ready to process them.
+        let transport_handle = transport.start().await?;
+
         // Actor-based architecture: lock-free per-partition actors with message-passing.
         info!("Initializing actor mode for multi-node service");
 
@@ -1465,6 +1549,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                 Arc::clone(&local_broker_heartbeats),
                 offset_group_states_vec.clone(),
                 Arc::clone(&pending_offset_proposals),
+                Arc::clone(&actor_handles.backpressure),
                 actor_handles.leader_update_rx,
                 rx,
             ));
@@ -1514,7 +1599,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             actor_output_tx: Some(actor_handles.output_tx.clone()),
             actor_shutdown_tx: Some(actor_handles.shutdown_tx),
             controller_shutdown_tx: Some(controller_shutdown_tx),
-            actor_backpressure: Some(actor_handles.backpressure),
+            actor_backpressure: actor_handles.backpressure,
             output_processor_stats: Some(actor_handles.output_processor_stats),
             vote_store,
             offset_group_states: offset_group_states_vec,
@@ -1699,7 +1784,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             actor_output_tx: None,
             actor_shutdown_tx: None,
             controller_shutdown_tx: None,
-            actor_backpressure: None,
+            actor_backpressure: batcher::BackpressureState::noop(),
             output_processor_stats: None,
             vote_store: None,
             offset_group_states: (0..OFFSET_GROUP_COUNT_USIZE)
@@ -2202,6 +2287,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                 Arc::clone(&local_broker_heartbeats),
                 offset_group_states_vec.clone(),
                 Arc::clone(&pending_offset_proposals_dst),
+                Arc::clone(&actor_handles.backpressure),
                 actor_handles.leader_update_rx,
                 rx,
             ));
@@ -2252,7 +2338,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             actor_output_tx: Some(actor_handles.output_tx.clone()),
             actor_shutdown_tx: Some(actor_handles.shutdown_tx),
             controller_shutdown_tx: Some(controller_shutdown_tx),
-            actor_backpressure: Some(actor_handles.backpressure),
+            actor_backpressure: actor_handles.backpressure,
             output_processor_stats: Some(actor_handles.output_processor_stats),
             vote_store,
             offset_group_states: offset_group_states_vec,

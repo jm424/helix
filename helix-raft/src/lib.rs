@@ -75,8 +75,17 @@ pub mod limits {
 
     /// Default number of trailing log entries to retain after compaction.
     ///
-    /// Helix entries are large (blob payloads, ~90 KB each). At 1K entries
-    /// this is ~90 MB, providing ~20 seconds of in-memory catch-up buffer
-    /// at typical throughput. Lagging followers use the WAL fallback path.
+    /// This is a secondary limit; the primary bound is `LOG_TRAILING_BYTES_MAX_DEFAULT`.
+    /// At typical entry sizes both limits fire together, but the bytes limit is
+    /// the effective guard against OOM at high throughput.
     pub const LOG_TRAILING_ENTRIES_DEFAULT: u64 = 1_000;
+
+    /// Default maximum bytes of entries to retain in the in-memory Raft log.
+    ///
+    /// At high produce throughput, entries can be up to ~2 MB each (multi-blob
+    /// batches encoded without the zero-copy split). 64 MB per group × 64 data
+    /// partition groups = 4 GB worst case across the whole process, well within
+    /// the 28 Gi pod limit. 64 MB at ~1 MB/s per partition = ~64 seconds of
+    /// in-memory catch-up window, far exceeding any realistic election timeout.
+    pub const LOG_TRAILING_BYTES_MAX_DEFAULT: u64 = 64 * 1024 * 1024; // 64 MB
 }

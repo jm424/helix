@@ -120,7 +120,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
 
         // Encode command.
         let command = PartitionCommand::Append { records };
-        let data = command.encode();
+        let (cmd_meta, cmd_payload) = command.encode_split();
 
         // Create channel for receiving the apply result.
         let (result_tx, result_rx) = oneshot::channel();
@@ -128,7 +128,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
         // Propose to Raft and get the log index.
         let (outputs, proposed_index) = {
             let mut mr = self.multi_raft.write().await;
-            mr.propose_with_index(group_id, data)
+            mr.propose_with_index_split(group_id, cmd_meta, cmd_payload)
                 .ok_or_else(|| ServerError::NotLeader {
                     topic: request.topic.clone(),
                     partition: partition_idx,
@@ -146,7 +146,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
         //
         // In multi-node mode, outputs won't contain CommitEntry (needs replication),
         // so we always register a pending proposal and wait for the tick task.
-        let mut committed_entry_data: Option<(Bytes, helix_core::TermId)> = None;
+        let mut committed_entry: Option<(Bytes, Bytes, helix_core::TermId)> = None;
         for output in &outputs {
             if let MultiRaftOutput::CommitEntry {
                 group_id: gid,
@@ -157,24 +157,13 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             } = output
             {
                 if *gid == group_id && *index == proposed_index {
-                    // Reconstitute data (single-node legacy path).
-                    let entry_data = if payload.is_empty() {
-                        metadata.clone()
-                    } else {
-                        let mut buf = bytes::BytesMut::with_capacity(
-                            metadata.len() + payload.len(),
-                        );
-                        buf.extend_from_slice(metadata);
-                        buf.extend_from_slice(payload);
-                        buf.freeze()
-                    };
-                    committed_entry_data = Some((entry_data, *term));
+                    committed_entry = Some((metadata.clone(), payload.clone(), *term));
                 }
             }
         }
 
         // If we got a CommitEntry (single-node mode), apply with ordering.
-        let base_offset = if let Some((entry_data, entry_term)) = committed_entry_data {
+        let base_offset = if let Some((entry_meta, entry_payload, entry_term)) = committed_entry {
             // Single-node fast path: apply in order.
             // Loop until it's our turn to apply (bounded by MAX_CONCURRENT_APPLY_RETRIES).
             const MAX_CONCURRENT_APPLY_RETRIES: u32 = 10_000;
@@ -215,7 +204,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
 
                 if proposed_index == expected_next {
                     // It's our turn to apply.
-                    match ps.apply_entry_async(proposed_index, entry_term, &entry_data).await {
+                    match ps.apply_entry_async(proposed_index, entry_term, &entry_meta, &entry_payload).await {
                         Ok(Some(offset)) => {
                             return Ok(WriteResponse {
                                 base_offset: offset.get(),

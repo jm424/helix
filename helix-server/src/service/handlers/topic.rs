@@ -156,20 +156,9 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                         } = output
                         {
                             if *gid == group_id {
-                                // Reconstitute data (single-node legacy path).
-                                let data = if payload.is_empty() {
-                                    metadata.clone()
-                                } else {
-                                    let mut buf = bytes::BytesMut::with_capacity(
-                                        metadata.len() + payload.len(),
-                                    );
-                                    buf.extend_from_slice(metadata);
-                                    buf.extend_from_slice(payload);
-                                    buf.freeze()
-                                };
                                 if let Some(ps_lock) = partition_storage.get(&group_id) {
                                     let mut ps = ps_lock.write().await;
-                                    let _ = ps.apply_entry_async(*index, *term, &data).await;
+                                    let _ = ps.apply_entry_async(*index, *term, metadata, payload).await;
                                 }
                             }
                         }
@@ -304,6 +293,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     Some(&self.storage),
                     &self.offset_group_states,
                     &self.pending_offset_proposals,
+                    &self.actor_backpressure,
                 )
                 .await;
             }
@@ -593,6 +583,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     Some(&self.storage),
                     &self.offset_group_states,
                     &self.pending_offset_proposals,
+                    &self.actor_backpressure,
                 )
                 .await;
             }

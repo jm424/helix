@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use helix_core::{GroupId, LogIndex, NodeId, Offset, PartitionId, TermId};
 use helix_raft::multi::{MultiRaft, MultiRaftOutput};
-use helix_raft::RaftState;
+use helix_raft::{LogEntry, RaftState};
 use helix_runtime::{BrokerHeartbeat, IncomingMessage, TransportService};
 use helix_wal::{SharedWalPool, Storage};
 use crate::storage::PartitionRecoveryState;
@@ -181,6 +181,7 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
     local_retention_ms: Option<u64>,
     offset_group_states: Vec<Arc<RwLock<OffsetGroupState>>>,
     pending_offset_proposals: Arc<RwLock<Vec<PendingOffsetProposal>>>,
+    backpressure: Arc<super::batcher::BackpressureState>,
     mut incoming_rx: mpsc::Receiver<IncomingMessage>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
@@ -224,6 +225,7 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
         &recovered_entries,
         &storage,
         &output_tx,
+        &backpressure,
     )
     .await;
 
@@ -321,6 +323,7 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
                                 Some(&storage),
                                 &offset_group_states,
                                 &pending_offset_proposals,
+                                &backpressure,
                             ).await;
                         }
 
@@ -388,6 +391,7 @@ pub async fn tick_task_controller<
     local_broker_heartbeats: Arc<RwLock<HashMap<NodeId, u64>>>,
     offset_group_states: Vec<Arc<RwLock<OffsetGroupState>>>,
     pending_offset_proposals: Arc<RwLock<Vec<PendingOffsetProposal>>>,
+    backpressure: Arc<super::batcher::BackpressureState>,
     mut leader_update_rx: mpsc::UnboundedReceiver<crate::controller::ControllerCommand>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
@@ -439,6 +443,7 @@ pub async fn tick_task_controller<
                     Some(&storage),
                     &offset_group_states,
                     &pending_offset_proposals,
+                    &backpressure,
                 ).await;
             }
             _ = rebalance_interval.tick() => {
@@ -669,6 +674,7 @@ pub async fn process_controller_outputs<
     storage: Option<&S>,
     offset_group_states: &[Arc<RwLock<OffsetGroupState>>],
     pending_offset_proposals: &Arc<RwLock<Vec<PendingOffsetProposal>>>,
+    backpressure: &Arc<super::batcher::BackpressureState>,
 ) {
     // Collect follow-up outputs for single-node processing.
     // For single-node clusters, propose() returns CommitEntry immediately,
@@ -948,6 +954,7 @@ pub async fn process_controller_outputs<
                                 commit_term,
                                 output_tx.clone(),
                                 super::partition_actor::PartitionActorConfig::default(),
+                                Arc::clone(backpressure),
                             );
 
                         if router
@@ -1044,9 +1051,142 @@ pub async fn process_controller_outputs<
                 }
                 // Ignore data partition vote changes - handled by OutputProcessor.
             }
-            MultiRaftOutput::NeedEntries { .. } => {
-                // NeedEntries is handled by the actor output processor path.
-                // The tick task only processes controller partition outputs.
+            MultiRaftOutput::NeedEntries {
+                group_id,
+                follower_id,
+                start_index,
+                prev_log_index,
+                max_bytes,
+            } => {
+                // Only serve NeedEntries for controller and offset groups.
+                // Data partition groups are handled by the OutputProcessor.
+                if *group_id != CONTROLLER_GROUP_ID && !is_offset_group(*group_id) {
+                    continue;
+                }
+
+                let Some(pool) = shared_wal_pool else {
+                    warn!(
+                        group = group_id.get(),
+                        follower = follower_id.get(),
+                        "NeedEntries for controller/offset group but no SharedWalPool"
+                    );
+                    continue;
+                };
+
+                // Determine the end of the readable range from the persisted-index guard.
+                // This is always the highest contiguous index we have on disk.
+                let end_index = if *group_id == CONTROLLER_GROUP_ID {
+                    CONTROLLER_LAST_PERSISTED_INDEX
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                } else {
+                    let slot = offset_group_slot(*group_id).unwrap_or(0);
+                    OFFSET_GROUP_LAST_PERSISTED[slot]
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                };
+
+                if end_index < start_index.get() {
+                    // Nothing we can serve yet (leader just started, no entries
+                    // committed since restart). The follower will retry on the
+                    // next NeedEntries once we have entries to send.
+                    debug!(
+                        group = group_id.get(),
+                        follower = follower_id.get(),
+                        start = start_index.get(),
+                        end_index,
+                        "NeedEntries: no entries available yet"
+                    );
+                    continue;
+                }
+
+                let handle = pool.handle(*group_id);
+
+                // Read WAL entries for the raft_index range [start_index, end_index].
+                let entries_result = handle
+                    .read_entries_by_raft_index(start_index.get(), end_index, *max_bytes)
+                    .await;
+
+                let shared_entries = match entries_result {
+                    Ok(e) => e,
+                    Err(e) => {
+                        warn!(
+                            group = group_id.get(),
+                            follower = follower_id.get(),
+                            start = start_index.get(),
+                            error = %e,
+                            "Failed to read WAL entries for NeedEntries"
+                        );
+                        continue;
+                    }
+                };
+
+                // Look up prev_log_term from the WAL entry at prev_log_index.
+                let prev_log_term = if prev_log_index.get() == 0 {
+                    TermId::new(0)
+                } else {
+                    match handle.read_entry_by_raft_index(prev_log_index.get()).await {
+                        Ok(Some(e)) => TermId::new(e.header.term),
+                        Ok(None) => TermId::new(0),
+                        Err(e) => {
+                            warn!(
+                                group = group_id.get(),
+                                prev_log_index = prev_log_index.get(),
+                                error = %e,
+                                "Failed to read prev_log entry for NeedEntries"
+                            );
+                            continue;
+                        }
+                    }
+                };
+
+                // Convert SharedEntry → LogEntry.
+                // For shared WAL the raft_index field is the Raft log index;
+                // the WAL auto-counter is different and irrelevant here.
+                let log_entries: Vec<LogEntry> = shared_entries
+                    .into_iter()
+                    .map(|e| LogEntry {
+                        term: TermId::new(e.header.term),
+                        index: LogIndex::new(e.header.raft_index),
+                        metadata: bytes::Bytes::copy_from_slice(&e.payload),
+                        payload: bytes::Bytes::new(),
+                    })
+                    .collect();
+
+                // Feed entries back into the Raft node and collect outbound messages.
+                let outbound = {
+                    let mut mr = multi_raft.write().await;
+                    mr.provide_entries(
+                        *group_id,
+                        *follower_id,
+                        *prev_log_index,
+                        prev_log_term,
+                        log_entries,
+                    )
+                };
+
+                // Send any resulting AppendEntries messages to the follower.
+                for msg_output in outbound {
+                    if let MultiRaftOutput::SendMessages { to, messages } = msg_output {
+                        // Filter to only controller/offset messages for safety.
+                        let managed: Vec<_> = messages
+                            .into_iter()
+                            .filter(|m| {
+                                m.group_id == CONTROLLER_GROUP_ID
+                                    || is_offset_group(m.group_id)
+                            })
+                            .collect();
+                        if !managed.is_empty() {
+                            if let Err(e) =
+                                transport_handle.send_batch(to, managed).await
+                            {
+                                warn!(
+                                    to = to.get(),
+                                    error = %e,
+                                    "Failed to send NeedEntries response to peer"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1169,6 +1309,7 @@ pub async fn process_controller_outputs<
                                 commit_term,
                                 output_tx.clone(),
                                 super::partition_actor::PartitionActorConfig::default(),
+                                Arc::clone(backpressure),
                             );
 
                         if router
@@ -1217,6 +1358,7 @@ async fn recover_partition_actors<S: Storage + Clone + Send + Sync + 'static>(
     recovered_entries: &Arc<RwLock<HashMap<GroupId, PartitionRecoveryState>>>,
     storage: &S,
     output_tx: &mpsc::Sender<super::partition_actor::GroupedOutput>,
+    backpressure: &Arc<super::batcher::BackpressureState>,
 ) {
     // Snapshot the assignments under a short read lock, then release it before
     // doing any async I/O below.
@@ -1304,6 +1446,7 @@ async fn recover_partition_actors<S: Storage + Clone + Send + Sync + 'static>(
             commit_term,
             output_tx.clone(),
             super::partition_actor::PartitionActorConfig::default(),
+            Arc::clone(backpressure),
         );
 
         if router
@@ -1521,18 +1664,6 @@ async fn process_outputs<S: Storage + Clone + Send + Sync + 'static>(
                 metadata,
                 payload,
             } => {
-                // Reconstitute data from metadata+payload (legacy non-actor path).
-                let data = if payload.is_empty() {
-                    metadata.clone()
-                } else {
-                    let mut buf = bytes::BytesMut::with_capacity(
-                        metadata.len() + payload.len(),
-                    );
-                    buf.extend_from_slice(metadata);
-                    buf.extend_from_slice(payload);
-                    buf.freeze()
-                };
-
                 let key = {
                     let gm = group_map.read().await;
                     gm.get_key(*group_id)
@@ -1559,7 +1690,7 @@ async fn process_outputs<S: Storage + Clone + Send + Sync + 'static>(
                     };
                     if let Some(ps_lock) = ps_lock {
                         let mut ps = ps_lock.write().await;
-                        match ps.apply_entry_async(*index, *term, &data).await {
+                        match ps.apply_entry_async(*index, *term, metadata, payload).await {
                             Ok(offset) => Ok(offset),
                             Err(e) => {
                                 warn!(
@@ -1586,7 +1717,8 @@ async fn process_outputs<S: Storage + Clone + Send + Sync + 'static>(
                 // Critical for PREVIOUS_TERM entries on new leader.
                 if apply_result.is_ok() {
                     extract_and_record_producer_state(
-                        &data,
+                        metadata,
+                        payload,
                         base_offset,
                         *group_id,
                         partition_storage,

@@ -591,6 +591,45 @@ impl MultiRaft {
         Some((self.process_outputs(group_id, outputs), proposed_index))
     }
 
+    /// Proposes a split (metadata, payload) command to a specific group.
+    ///
+    /// Equivalent to `propose` but avoids re-encoding: the command is already
+    /// split into its metadata and payload parts by `encode_split`.
+    ///
+    /// Returns outputs if this node is the leader of the group.
+    /// Returns `None` if not leader or group doesn't exist.
+    pub fn propose_split(
+        &mut self,
+        group_id: GroupId,
+        metadata: Bytes,
+        payload: Bytes,
+    ) -> Option<Vec<MultiRaftOutput>> {
+        let info = self.groups.get_mut(&group_id)?;
+        let request = ClientRequest::new(metadata, payload);
+        let outputs = info.node.handle_client_request(request)?;
+        Some(self.process_outputs(group_id, outputs))
+    }
+
+    /// Proposes a split (metadata, payload) command and returns the log index.
+    ///
+    /// Equivalent to `propose_with_index` but avoids re-encoding: the command
+    /// is already split into its metadata and payload parts by `encode_split`.
+    ///
+    /// Returns `(outputs, log_index)` if this node is the leader.
+    /// Returns `None` if not leader or group doesn't exist.
+    pub fn propose_with_index_split(
+        &mut self,
+        group_id: GroupId,
+        metadata: Bytes,
+        payload: Bytes,
+    ) -> Option<(Vec<MultiRaftOutput>, LogIndex)> {
+        let info = self.groups.get_mut(&group_id)?;
+        let proposed_index = LogIndex::new(info.node.log().last_index().get() + 1);
+        let request = ClientRequest::new(metadata, payload);
+        let outputs = info.node.handle_client_request(request)?;
+        Some((self.process_outputs(group_id, outputs), proposed_index))
+    }
+
     /// Handles an incoming message for a specific group.
     ///
     /// If the group doesn't exist and `default_peers` is set, the group
@@ -645,6 +684,32 @@ impl MultiRaft {
         let info = self.groups.get_mut(&group_id)?;
         let outputs = info.node.transfer_leadership(target)?;
         Some(self.process_outputs(group_id, outputs))
+    }
+
+    /// Provides WAL entries to a follower that requested them via `NeedEntries`.
+    ///
+    /// Call this in response to a `MultiRaftOutput::NeedEntries` output after
+    /// reading the requested entries from the data WAL. Constructs and sends
+    /// an `AppendEntries` RPC to the follower.
+    ///
+    /// Returns outbound messages (when still leader), or empty when not leader.
+    pub fn provide_entries(
+        &mut self,
+        group_id: GroupId,
+        follower_id: NodeId,
+        prev_log_index: LogIndex,
+        prev_log_term: TermId,
+        entries: Vec<crate::log::LogEntry>,
+    ) -> Vec<MultiRaftOutput> {
+        let Some(info) = self.groups.get_mut(&group_id) else {
+            return Vec::new();
+        };
+        let outputs =
+            info.node.provide_entries(follower_id, prev_log_index, prev_log_term, entries);
+        let mut result = self.process_outputs(group_id, outputs);
+        // Flush outbound batches so the AppendEntries message is returned immediately.
+        result.extend(self.flush_outbound_batches());
+        result
     }
 
     /// Returns an iterator over groups where this node is the leader.

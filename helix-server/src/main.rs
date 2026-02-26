@@ -68,7 +68,7 @@ use clap::{Parser, ValueEnum};
 use helix_core::{NodeId, WriteDurability};
 use helix_runtime::PeerInfo;
 use tonic::transport::Server;
-use tracing::{info, Level};
+use tracing::{info, warn, Level};
 use tracing_subscriber::{fmt::format::FmtSpan, FmtSubscriber};
 
 use helix_server::admin_grpc::AdminService;
@@ -664,6 +664,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         helix_server::alloc_stats::spawn(port);
     }
 
+    // Pre-compute the retention window for WAL tiering.
+    // Used in the shutdown path to run a final tiering pass (same semantics
+    // as the periodic tick-driven tiering: 0 means no local deletion).
+    let local_retention_ms_shutdown = if args.local_retention_ms == 0 {
+        None
+    } else {
+        Some(args.local_retention_ms)
+    };
+
     // Start the appropriate server based on protocol.
     match args.protocol {
         Protocol::Grpc => {
@@ -673,14 +682,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info!("Created default topic with 4 partitions");
             }
 
-            // Start the gRPC server.
+            // Extract WAL pool reference before service is consumed by the server.
+            let wal_pool_for_shutdown = service.shared_wal_pool();
+
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            tokio::spawn(async move {
+                wait_for_shutdown_signal().await;
+                info!("Shutdown signal received; stopping gRPC server");
+                let _ = shutdown_tx.send(());
+            });
+
+            // Start the gRPC server with graceful shutdown.
             info!(addr = %args.listen_addr, "gRPC server listening");
             Server::builder()
                 .add_service(HelixServer::new(service))
-                .serve(args.listen_addr)
+                .serve_with_shutdown(args.listen_addr, async {
+                    let _ = shutdown_rx.await;
+                })
                 .await?;
+
+            // Graceful WAL shutdown (no new client writes can arrive now):
+            // 1. Flush write buffer to disk (fsync) so in-flight append_nowait
+            //    writes are durable and don't create holes in the WAL.
+            // 2. Upload the now-fully-durable segments to S3 so a pod restart
+            //    on a new node (ephemeral disk) can recover without re-uploading.
+            if let Some(pool) = wal_pool_for_shutdown {
+                info!("Flushing SharedWalPool to disk before exit");
+                if let Err(e) = pool.shutdown().await {
+                    warn!(error = %e, "SharedWalPool shutdown failed");
+                } else {
+                    info!("Running final tiering pass after fsync");
+                    pool.process_tiering(local_retention_ms_shutdown).await;
+                }
+            }
         }
         Protocol::Kafka => {
+            // Extract WAL pool reference before service is moved into Arc.
+            let wal_pool_for_shutdown = service.shared_wal_pool();
+
             // For Kafka mode, wrap service in Arc for sharing.
             let service = Arc::new(service);
 
@@ -746,6 +785,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let kafka_server = KafkaServer::new(service, kafka_config);
+            let shutdown_notify = kafka_server.shutdown_handle();
+
+            // Install signal handler to stop the Kafka server gracefully.
+            tokio::spawn(async move {
+                wait_for_shutdown_signal().await;
+                info!("Shutdown signal received; stopping Kafka server");
+                shutdown_notify.notify_one();
+            });
 
             info!(
                 addr = %args.listen_addr,
@@ -755,8 +802,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             kafka_server.run().await?;
+
+            // Graceful WAL shutdown (no new client writes can arrive now):
+            // 1. Flush write buffer to disk (fsync) so in-flight append_nowait
+            //    writes are durable and don't create holes in the WAL.
+            // 2. Upload the now-fully-durable segments to S3 so a pod restart
+            //    on a new node (ephemeral disk) can recover without re-uploading.
+            if let Some(pool) = wal_pool_for_shutdown {
+                info!("Flushing SharedWalPool to disk before exit");
+                if let Err(e) = pool.shutdown().await {
+                    warn!(error = %e, "SharedWalPool shutdown failed");
+                } else {
+                    info!("Running final tiering pass after fsync");
+                    pool.process_tiering(local_retention_ms_shutdown).await;
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+/// Waits for a process termination signal.
+///
+/// On Unix this listens for both SIGTERM (the standard K8s pod termination
+/// signal) and SIGINT (Ctrl+C for local development). On other platforms
+/// only SIGINT / Ctrl+C is supported.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+        let mut sigint = signal(SignalKind::interrupt())
+            .expect("failed to register SIGINT handler");
+        tokio::select! {
+            _ = sigterm.recv() => { info!("Received SIGTERM"); }
+            _ = sigint.recv() => { info!("Received SIGINT"); }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to listen for ctrl+c");
+        info!("Received Ctrl+C");
+    }
 }
