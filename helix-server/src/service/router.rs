@@ -230,7 +230,7 @@ impl PartitionRouter {
     ) -> Result<(), PartitionNotFound> {
         let handle = self.partition(group_id).await?;
         // Ignore send errors (actor may have shut down).
-        let _ = handle.send_raft_message(from, message).await;
+        let _ = handle.send_raft_message(from, message);
         Ok(())
     }
 

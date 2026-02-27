@@ -187,6 +187,15 @@ pub enum ServerError {
         partition: i32,
     },
 
+    /// Raft proposal rejected because the leader is mid-transfer.
+    ///
+    /// The leader has sent `TimeoutNow` to a transfer target and is
+    /// temporarily not accepting new proposals. The condition resolves
+    /// within one election timeout (~500ms). Clients should treat this
+    /// as retriable (Kafka error 6: `NOT_LEADER_OR_FOLLOWER`).
+    #[error("raft proposal rejected: leader transfer in progress")]
+    RaftProposalRejected,
+
     /// Internal error.
     #[error("internal error: {message}")]
     Internal {
@@ -218,6 +227,7 @@ impl ServerError {
             Self::OutOfOrderSequence { .. } => ErrorCode::OutOfOrderSequence,
             Self::ProducerFenced { .. } => ErrorCode::ProducerFenced,
             Self::Overloaded { .. } | Self::NotEnoughReplicas { .. } => ErrorCode::BrokerNotAvailable,
+            Self::RaftProposalRejected => ErrorCode::NotLeader,
             Self::Internal { .. } => ErrorCode::Unknown,
         }
     }

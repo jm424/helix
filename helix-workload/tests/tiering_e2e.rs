@@ -22,10 +22,10 @@
 //! # Running Tests
 //!
 //! ```bash
-//! # Build helix-server with S3 support
-//! cargo build --release -p helix-server --features s3
+//! # Build helix-server (S3 is enabled by default)
+//! cargo build --release -p helix-server
 //!
-//! # Run tiering tests (ignored by default)
+//! # Run tiering tests (ignored by default, require LocalStack)
 //! cargo test -p helix-workload --test tiering_e2e -- --ignored --nocapture
 //! ```
 
@@ -537,7 +537,7 @@ fn log_ack_offset_summary(acknowledged: &[(u64, Bytes)]) {
 /// 3. Waits for tiering to complete
 /// 4. Reads all messages back and verifies correctness
 #[tokio::test]
-#[ignore = "requires `LocalStack` and helix-server with S3 feature"]
+#[ignore = "requires `LocalStack` running on localhost:4566"]
 async fn test_basic_tiering_roundtrip() {
     let test_name = current_test_name();
     let run_start = Instant::now();
@@ -676,7 +676,7 @@ async fn test_basic_tiering_roundtrip() {
 /// This is the key durability test: if data can be read after all nodes
 /// restart, tiering to S3 is working correctly.
 #[tokio::test]
-#[ignore = "requires `LocalStack` and helix-server with S3 feature"]
+#[ignore = "requires `LocalStack` running on localhost:4566"]
 async fn test_tiering_survives_cluster_restart() {
     let test_name = current_test_name();
     let run_start = Instant::now();
@@ -960,7 +960,7 @@ async fn test_filesystem_tiering() {
 /// messages so that at least one full segment is sealed and eligible for
 /// tiering, with a second segment starting to absorb additional writes.
 #[tokio::test]
-#[ignore = "requires `LocalStack` and helix-server with S3 feature"]
+#[ignore = "requires `LocalStack` running on localhost:4566"]
 #[allow(clippy::too_many_lines)] // Multi-phase E2E test requires more than 100 lines.
 async fn test_shared_wal_tiering_and_recovery() {
     let test_name = current_test_name();

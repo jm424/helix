@@ -178,8 +178,13 @@ pub enum IncomingMessage {
 enum OutgoingData {
     /// A single message to send.
     Single(Message),
-    /// A batch of group messages to send.
-    Batch(Bytes),
+    /// Unencoded Raft messages; encoding and size-splitting happen in `sender_loop`.
+    ///
+    /// Moving encoding here (rather than in the output processor) means:
+    /// - No wasted allocation when a merged batch would exceed `MAX_MESSAGE_SIZE`.
+    /// - Encoding runs in parallel across peers (each peer has its own sender task).
+    /// - The output processor never blocks on encoding overhead.
+    RaftMessages(Vec<GroupMessage>),
     /// A broker heartbeat to send.
     Heartbeat(Bytes),
     /// A coalesced batch of Raft heartbeats (`AppendEntries` with no entries).
@@ -309,10 +314,10 @@ impl TransportHandle {
         let conn = peers.get(&to).ok_or(TransportError::UnknownPeer(to))?;
 
         if conn.data_senders.len() == 1 {
-            // Phase A fast path: one data connection, encode once.
-            let encoded = encode_group_batch(&messages)?;
+            // Phase A fast path: one data connection, no encoding here.
+            // Encoding happens in the sender_loop task for this peer.
             conn.data_senders[0]
-                .try_send(OutgoingData::Batch(encoded))
+                .try_send(OutgoingData::RaftMessages(messages))
                 .map_err(|_| TransportError::QueueFull(to))
         } else {
             // Phase B: shard by group_id to preserve per-group ordering across
@@ -330,9 +335,8 @@ impl TransportHandle {
                 if shard_messages.is_empty() {
                     continue;
                 }
-                let encoded = encode_group_batch(&shard_messages)?;
                 conn.data_senders[i]
-                    .try_send(OutgoingData::Batch(encoded))
+                    .try_send(OutgoingData::RaftMessages(shard_messages))
                     .map_err(|_| TransportError::QueueFull(to))?;
             }
             Ok(())
@@ -739,34 +743,89 @@ impl Transport {
 
     /// Sends `data` on `stream`. Returns `true` on success, `false` on error.
     async fn try_send(stream: &mut TcpStream, data: &OutgoingData) -> bool {
-        let result = match data {
+        match data {
+            OutgoingData::RaftMessages(messages) => {
+                // Encode in sender_loop, not in the caller. Splits into
+                // BATCH_BYTES_MAX chunks so no single TCP frame exceeds
+                // MAX_MESSAGE_SIZE and no allocation is wasted.
+                Self::send_raft_messages_chunked(stream, messages).await
+            }
             OutgoingData::Single(message) => {
-                let encoded = encode_message(message);
-                match encoded {
-                    Ok(bytes) => Self::send_bytes(stream, &bytes).await,
-                    Err(e) => Err(e.into()),
+                match encode_message(message) {
+                    Ok(bytes) => Self::send_bytes(stream, &bytes).await.is_ok(),
+                    Err(_) => false,
                 }
             }
-            OutgoingData::Batch(bytes)
-            | OutgoingData::Heartbeat(bytes)
-            | OutgoingData::CoalescedHeartbeats(bytes) => {
-                Self::send_bytes(stream, bytes).await
+            OutgoingData::Heartbeat(bytes) | OutgoingData::CoalescedHeartbeats(bytes) => {
+                Self::send_bytes(stream, bytes).await.is_ok()
             }
-        };
-        match result {
-            Ok(()) => {
-                let msg_desc = match data {
-                    OutgoingData::Single(m) => format!("single:{:?}", std::mem::discriminant(m)),
-                    OutgoingData::Batch(b) => format!("batch:{} bytes", b.len()),
-                    OutgoingData::Heartbeat(_) => "heartbeat".to_string(),
-                    OutgoingData::CoalescedHeartbeats(b) => {
-                        format!("coalesced_heartbeats:{} bytes", b.len())
-                    }
-                };
-                debug!(msg = %msg_desc, "Sent data");
-                true
+        }
+    }
+
+    /// Encodes `messages` into `BATCH_BYTES_MAX`-sized TCP frames and sends each.
+    ///
+    /// Size is estimated by summing entry byte sizes before encoding, so no
+    /// allocation is wasted on batches that would fail the size check.
+    async fn send_raft_messages_chunked(
+        stream: &mut TcpStream,
+        messages: &[GroupMessage],
+    ) -> bool {
+        if messages.is_empty() {
+            return true;
+        }
+        /// Maximum encoded bytes per TCP frame.
+        const BATCH_BYTES_MAX: usize = 4 * 1024 * 1024;
+        let mut chunk_start = 0usize;
+        let mut chunk_bytes = 0usize;
+        for (i, msg) in messages.iter().enumerate() {
+            let msg_bytes = Self::estimate_group_message_bytes(msg);
+            if chunk_bytes + msg_bytes > BATCH_BYTES_MAX && i > chunk_start {
+                if !Self::send_encoded_chunk(stream, &messages[chunk_start..i]).await {
+                    return false;
+                }
+                chunk_start = i;
+                chunk_bytes = 0;
             }
-            Err(_) => false,
+            chunk_bytes += msg_bytes;
+        }
+        Self::send_encoded_chunk(stream, &messages[chunk_start..]).await
+    }
+
+    /// Encodes `messages` with `encode_group_batch` and writes to `stream`.
+    async fn send_encoded_chunk(stream: &mut TcpStream, messages: &[GroupMessage]) -> bool {
+        if messages.is_empty() {
+            return true;
+        }
+        match encode_group_batch(messages) {
+            Ok(encoded) => Self::send_bytes(stream, &encoded).await.is_ok(),
+            Err(e) => {
+                error!(error = %e, count = messages.len(), "Failed to encode Raft message chunk");
+                false
+            }
+        }
+    }
+
+    /// Estimates the encoded byte size of a single `GroupMessage`.
+    ///
+    /// For `AppendEntries` with entries the dominant cost is the entry payloads.
+    /// All other messages are small enough that a constant overhead suffices.
+    /// This is O(n entries) with no allocations.
+    fn estimate_group_message_bytes(msg: &GroupMessage) -> usize {
+        // Per-message overhead: 4 (length prefix) + 1 (tag) + 8 (group_id) +
+        // ~90 bytes of Raft header fields (term, leader_id, indexes, etc.).
+        const OVERHEAD: usize = 103;
+        match &msg.message {
+            Message::AppendEntries(req) => {
+                // Each entry: 8 (term) + 8 (index) + 4 (meta_len) +
+                // metadata.len() + 4 (payload_len) + payload.len().
+                let entries_bytes: usize = req
+                    .entries
+                    .iter()
+                    .map(|e| 24 + e.metadata.len() + e.payload.len())
+                    .sum();
+                OVERHEAD + entries_bytes
+            }
+            _ => OVERHEAD,
         }
     }
 

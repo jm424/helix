@@ -1249,6 +1249,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt as _;
 use tokio::sync::{oneshot, watch, Mutex, Notify, RwLock};
 use tracing::error;
 
@@ -2879,61 +2880,95 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
                 .collect()
         };
 
-        let mut downloaded: u32 = 0;
-        let mut already_local: u32 = 0;
-
-        for segment_id in &remote_ids {
-            self.mark_segment_tiered(*segment_id);
-
-            if local_ids.contains(segment_id) {
-                // Already present locally — no need to download.
-                already_local += 1;
-                continue;
-            }
-
-            let key = format!("{prefix}{segment_id:08x}.wal");
-            let bytes = match store.get(&key).await {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(
-                        segment_id,
-                        key = %key,
-                        error = %e,
-                        "Failed to download segment from object store during startup"
-                    );
-                    continue;
-                }
-            };
-
-            // Validate: refuse to restore empty or header-only segments from S3.
-            // A corrupt S3 object (e.g. uploaded when only a 32-byte header
-            // existed) must not be registered in the WAL — doing so would cause
-            // "segment header too small" errors on every read of that segment.
-            if bytes.len() <= crate::segment::SEGMENT_HEADER_SIZE {
-                warn!(
-                    segment_id,
-                    key = %key,
-                    bytes = bytes.len(),
-                    "Skipping corrupt/empty segment from S3 (header-only or truncated)"
-                );
-                continue;
-            }
-
-            // Write to WAL directory.
-            match self.restore_segment_from_bytes(*segment_id, bytes).await {
-                Ok(()) => {
-                    info!(segment_id, "Downloaded segment from object store");
-                    downloaded += 1;
-                }
-                Err(e) => {
-                    warn!(
-                        segment_id,
-                        error = %e,
-                        "Failed to restore downloaded segment"
-                    );
-                }
-            }
+        // Mark all remote segments as tiered (fast sync operation) before
+        // launching concurrent downloads.
+        for &segment_id in &remote_ids {
+            self.mark_segment_tiered(segment_id);
         }
+
+        // Download missing segments concurrently.
+        //
+        // S3 GET latency (~100ms) dominates over local disk writes (~5ms), so
+        // parallelising downloads yields an N-fold speedup on startup time.
+        // DOWNLOAD_CONCURRENCY=16 is grounded in reference implementations
+        // (object_store uses 10, Neon uses 16 for startup replay) and comfortably
+        // below the S3 per-prefix rate limit of 5,500 GET/s.
+        //
+        // Each future downloads its segment then acquires the WAL mutex to write
+        // to disk. Disk writes serialise through the mutex; S3 GETs run in
+        // parallel. Peak in-flight memory is bounded at
+        // DOWNLOAD_CONCURRENCY × max_segment_size.
+        const DOWNLOAD_CONCURRENCY: usize = 16;
+
+        let inner = Arc::clone(&self.inner);
+        let local_ids = Arc::new(local_ids);
+
+        // Each element: (downloaded: bool, already_local: bool).
+        let results: Vec<(bool, bool)> = futures::stream::iter(remote_ids.iter().copied())
+            .map(|segment_id| {
+                let store = Arc::clone(&store);
+                let prefix = prefix.clone();
+                let local_ids = Arc::clone(&local_ids);
+                let inner = Arc::clone(&inner);
+                async move {
+                    if local_ids.contains(&segment_id) {
+                        // Already present locally — no need to download.
+                        return (false, true);
+                    }
+
+                    let key = format!("{prefix}{segment_id:08x}.wal");
+                    let bytes = match store.get(&key).await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!(
+                                segment_id,
+                                key = %key,
+                                error = %e,
+                                "Failed to download segment from object store during startup"
+                            );
+                            return (false, false);
+                        }
+                    };
+
+                    // Validate: refuse to restore empty or header-only segments
+                    // from S3. A corrupt S3 object must not be registered in the
+                    // WAL — doing so would cause "segment header too small" errors
+                    // on every read.
+                    if bytes.len() <= crate::segment::SEGMENT_HEADER_SIZE {
+                        warn!(
+                            segment_id,
+                            key = %key,
+                            bytes = bytes.len(),
+                            "Skipping corrupt/empty segment from S3 (header-only or truncated)"
+                        );
+                        return (false, false);
+                    }
+
+                    // Write to WAL directory. The WAL mutex serialises disk writes
+                    // while S3 downloads run concurrently.
+                    let mut wal = inner.wal.lock().await;
+                    match wal.restore_segment_from_bytes(segment_id, bytes).await {
+                        Ok(()) => {
+                            info!(segment_id, "Downloaded segment from object store");
+                            (true, false)
+                        }
+                        Err(e) => {
+                            warn!(
+                                segment_id,
+                                error = %e,
+                                "Failed to restore downloaded segment"
+                            );
+                            (false, false)
+                        }
+                    }
+                }
+            })
+            .buffer_unordered(DOWNLOAD_CONCURRENCY)
+            .collect()
+            .await;
+
+        let downloaded: u32 = results.iter().filter(|(d, _)| *d).count() as u32;
+        let already_local: u32 = results.iter().filter(|(_, a)| *a).count() as u32;
 
         info!(
             remote_count = remote_ids.len(),
@@ -2945,22 +2980,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
         Ok(downloaded)
     }
 
-    /// Writes raw segment bytes back to the local WAL directory.
-    ///
-    /// Used by `download_missing_segments()` to restore segments downloaded
-    /// from the object store.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the write fails.
-    async fn restore_segment_from_bytes(
-        &self,
-        segment_id: u64,
-        bytes: Bytes,
-    ) -> WalResult<()> {
-        let mut wal = self.inner.wal.lock().await;
-        wal.restore_segment_from_bytes(segment_id, bytes).await
-    }
 }
 
 /// Background task that batches writes and syncs.
@@ -3446,11 +3465,14 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalPool<S> {
     ///
     /// Returns an error if listing the object store fails.
     pub async fn download_missing_segments(&self) -> WalResult<u32> {
-        let mut total: u32 = 0;
-        for coordinator in &self.coordinators {
-            total += coordinator.download_missing_segments().await?;
-        }
-        Ok(total)
+        // Run all coordinator downloads concurrently. Each coordinator manages
+        // an independent WAL directory, so there is no shared state between them.
+        let futures = self
+            .coordinators
+            .iter()
+            .map(SharedWalCoordinator::download_missing_segments);
+        let counts = futures::future::try_join_all(futures).await?;
+        Ok(counts.iter().sum())
     }
 }
 

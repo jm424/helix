@@ -1238,14 +1238,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             // term so the controller Raft group can be initialised with correct
             // compacted state, preventing log divergence after restart.
             //
-            // We use max_contiguous (not max_raft_index) to handle WAL holes
-            // created when `append_nowait` writes are lost on an unclean
-            // shutdown. If index N is missing but N+1 exists, using
-            // max_raft_index as the guard would cause the persistence path to
-            // skip re-writing N when the leader re-delivers it (N > max
-            // evaluates to false), making the hole permanent. Using
-            // max_contiguous lets the guard pass for any index > max_contiguous,
-            // so the hole is filled when the leader catches us up.
+            // We use max_raft_index (not max_contiguous) for both the Raft
+            // commit_index and the WAL write guard. The state machine is built
+            // from ALL entries found in the WAL during startup replay (not just
+            // up to max_contiguous), so the Raft commit_index must match to
+            // prevent re-delivery of already-applied entries.
+            // max_contiguous is tracked for diagnostics only (wal_holes log field).
             let (ctl_commit_index, ctl_commit_term) = {
                 // Compute max_contiguous: the highest N where all indices
                 // from min_raft_index..=N are present (no gaps).
@@ -1285,11 +1283,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
 
                 let mut state = controller_state.write().await;
                 let mut count = 0u64;
-                let max_raft_index = controller_entries_raw
+                let (max_raft_index, max_raft_term) = controller_entries_raw
                     .iter()
-                    .map(|e| e.header.raft_index)
-                    .max()
-                    .unwrap_or(0);
+                    .max_by_key(|e| e.header.raft_index)
+                    .map(|e| (e.header.raft_index, e.header.term))
+                    .unwrap_or((0, 0));
                 for entry in &controller_entries_raw {
                     if let Some(cmd) =
                         crate::controller::ControllerCommand::decode(&entry.payload)
@@ -1308,10 +1306,14 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                 drop(state);
                 // Tell tick tasks to skip WAL writes for entries at or
                 // below this index — they're already persisted.
-                // Use max_contiguous so holes above it are re-filled by
-                // leader catch-up.
+                // Use max_raft_index (the full WAL tip) so the WAL guard and
+                // Raft commit_index agree with the state machine, which was
+                // built from all entries. Using max_contiguous here caused a
+                // panic: the state machine saw entries above max_contiguous
+                // from startup replay, then Raft re-delivered them (via
+                // NeedEntries catch-up), and the monotonicity check fired.
                 tick::CONTROLLER_LAST_PERSISTED_INDEX
-                    .store(max_contiguous_index, std::sync::atomic::Ordering::Relaxed);
+                    .store(max_raft_index, std::sync::atomic::Ordering::Relaxed);
                 if count > 0 {
                     info!(
                         replayed = count,
@@ -1322,13 +1324,14 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                         "Replayed controller state from SharedWAL"
                     );
                 }
-                (max_contiguous_index, max_contiguous_term)
+                (max_raft_index, max_raft_term)
             };
 
             // Replay offset group entries into per-group state machines.
-            // Use max_contiguous (not max_raft_index) for the same reason as
-            // the controller: holes above max_contiguous must be re-fillable
-            // by leader catch-up, not masked by the persistence guard.
+            // Use max_raft_index (not max_contiguous) for the Raft commit_index
+            // and WAL guard so they agree with the state machine, which is built
+            // from all entries found in the WAL. max_contiguous is logged for
+            // diagnostics only.
             for (slot, entries) in offset_entries_raw.into_iter().enumerate() {
                 // Compute max_contiguous for this offset group.
                 let (max_contiguous_index, max_contiguous_term) = {
@@ -1357,8 +1360,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                     }
                 };
 
-                let max_raft_index =
-                    entries.iter().map(|e| e.header.raft_index).max().unwrap_or(0);
+                let (max_raft_index, max_raft_term) = entries
+                    .iter()
+                    .max_by_key(|e| e.header.raft_index)
+                    .map(|e| (e.header.raft_index, e.header.term))
+                    .unwrap_or((0, 0));
                 let mut count = 0u64;
                 let mut state = offset_group_states_vec[slot].write().await;
                 for entry in entries {
@@ -1376,11 +1382,16 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                     }
                 }
                 drop(state);
-                offset_commit_indices[slot] = (max_contiguous_index, max_contiguous_term);
+                offset_commit_indices[slot] = (max_raft_index, max_raft_term);
                 // Guard: skip re-persisting recovered entries in tick task.
-                // Use max_contiguous so holes above it are re-filled on catch-up.
+                // Use max_raft_index so the guard and commit_index agree with
+                // the state machine (built from all WAL entries). Using
+                // max_contiguous caused a panic: the offset group state machine
+                // had entries above max_contiguous from startup replay, then
+                // Raft re-delivered them via catch-up, tripping the
+                // monotonicity assertion in offset_group.rs.
                 tick::OFFSET_GROUP_LAST_PERSISTED[slot]
-                    .store(max_contiguous_index, std::sync::atomic::Ordering::Relaxed);
+                    .store(max_raft_index, std::sync::atomic::Ordering::Relaxed);
                 if count > 0 {
                     info!(
                         slot,

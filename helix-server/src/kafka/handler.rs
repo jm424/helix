@@ -754,9 +754,17 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
                 );
                 (0, 9) // BROKER_NOT_AVAILABLE - triggers client retry
             }
+            Err(crate::ServerError::RaftProposalRejected) => {
+                debug!(
+                    topic = %topic,
+                    partition,
+                    "Raft proposal rejected (leader transfer in progress), client should retry"
+                );
+                (0, 6) // NOT_LEADER_OR_FOLLOWER - retriable
+            }
             Err(e) => {
                 warn!(topic = %topic, partition, error = %e, "Produce failed");
-                (0, -1_i16) // UNKNOWN - generic server error
+                (0, 7_i16) // REQUEST_TIMED_OUT - retriable fallback for unclassified errors
             }
         }
     }

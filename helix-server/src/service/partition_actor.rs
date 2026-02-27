@@ -46,17 +46,24 @@ use crate::storage::{
     PartitionCommand as StoragePartitionCommand,
 };
 
-/// Ticks without a commit before the actor considers quorum lost.
+/// Real-time duration without a commit before the actor considers quorum lost.
 ///
 /// When the actor is leader with pending proposals and no `CommitEntry`
-/// arrives for this many ticks, new proposals are rejected immediately
-/// with `NotEnoughReplicas`. This prevents accumulating uncommittable
-/// entries in the Raft log when a majority of followers are unreachable.
+/// arrives within this wall-clock duration, new proposals are rejected
+/// immediately with `NotEnoughReplicas`. This prevents accumulating
+/// uncommittable entries in the Raft log when a majority of followers
+/// are unreachable.
 ///
-/// Set to 20 ticks (= 1 second at 50ms tick interval), which is 2×
-/// the default election timeout. This gives enough time for normal
-/// replication latency while detecting sustained quorum loss quickly.
-const QUORUM_LOSS_TICKS: u32 = 20;
+/// Wall-clock time (not tick count) is used to prevent false quorum-loss
+/// detection when the output channel is backlogged and Raft ticks pile up
+/// in the actor's command queue. In a burst-processing scenario, 20 ticks
+/// can be processed in far less than 1 second of real time, incorrectly
+/// triggering the quorum-loss path even though the cluster is healthy.
+///
+/// Set to 2 seconds: 4× the default election timeout (10 ticks × 50ms =
+/// 500ms). This allows ample time for replication round-trips under load
+/// while still detecting sustained quorum loss quickly.
+const QUORUM_LOSS_DURATION: Duration = Duration::from_secs(2);
 
 // =============================================================================
 // Commands
@@ -511,18 +518,31 @@ impl PartitionActorHandle {
 
     /// Sends a Raft message to the partition actor.
     ///
+    /// Non-blocking: if the command channel is full the message is dropped and
+    /// a warning is logged. Dropping is correct — the sender's Raft state machine
+    /// will retransmit on the next heartbeat or timeout. Blocking here would
+    /// stall the transport receive task, preventing delivery of responses to
+    /// other groups and completing the output-channel deadlock.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the actor has shut down.
-    pub async fn send_raft_message(
+    /// Returns an error only if the actor has shut down (channel closed).
+    pub fn send_raft_message(
         &self,
         from: NodeId,
         message: Message,
     ) -> Result<(), PartitionError> {
-        self.tx
-            .send(PartitionCommand::RaftMessage { from, message })
-            .await
-            .map_err(|_| PartitionError::ActorShutdown)
+        match self.tx.try_send(PartitionCommand::RaftMessage { from, message }) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                warn!(
+                    group_id = self.group_id.get(),
+                    "RaftMessage dropped: command channel full (Raft will retransmit)"
+                );
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(PartitionError::ActorShutdown),
+        }
     }
 
     /// Checks if this node is the leader for this partition.
@@ -741,6 +761,7 @@ pub fn spawn_partition_actor(
         cmd_rx,
         output_tx,
         pending_proposals: HashMap::new(),
+        send_message_drops: 0,
     };
     tokio::spawn(actor.run());
 
@@ -815,7 +836,8 @@ pub fn spawn_partition_actor_shared_with_batch_config(
         batcher_stats,
         global_backpressure,
         producer_state: PartitionProducerState::new(),
-        ticks_without_commit: 0,
+        pending_without_commit_since: None,
+        send_message_drops: 0,
     };
     tokio::spawn(actor.run());
 
@@ -940,14 +962,23 @@ struct PartitionActorShared {
     /// leadership changes. Sequence checks run after the `offset_seeded`
     /// gate, guaranteeing fully-rebuilt state.
     producer_state: PartitionProducerState,
-    /// Ticks since the last `CommitEntry` was received while leader.
-    /// Reset to 0 on every commit. Incremented on every tick when
-    /// there are pending (uncommitted) proposals. Used to detect
-    /// quorum loss: if proposals aren't committing for an extended
-    /// period, the leader has likely lost its quorum and should
-    /// reject new writes immediately rather than accumulating
-    /// uncommittable entries.
-    ticks_without_commit: u32,
+    /// Wall-clock instant when pending proposals were first seen without a commit.
+    ///
+    /// Set to `Some(Instant::now())` on the first tick where the actor is
+    /// leader with pending proposals and no commit has arrived. Reset to
+    /// `None` on every `CommitEntry`, on leadership loss, or when there are
+    /// no pending proposals. When `elapsed() >= QUORUM_LOSS_DURATION`, the
+    /// leader is considered to have lost quorum and new writes are rejected.
+    ///
+    /// Wall-clock time is used instead of tick count to prevent false quorum-loss
+    /// detection when ticks pile up in the actor's command queue under output
+    /// channel backpressure and are then processed in a rapid burst.
+    pending_without_commit_since: Option<Instant>,
+    /// Count of `SendMessages` outputs dropped because the output channel was full.
+    ///
+    /// Dropping is correct: Raft retransmits `AppendEntries` on the next tick
+    /// (50ms). Blocking instead would deadlock the actor under backpressure.
+    send_message_drops: u64,
 }
 
 impl PartitionActorShared {
@@ -1224,12 +1255,9 @@ impl PartitionActorShared {
             );
             self.process_raft_outputs(outputs).await;
         } else {
-            let err = ServerError::Internal {
-                message: "Raft rejected proposal".to_string(),
-            };
             self.release_global_backpressure(&batch_info);
             for result_tx in batch_info.result_txs {
-                let _ = result_tx.send(Err(err.clone()));
+                let _ = result_tx.send(Err(ServerError::RaftProposalRejected));
             }
         }
     }
@@ -1342,10 +1370,16 @@ impl PartitionActorShared {
 
         // Track quorum liveness: if we're leader with pending proposals
         // but no commits are arriving, we've likely lost quorum.
+        //
+        // Start the wall-clock on the first tick with pending proposals.
+        // Reset when there are no pending proposals or we lose leadership.
+        // CommitEntry resets it unconditionally in process_raft_outputs.
         if self.raft_node.is_leader() && self.has_pending_proposals() {
-            self.ticks_without_commit += 1;
+            if self.pending_without_commit_since.is_none() {
+                self.pending_without_commit_since = Some(Instant::now());
+            }
         } else {
-            self.ticks_without_commit = 0;
+            self.pending_without_commit_since = None;
         }
     }
 
@@ -1357,10 +1391,11 @@ impl PartitionActorShared {
 
     /// Returns true if the leader appears to have lost quorum.
     ///
-    /// Detected when proposals have been pending for `QUORUM_LOSS_TICKS`
-    /// without any commits arriving.
-    const fn is_quorum_lost(&self) -> bool {
-        self.ticks_without_commit >= QUORUM_LOSS_TICKS
+    /// Detected when proposals have been pending for `QUORUM_LOSS_DURATION`
+    /// of wall-clock time without any commits arriving.
+    fn is_quorum_lost(&self) -> bool {
+        self.pending_without_commit_since
+            .is_some_and(|t| t.elapsed() >= QUORUM_LOSS_DURATION)
     }
 
     async fn handle_raft_message(
@@ -1530,11 +1565,8 @@ impl PartitionActorShared {
         let Some(outputs) =
             self.raft_node.handle_client_request(request)
         else {
-            let err = ServerError::Internal {
-                message: "Raft rejected proposal".to_string(),
-            };
             for tx in result_txs {
-                let _ = tx.send(Err(err.clone()));
+                let _ = tx.send(Err(ServerError::RaftProposalRejected));
             }
             self.backpressure
                 .subtract_batch(batch_bytes, batch_size);
@@ -1839,13 +1871,28 @@ impl PartitionActorShared {
                             messages: vec![gm],
                         },
                     };
-                    if self.output_tx.send(grouped).await.is_err() {
-                        warn!("Failed to send message output");
+                    // Non-blocking: a full output channel means the output
+                    // processor is busy. Dropping is correct — Raft retransmits
+                    // AppendEntries on the next tick (50ms). Blocking here
+                    // would deadlock: the output processor can't drain the
+                    // channel while the actor is blocked, and the transport
+                    // receive task can't deliver responses while blocked on
+                    // a full command channel.
+                    if self.output_tx.try_send(grouped).is_err() {
+                        self.send_message_drops += 1;
+                        if self.send_message_drops % 100 == 1 {
+                            warn!(
+                                group_id = self.group_id.get(),
+                                drops = self.send_message_drops,
+                                "SendMessages dropped: output channel full \
+                                 (Raft will retransmit)"
+                            );
+                        }
                     }
                 }
                 RaftOutput::CommitEntry { index, term, metadata, payload } => {
                     // Quorum is alive — a commit means majority replicated.
-                    self.ticks_without_commit = 0;
+                    self.pending_without_commit_since = None;
 
                     // Advance next_base_offset and record producer state
                     // from committed entries (including PREVIOUS_TERM).
@@ -1903,7 +1950,7 @@ impl PartitionActorShared {
                     self.is_leader_cache
                         .store(true, Ordering::Relaxed);
                     self.offset_seeded = false;
-                    self.ticks_without_commit = 0;
+                    self.pending_without_commit_since = None;
                     // Reset producer state — will be rebuilt from
                     // PREVIOUS_TERM CommitEntry events before
                     // offset_seeded is set.
@@ -2029,6 +2076,7 @@ struct PartitionActor {
         LogIndex,
         oneshot::Sender<Result<ProposeResult, PartitionError>>,
     >,
+    send_message_drops: u64,
 }
 
 impl PartitionActor {
@@ -2177,13 +2225,24 @@ impl PartitionActor {
                         group_id: self.group_id,
                         message,
                     };
-                    let _ = self
+                    if self
                         .output_tx
-                        .send(PartitionOutput::SendMessages {
+                        .try_send(PartitionOutput::SendMessages {
                             to,
                             messages: vec![gm],
                         })
-                        .await;
+                        .is_err()
+                    {
+                        self.send_message_drops += 1;
+                        if self.send_message_drops % 100 == 1 {
+                            warn!(
+                                group_id = self.group_id.get(),
+                                drops = self.send_message_drops,
+                                "SendMessages dropped: output channel full \
+                                 (Raft will retransmit)"
+                            );
+                        }
+                    }
                 }
                 RaftOutput::CommitEntry { index, term, metadata, payload } => {
                     if let Some(reply) =
@@ -2408,7 +2467,8 @@ mod tests {
             batcher_stats: None,
             global_backpressure: BackpressureState::noop(),
             producer_state: PartitionProducerState::new(),
-            ticks_without_commit: 0,
+            pending_without_commit_since: None,
+            send_message_drops: 0,
         };
         (actor, output_rx, cmd_tx)
     }

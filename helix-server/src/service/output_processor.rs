@@ -261,7 +261,10 @@ async fn process_message_batch<
     //
     // Heartbeats (AppendEntries with no entries) are sent via the compact coalesced
     // format, saving ~34% bytes per heartbeat. Non-heartbeat messages (AppendEntries
-    // with entries, responses, vote requests, etc.) use the standard batch format.
+    // with entries, responses, vote requests, etc.) are passed to send_batch as
+    // Vec<GroupMessage>; encoding and size-splitting happen in the transport
+    // sender_loop (one task per peer), so the output processor never allocates
+    // a BytesMut that would be thrown away on a size check.
     let send_phase_start = std::time::Instant::now();
     let mut send_call_count: u64 = 0;
     for (to, messages) in sends.drain(..) {
@@ -453,6 +456,7 @@ fn report_output_processor_stats(
         "{label}"
     );
 }
+
 
 /// Handles `SendMessages` output by sending via transport.
 async fn handle_send_messages<T: TransportService>(
