@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use bytes::Bytes;
 use helix_core::{
-    LogIndex, Offset, PartitionId, ProducerEpoch, ProducerId, Record, SequenceNum, TopicId,
+    GroupId, LogIndex, Offset, PartitionId, ProducerEpoch, ProducerId, Record, SequenceNum, TopicId,
 };
 use helix_wal::{SharedEntry, SharedWalHandle, Storage, TokioStorage};
 use tracing::{debug, info};
@@ -46,6 +46,7 @@ fn extract_payload_preview(blob: &Bytes) -> String {
 
 use crate::error::{ServerError, ServerResult};
 use crate::producer_state::{PartitionProducerState, SequenceCheckResult};
+use crate::snapshot::{SnapshotError, SnapshotMeta, Snapshottable};
 use crate::storage::{
     patch_kafka_base_offset, BlobFormat, DurablePartition,
     DurablePartitionConfig, DurablePartitionError, Partition, PartitionCommand, PartitionConfig,
@@ -132,8 +133,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         tiering_config: Option<&TieringConfig>,
         topic_id: TopicId,
         partition_id: PartitionId,
+        group_id: GroupId,
     ) -> Result<Self, DurablePartitionError> {
-        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id);
+        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id)
+            .with_group_id(group_id);
         if let Some(s3_cfg) = s3_config {
             config = config.with_s3_config(s3_cfg.clone());
         } else if let Some(object_dir) = object_storage_dir {
@@ -178,8 +181,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         tiering_config: Option<&TieringConfig>,
         topic_id: TopicId,
         partition_id: PartitionId,
+        group_id: GroupId,
     ) -> Result<Self, DurablePartitionError> {
-        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id);
+        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id)
+            .with_group_id(group_id);
         if let Some(object_dir) = object_storage_dir {
             config = config.with_object_storage_dir(object_dir);
         }
@@ -224,13 +229,15 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         data_dir: &PathBuf,
         topic_id: TopicId,
         partition_id: PartitionId,
+        group_id: GroupId,
         wal_handle: SharedWalHandle<S>,
         recovered_entries: Vec<SharedEntry>,
         object_storage_dir: Option<&PathBuf>,
         s3_config: Option<&S3Config>,
         tiering_config: Option<&TieringConfig>,
     ) -> Result<Self, DurablePartitionError> {
-        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id);
+        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id)
+            .with_group_id(group_id);
         if let Some(s3_cfg) = s3_config {
             config = config.with_s3_config(s3_cfg.clone());
         } else if let Some(object_dir) = object_storage_dir {
@@ -266,12 +273,14 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         data_dir: &PathBuf,
         topic_id: TopicId,
         partition_id: PartitionId,
+        group_id: GroupId,
         wal_handle: SharedWalHandle<S>,
         recovered_entries: Vec<SharedEntry>,
         object_storage_dir: Option<&PathBuf>,
         tiering_config: Option<&TieringConfig>,
     ) -> Result<Self, DurablePartitionError> {
-        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id);
+        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id)
+            .with_group_id(group_id);
         if let Some(object_dir) = object_storage_dir {
             config = config.with_object_storage_dir(object_dir);
         }
@@ -307,13 +316,15 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         data_dir: &PathBuf,
         topic_id: TopicId,
         partition_id: PartitionId,
+        group_id: GroupId,
         wal_handle: SharedWalHandle<S>,
         state: PartitionRecoveryState,
         object_storage_dir: Option<&PathBuf>,
         s3_config: Option<&S3Config>,
         tiering_config: Option<&TieringConfig>,
     ) -> Result<Self, DurablePartitionError> {
-        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id);
+        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id)
+            .with_group_id(group_id);
         if let Some(s3_cfg) = s3_config {
             config = config.with_s3_config(s3_cfg.clone());
         } else if let Some(object_dir) = object_storage_dir {
@@ -348,12 +359,14 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         data_dir: &PathBuf,
         topic_id: TopicId,
         partition_id: PartitionId,
+        group_id: GroupId,
         wal_handle: SharedWalHandle<S>,
         state: PartitionRecoveryState,
         object_storage_dir: Option<&PathBuf>,
         tiering_config: Option<&TieringConfig>,
     ) -> Result<Self, DurablePartitionError> {
-        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id);
+        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id)
+            .with_group_id(group_id);
         if let Some(object_dir) = object_storage_dir {
             config = config.with_object_storage_dir(object_dir);
         }
@@ -415,6 +428,19 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     #[must_use]
     pub const fn last_applied(&self) -> LogIndex {
         self.last_applied
+    }
+
+    /// Returns the WAL auto-counter index of the most recently applied entry.
+    ///
+    /// Returns `0` for in-memory partitions (no WAL). Used by the snapshot
+    /// coordinator to track how many entries have accumulated since the last
+    /// snapshot.
+    #[must_use]
+    pub fn last_applied_wal_index(&self) -> u64 {
+        match &self.inner {
+            PartitionStorageInner::Durable(p) => p.last_applied_wal_index(),
+            PartitionStorageInner::InMemory(_) => 0,
+        }
     }
 
     /// Returns the term of the last applied Raft log entry.
@@ -1113,6 +1139,66 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         match &self.inner {
             PartitionStorageInner::InMemory(_) => None,
             PartitionStorageInner::Durable(p) => p.wal_floor().await,
+        }
+    }
+}
+
+// ============================================================================
+// Snapshottable impl
+// ============================================================================
+
+impl<S: Storage + Clone + Send + Sync + 'static> Snapshottable for PartitionStorage<S> {
+    /// Serializes the current committed state for durable partitions.
+    ///
+    /// Returns `SnapshotError::Truncated` for in-memory partitions — they are
+    /// ephemeral and do not need persistent snapshots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotError`] if the underlying durable partition fails to
+    /// serialize, or if called on an in-memory partition.
+    fn take_snapshot(&self) -> Result<(SnapshotMeta, Bytes), SnapshotError> {
+        match &self.inner {
+            PartitionStorageInner::Durable(p) => p.take_snapshot(),
+            PartitionStorageInner::InMemory(_) => Err(SnapshotError::Truncated {
+                context: "in-memory partition does not support snapshots".to_string(),
+            }),
+        }
+    }
+
+    /// Replaces the state machine from a snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from the underlying durable partition. No-ops for
+    /// in-memory partitions.
+    fn apply_snapshot(&mut self, meta: &SnapshotMeta, data: &[u8]) -> Result<(), SnapshotError> {
+        match &mut self.inner {
+            PartitionStorageInner::Durable(p) => {
+                p.apply_snapshot(meta, data)?;
+                self.last_applied = LogIndex::new(meta.last_included_index);
+                self.last_applied_term = helix_core::TermId::new(meta.last_included_term);
+                Ok(())
+            }
+            PartitionStorageInner::InMemory(_) => Ok(()),
+        }
+    }
+
+    /// Minimum WAL index still needed for correct recovery.
+    ///
+    /// Delegates to the inner durable partition. Returns `None` for in-memory
+    /// partitions (no WAL to protect).
+    fn min_required_wal_index(&self) -> Option<u64> {
+        match &self.inner {
+            PartitionStorageInner::Durable(p) => p.min_required_wal_index(),
+            PartitionStorageInner::InMemory(_) => None,
+        }
+    }
+
+    fn set_last_snapshot_wal_index(&mut self, wal_index: u64) {
+        match &mut self.inner {
+            PartitionStorageInner::Durable(p) => p.set_last_snapshot_wal_index(wal_index),
+            PartitionStorageInner::InMemory(_) => {}
         }
     }
 }

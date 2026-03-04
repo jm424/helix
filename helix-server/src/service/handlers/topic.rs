@@ -78,6 +78,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     data_dir,
                     topic_id,
                     partition_id,
+                    group_id,
                     wal_handle,
                     state,
                     self.object_storage_dir.as_ref(),
@@ -89,6 +90,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     data_dir,
                     topic_id,
                     partition_id,
+                    group_id,
                     wal_handle,
                     state,
                     self.object_storage_dir.as_ref(),
@@ -109,6 +111,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                         self.tiering_config.as_ref(),
                         topic_id,
                         partition_id,
+                        group_id,
                     )
                     .await
                     .map_err(|e| ServerError::Internal {
@@ -126,6 +129,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                         self.tiering_config.as_ref(),
                         topic_id,
                         partition_id,
+                        group_id,
                     )
                     .await
                     .map_err(|e| ServerError::Internal {
@@ -272,7 +276,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     outputs = propose_outputs.len(),
                     "Single-node actor: processing propose outputs"
                 );
-                crate::service::tick::process_controller_outputs(
+                let _ = crate::service::tick::process_controller_outputs(
                     &propose_outputs,
                     &self.multi_raft,
                     &self.partition_storage,
@@ -294,6 +298,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     &self.offset_group_states,
                     &self.pending_offset_proposals,
                     &self.actor_backpressure,
+                    None, // log_trailing_entries: single-node uses default
                 )
                 .await;
             }
@@ -562,7 +567,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
         // For single-node actor mode, process propose outputs immediately.
         if is_single_node_actor && !propose_outputs.is_empty() {
             if let (Some(router), Some(output_tx)) = (&self.actor_router, &self.actor_output_tx) {
-                crate::service::tick::process_controller_outputs(
+                let _ = crate::service::tick::process_controller_outputs(
                     &propose_outputs,
                     &self.multi_raft,
                     &self.partition_storage,
@@ -584,6 +589,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     &self.offset_group_states,
                     &self.pending_offset_proposals,
                     &self.actor_backpressure,
+                    None, // log_trailing_entries: single-node uses default
                 )
                 .await;
             }

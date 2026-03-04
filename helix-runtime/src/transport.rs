@@ -770,11 +770,11 @@ impl Transport {
         stream: &mut TcpStream,
         messages: &[GroupMessage],
     ) -> bool {
+        /// Maximum encoded bytes per TCP frame.
+        const BATCH_BYTES_MAX: usize = 4 * 1024 * 1024;
         if messages.is_empty() {
             return true;
         }
-        /// Maximum encoded bytes per TCP frame.
-        const BATCH_BYTES_MAX: usize = 4 * 1024 * 1024;
         let mut chunk_start = 0usize;
         let mut chunk_bytes = 0usize;
         for (i, msg) in messages.iter().enumerate() {
@@ -873,27 +873,31 @@ impl Transport {
                 // never reaches the peer. Keepalive detects this within
                 // TCP_KEEPALIVE_SECS + TCP_KEEPALIVE_SECS * TCP_KEEPALIVE_CNT
                 // seconds (~30s) when the send buffer is empty.
-                let sock = socket2::SockRef::from(&stream);
-                let keepalive = socket2::TcpKeepalive::new()
-                    .with_time(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS))
-                    .with_interval(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS))
-                    .with_retries(TCP_KEEPALIVE_CNT);
-                if let Err(e) = sock.set_tcp_keepalive(&keepalive) {
-                    warn!(peer_id = peer_id.get(), error = %e, "Failed to set TCP keepalive");
-                }
+                // socket2 does not work under MadSim (shims TcpStream).
+                #[cfg(not(madsim))]
+                {
+                    let sock = socket2::SockRef::from(&stream);
+                    let keepalive = socket2::TcpKeepalive::new()
+                        .with_time(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS))
+                        .with_interval(std::time::Duration::from_secs(TCP_KEEPALIVE_SECS))
+                        .with_retries(TCP_KEEPALIVE_CNT);
+                    if let Err(e) = sock.set_tcp_keepalive(&keepalive) {
+                        warn!(peer_id = peer_id.get(), error = %e, "Failed to set TCP keepalive");
+                    }
 
-                // Set TCP_USER_TIMEOUT to detect half-open connections when
-                // the send buffer has pending unacked data. SO_KEEPALIVE is
-                // suppressed by the retransmission timer in this case, so
-                // keepalive alone cannot detect a wedged connection under
-                // load. TCP_USER_TIMEOUT aborts after N ms of unacknowledged
-                // data, matching the ~30s bound of our keepalive config.
-                // Linux only; macOS does not support this socket option.
-                #[cfg(target_os = "linux")]
-                if let Err(e) = sock.set_tcp_user_timeout(Some(
-                    std::time::Duration::from_secs(TCP_USER_TIMEOUT_SECS),
-                )) {
-                    warn!(peer_id = peer_id.get(), error = %e, "Failed to set TCP_USER_TIMEOUT");
+                    // Set TCP_USER_TIMEOUT to detect half-open connections when
+                    // the send buffer has pending unacked data. SO_KEEPALIVE is
+                    // suppressed by the retransmission timer in this case, so
+                    // keepalive alone cannot detect a wedged connection under
+                    // load. TCP_USER_TIMEOUT aborts after N ms of unacknowledged
+                    // data, matching the ~30s bound of our keepalive config.
+                    // Linux only; macOS does not support this socket option.
+                    #[cfg(target_os = "linux")]
+                    if let Err(e) = sock.set_tcp_user_timeout(Some(
+                        std::time::Duration::from_secs(TCP_USER_TIMEOUT_SECS),
+                    )) {
+                        warn!(peer_id = peer_id.get(), error = %e, "Failed to set TCP_USER_TIMEOUT");
+                    }
                 }
 
                 Ok(stream)

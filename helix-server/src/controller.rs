@@ -9,13 +9,19 @@
 //! This follows the Redpanda controller partition pattern.
 
 use std::collections::HashMap;
-
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use helix_core::{GroupId, NodeId, PartitionId, TopicId};
+use tracing::warn;
+
+use crate::snapshot::{SnapshotError, SnapshotMeta, Snapshottable};
 
 
 /// Controller partition group ID (always 0).
 pub const CONTROLLER_GROUP_ID: GroupId = GroupId::new(0);
+
+// Snapshot format constants.
+const CONTROLLER_SNAPSHOT_MAGIC: &[u8; 4] = b"CSNP";
+const CONTROLLER_SNAPSHOT_VERSION: u32 = 1;
 
 // -----------------------------------------------------------------------------
 // ControllerCommand
@@ -345,6 +351,25 @@ pub struct ControllerState {
     /// Last heartbeat timestamp (ms) for each broker.
     /// Brokers that miss heartbeats are considered dead and excluded from metadata.
     broker_heartbeats: HashMap<NodeId, u64>,
+
+    /// Raft index of the last applied entry (used as `last_included_index` in snapshots).
+    pub last_applied_index: u64,
+
+    /// Raft term of the last applied entry.
+    pub last_applied_term: u64,
+
+    /// `SharedWAL` index of the last entry applied to this state machine.
+    ///
+    /// Set by the tick task on every committed entry. Placed into
+    /// `SnapshotMeta::last_included_wal_index` when taking a snapshot.
+    pub last_applied_wal_index: u64,
+
+    /// `SharedWAL` index at which this group's most recent snapshot was taken.
+    ///
+    /// `None` until the first snapshot is durably saved, or until the state is
+    /// restored from a snapshot via `apply_snapshot`. Used by
+    /// `min_required_wal_index` to tell the WAL how far back to retain entries.
+    pub last_snapshot_wal_index: Option<u64>,
 }
 
 impl ControllerState {
@@ -360,6 +385,10 @@ impl ControllerState {
             // range (OFFSET_GROUP_ID_BASE = 1_000_000) that never collides.
             next_group_id: 1,
             broker_heartbeats: HashMap::new(),
+            last_applied_index: 0,
+            last_applied_term: 0,
+            last_applied_wal_index: 0,
+            last_snapshot_wal_index: None,
         }
     }
 
@@ -620,6 +649,243 @@ impl ControllerState {
         self.broker_heartbeats.insert(node_id, timestamp_ms);
     }
 
+    // -------------------------------------------------------------------------
+    // Snapshot serialization (CSNP v1 format)
+    // -------------------------------------------------------------------------
+
+    /// Serializes this state to the CSNP v1 binary format.
+    ///
+    /// The format is unchanged since the initial release so that snapshots
+    /// written by older nodes can be read by newer nodes and vice-versa.
+    fn serialize_snapshot(&self) -> Bytes {
+        let topic_count = self.topics.len();
+        let assignment_count = self.assignments.len();
+        let mut buf = BytesMut::with_capacity(64 + topic_count * 64 + assignment_count * 48);
+
+        buf.put_slice(CONTROLLER_SNAPSHOT_MAGIC);
+        buf.put_u32_le(CONTROLLER_SNAPSHOT_VERSION);
+        buf.put_u64_le(self.last_applied_index);
+        buf.put_u64_le(self.last_applied_term);
+
+        // Topics (sorted for determinism).
+        let mut topics: Vec<_> = self.topics.values().collect();
+        topics.sort_by_key(|t| t.topic_id.get());
+        #[allow(clippy::cast_possible_truncation)]
+        buf.put_u32_le(topics.len() as u32);
+        for topic in &topics {
+            let name_bytes = topic.name.as_bytes();
+            #[allow(clippy::cast_possible_truncation)]
+            buf.put_u32_le(name_bytes.len() as u32);
+            buf.put_slice(name_bytes);
+            buf.put_u64_le(topic.topic_id.get());
+            buf.put_u32_le(topic.partition_count);
+            buf.put_u32_le(topic.replication_factor);
+        }
+
+        // Assignments (sorted for determinism).
+        let mut assignments: Vec<_> = self.assignments.iter().collect();
+        assignments.sort_by_key(|((tid, pid), _)| (tid.get(), pid.get()));
+        #[allow(clippy::cast_possible_truncation)]
+        buf.put_u32_le(assignments.len() as u32);
+        for ((topic_id, partition_id), assignment) in &assignments {
+            buf.put_u64_le(topic_id.get());
+            buf.put_u64_le(partition_id.get());
+            buf.put_u64_le(assignment.group_id.get());
+            #[allow(clippy::cast_possible_truncation)]
+            buf.put_u32_le(assignment.replicas.len() as u32);
+            for replica in &assignment.replicas {
+                buf.put_u64_le(replica.get());
+            }
+            match assignment.leader {
+                Some(leader) => {
+                    buf.put_u8(1);
+                    buf.put_u64_le(leader.get());
+                }
+                None => buf.put_u8(0),
+            }
+        }
+
+        buf.put_u64_le(self.next_topic_id);
+        buf.put_u64_le(self.next_group_id);
+
+        // CRC32 over all bytes above.
+        let checksum = crc32fast::hash(&buf);
+        buf.put_u32_le(checksum);
+
+        buf.freeze()
+    }
+
+    /// Deserializes CSNP v1 bytes into a fresh `ControllerState`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `SnapshotError` if the data is truncated, has bad magic,
+    /// an unsupported version, or a CRC mismatch.
+    fn deserialize_snapshot(data: &[u8]) -> Result<Self, SnapshotError> {
+        if data.len() < 32 {
+            return Err(SnapshotError::Truncated {
+                context: "snapshot shorter than minimum header (32 bytes)".to_string(),
+            });
+        }
+
+        // Verify CRC over all bytes except the trailing 4-byte checksum.
+        let payload = &data[..data.len() - 4];
+        let expected = crc32fast::hash(payload);
+        let stored = u32::from_le_bytes(
+            data[data.len() - 4..].try_into().expect("4-byte slice"),
+        );
+        if expected != stored {
+            return Err(SnapshotError::ChecksumMismatch { expected, got: stored });
+        }
+
+        let mut buf = data;
+
+        if &buf[..4] != CONTROLLER_SNAPSHOT_MAGIC {
+            return Err(SnapshotError::BadMagic);
+        }
+        buf.advance(4);
+
+        let version = buf.get_u32_le();
+        if version != CONTROLLER_SNAPSHOT_VERSION {
+            return Err(SnapshotError::UnknownVersion { version });
+        }
+
+        let last_index = buf.get_u64_le();
+        let last_term = buf.get_u64_le();
+        let topic_count = buf.get_u32_le() as usize;
+
+        let mut state = Self::new();
+        state.last_applied_index = last_index;
+        state.last_applied_term = last_term;
+
+        Self::decode_topics(&mut buf, &mut state, topic_count).ok_or_else(|| {
+            SnapshotError::Truncated { context: "topics section".to_string() }
+        })?;
+
+        if buf.remaining() < 4 {
+            return Err(SnapshotError::Truncated {
+                context: "assignment count".to_string(),
+            });
+        }
+        let assignment_count = buf.get_u32_le() as usize;
+
+        Self::decode_assignments(&mut buf, &mut state, assignment_count).ok_or_else(|| {
+            SnapshotError::Truncated { context: "assignments section".to_string() }
+        })?;
+
+        if buf.remaining() < 16 {
+            return Err(SnapshotError::Truncated {
+                context: "allocator fields (next_topic_id, next_group_id)".to_string(),
+            });
+        }
+        state.next_topic_id = buf.get_u64_le();
+        state.next_group_id = buf.get_u64_le();
+
+        Ok(state)
+    }
+
+    fn decode_topics(buf: &mut &[u8], state: &mut Self, count: usize) -> Option<()> {
+        for _ in 0..count {
+            if buf.remaining() < 4 {
+                warn!("Controller snapshot truncated at topic");
+                return None;
+            }
+            let name_len = buf.get_u32_le() as usize;
+            if buf.remaining() < name_len + 20 {
+                warn!("Controller snapshot truncated in topic name");
+                return None;
+            }
+            let name = String::from_utf8(buf.copy_to_bytes(name_len).to_vec()).ok()?;
+            let topic_id = TopicId::new(buf.get_u64_le());
+            let partition_count = buf.get_u32_le();
+            let replication_factor = buf.get_u32_le();
+            state.topics.insert(
+                name.clone(),
+                TopicInfo { topic_id, name: name.clone(), partition_count, replication_factor },
+            );
+            state.topics_by_id.insert(topic_id, name);
+        }
+        Some(())
+    }
+
+    fn decode_assignments(
+        buf: &mut &[u8],
+        state: &mut Self,
+        count: usize,
+    ) -> Option<()> {
+        for _ in 0..count {
+            if buf.remaining() < 28 {
+                warn!("Controller snapshot truncated at assignment");
+                return None;
+            }
+            let topic_id = TopicId::new(buf.get_u64_le());
+            let partition_id = PartitionId::new(buf.get_u64_le());
+            let group_id = GroupId::new(buf.get_u64_le());
+            let replica_count = buf.get_u32_le() as usize;
+            if buf.remaining() < replica_count * 8 + 1 {
+                warn!("Controller snapshot truncated in replicas");
+                return None;
+            }
+            let replicas: Vec<NodeId> =
+                (0..replica_count).map(|_| NodeId::new(buf.get_u64_le())).collect();
+            let has_leader = buf.get_u8();
+            let leader = if has_leader == 1 {
+                if buf.remaining() < 8 {
+                    warn!("Controller snapshot truncated at leader");
+                    return None;
+                }
+                Some(NodeId::new(buf.get_u64_le()))
+            } else {
+                None
+            };
+            state.assignments.insert(
+                (topic_id, partition_id),
+                PartitionAssignment { group_id, replicas, leader },
+            );
+        }
+        Some(())
+    }
+
+}
+
+// =============================================================================
+// Snapshottable impl
+// =============================================================================
+
+impl Snapshottable for ControllerState {
+    fn take_snapshot(&self) -> Result<(SnapshotMeta, Bytes), SnapshotError> {
+        let bytes = self.serialize_snapshot();
+        let meta = SnapshotMeta {
+            last_included_index: self.last_applied_index,
+            last_included_term: self.last_applied_term,
+            last_included_wal_index: self.last_applied_wal_index,
+            group_id: CONTROLLER_GROUP_ID,
+        };
+        Ok((meta, bytes))
+    }
+
+    fn apply_snapshot(&mut self, meta: &SnapshotMeta, data: &[u8]) -> Result<(), SnapshotError> {
+        assert_eq!(
+            meta.group_id, CONTROLLER_GROUP_ID,
+            "apply_snapshot called with wrong group_id"
+        );
+        let mut state = Self::deserialize_snapshot(data)?;
+        // The WAL index comes from the caller (meta), not from the serialized
+        // bytes (which predate the WAL index field).
+        state.last_applied_wal_index = meta.last_included_wal_index;
+        // Mark that we now have a confirmed snapshot floor.
+        state.last_snapshot_wal_index = Some(meta.last_included_wal_index);
+        *self = state;
+        Ok(())
+    }
+
+    fn min_required_wal_index(&self) -> Option<u64> {
+        self.last_snapshot_wal_index.map(|w| w + 1)
+    }
+
+    fn set_last_snapshot_wal_index(&mut self, wal_index: u64) {
+        self.last_snapshot_wal_index = Some(wal_index);
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -790,5 +1056,286 @@ mod tests {
 
         assert!(!state.topic_exists("test-topic"));
         assert_eq!(state.assignments.len(), 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Snapshottable tests
+    // -------------------------------------------------------------------------
+
+    fn make_populated_state() -> ControllerState {
+        let mut state = ControllerState::new();
+        let nodes = vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)];
+
+        let create = ControllerCommand::CreateTopic {
+            name: "my-topic".to_string(),
+            partition_count: 2,
+            replication_factor: 3,
+        };
+        let follow_ups = state.apply(&create, &nodes);
+        for cmd in follow_ups {
+            let _ = state.apply(&cmd, &nodes);
+        }
+
+        // Simulate a few entries being applied.
+        state.last_applied_index = 42;
+        state.last_applied_term = 3;
+        state.last_applied_wal_index = 100;
+        state
+    }
+
+    #[test]
+    fn test_snapshottable_roundtrip() {
+        let original = make_populated_state();
+
+        let (meta, bytes) = original.take_snapshot().expect("take_snapshot failed");
+
+        assert_eq!(meta.last_included_index, 42);
+        assert_eq!(meta.last_included_term, 3);
+        assert_eq!(meta.last_included_wal_index, 100);
+        assert_eq!(meta.group_id, CONTROLLER_GROUP_ID);
+
+        let mut restored = ControllerState::new();
+        restored.apply_snapshot(&meta, &bytes).expect("apply_snapshot failed");
+
+        assert_eq!(restored.last_applied_index, original.last_applied_index);
+        assert_eq!(restored.last_applied_term, original.last_applied_term);
+        assert_eq!(restored.last_applied_wal_index, 100);
+        assert_eq!(restored.last_snapshot_wal_index, Some(100));
+        assert_eq!(restored.topics.len(), original.topics.len());
+        assert_eq!(restored.assignments.len(), original.assignments.len());
+        assert_eq!(restored.next_topic_id, original.next_topic_id);
+        assert_eq!(restored.next_group_id, original.next_group_id);
+    }
+
+    #[test]
+    fn test_snapshottable_crc_mismatch() {
+        let state = make_populated_state();
+        let (_meta, bytes) = state.take_snapshot().unwrap();
+
+        let mut corrupted = bytes.to_vec();
+        // Flip a bit in the middle of the payload.
+        let mid = corrupted.len() / 2;
+        corrupted[mid] ^= 0xFF;
+
+        let result = ControllerState::deserialize_snapshot(&corrupted);
+        assert!(
+            matches!(result, Err(SnapshotError::ChecksumMismatch { .. })),
+            "expected ChecksumMismatch, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_snapshottable_bad_magic() {
+        let state = make_populated_state();
+        let (_meta, bytes) = state.take_snapshot().unwrap();
+
+        // Recompute CRC after corrupting magic so we get past CRC check.
+        let mut corrupted = bytes.to_vec();
+        corrupted[0] = b'X';
+        let payload_len = corrupted.len() - 4;
+        let new_crc = crc32fast::hash(&corrupted[..payload_len]);
+        corrupted[payload_len..].copy_from_slice(&new_crc.to_le_bytes());
+
+        let result = ControllerState::deserialize_snapshot(&corrupted);
+        assert!(
+            matches!(result, Err(SnapshotError::BadMagic)),
+            "expected BadMagic, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_snapshottable_empty_state() {
+        // An empty state (no topics, no assignments) should round-trip cleanly.
+        let mut state = ControllerState::new();
+        state.last_applied_index = 1;
+        state.last_applied_term = 1;
+        state.last_applied_wal_index = 1;
+
+        let (meta, bytes) = state.take_snapshot().unwrap();
+        let mut restored = ControllerState::new();
+        restored.apply_snapshot(&meta, &bytes).unwrap();
+
+        assert_eq!(restored.topics.len(), 0);
+        assert_eq!(restored.assignments.len(), 0);
+        assert_eq!(restored.last_snapshot_wal_index, Some(1));
+    }
+
+    #[test]
+    fn test_min_required_wal_index() {
+        let mut state = ControllerState::new();
+
+        // Before any snapshot: must return None (full replay required).
+        assert_eq!(state.min_required_wal_index(), None);
+
+        // After apply_snapshot, returns wal_index + 1.
+        state.last_applied_wal_index = 50;
+        let (meta, bytes) = state.take_snapshot().unwrap();
+        state.apply_snapshot(&meta, &bytes).unwrap();
+
+        assert_eq!(state.min_required_wal_index(), Some(51));
+    }
+
+    #[test]
+    fn test_snapshottable_backward_compat_with_old_serialize() {
+        // Bytes produced by serialize_snapshot (the stable on-disk format) must be
+        // readable by the new deserialize_snapshot path without wrapping in an envelope.
+        let state = make_populated_state();
+        let old_bytes = state.serialize_snapshot();
+
+        let result = ControllerState::deserialize_snapshot(&old_bytes);
+        assert!(result.is_ok(), "old-format bytes must be readable: {result:?}");
+        let restored = result.unwrap();
+        assert_eq!(restored.topics.len(), state.topics.len());
+        assert_eq!(restored.assignments.len(), state.assignments.len());
+    }
+
+    #[test]
+    fn test_snapshot_equivalence() {
+        // Property: snapshot at K + replay of K+1..N == full replay from scratch.
+        //
+        // Build a deterministic entry sequence, apply the first half, snapshot,
+        // restore, apply the second half, then compare observable state to a
+        // fresh state machine that applied all entries without snapshotting.
+        use helix_core::{NodeId, TopicId};
+
+        let nodes = vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)];
+
+        // Commands to apply in order (each creates a distinct observable state change).
+        let topic_names = ["alpha", "beta", "gamma", "delta", "epsilon"];
+
+        // Build the full sequence: CreateTopic for each name + their AssignPartition follow-ups.
+        type Seq = Vec<ControllerCommand>;
+        let mut full_sequence: Seq = Vec::new();
+        {
+            let mut tmp = ControllerState::new();
+            for name in &topic_names {
+                let cmd = ControllerCommand::CreateTopic {
+                    name: (*name).to_string(),
+                    partition_count: 2,
+                    replication_factor: 3,
+                };
+                let follow_ups = tmp.apply(&cmd, &nodes);
+                full_sequence.push(cmd);
+                for fu in follow_ups {
+                    let _ = tmp.apply(&fu, &nodes);
+                    full_sequence.push(fu);
+                }
+            }
+        }
+
+        let n = full_sequence.len();
+        assert!(n > 2, "need at least two entries for a meaningful split");
+        let k = n / 2;
+
+        // Full replay: apply all N commands from scratch.
+        let mut state_full = ControllerState::new();
+        for (i, cmd) in full_sequence.iter().enumerate() {
+            state_full.last_applied_wal_index = (i as u64) + 1;
+            let _ = state_full.apply(cmd, &nodes);
+        }
+        state_full.last_applied_index = n as u64;
+        state_full.last_applied_term = 1;
+
+        // Hybrid: apply K commands, snapshot, restore, apply remaining commands.
+        let mut state_at_k = ControllerState::new();
+        for (i, cmd) in full_sequence[..k].iter().enumerate() {
+            state_at_k.last_applied_wal_index = (i as u64) + 1;
+            let _ = state_at_k.apply(cmd, &nodes);
+        }
+        state_at_k.last_applied_index = k as u64;
+        state_at_k.last_applied_term = 1;
+
+        let (meta, body) = state_at_k.take_snapshot().expect("take_snapshot at K");
+
+        let mut state_hybrid = ControllerState::new();
+        state_hybrid.apply_snapshot(&meta, &body).expect("apply_snapshot");
+
+        for (i, cmd) in full_sequence[k..].iter().enumerate() {
+            state_hybrid.last_applied_wal_index = (k as u64) + (i as u64) + 1;
+            let _ = state_hybrid.apply(cmd, &nodes);
+        }
+        state_hybrid.last_applied_index = n as u64;
+        state_hybrid.last_applied_term = 1;
+
+        // Compare observable state: topics, assignments, and Raft metadata.
+        let full_topics: Vec<TopicId> = {
+            let mut v: Vec<_> = state_full.topics().map(|t| t.topic_id).collect();
+            v.sort_by_key(|id| id.get());
+            v
+        };
+        let hybrid_topics: Vec<TopicId> = {
+            let mut v: Vec<_> = state_hybrid.topics().map(|t| t.topic_id).collect();
+            v.sort_by_key(|id| id.get());
+            v
+        };
+        assert_eq!(full_topics, hybrid_topics, "topics differ");
+
+        let full_asgn_count: usize = state_full.all_assignments().count();
+        let hybrid_asgn_count: usize = state_hybrid.all_assignments().count();
+        assert_eq!(full_asgn_count, hybrid_asgn_count, "assignment counts differ");
+
+        assert_eq!(
+            state_full.last_applied_index,
+            state_hybrid.last_applied_index,
+            "last_applied_index differs"
+        );
+    }
+
+    #[test]
+    fn test_controller_snapshot_raft_pipeline() {
+        // Phase 3 pipeline: take_snapshot → encode_envelope → decode_envelope → apply_snapshot.
+        //
+        // The Raft Snapshot struct only carries (index, term, data bytes).
+        // last_included_wal_index and group_id must therefore survive the Raft
+        // wire as part of the data payload via encode_envelope/decode_envelope.
+        use crate::snapshot::{decode_envelope, encode_envelope};
+
+        let original = make_populated_state(); // last_applied_wal_index=100, last_applied_index=42
+
+        let (meta, body) = original.take_snapshot().expect("take_snapshot");
+
+        // Leader side (build_snapshot_payload_for_follower): pack body + meta into wire bytes.
+        let wire_bytes = encode_envelope(&meta, &body);
+
+        // Follower side (handle_apply_snapshot): decode wire bytes back to meta + body.
+        let (decoded_meta, decoded_body) =
+            decode_envelope(&wire_bytes).expect("decode_envelope");
+
+        // The envelope must preserve fields absent from the Raft Snapshot struct.
+        assert_eq!(decoded_meta.last_included_index, meta.last_included_index);
+        assert_eq!(decoded_meta.last_included_term, meta.last_included_term);
+        assert_eq!(
+            decoded_meta.last_included_wal_index,
+            meta.last_included_wal_index,
+            "wal_index must survive Raft wire transmission"
+        );
+        assert_eq!(
+            decoded_meta.group_id,
+            meta.group_id,
+            "group_id must survive Raft wire transmission"
+        );
+
+        // Apply decoded snapshot to a fresh state machine — must restore full state.
+        let mut restored = ControllerState::new();
+        restored
+            .apply_snapshot(&decoded_meta, &decoded_body)
+            .expect("apply_snapshot from decoded envelope");
+
+        assert_eq!(
+            restored.last_applied_wal_index,
+            original.last_applied_wal_index,
+            "wal index must be restored after envelope roundtrip"
+        );
+        assert_eq!(restored.last_applied_index, original.last_applied_index);
+        assert_eq!(
+            restored.topics.len(),
+            original.topics.len(),
+            "topics must be preserved"
+        );
+        assert_eq!(
+            restored.last_snapshot_wal_index,
+            Some(original.last_applied_wal_index),
+            "last_snapshot_wal_index must be set after apply_snapshot"
+        );
     }
 }

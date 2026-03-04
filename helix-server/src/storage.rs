@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use helix_core::{ConsumerGroupId, ConsumerId, Offset, PartitionId, Record, TopicId};
+use helix_core::{ConsumerGroupId, ConsumerId, GroupId, Offset, PartitionId, Record, TopicId};
 
 // -----------------------------------------------------------------------------
 // StoredBlob
@@ -215,6 +215,7 @@ use helix_wal::{
     SharedWalHandle, Storage, TokioStorage, WalConfig,
 };
 use tracing::{debug, info, warn};
+use crate::snapshot::{SnapshotError, SnapshotMeta, Snapshottable};
 
 // -----------------------------------------------------------------------------
 // WalBackend
@@ -1545,6 +1546,11 @@ pub struct DurablePartitionConfig {
     pub topic_id: TopicId,
     /// Partition ID.
     pub partition_id: PartitionId,
+    /// Raft `GroupId` for this partition, used to tag snapshot metadata.
+    ///
+    /// Defaults to `GroupId::new(0)` (unset). Must be set via `with_group_id`
+    /// before calling `DurablePartition::take_snapshot`.
+    pub group_id: GroupId,
     /// Whether to sync after every write (legacy, use `flush_interval` instead).
     ///
     /// If `true`, sets `flush_interval` to zero for immediate sync.
@@ -1593,6 +1599,7 @@ impl DurablePartitionConfig {
             data_dir: data_dir.into(),
             topic_id,
             partition_id,
+            group_id: GroupId::new(0), // Must be set via with_group_id before snapshotting.
             sync_on_write: false, // Default to batched syncs for performance.
             flush_interval: Duration::from_millis(1), // Default: 1ms batching.
             tiering: None,
@@ -1603,6 +1610,16 @@ impl DurablePartitionConfig {
             local_retention_ms: None,
             segment_config: None,
         }
+    }
+
+    /// Sets the Raft `GroupId` for this partition.
+    ///
+    /// Required before calling `DurablePartition::take_snapshot`. The group ID
+    /// is embedded in snapshot metadata so the store can validate ownership.
+    #[must_use]
+    pub const fn with_group_id(mut self, group_id: GroupId) -> Self {
+        self.group_id = group_id;
+        self
     }
 
     /// Enables sync after every write (legacy).
@@ -1786,6 +1803,12 @@ pub struct PartitionRecoveryState {
     prev_entry_index: u64,
     /// Number of non-contiguous index gaps detected (for logging).
     gap_count: u64,
+    /// High-watermark from a partition snapshot loaded at startup.
+    ///
+    /// `None` for WAL-entry-only recovery (the default path). When set,
+    /// `open_with_recovery_state` uses this value if `blob_log_end_offset()`
+    /// is zero (i.e., no tail entries were applied after the snapshot).
+    pub snapshot_high_watermark: Option<Offset>,
 }
 
 impl Default for PartitionRecoveryState {
@@ -1807,11 +1830,97 @@ impl Default for PartitionRecoveryState {
             last_applied_term: 0,
             prev_entry_index: 0,
             gap_count: 0,
+            snapshot_high_watermark: None,
         }
     }
 }
 
 impl PartitionRecoveryState {
+    /// Constructs recovery state restored from a partition snapshot.
+    ///
+    /// Parses the PSNP v1 body (as returned by [`SnapshotStore::load`]) and
+    /// pre-populates `BlobIndex` and `snapshot_high_watermark`.
+    /// Subsequent [`apply_entry`] calls append WAL tail entries on top.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic in practice. Internal `expect` calls operate on slices
+    /// with statically known lengths that are verified by the preceding length
+    /// checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotError`] if the body is corrupt or uses an unknown
+    /// format version.
+    pub fn from_snapshot(
+        meta: &SnapshotMeta,
+        data: &[u8],
+    ) -> Result<Self, SnapshotError> {
+        // Minimum: 4 magic + 4 version + 4 count + 8 hwm + 4 crc = 24 bytes.
+        if data.len() < 24 {
+            return Err(SnapshotError::Truncated {
+                context: format!(
+                    "partition snapshot too short: {} bytes (need ≥ 24)",
+                    data.len(),
+                ),
+            });
+        }
+        // Verify CRC over all bytes preceding the trailing 4-byte checksum.
+        let payload = &data[..data.len() - 4];
+        let expected = crc32fast::hash(payload);
+        let stored = u32::from_le_bytes(
+            data[data.len() - 4..].try_into().expect("4-byte slice"),
+        );
+        if expected != stored {
+            return Err(SnapshotError::ChecksumMismatch { expected, got: stored });
+        }
+        let mut buf = data;
+        if &buf[..4] != PARTITION_SNAPSHOT_MAGIC {
+            return Err(SnapshotError::BadMagic);
+        }
+        buf.advance(4);
+        let version = buf.get_u32_le();
+        if version != PARTITION_SNAPSHOT_VERSION {
+            return Err(SnapshotError::UnknownVersion { version });
+        }
+        #[allow(clippy::cast_possible_truncation)] // entry_count bounded by body length
+        let entry_count = buf.get_u32_le() as usize;
+        let min_remaining = entry_count * 20 + 8 + 4;
+        if buf.len() < min_remaining {
+            return Err(SnapshotError::Truncated {
+                context: format!(
+                    "need {min_remaining} bytes for {entry_count} entries + hwm + crc; got {}",
+                    buf.len(),
+                ),
+            });
+        }
+        let mut blob_index = BlobIndex::new();
+        for _ in 0..entry_count {
+            let base_offset = buf.get_u64_le();
+            let wal_index = buf.get_u64_le();
+            let record_count = buf.get_u32_le();
+            blob_index.push(base_offset, wal_index, record_count);
+        }
+        let high_watermark = Offset::new(buf.get_u64_le());
+        Ok(Self {
+            cache: Partition::new(PartitionConfig::new(
+                helix_core::TopicId::new(0),
+                helix_core::PartitionId::new(0),
+            )),
+            blob_index,
+            entry_count: 0,
+            first_entry_index: 0,
+            last_applied_index: meta.last_included_index,
+            last_applied_wal_index: meta.last_included_wal_index,
+            last_applied_term: meta.last_included_term,
+            // Set prev_entry_index to the snapshot WAL index so the first
+            // tail entry (wal_index + 1) does not falsely trigger gap detection.
+            prev_entry_index: meta.last_included_wal_index,
+            gap_count: 0,
+            snapshot_high_watermark: Some(high_watermark),
+        })
+    }
+
     /// Applies a single WAL entry to the recovery state.
     ///
     /// Called in the streaming recovery callback for each winning entry.
@@ -1890,6 +1999,13 @@ pub struct DurablePartition<S: Storage + Clone + Send + Sync + 'static> {
     last_applied_wal_index: u64,
     /// Term of the last applied WAL entry.
     last_applied_term: u64,
+    /// WAL index of the last confirmed snapshot, if any.
+    ///
+    /// Set by `apply_snapshot` when restoring from a snapshot, and by the
+    /// tick loop after a successful `take_snapshot`. Used by
+    /// `min_required_wal_index` to tell the WAL layer which segments can be
+    /// safely evicted.
+    last_snapshot_wal_index: Option<u64>,
     /// Tiering manager for object storage uploads (optional).
     tiering: Option<TieringBackend<S>>,
     /// Set of segment IDs that have been registered with tiering.
@@ -2144,6 +2260,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             last_applied_index,
             last_applied_wal_index: last_applied_index,
             last_applied_term,
+            last_snapshot_wal_index: None,
             tiering,
             tiered_segments: std::collections::HashSet::new(),
             progress,
@@ -2290,6 +2407,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             last_applied_index,
             last_applied_wal_index,
             last_applied_term,
+            last_snapshot_wal_index: None,
             tiering,
             tiered_segments: std::collections::HashSet::new(),
             progress,
@@ -2320,8 +2438,15 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
 
         let mut cache = state.cache;
 
-        // Set high watermark from recovered state.
-        let recovered_hwm = cache.blob_log_end_offset();
+        // High-watermark: use blob_log_end_offset from applied WAL tail entries.
+        // If no tail entries were applied (snapshot-only recovery), fall back to
+        // the snapshot hwm stored in state. Takes the maximum so that the tail
+        // (when present) always wins.
+        let blob_end = cache.blob_log_end_offset();
+        let recovered_hwm = state
+            .snapshot_high_watermark
+            .filter(|&snap| snap.get() > blob_end.get())
+            .unwrap_or(blob_end);
         cache.set_high_watermark(recovered_hwm);
 
         info!(
@@ -2370,6 +2495,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             last_applied_index: state.last_applied_index,
             last_applied_wal_index: state.last_applied_wal_index,
             last_applied_term: state.last_applied_term,
+            last_snapshot_wal_index: None,
             tiering,
             tiered_segments: std::collections::HashSet::new(),
             progress,
@@ -3817,6 +3943,174 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
     pub fn trim_blob_index(&mut self, min_wal_index: u64) {
         self.blob_index.truncate_below(min_wal_index);
     }
+
+    /// Sets `last_snapshot_wal_index` after the tick loop confirms a snapshot.
+    ///
+    /// Called by the tick loop immediately after `SnapshotStore::save` returns.
+    /// Advances the WAL floor so segments covered by the snapshot can be evicted.
+    pub const fn mark_snapshot_complete(&mut self, wal_index: u64) {
+        self.last_snapshot_wal_index = Some(wal_index);
+    }
+}
+
+// ============================================================================
+// Snapshottable for DurablePartition  (PSNP v1)
+// ============================================================================
+
+/// Magic bytes identifying the data-partition snapshot body format.
+const PARTITION_SNAPSHOT_MAGIC: &[u8; 4] = b"PSNP";
+/// Current PSNP body format version.
+const PARTITION_SNAPSHOT_VERSION: u32 = 1;
+
+/// PSNP v1 body layout (opaque to `SnapshotStore`):
+///
+/// ```text
+/// [magic: 4 bytes]          b"PSNP"
+/// [version: u32 LE]         1
+/// [entry_count: u32 LE]     number of BlobIndex entries
+/// [entries: 20 * count]     base_offset u64 LE, wal_index u64 LE, record_count u32 LE
+/// [high_watermark: u64 LE]  committed consumer offset
+/// [crc32: u32 LE]           checksum over all preceding bytes
+/// ```
+///
+/// `tiered_segments` is never stored — it is reconstructed at startup via S3
+/// LIST. The Raft index, term, and WAL index live in `SnapshotMeta` (returned
+/// by `take_snapshot`) and are not duplicated in the body bytes.
+impl<S: Storage + Clone + Send + Sync + 'static> Snapshottable for DurablePartition<S> {
+    /// Serializes the `BlobIndex` and high-watermark to PSNP v1 body bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.group_id` is still the default `GroupId::new(0)`.
+    /// Call `DurablePartitionConfig::with_group_id` before snapshotting.
+    ///
+    /// # Errors
+    ///
+    /// Currently infallible; returns `Ok` unconditionally. The `Result` return
+    /// type satisfies the `Snapshottable` trait contract.
+    fn take_snapshot(&self) -> Result<(SnapshotMeta, Bytes), SnapshotError> {
+        assert!(
+            self.config.group_id.get() != 0,
+            "DurablePartition::take_snapshot: group_id not set — call with_group_id"
+        );
+
+        let entries = &self.blob_index.entries;
+        // 4 magic + 4 version + 4 count + 20 per entry + 8 hwm + 4 crc
+        #[allow(clippy::cast_possible_truncation)]
+        let entry_count = entries.len() as u32;
+        let capacity = 4 + 4 + 4 + (entry_count as usize) * 20 + 8 + 4;
+        let mut buf = BytesMut::with_capacity(capacity);
+
+        buf.put_slice(PARTITION_SNAPSHOT_MAGIC);
+        buf.put_u32_le(PARTITION_SNAPSHOT_VERSION);
+        buf.put_u32_le(entry_count);
+
+        for e in entries {
+            buf.put_u64_le(e.base_offset);
+            buf.put_u64_le(e.wal_index);
+            buf.put_u32_le(e.record_count);
+        }
+
+        buf.put_u64_le(self.cache.high_watermark().get());
+
+        let checksum = crc32fast::hash(&buf);
+        buf.put_u32_le(checksum);
+
+        let meta = SnapshotMeta {
+            last_included_index: self.last_applied_index,
+            last_included_term: self.last_applied_term,
+            last_included_wal_index: self.last_applied_wal_index,
+            group_id: self.config.group_id,
+        };
+
+        Ok((meta, buf.freeze()))
+    }
+
+    /// Restores the `BlobIndex` and high-watermark from PSNP v1 body bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SnapshotError` if the data is truncated, has bad magic, an
+    /// unsupported version, or a CRC mismatch.
+    fn apply_snapshot(&mut self, meta: &SnapshotMeta, data: &[u8]) -> Result<(), SnapshotError> {
+        assert_eq!(
+            meta.group_id, self.config.group_id,
+            "apply_snapshot: group_id mismatch"
+        );
+
+        // Minimum: 4 magic + 4 version + 4 count + 8 hwm + 4 crc = 24 bytes.
+        if data.len() < 24 {
+            return Err(SnapshotError::Truncated {
+                context: "partition snapshot shorter than minimum header (24 bytes)".to_string(),
+            });
+        }
+
+        // Verify CRC over all bytes except the trailing 4-byte checksum.
+        let payload = &data[..data.len() - 4];
+        let expected = crc32fast::hash(payload);
+        let stored =
+            u32::from_le_bytes(data[data.len() - 4..].try_into().expect("4-byte slice"));
+        if expected != stored {
+            return Err(SnapshotError::ChecksumMismatch { expected, got: stored });
+        }
+
+        let mut buf = data;
+
+        if &buf[..4] != PARTITION_SNAPSHOT_MAGIC {
+            return Err(SnapshotError::BadMagic);
+        }
+        buf.advance(4);
+
+        let version = buf.get_u32_le();
+        if version != PARTITION_SNAPSHOT_VERSION {
+            return Err(SnapshotError::UnknownVersion { version });
+        }
+
+        let entry_count = buf.get_u32_le() as usize;
+        // Remaining bytes must hold all entries (20 bytes each) + hwm + crc.
+        let min_remaining = entry_count * 20 + 8 + 4;
+        if buf.len() < min_remaining {
+            return Err(SnapshotError::Truncated {
+                context: format!(
+                    "expected {min_remaining} more bytes for {entry_count} entries + hwm + crc; got {}",
+                    buf.len()
+                ),
+            });
+        }
+
+        let mut new_blob_index = BlobIndex::new();
+        for _ in 0..entry_count {
+            let base_offset = buf.get_u64_le();
+            let wal_index = buf.get_u64_le();
+            let record_count = buf.get_u32_le();
+            new_blob_index.push(base_offset, wal_index, record_count);
+        }
+
+        let high_watermark = Offset::new(buf.get_u64_le());
+
+        // Replace state atomically.
+        self.blob_index = new_blob_index;
+        self.cache.set_high_watermark(high_watermark);
+        self.last_applied_index = meta.last_included_index;
+        self.last_applied_wal_index = meta.last_included_wal_index;
+        self.last_applied_term = meta.last_included_term;
+        self.last_snapshot_wal_index = Some(meta.last_included_wal_index);
+
+        Ok(())
+    }
+
+    /// Returns the minimum WAL index this partition still needs.
+    ///
+    /// Returns `Some(W + 1)` after a confirmed snapshot at WAL index `W`, so
+    /// the WAL layer knows segments `[0, W]` can be evicted. Returns `None`
+    /// before any snapshot, requiring full WAL replay on recovery.
+    fn min_required_wal_index(&self) -> Option<u64> {
+        self.last_snapshot_wal_index.map(|w| w + 1)
+    }
+
+    fn set_last_snapshot_wal_index(&mut self, wal_index: u64) {
+        self.last_snapshot_wal_index = Some(wal_index);
+    }
 }
 
 /// Error type for durable partition operations.
@@ -4876,5 +5170,221 @@ mod tests {
 
             coordinator.shutdown().await.unwrap();
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Snapshottable for DurablePartition (PSNP v1)
+    // -------------------------------------------------------------------------
+
+    /// Helper: create a DurablePartition with `group_id` set, write two blobs,
+    /// and set HWM = 5. Returns the partition and the temp dir (to keep alive).
+    async fn make_snapshot_partition(
+        group_id: GroupId,
+    ) -> (DurablePartition<TokioStorage>, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = DurablePartitionConfig::new(
+            temp_dir.path(),
+            TopicId::new(1),
+            PartitionId::new(0),
+        )
+        .with_group_id(group_id);
+
+        let mut partition = DurablePartition::open(TokioStorage::new(), config)
+            .await
+            .unwrap();
+
+        // Blob 1: 3 records starting at offset 0, wal_index 1.
+        let cmd1 = PartitionCommand::AppendBlob {
+            blob: Bytes::from(vec![0u8; 16]),
+            record_count: 3,
+            format: BlobFormat::Raw,
+            base_offset: Offset::new(0),
+        };
+        let data1 = cmd1.encode();
+        partition.write_wal_entry(1, 1, data1.clone()).await.unwrap();
+        partition.apply_command_to_cache(1, &data1).unwrap();
+
+        // Blob 2: 2 records starting at offset 3, wal_index 2.
+        let cmd2 = PartitionCommand::AppendBlob {
+            blob: Bytes::from(vec![1u8; 16]),
+            record_count: 2,
+            format: BlobFormat::Raw,
+            base_offset: Offset::new(3),
+        };
+        let data2 = cmd2.encode();
+        partition.write_wal_entry(2, 1, data2.clone()).await.unwrap();
+        partition.apply_command_to_cache(2, &data2).unwrap();
+
+        // Advance last_applied fields to simulate Raft commit.
+        // The partition tracks WAL index; manually set term/index for test.
+        partition.set_high_watermark(Offset::new(5));
+
+        (partition, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn test_partition_snapshot_roundtrip() {
+        let gid = GroupId::new(42);
+        let (source, _dir) = make_snapshot_partition(gid).await;
+
+        // Capture source state before snapshotting.
+        let src_index = source.last_applied_index();
+        let src_wal_index = source.last_applied_wal_index();
+        let src_term = source.last_applied_term();
+        let src_hwm = source.high_watermark();
+
+        // Take snapshot from source.
+        let (meta, bytes) = source.take_snapshot().unwrap();
+        assert_eq!(meta.group_id, gid);
+        assert_eq!(meta.last_included_index, src_index);
+        assert_eq!(meta.last_included_wal_index, src_wal_index);
+        assert_eq!(meta.last_included_term, src_term);
+
+        // Apply snapshot to a fresh partition.
+        let temp2 = tempfile::tempdir().unwrap();
+        let config2 = DurablePartitionConfig::new(temp2.path(), TopicId::new(1), PartitionId::new(0))
+            .with_group_id(gid);
+        let mut dest = DurablePartition::open(TokioStorage::new(), config2)
+            .await
+            .unwrap();
+
+        assert!(dest.min_required_wal_index().is_none(), "no snapshot yet");
+
+        dest.apply_snapshot(&meta, &bytes).unwrap();
+
+        // Verify all fields are restored to source values.
+        assert_eq!(dest.high_watermark(), src_hwm, "high_watermark restored");
+        assert_eq!(dest.last_applied_index(), src_index, "last_applied_index restored");
+        assert_eq!(dest.last_applied_wal_index(), src_wal_index, "last_applied_wal_index restored");
+        assert_eq!(dest.last_applied_term(), src_term, "last_applied_term restored");
+        assert_eq!(
+            dest.min_required_wal_index(),
+            Some(src_wal_index + 1),
+            "WAL floor advances past snapshot WAL index"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partition_snapshot_crc_mismatch() {
+        let gid = GroupId::new(7);
+        let (source, _dir) = make_snapshot_partition(gid).await;
+        let (meta, bytes) = source.take_snapshot().unwrap();
+
+        // Corrupt the body bytes (not the CRC itself).
+        let mut corrupted = bytes.to_vec();
+        corrupted[8] ^= 0xFF; // flip byte inside body
+
+        let temp2 = tempfile::tempdir().unwrap();
+        let config2 = DurablePartitionConfig::new(temp2.path(), TopicId::new(1), PartitionId::new(0))
+            .with_group_id(gid);
+        let mut dest = DurablePartition::open(TokioStorage::new(), config2)
+            .await
+            .unwrap();
+
+        let result = dest.apply_snapshot(&meta, &corrupted);
+        assert!(matches!(result, Err(SnapshotError::ChecksumMismatch { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_partition_snapshot_bad_magic() {
+        let gid = GroupId::new(7);
+        let (source, _dir) = make_snapshot_partition(gid).await;
+        let (meta, bytes) = source.take_snapshot().unwrap();
+
+        // Overwrite magic and recalculate CRC so CRC check passes.
+        let mut corrupted = bytes.to_vec();
+        corrupted[0] = b'X';
+        corrupted[1] = b'Y';
+        corrupted[2] = b'Z';
+        corrupted[3] = b'W';
+        let payload_len = corrupted.len() - 4;
+        let new_crc = crc32fast::hash(&corrupted[..payload_len]);
+        corrupted[payload_len..].copy_from_slice(&new_crc.to_le_bytes());
+
+        let temp2 = tempfile::tempdir().unwrap();
+        let config2 = DurablePartitionConfig::new(temp2.path(), TopicId::new(1), PartitionId::new(0))
+            .with_group_id(gid);
+        let mut dest = DurablePartition::open(TokioStorage::new(), config2)
+            .await
+            .unwrap();
+
+        let result = dest.apply_snapshot(&meta, &corrupted);
+        assert!(matches!(result, Err(SnapshotError::BadMagic)));
+    }
+
+    #[tokio::test]
+    async fn test_partition_snapshot_truncated() {
+        let gid = GroupId::new(7);
+        let (source, _dir) = make_snapshot_partition(gid).await;
+        let (meta, _bytes) = source.take_snapshot().unwrap();
+
+        let temp2 = tempfile::tempdir().unwrap();
+        let config2 = DurablePartitionConfig::new(temp2.path(), TopicId::new(1), PartitionId::new(0))
+            .with_group_id(gid);
+        let mut dest = DurablePartition::open(TokioStorage::new(), config2)
+            .await
+            .unwrap();
+
+        let result = dest.apply_snapshot(&meta, &[0u8; 8]);
+        assert!(matches!(result, Err(SnapshotError::Truncated { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_partition_snapshot_min_required_wal_index() {
+        let gid = GroupId::new(99);
+        let (mut source, _dir) = make_snapshot_partition(gid).await;
+
+        // Before any snapshot.
+        assert!(source.min_required_wal_index().is_none());
+
+        // After mark_snapshot_complete at WAL index 10.
+        source.mark_snapshot_complete(10);
+        assert_eq!(source.min_required_wal_index(), Some(11));
+
+        // After another snapshot at WAL index 20.
+        source.mark_snapshot_complete(20);
+        assert_eq!(source.min_required_wal_index(), Some(21));
+    }
+
+    #[tokio::test]
+    async fn test_partition_snapshot_apply_advances_wal_floor() {
+        let gid = GroupId::new(55);
+        let (source, _dir) = make_snapshot_partition(gid).await;
+        let (meta, bytes) = source.take_snapshot().unwrap();
+
+        let temp2 = tempfile::tempdir().unwrap();
+        let config2 = DurablePartitionConfig::new(temp2.path(), TopicId::new(1), PartitionId::new(0))
+            .with_group_id(gid);
+        let mut dest = DurablePartition::open(TokioStorage::new(), config2)
+            .await
+            .unwrap();
+
+        dest.apply_snapshot(&meta, &bytes).unwrap();
+
+        // After apply_snapshot the WAL floor must be Some.
+        assert!(
+            dest.min_required_wal_index().is_some(),
+            "WAL floor must be set after apply_snapshot"
+        );
+        assert_eq!(
+            dest.min_required_wal_index(),
+            Some(meta.last_included_wal_index + 1)
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "group_id not set")]
+    async fn test_partition_snapshot_panics_without_group_id() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        // No with_group_id — group_id defaults to 0.
+        let config = DurablePartitionConfig::new(
+            temp_dir.path(),
+            TopicId::new(1),
+            PartitionId::new(0),
+        );
+        let partition = DurablePartition::open(TokioStorage::new(), config)
+            .await
+            .unwrap();
+        let _ = partition.take_snapshot(); // should panic
     }
 }

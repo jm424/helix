@@ -158,7 +158,7 @@ pub enum PartitionCommand {
         entries: Vec<helix_raft::LogEntry>,
     },
 
-    /// Provide snapshot position to fast-forward a follower past the WAL floor.
+    /// Provide snapshot to fast-forward a follower past the WAL floor.
     ///
     /// Sent by the output processor when a WAL read fails because the follower's
     /// `next_index` is below the WAL floor (retention has advanced past it).
@@ -169,6 +169,9 @@ pub enum PartitionCommand {
         last_included_index: LogIndex,
         /// Term at `last_included_index`.
         last_included_term: helix_core::TermId,
+        /// Serialized application state (snapshot envelope). Empty bytes for
+        /// callers that only need to establish the log compaction boundary.
+        payload: bytes::Bytes,
     },
 
     /// Graceful shutdown.
@@ -509,8 +512,7 @@ impl PartitionActorHandle {
     /// A full channel (tick dropped) is not an error.
     pub fn tick(&self) -> Result<(), PartitionError> {
         match self.tx.try_send(PartitionCommand::Tick) {
-            Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
             // Closed variant name varies by tokio/madsim version; catch remaining.
             Err(_) => Err(PartitionError::ActorShutdown),
         }
@@ -598,7 +600,7 @@ impl PartitionActorHandle {
             .map_err(|_| PartitionError::ActorShutdown)
     }
 
-    /// Provides a snapshot position to fast-forward a follower past the WAL floor.
+    /// Provides a snapshot to fast-forward a follower past the WAL floor.
     ///
     /// # Errors
     ///
@@ -608,12 +610,14 @@ impl PartitionActorHandle {
         follower_id: NodeId,
         last_included_index: LogIndex,
         last_included_term: helix_core::TermId,
+        payload: bytes::Bytes,
     ) -> Result<(), PartitionError> {
         self.tx
             .send(PartitionCommand::ProvideSnapshot {
                 follower_id,
                 last_included_index,
                 last_included_term,
+                payload,
             })
             .await
             .map_err(|_| PartitionError::ActorShutdown)
@@ -691,6 +695,14 @@ pub enum PartitionOutput {
         prev_log_index: LogIndex,
         /// Maximum bytes to read.
         max_bytes: u64,
+    },
+    /// A complete snapshot was received from the leader and should be applied.
+    ///
+    /// The output processor calls `apply_snapshot` on partition storage and
+    /// advances the WAL snapshot floor so old segments can be evicted.
+    ApplySnapshot {
+        /// The snapshot from the Raft layer (includes index, term, and data).
+        snapshot: helix_raft::snapshot::Snapshot,
     },
 }
 
@@ -1126,11 +1138,13 @@ impl PartitionActorShared {
                 follower_id,
                 last_included_index,
                 last_included_term,
+                payload,
             } => {
                 let outputs = self.raft_node.provide_snapshot(
                     follower_id,
                     last_included_index,
                     last_included_term,
+                    payload,
                 );
                 self.process_raft_outputs(outputs).await;
             }
@@ -2042,6 +2056,17 @@ impl PartitionActorShared {
                         warn!("Failed to send NeedWalEntries output");
                     }
                 }
+                RaftOutput::ApplySnapshot { snapshot } => {
+                    // Follower received a complete snapshot from the leader.
+                    // Forward to the output processor to apply to storage.
+                    let grouped = GroupedOutput {
+                        group_id: self.group_id,
+                        output: PartitionOutput::ApplySnapshot { snapshot },
+                    };
+                    if self.output_tx.send(grouped).await.is_err() {
+                        warn!("Failed to send ApplySnapshot output");
+                    }
+                }
             }
         }
 
@@ -2141,11 +2166,13 @@ impl PartitionActor {
                     follower_id,
                     last_included_index,
                     last_included_term,
+                    payload,
                 } => {
                     let outputs = self.raft_node.provide_snapshot(
                         follower_id,
                         last_included_index,
                         last_included_term,
+                        payload,
                     );
                     self.process_raft_outputs(outputs).await;
                 }
@@ -2212,6 +2239,7 @@ impl PartitionActor {
         self.process_raft_outputs(outputs).await;
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn process_raft_outputs(
         &mut self,
         outputs: Vec<helix_raft::RaftOutput>,
@@ -2315,6 +2343,14 @@ impl PartitionActor {
                             prev_log_index,
                             max_bytes,
                         })
+                        .await;
+                }
+                RaftOutput::ApplySnapshot { snapshot } => {
+                    // Follower received a complete snapshot from the leader.
+                    // Forward to the output processor to apply to storage.
+                    let _ = self
+                        .output_tx
+                        .send(PartitionOutput::ApplySnapshot { snapshot })
                         .await;
                 }
             }

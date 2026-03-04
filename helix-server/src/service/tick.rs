@@ -23,6 +23,11 @@ use crate::vote_store::{LocalFileVoteStorage, VoteStore};
 use crate::controller::{ControllerCommand, ControllerState, CONTROLLER_GROUP_ID};
 use crate::offset_group::{
     is_offset_group, offset_group_slot, OffsetGroupCommand, OffsetGroupState,
+    OFFSET_GROUP_COUNT_USIZE, OFFSET_GROUP_ID_BASE,
+};
+use crate::snapshot::{
+    decode_envelope, encode_envelope, SnapshotConfig, SnapshotCoordinator, SnapshotStore,
+    Snapshottable,
 };
 
 /// Last Raft index persisted for the controller partition (group 0) in the `SharedWAL`.
@@ -182,6 +187,8 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
     offset_group_states: Vec<Arc<RwLock<OffsetGroupState>>>,
     pending_offset_proposals: Arc<RwLock<Vec<PendingOffsetProposal>>>,
     backpressure: Arc<super::batcher::BackpressureState>,
+    snapshot_store: Option<Arc<SnapshotStore>>,
+    log_trailing_entries: Option<u64>,
     mut incoming_rx: mpsc::Receiver<IncomingMessage>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
@@ -189,10 +196,44 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
         tokio::time::interval(tokio::time::Duration::from_millis(TICK_INTERVAL_MS));
     let mut heartbeat_interval =
         tokio::time::interval(tokio::time::Duration::from_millis(HEARTBEAT_INTERVAL_MS));
+    // When retention is short (DST), run tiering at the same frequency so
+    // uploads + local file deletion keep pace with segment rotation.
+    let tiering_check_ms = local_retention_ms
+        .map_or(TIERING_INTERVAL_MS, |r| r.min(TIERING_INTERVAL_MS));
     let mut tiering_interval =
-        tokio::time::interval(tokio::time::Duration::from_millis(TIERING_INTERVAL_MS));
+        tokio::time::interval(tokio::time::Duration::from_millis(tiering_check_ms));
+    // Check retention at least as often as the retention threshold itself, so
+    // DST (short simulated time) still exercises the deletion path.
+    let retention_check_ms = local_retention_ms
+        .map_or(RETENTION_INTERVAL_MS, |r| r.min(RETENTION_INTERVAL_MS));
     let mut retention_interval =
-        tokio::time::interval(tokio::time::Duration::from_millis(RETENTION_INTERVAL_MS));
+        tokio::time::interval(tokio::time::Duration::from_millis(retention_check_ms));
+
+    // Per-partition snapshot coordinators and WAL index tracking.
+    // Coordinators start with `eager_first_snapshot` for new groups (no prior
+    // snapshot) and switch to `for_data_partition` after the first snapshot.
+    let mut data_snap_coords: HashMap<GroupId, SnapshotCoordinator> = HashMap::new();
+    let mut data_snap_last_wal: HashMap<GroupId, u64> = HashMap::new();
+
+    // Controller/offset snapshot coordinators for the incoming message path.
+    //
+    // In a multi-node cluster, most controller/offset CommitEntry outputs
+    // arrive via `mr.handle_messages()` (when follower AppendEntries
+    // responses achieve quorum), NOT via `mr.tick()`. The tick_task_controller
+    // only sees entries from `mr.tick()`, which rarely includes commits.
+    // Without coordinators here, the eager first snapshot would never fire.
+    //
+    // All groups start eager (threshold=1) then switch to their normal
+    // config after the first snapshot fires.
+    let mut actor_ctl_snap_coord =
+        SnapshotCoordinator::new(SnapshotConfig::eager_first_snapshot());
+    let mut actor_ctl_eager = true;
+    let mut actor_og_snap_coords: Vec<SnapshotCoordinator> = (0
+        ..crate::offset_group::OFFSET_GROUP_COUNT_USIZE)
+        .map(|_| SnapshotCoordinator::new(SnapshotConfig::eager_first_snapshot()))
+        .collect();
+    let mut actor_og_eager: Vec<bool> =
+        vec![true; crate::offset_group::OFFSET_GROUP_COUNT_USIZE];
 
     let initial_partition_count = router.partition_count().await;
     info!(
@@ -226,6 +267,7 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
         &storage,
         &output_tx,
         &backpressure,
+        log_trailing_entries,
     )
     .await;
 
@@ -259,6 +301,20 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
                 tokio::spawn(async move {
                     process_tiering(&ps, pool.as_ref(), local_retention_ms).await;
                 });
+
+                // Trigger data partition snapshots when coordinators signal.
+                if let Some(ref store) = snapshot_store {
+                    let leader_map = router.leader_cached_snapshot().await;
+                    process_data_partition_snapshots(
+                        &partition_storage,
+                        &leader_map,
+                        &mut data_snap_coords,
+                        &mut data_snap_last_wal,
+                        store,
+                        shared_wal_pool.clone(),
+                    )
+                    .await;
+                }
             }
             _ = retention_interval.tick() => {
                 // Delete old WAL segments that have been replicated.
@@ -304,7 +360,7 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
                             );
 
                             // Process all controller and offset group outputs.
-                            process_controller_outputs(
+                            let (ctl_entries, og_entries) = process_controller_outputs(
                                 &outputs,
                                 &multi_raft,
                                 &partition_storage,
@@ -324,7 +380,67 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
                                 &offset_group_states,
                                 &pending_offset_proposals,
                                 &backpressure,
+                                log_trailing_entries,
                             ).await;
+
+                            // Feed committed entry counts into controller/offset
+                            // snapshot coordinators and trigger snapshots when due.
+                            for _ in 0..ctl_entries {
+                                actor_ctl_snap_coord.record_entry();
+                            }
+                            maybe_snapshot(
+                                &controller_state,
+                                &mut actor_ctl_snap_coord,
+                                snapshot_store.as_ref(),
+                                CONTROLLER_GROUP_ID,
+                                &multi_raft,
+                                shared_wal_pool.clone(),
+                            ).await;
+                            // Switch from eager to normal after the first
+                            // snapshot. Detect "snapshot fired this
+                            // iteration" by: we recorded entries
+                            // (ctl_entries > 0) but entries_since_snapshot
+                            // is back to 0 (mark_completed was called).
+                            if actor_ctl_eager
+                                && ctl_entries > 0
+                                && actor_ctl_snap_coord.entries_since_snapshot()
+                                    == 0
+                            {
+                                actor_ctl_snap_coord = SnapshotCoordinator::new(
+                                    SnapshotConfig::for_controller(),
+                                );
+                                actor_ctl_eager = false;
+                            }
+
+                            for (slot, count) in og_entries.iter().enumerate() {
+                                for _ in 0..*count {
+                                    actor_og_snap_coords[slot].record_entry();
+                                }
+                                let og_had =
+                                    actor_og_snap_coords[slot].entries_since_snapshot() > 0;
+                                #[allow(clippy::cast_possible_truncation)]
+                                let group_id = GroupId::new(
+                                    OFFSET_GROUP_ID_BASE.get() + slot as u64,
+                                );
+                                maybe_snapshot(
+                                    &offset_group_states[slot],
+                                    &mut actor_og_snap_coords[slot],
+                                    snapshot_store.as_ref(),
+                                    group_id,
+                                    &multi_raft,
+                                    shared_wal_pool.clone(),
+                                ).await;
+                                if actor_og_eager[slot]
+                                    && og_had
+                                    && actor_og_snap_coords[slot].entries_since_snapshot() == 0
+                                {
+                                    actor_og_snap_coords[slot] =
+                                        SnapshotCoordinator::new(
+                                            SnapshotConfig::for_offset_group(),
+                                        );
+                                    actor_og_eager[slot] = false;
+                                }
+                            }
                         }
 
                         // Route data partition messages to partition actors.
@@ -366,7 +482,7 @@ pub async fn tick_task_actor<S: Storage + Clone + Send + Sync + 'static, T: Tran
 /// 4. **Dynamic partition creation**: Creates partition actors on `AssignPartition`.
 ///
 /// Data partition operations are handled by `tick_task_actor` via the router.
-#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher, clippy::too_many_lines)]
 pub async fn tick_task_controller<
     S: Storage + Clone + Send + Sync + 'static,
     T: TransportService,
@@ -392,6 +508,8 @@ pub async fn tick_task_controller<
     offset_group_states: Vec<Arc<RwLock<OffsetGroupState>>>,
     pending_offset_proposals: Arc<RwLock<Vec<PendingOffsetProposal>>>,
     backpressure: Arc<super::batcher::BackpressureState>,
+    snapshot_store: Option<Arc<crate::snapshot::SnapshotStore>>,
+    log_trailing_entries: Option<u64>,
     mut leader_update_rx: mpsc::UnboundedReceiver<crate::controller::ControllerCommand>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) {
@@ -404,6 +522,26 @@ pub async fn tick_task_controller<
         let mr = multi_raft.read().await;
         mr.node_id()
     };
+
+    // Snapshot coordinators track when a snapshot is due for each Raft group.
+    // The coordinator fires when both the entry count AND the time interval
+    // thresholds defined in SnapshotConfig are met.
+    //
+    // All groups start with eager first snapshot (1 entry, 0s interval) so
+    // the WAL eviction floor is advanced quickly. After the first snapshot
+    // fires, each switches to its normal config. The controller snapshot
+    // is an optimization (skip WAL entries during replay), not a
+    // correctness requirement — data partition snapshot loading happens
+    // after full controller WAL replay.
+    let mut controller_snap_coord =
+        SnapshotCoordinator::new(SnapshotConfig::eager_first_snapshot());
+    let mut controller_eager = true;
+    let mut offset_snap_coords: Vec<SnapshotCoordinator> = (0
+        ..crate::offset_group::OFFSET_GROUP_COUNT_USIZE)
+        .map(|_| SnapshotCoordinator::new(SnapshotConfig::eager_first_snapshot()))
+        .collect();
+    let mut offset_eager: Vec<bool> =
+        vec![true; crate::offset_group::OFFSET_GROUP_COUNT_USIZE];
 
     info!(
         node_id = node_id.get(),
@@ -424,7 +562,7 @@ pub async fn tick_task_controller<
                 };
 
                 // Process controller and offset group outputs.
-                process_controller_outputs(
+                let (ctl_entries, og_entries) = process_controller_outputs(
                     &outputs,
                     &multi_raft,
                     &partition_storage,
@@ -444,7 +582,63 @@ pub async fn tick_task_controller<
                     &offset_group_states,
                     &pending_offset_proposals,
                     &backpressure,
+                    log_trailing_entries,
                 ).await;
+
+                // Feed applied entry counts into snapshot coordinators.
+                for _ in 0..ctl_entries {
+                    controller_snap_coord.record_entry();
+                }
+                for (slot, count) in og_entries.iter().enumerate() {
+                    for _ in 0..*count {
+                        offset_snap_coords[slot].record_entry();
+                    }
+                }
+
+                // Snapshot trigger: controller (leader only).
+                maybe_snapshot(
+                    &controller_state,
+                    &mut controller_snap_coord,
+                    snapshot_store.as_ref(),
+                    CONTROLLER_GROUP_ID,
+                    &multi_raft,
+                    shared_wal_pool.clone(),
+                ).await;
+                // Switch from eager to normal after the first snapshot.
+                if controller_eager
+                    && ctl_entries > 0
+                    && controller_snap_coord.entries_since_snapshot() == 0
+                {
+                    controller_snap_coord = SnapshotCoordinator::new(
+                        SnapshotConfig::for_controller(),
+                    );
+                    controller_eager = false;
+                }
+
+                // Snapshot trigger: offset groups (leader only per group).
+                for slot in 0..OFFSET_GROUP_COUNT_USIZE {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let group_id = GroupId::new(OFFSET_GROUP_ID_BASE.get() + slot as u64);
+                    let og_had_entries =
+                        offset_snap_coords[slot].entries_since_snapshot() > 0;
+                    maybe_snapshot(
+                        &offset_group_states[slot],
+                        &mut offset_snap_coords[slot],
+                        snapshot_store.as_ref(),
+                        group_id,
+                        &multi_raft,
+                        shared_wal_pool.clone(),
+                    ).await;
+                    // Switch from eager to normal after the first snapshot.
+                    if offset_eager[slot]
+                        && og_had_entries
+                        && offset_snap_coords[slot].entries_since_snapshot() == 0
+                    {
+                        offset_snap_coords[slot] =
+                            SnapshotCoordinator::new(SnapshotConfig::for_offset_group());
+                        offset_eager[slot] = false;
+                    }
+                }
             }
             _ = rebalance_interval.tick() => {
                 // Leader rebalancing: move partition leaders to their preferred
@@ -481,6 +675,212 @@ pub async fn tick_task_controller<
     }
 
     info!("Controller tick task stopped");
+}
+
+/// Takes a snapshot for a Raft group if the coordinator signals one is due.
+///
+/// Only the Raft leader for `group_id` saves snapshots to avoid duplicate
+/// writes. State is serialized under the read lock (fast, no I/O), then
+/// persisted asynchronously so the tick loop is never blocked by disk or S3.
+///
+/// `coordinator.mark_completed()` is called synchronously after spawning the
+/// save task. The coordinator is reset regardless of whether the save
+/// ultimately succeeds — a failed save will cause the next snapshot to be
+/// taken after the next threshold crossing rather than retrying immediately.
+async fn maybe_snapshot<SM, S>(
+    state_lock: &Arc<RwLock<SM>>,
+    coordinator: &mut SnapshotCoordinator,
+    store_opt: Option<&Arc<SnapshotStore>>,
+    group_id: GroupId,
+    multi_raft: &Arc<RwLock<MultiRaft>>,
+    wal_pool: Option<Arc<SharedWalPool<S>>>,
+)
+where
+    SM: Snapshottable + Send + Sync + 'static,
+    S: helix_wal::Storage + Clone + Send + Sync + 'static,
+{
+    let Some(store) = store_opt else { return };
+
+    if !coordinator.should_snapshot() {
+        return;
+    }
+
+    // Only the Raft leader for this group saves snapshots.
+    let is_leader = {
+        let mr = multi_raft.read().await;
+        mr.group_state(group_id)
+            .is_some_and(|s| s.state == RaftState::Leader)
+    };
+    if !is_leader {
+        return;
+    }
+    eprintln!(
+        "[DST-PROBE] MAYBE_SNAPSHOT: group={} entries_since={}",
+        group_id.get(),
+        coordinator.entries_since_snapshot(),
+    );
+
+    // Serialize state under the read lock — fast, no I/O.
+    let snapshot_result = {
+        let state = state_lock.read().await;
+        state.take_snapshot()
+    };
+    let (meta, body) = match snapshot_result {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(group = group_id.get(), error = %e, "Failed to serialize snapshot");
+            return;
+        }
+    };
+
+    // Save asynchronously so S3 upload does not block the tick loop.
+    // After a successful save, advance the WAL eviction floor and update the
+    // state machine's last_snapshot_wal_index so min_required_wal_index()
+    // returns the correct value on the leader.
+    let store = Arc::clone(store);
+    let state_for_update = Arc::clone(state_lock);
+    let wal_floor = meta.last_included_wal_index;
+    eprintln!(
+        "[DST-PROBE] SNAPSHOT_SAVE_SPAWNING: group={} wal_floor={}",
+        group_id.get(),
+        wal_floor,
+    );
+    tokio::spawn(async move {
+        match store.save(&meta, &body).await {
+            Ok(()) => {
+                eprintln!(
+                    "[DST-PROBE] SNAPSHOT_SAVED: group={} wal_floor={} index={}",
+                    group_id.get(),
+                    wal_floor,
+                    meta.last_included_index,
+                );
+                info!(
+                    group = group_id.get(),
+                    last_index = meta.last_included_index,
+                    wal_floor,
+                    "Saved Raft group snapshot"
+                );
+                if let Some(pool) = wal_pool {
+                    pool.set_snapshot_floor(group_id, wal_floor);
+                }
+                state_for_update.write().await.set_last_snapshot_wal_index(wal_floor);
+            }
+            Err(e) => {
+                eprintln!(
+                    "[DST-PROBE] SNAPSHOT_SAVE_FAILED: group={} error={}",
+                    group_id.get(),
+                    e,
+                );
+                warn!(group = group_id.get(), error = %e, "Failed to save snapshot");
+            }
+        }
+    });
+
+    coordinator.mark_completed();
+}
+
+/// Checks each data partition for snapshot eligibility and saves when due.
+///
+/// Iterates the `partition_storage` map, tracks committed entry counts via
+/// WAL-index deltas, and feeds them into per-partition `SnapshotCoordinator`
+/// instances. When a coordinator signals a snapshot is due and this node is
+/// the leader, the snapshot is serialized under the read lock and saved
+/// asynchronously.
+///
+/// New groups (no prior snapshot, `min_required_wal_index == None`) use the
+/// `eager_first_snapshot` config so the WAL eviction floor is advanced after
+/// just one applied entry. After the first snapshot fires the coordinator
+/// switches to the normal `for_data_partition` config.
+async fn process_data_partition_snapshots<S>(
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<crate::partition_storage::PartitionStorage<S>>>>>>,
+    leader_map: &HashMap<GroupId, bool>,
+    snap_coords: &mut HashMap<GroupId, SnapshotCoordinator>,
+    snap_last_wal: &mut HashMap<GroupId, u64>,
+    store: &Arc<SnapshotStore>,
+    wal_pool: Option<Arc<SharedWalPool<S>>>,
+)
+where
+    S: helix_wal::Storage + Clone + Send + Sync + 'static,
+{
+    let storage_guard = partition_storage.read().await;
+    for (&group_id, storage_lock) in storage_guard.iter() {
+        let ps = storage_lock.read().await;
+        // Determine if this is the first snapshot for this group.
+        let no_snapshot_yet = ps.min_required_wal_index().is_none();
+        // Get-or-create coordinator: eager for new groups, normal otherwise.
+        let coord = snap_coords.entry(group_id).or_insert_with(|| {
+            if no_snapshot_yet {
+                SnapshotCoordinator::new(SnapshotConfig::eager_first_snapshot())
+            } else {
+                SnapshotCoordinator::new(SnapshotConfig::for_data_partition())
+            }
+        });
+        // Advance coordinator by delta WAL entries since last check.
+        let current_wal = ps.last_applied_wal_index();
+        let last_seen = snap_last_wal.entry(group_id).or_insert(current_wal);
+        let delta = current_wal.saturating_sub(*last_seen);
+        for _ in 0..delta {
+            coord.record_entry();
+        }
+        *last_seen = current_wal;
+        // Skip if coordinator says not yet or this node is not the leader.
+        if !coord.should_snapshot() {
+            continue;
+        }
+        if !leader_map.get(&group_id).copied().unwrap_or(false) {
+            continue;
+        }
+        // Serialize under read lock (fast, no I/O).
+        let snapshot_result = ps.take_snapshot();
+        drop(ps);
+        let (meta, body) = match snapshot_result {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!(group = group_id.get(), error = %e, "Failed to serialize data partition snapshot");
+                coord.mark_completed();
+                continue;
+            }
+        };
+        // Reset coordinator; switch new groups to normal frequency.
+        coord.mark_completed();
+        if no_snapshot_yet {
+            *coord = SnapshotCoordinator::new(SnapshotConfig::for_data_partition());
+        }
+        // Save asynchronously so disk/S3 I/O does not block the tick loop.
+        let store = Arc::clone(store);
+        let pool = wal_pool.clone();
+        let wal_floor = meta.last_included_wal_index;
+        let ps_lock = Arc::clone(storage_lock);
+        eprintln!(
+            "[DST-PROBE] DATA_SNAPSHOT_SPAWNING: group={} wal_floor={}",
+            group_id.get(),
+            wal_floor,
+        );
+        tokio::spawn(async move {
+            match store.save(&meta, &body).await {
+                Ok(()) => {
+                    eprintln!(
+                        "[DST-PROBE] DATA_SNAPSHOT_SAVED: group={} wal_floor={}",
+                        group_id.get(),
+                        wal_floor,
+                    );
+                    info!(
+                        group = group_id.get(),
+                        last_index = meta.last_included_index,
+                        wal_floor,
+                        "Saved data partition snapshot"
+                    );
+                    if let Some(pool) = pool {
+                        pool.set_snapshot_floor(group_id, wal_floor);
+                    }
+                    ps_lock.write().await.set_last_snapshot_wal_index(wal_floor);
+                }
+                Err(e) => {
+                    warn!(group = group_id.get(), error = %e, "Failed to save data partition snapshot");
+                }
+            }
+        });
+    }
 }
 
 /// Rebalances partition leaders to their preferred replicas (decentralized).
@@ -675,7 +1075,14 @@ pub async fn process_controller_outputs<
     offset_group_states: &[Arc<RwLock<OffsetGroupState>>],
     pending_offset_proposals: &Arc<RwLock<Vec<PendingOffsetProposal>>>,
     backpressure: &Arc<super::batcher::BackpressureState>,
-) {
+    log_trailing_entries: Option<u64>,
+) -> (u64, Vec<u64>) {
+    // Entry counts returned to the caller so snapshot coordinators can be
+    // updated without threading mutable coordinator refs through this function.
+    let mut controller_entries_applied: u64 = 0;
+    let mut offset_entries_applied: Vec<u64> =
+        vec![0; crate::offset_group::OFFSET_GROUP_COUNT_USIZE];
+
     // Collect follow-up outputs for single-node processing.
     // For single-node clusters, propose() returns CommitEntry immediately,
     // so we need to process those after the main loop.
@@ -705,16 +1112,18 @@ pub async fn process_controller_outputs<
                         continue;
                     };
 
-                    {
-                        let mut state = offset_group_states[slot].write().await;
-                        state.apply(&cmd, index.get(), term.get());
-                    }
+                    let mut og_state = offset_group_states[slot].write().await;
+                    og_state.apply(&cmd, index.get(), term.get());
+                    offset_entries_applied[slot] = offset_entries_applied[slot].saturating_add(1);
 
                     // Persist to SharedWAL (skip already-recovered entries).
                     let last_persisted = OFFSET_GROUP_LAST_PERSISTED[slot]
                         .load(std::sync::atomic::Ordering::Relaxed);
                     if index.get() > last_persisted {
                         if let Some(pool) = shared_wal_pool {
+                            // Lazy registration: register on first WAL append
+                            // so groups with no entries don't pin eviction floor.
+                            pool.register_group(*group_id);
                             let handle = pool.handle(*group_id);
                             match handle
                                 .append_nowait(term.get(), index.get(), metadata.clone())
@@ -731,11 +1140,16 @@ pub async fn process_controller_outputs<
                                         index.get(),
                                         std::sync::atomic::Ordering::Relaxed,
                                     );
+                                    // Track the WAL counter so `take_snapshot()` includes
+                                    // the correct `last_included_wal_index` for the
+                                    // eviction floor.
+                                    og_state.last_applied_wal_index = wal_index;
                                     handle.update_committed_wal_index(wal_index);
                                 }
                             }
                         }
                     }
+                    drop(og_state);
 
                     // Notify any pending offset proposals for this (group, index).
                     {
@@ -775,8 +1189,38 @@ pub async fn process_controller_outputs<
                     command = ?cmd,
                     "Applying controller command (actor mode)"
                 );
+                // Collect group IDs that will be removed by DeleteTopic so
+                // we can deregister them from the WAL floor after apply.
+                let deleted_groups: Vec<GroupId> =
+                    if let ControllerCommand::DeleteTopic { ref name } = cmd {
+                        let state = controller_state.read().await;
+                        state
+                            .get_topic(name)
+                            .map(|t| {
+                                state
+                                    .topic_assignments(t.topic_id)
+                                    .map(|(_, a)| a.group_id)
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+
                 let mut state = controller_state.write().await;
                 let follow_ups = state.apply(&cmd, cluster_nodes);
+                state.last_applied_index = index.get();
+                state.last_applied_term = term.get();
+                controller_entries_applied = controller_entries_applied.saturating_add(1);
+
+                // Deregister deleted groups from WAL floor coordination.
+                if !deleted_groups.is_empty() {
+                    if let Some(pool) = shared_wal_pool {
+                        for gid in &deleted_groups {
+                            pool.deregister_group(*gid);
+                        }
+                    }
+                }
 
                 // Persist controller entry to SharedWAL for crash recovery.
                 // Skip entries already recovered from WAL to avoid the
@@ -801,6 +1245,12 @@ pub async fn process_controller_outputs<
                             Ok(wal_index) => {
                                 CONTROLLER_LAST_PERSISTED_INDEX
                                     .store(index.get(), std::sync::atomic::Ordering::Relaxed);
+                                // Track the WAL counter so `take_snapshot()` includes
+                                // the correct `last_included_wal_index` for the eviction
+                                // floor. Without this, controller snapshots always report
+                                // wal_floor=0, pinning the eviction floor and preventing
+                                // local segment deletion.
+                                state.last_applied_wal_index = wal_index;
                                 // Mark this WAL entry committed so the coordinator knows
                                 // this group has consumed through wal_index. Without this,
                                 // controller segments never become eligible for S3 tiering
@@ -955,7 +1405,13 @@ pub async fn process_controller_outputs<
                                 output_tx.clone(),
                                 super::partition_actor::PartitionActorConfig::default(),
                                 Arc::clone(backpressure),
+                                log_trailing_entries,
                             );
+
+                        // Register with WAL floor so eviction_floor() accounts for this group.
+                        if let Some(pool) = shared_wal_pool {
+                            pool.register_group(data_group_id);
+                        }
 
                         if router
                             .add_partition_dynamic(data_group_id, partition_handle)
@@ -1108,16 +1564,58 @@ pub async fn process_controller_outputs<
                 let shared_entries = match entries_result {
                     Ok(e) => e,
                     Err(e) => {
+                        // WAL read failed — entries may be tiered or compacted.
+                        // Fall back to sending a live snapshot so the follower
+                        // can fast-forward past the unavailable range.
+                        eprintln!(
+                            "[DST-PROBE] NEED_ENTRIES_FALLBACK: group={} follower={} start={} error={}",
+                            group_id.get(),
+                            follower_id.get(),
+                            start_index.get(),
+                            e,
+                        );
                         warn!(
                             group = group_id.get(),
                             follower = follower_id.get(),
                             start = start_index.get(),
                             error = %e,
-                            "Failed to read WAL entries for NeedEntries"
+                            "Failed to read WAL entries for NeedEntries; \
+                             attempting snapshot fallback"
                         );
+                        provide_controller_group_snapshot(
+                            *group_id,
+                            *follower_id,
+                            controller_state,
+                            offset_group_states,
+                            multi_raft,
+                            transport_handle,
+                        )
+                        .await;
                         continue;
                     }
                 };
+
+                // WAL read succeeded but returned no entries — the requested
+                // range has been compacted or tiered. Fall back to a snapshot
+                // so the follower can fast-forward past the gap.
+                if shared_entries.is_empty() {
+                    warn!(
+                        group = group_id.get(),
+                        follower = follower_id.get(),
+                        start = start_index.get(),
+                        "WAL read returned empty entries; falling back to snapshot"
+                    );
+                    provide_controller_group_snapshot(
+                        *group_id,
+                        *follower_id,
+                        controller_state,
+                        offset_group_states,
+                        multi_raft,
+                        transport_handle,
+                    )
+                    .await;
+                    continue;
+                }
 
                 // Look up prev_log_term from the WAL entry at prev_log_index.
                 let prev_log_term = if prev_log_index.get() == 0 {
@@ -1127,12 +1625,34 @@ pub async fn process_controller_outputs<
                         Ok(Some(e)) => TermId::new(e.header.term),
                         Ok(None) => TermId::new(0),
                         Err(e) => {
+                            // prev_log entry is unavailable (segment deleted by
+                            // tiering/retention). Fall back to snapshot so the
+                            // follower can fast-forward past the gap.
+                            eprintln!(
+                                "[DST-PROBE] NEED_ENTRIES_FALLBACK: group={} \
+                                 follower={} prev_log={} error={}",
+                                group_id.get(),
+                                follower_id.get(),
+                                prev_log_index.get(),
+                                e,
+                            );
                             warn!(
                                 group = group_id.get(),
+                                follower = follower_id.get(),
                                 prev_log_index = prev_log_index.get(),
                                 error = %e,
-                                "Failed to read prev_log entry for NeedEntries"
+                                "Failed to read prev_log entry for NeedEntries; \
+                                 attempting snapshot fallback"
                             );
+                            provide_controller_group_snapshot(
+                                *group_id,
+                                *follower_id,
+                                controller_state,
+                                offset_group_states,
+                                multi_raft,
+                                transport_handle,
+                            )
+                            .await;
                             continue;
                         }
                     }
@@ -1188,6 +1708,21 @@ pub async fn process_controller_outputs<
                     }
                 }
             }
+            MultiRaftOutput::ApplySnapshot { group_id, snapshot } => {
+                // Follower received a complete snapshot for a controller or offset
+                // group. Decode the envelope and apply to the in-memory state machine.
+                if *group_id != CONTROLLER_GROUP_ID && !is_offset_group(*group_id) {
+                    // Data partition snapshots are handled by the output processor.
+                    continue;
+                }
+                apply_controller_group_snapshot(
+                    *group_id,
+                    snapshot,
+                    controller_state,
+                    offset_group_states,
+                )
+                .await;
+            }
         }
     }
 
@@ -1216,10 +1751,37 @@ pub async fn process_controller_outputs<
                     continue;
                 };
 
-                // Apply to controller state (for AssignPartition, this is a no-op since already applied).
+                // Capture groups to deregister before apply removes them.
+                let deleted_groups: Vec<GroupId> =
+                    if let ControllerCommand::DeleteTopic { ref name } = cmd {
+                        let state = controller_state.read().await;
+                        state
+                            .get_topic(name)
+                            .map(|t| {
+                                state
+                                    .topic_assignments(t.topic_id)
+                                    .map(|(_, a)| a.group_id)
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+
                 {
                     let mut state = controller_state.write().await;
                     let _ = state.apply(&cmd, cluster_nodes);
+                    state.last_applied_index = index.get();
+                    state.last_applied_term = term.get();
+                }
+                controller_entries_applied = controller_entries_applied.saturating_add(1);
+
+                if !deleted_groups.is_empty() {
+                    if let Some(pool) = shared_wal_pool {
+                        for gid in &deleted_groups {
+                            pool.deregister_group(*gid);
+                        }
+                    }
                 }
 
                 // Persist follow-up controller entry to SharedWAL.
@@ -1310,7 +1872,13 @@ pub async fn process_controller_outputs<
                                 output_tx.clone(),
                                 super::partition_actor::PartitionActorConfig::default(),
                                 Arc::clone(backpressure),
+                                log_trailing_entries,
                             );
+
+                        // Register with WAL floor so eviction_floor() accounts for this group.
+                        if let Some(pool) = shared_wal_pool {
+                            pool.register_group(data_group_id);
+                        }
 
                         if router
                             .add_partition_dynamic(data_group_id, partition_handle)
@@ -1333,6 +1901,7 @@ pub async fn process_controller_outputs<
             }
         }
     }
+    (controller_entries_applied, offset_entries_applied)
 }
 
 /// Creates partition actors for all pre-existing assignments after a restart.
@@ -1359,6 +1928,7 @@ async fn recover_partition_actors<S: Storage + Clone + Send + Sync + 'static>(
     storage: &S,
     output_tx: &mpsc::Sender<super::partition_actor::GroupedOutput>,
     backpressure: &Arc<super::batcher::BackpressureState>,
+    log_trailing_entries: Option<u64>,
 ) {
     // Snapshot the assignments under a short read lock, then release it before
     // doing any async I/O below.
@@ -1447,7 +2017,13 @@ async fn recover_partition_actors<S: Storage + Clone + Send + Sync + 'static>(
             output_tx.clone(),
             super::partition_actor::PartitionActorConfig::default(),
             Arc::clone(backpressure),
+            log_trailing_entries,
         );
+
+        // Register with WAL floor so eviction_floor() accounts for this group.
+        if let Some(pool) = shared_wal_pool {
+            pool.register_group(data_group_id);
+        }
 
         if router
             .add_partition_dynamic(data_group_id, partition_handle)
@@ -1504,6 +2080,7 @@ async fn create_partition_storage<S: Storage + Clone + Send + Sync + 'static>(
             dir,
             topic_id,
             partition_id,
+            data_group_id,
             wal_handle,
             state,
             None, // object_storage_dir
@@ -1515,6 +2092,7 @@ async fn create_partition_storage<S: Storage + Clone + Send + Sync + 'static>(
             dir,
             topic_id,
             partition_id,
+            data_group_id,
             wal_handle,
             state,
             None, // object_storage_dir
@@ -1553,6 +2131,7 @@ async fn create_partition_storage<S: Storage + Clone + Send + Sync + 'static>(
             None, // tiering_config
             topic_id,
             partition_id,
+            data_group_id,
         )
         .await;
         #[cfg(not(feature = "s3"))]
@@ -1563,6 +2142,7 @@ async fn create_partition_storage<S: Storage + Clone + Send + Sync + 'static>(
             None, // tiering_config
             topic_id,
             partition_id,
+            data_group_id,
         )
         .await;
 
@@ -1808,8 +2388,8 @@ async fn process_outputs<S: Storage + Clone + Send + Sync + 'static>(
                 // Single-node mode doesn't persist vote state.
                 // Multi-node mode uses the VoteStore for persistence.
             }
-            MultiRaftOutput::NeedEntries { .. } => {
-                // Single-node mode doesn't need WAL-backed AppendEntries.
+            MultiRaftOutput::NeedEntries { .. } | MultiRaftOutput::ApplySnapshot { .. } => {
+                // Single-node mode never has followers: no AppendEntries or snapshots needed.
             }
         }
     }
@@ -2050,6 +2630,185 @@ async fn process_retention<S: Storage + Clone + Send + Sync + 'static>(
                     }
                 }
             }
+        }
+    }
+}
+
+// ============================================================================
+// Snapshot helpers for controller/offset groups
+// ============================================================================
+
+/// Takes a live snapshot from a controller or offset group and sends it to
+/// the follower via the Raft `InstallSnapshot` path.
+///
+/// Called by the `NeedEntries` handler when the WAL read fails (entries are
+/// tiered or compacted). The follower applies the snapshot and then requests
+/// only the entries after `last_included_index`.
+///
+/// # Panics
+///
+/// Does not panic; all fallible operations are logged and silently ignored.
+async fn provide_controller_group_snapshot<T: TransportService>(
+    group_id: GroupId,
+    follower_id: NodeId,
+    controller_state: &Arc<RwLock<ControllerState>>,
+    offset_group_states: &[Arc<RwLock<OffsetGroupState>>],
+    multi_raft: &Arc<RwLock<MultiRaft>>,
+    transport_handle: &T,
+) {
+    // Take a snapshot from the appropriate in-memory state machine.
+    let snap_result = if group_id == CONTROLLER_GROUP_ID {
+        controller_state.read().await.take_snapshot()
+    } else if let Some(slot) = offset_group_slot(group_id) {
+        offset_group_states[slot].read().await.take_snapshot()
+    } else {
+        return;
+    };
+
+    let (meta, body) = match snap_result {
+        Ok(pair) if pair.0.last_included_index > 0 => {
+            eprintln!(
+                "[DST-PROBE] PROVIDE_SNAPSHOT: group={} follower={} index={}",
+                group_id.get(),
+                follower_id.get(),
+                pair.0.last_included_index,
+            );
+            pair
+        }
+        Ok(_) => {
+            // State machine has no entries applied yet — nothing to snapshot.
+            debug!(
+                group = group_id.get(),
+                follower = follower_id.get(),
+                "No snapshot available for NeedEntries fallback (index=0)"
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(
+                group = group_id.get(),
+                follower = follower_id.get(),
+                error = %e,
+                "take_snapshot failed during NeedEntries fallback"
+            );
+            return;
+        }
+    };
+
+    // Encode snapshot into the common envelope format so the follower can
+    // decode both the application body and the full SnapshotMeta.
+    let encoded = encode_envelope(&meta, &body);
+    let snapshot = helix_raft::snapshot::Snapshot::new(
+        LogIndex::new(meta.last_included_index),
+        TermId::new(meta.last_included_term),
+        encoded,
+    );
+
+    // Feed through the Raft layer, which sends InstallSnapshotRequest chunks.
+    let outbound = multi_raft
+        .write()
+        .await
+        .provide_group_snapshot(group_id, follower_id, &snapshot);
+
+    // Send resulting messages to the follower.
+    for msg_output in outbound {
+        if let MultiRaftOutput::SendMessages { to, messages } = msg_output {
+            let managed: Vec<_> = messages
+                .into_iter()
+                .filter(|m| {
+                    m.group_id == CONTROLLER_GROUP_ID || is_offset_group(m.group_id)
+                })
+                .collect();
+            if !managed.is_empty() {
+                if let Err(e) = transport_handle.send_batch(to, managed).await {
+                    warn!(
+                        to = to.get(),
+                        error = %e,
+                        "Failed to send InstallSnapshot to follower"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Applies a received `InstallSnapshot` to the controller or offset group
+/// in-memory state machine.
+///
+/// Decodes the snapshot envelope, validates the group ID, and calls
+/// `apply_snapshot` on the appropriate state machine under write lock.
+///
+/// # Panics
+///
+/// Does not panic; all fallible operations are logged and silently ignored.
+async fn apply_controller_group_snapshot(
+    group_id: GroupId,
+    snapshot: &helix_raft::snapshot::Snapshot,
+    controller_state: &Arc<RwLock<ControllerState>>,
+    offset_group_states: &[Arc<RwLock<OffsetGroupState>>],
+) {
+    assert!(
+        snapshot.last_included_index.get() > 0,
+        "apply_controller_group_snapshot: snapshot must have last_included_index > 0"
+    );
+
+    let (meta, body) = match decode_envelope(&snapshot.data) {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(
+                group = group_id.get(),
+                index = snapshot.last_included_index.get(),
+                error = %e,
+                "Failed to decode snapshot envelope for controller/offset group"
+            );
+            return;
+        }
+    };
+
+    if group_id == CONTROLLER_GROUP_ID {
+        let mut state = controller_state.write().await;
+        if let Err(e) = state.apply_snapshot(&meta, &body) {
+            warn!(
+                group = group_id.get(),
+                index = meta.last_included_index,
+                error = %e,
+                "Failed to apply snapshot to ControllerState"
+            );
+        } else {
+            eprintln!(
+                "[DST-PROBE] APPLY_SNAPSHOT: group={} index={} type=controller",
+                group_id.get(),
+                meta.last_included_index,
+            );
+            info!(
+                group = group_id.get(),
+                index = meta.last_included_index,
+                "Applied snapshot to ControllerState"
+            );
+        }
+    } else if let Some(slot) = offset_group_slot(group_id) {
+        let mut state = offset_group_states[slot].write().await;
+        if let Err(e) = state.apply_snapshot(&meta, &body) {
+            warn!(
+                group = group_id.get(),
+                slot,
+                index = meta.last_included_index,
+                error = %e,
+                "Failed to apply snapshot to OffsetGroupState"
+            );
+        } else {
+            eprintln!(
+                "[DST-PROBE] APPLY_SNAPSHOT: group={} slot={} index={} type=offset_group",
+                group_id.get(),
+                slot,
+                meta.last_included_index,
+            );
+            info!(
+                group = group_id.get(),
+                slot,
+                index = meta.last_included_index,
+                "Applied snapshot to OffsetGroupState"
+            );
         }
     }
 }

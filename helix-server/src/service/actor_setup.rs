@@ -68,6 +68,10 @@ pub struct ActorSetupConfig {
     pub output_processor_config: OutputProcessorConfig,
     /// Configuration for the batcher.
     pub batcher_config: BatcherConfig,
+    /// Override for Raft in-memory log trailing entries.
+    /// When set, data partition Raft nodes compact their in-memory log
+    /// more aggressively, which is useful for testing snapshot transfer.
+    pub log_trailing_entries: Option<u64>,
 }
 
 /// Handles returned from actor setup for external interaction.
@@ -143,7 +147,10 @@ pub async fn setup_single_partition<
     let (batcher_handle, batcher_rx, backpressure) = batcher::create_batcher();
 
     // Create the Raft node for this partition.
-    let raft_config = RaftConfig::new(node_id, cluster_nodes);
+    let mut raft_config = RaftConfig::new(node_id, cluster_nodes);
+    if let Some(trailing) = config.log_trailing_entries {
+        raft_config = raft_config.with_log_trailing_entries(trailing);
+    }
     let raft_node = RaftNode::new(raft_config);
 
     // Spawn the partition actor with shared output channel and backpressure.
@@ -273,6 +280,7 @@ pub async fn setup_multi_partition<
     local_retention_ms: Option<u64>,
     offset_group_states: Vec<Arc<RwLock<OffsetGroupState>>>,
     pending_offset_proposals: Arc<RwLock<Vec<PendingOffsetProposal>>>,
+    snapshot_store: Option<Arc<crate::snapshot::SnapshotStore>>,
 ) -> ActorSetupHandles {
     let group_count = initial_groups.len();
 
@@ -299,7 +307,10 @@ pub async fn setup_multi_partition<
 
     for (group_id, replicas) in initial_groups {
         // Create the Raft node for this partition.
-        let raft_config = RaftConfig::new(node_id, replicas);
+        let mut raft_config = RaftConfig::new(node_id, replicas);
+        if let Some(trailing) = config.log_trailing_entries {
+            raft_config = raft_config.with_log_trailing_entries(trailing);
+        }
         let raft_node = RaftNode::new(raft_config);
 
         // Spawn the partition actor with shared output channel and backpressure.
@@ -391,6 +402,8 @@ pub async fn setup_multi_partition<
         offset_group_states,
         pending_offset_proposals,
         Arc::clone(&backpressure),
+        snapshot_store,
+        config.log_trailing_entries,
         incoming_rx,
         shutdown_rx,
     ));
@@ -445,8 +458,12 @@ pub fn create_partition_actor(
     output_tx: mpsc::Sender<GroupedOutput>,
     config: PartitionActorConfig,
     backpressure: Arc<BackpressureState>,
+    log_trailing_entries: Option<u64>,
 ) -> PartitionActorHandle {
-    let raft_config = RaftConfig::new(node_id, replicas);
+    let mut raft_config = RaftConfig::new(node_id, replicas);
+    if let Some(trailing) = log_trailing_entries {
+        raft_config = raft_config.with_log_trailing_entries(trailing);
+    }
     let raft_node = RaftNode::new(raft_config);
 
     spawn_partition_actor_shared_with_batch_config(
@@ -479,8 +496,12 @@ pub fn create_partition_actor_with_state(
     output_tx: mpsc::Sender<GroupedOutput>,
     config: PartitionActorConfig,
     backpressure: Arc<BackpressureState>,
+    log_trailing_entries: Option<u64>,
 ) -> PartitionActorHandle {
-    let raft_config = RaftConfig::new(node_id, replicas);
+    let mut raft_config = RaftConfig::new(node_id, replicas);
+    if let Some(trailing) = log_trailing_entries {
+        raft_config = raft_config.with_log_trailing_entries(trailing);
+    }
     let raft_node = RaftNode::with_recovery_state(
         raft_config,
         term,
@@ -656,6 +677,7 @@ mod tests {
             output_tx,
             PartitionActorConfig::default(),
             batcher::BackpressureState::noop(),
+            None,
         );
 
         // Verify the handle works.
@@ -709,18 +731,17 @@ pub(super) fn spawn_output_processor_watchdog(
             let current = stats.batch_count.load(Ordering::Relaxed);
             if current == last_batch_count {
                 stall_checks += 1;
-                if stall_checks >= STALL_CHECKS {
-                    // batch_count has not advanced for STALL_CHECKS × CHECK_INTERVAL_SECS
-                    // seconds with active partitions. The output processor is deadlocked.
-                    panic!(
-                        "Output processor watchdog: no progress for {}s with {} active partitions \
-                         (node_id={}, batch_count={}). Deadlock detected — forcing restart.",
-                        CHECK_INTERVAL_SECS * STALL_CHECKS,
-                        partition_count,
-                        node_id.get(),
-                        current,
-                    );
-                }
+                // batch_count has not advanced for STALL_CHECKS × CHECK_INTERVAL_SECS
+                // seconds with active partitions. The output processor is deadlocked.
+                assert!(
+                    stall_checks < STALL_CHECKS,
+                    "Output processor watchdog: no progress for {}s with {} active partitions \
+                     (node_id={}, batch_count={}). Deadlock detected — forcing restart.",
+                    CHECK_INTERVAL_SECS * STALL_CHECKS,
+                    partition_count,
+                    node_id.get(),
+                    current,
+                );
                 warn!(
                     node_id = node_id.get(),
                     stall_checks,

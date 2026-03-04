@@ -861,6 +861,16 @@ impl RaftActor {
                         self.handle_need_entries(follower_id, start_index, prev_log_index, max_bytes);
                     extra_messages.extend(msgs);
                 }
+                RaftOutput::ApplySnapshot { snapshot } => {
+                    // DST simulation: the Raft protocol snapshot path is exercised.
+                    // No application state to restore (DST actors have no storage layer).
+                    debug!(
+                        actor = %self.name,
+                        index = snapshot.last_included_index.get(),
+                        term = snapshot.last_included_term.get(),
+                        "follower received snapshot (DST: no storage to apply)"
+                    );
+                }
             }
         }
 
@@ -905,7 +915,8 @@ impl RaftActor {
                     state.install_snapshots_sent += 1;
                 }
             }
-            self.node.provide_snapshot(follower_id, snap_index, snap_term)
+            self.node
+                .provide_snapshot(follower_id, snap_index, snap_term, bytes::Bytes::new())
         } else {
             // Entries are in the in-memory log — provide them directly.
             let entries = self.node.log().entries_from_limited(start_index, max_bytes);

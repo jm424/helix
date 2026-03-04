@@ -212,7 +212,7 @@ impl ServerError {
             Self::TopicAlreadyExists { .. } | Self::TopicNotFound { .. } => ErrorCode::InvalidTopic,
             Self::PartitionNotFound { .. } => ErrorCode::InvalidPartition,
             Self::OffsetOutOfRange { .. } => ErrorCode::OffsetOutOfRange,
-            Self::NotLeader { .. } => ErrorCode::NotLeader,
+            Self::NotLeader { .. } | Self::RaftProposalRejected => ErrorCode::NotLeader,
             Self::NotController { .. } => ErrorCode::NotController,
             Self::RecordBatchTooLarge { .. } => ErrorCode::RecordBatchTooLarge,
             Self::ConsumerGroupNotFound { .. } => ErrorCode::ConsumerGroupNotFound,
@@ -227,7 +227,6 @@ impl ServerError {
             Self::OutOfOrderSequence { .. } => ErrorCode::OutOfOrderSequence,
             Self::ProducerFenced { .. } => ErrorCode::ProducerFenced,
             Self::Overloaded { .. } | Self::NotEnoughReplicas { .. } => ErrorCode::BrokerNotAvailable,
-            Self::RaftProposalRejected => ErrorCode::NotLeader,
             Self::Internal { .. } => ErrorCode::Unknown,
         }
     }

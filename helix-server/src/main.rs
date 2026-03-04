@@ -682,8 +682,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info!("Created default topic with 4 partitions");
             }
 
-            // Extract WAL pool reference before service is consumed by the server.
+            // Extract WAL pool and snapshot store before service is consumed by the server.
             let wal_pool_for_shutdown = service.shared_wal_pool();
+            let snapshot_store_for_shutdown = service.snapshot_store();
 
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
             tokio::spawn(async move {
@@ -701,11 +702,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .await?;
 
-            // Graceful WAL shutdown (no new client writes can arrive now):
+            // Graceful shutdown sequence (no new client writes can arrive now):
             // 1. Flush write buffer to disk (fsync) so in-flight append_nowait
             //    writes are durable and don't create holes in the WAL.
             // 2. Upload the now-fully-durable segments to S3 so a pod restart
             //    on a new node (ephemeral disk) can recover without re-uploading.
+            // 3. Drain the snapshot upload worker so all queued snapshot S3 PUTs
+            //    complete before exit. This ensures the next incarnation can skip
+            //    WAL replay for any group that was snapshotted in this run.
             if let Some(pool) = wal_pool_for_shutdown {
                 info!("Flushing SharedWalPool to disk before exit");
                 if let Err(e) = pool.shutdown().await {
@@ -715,10 +719,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pool.process_tiering(local_retention_ms_shutdown).await;
                 }
             }
+            if let Some(store) = snapshot_store_for_shutdown {
+                info!("Draining snapshot upload worker before exit");
+                store.drain().await;
+            }
         }
         Protocol::Kafka => {
-            // Extract WAL pool reference before service is moved into Arc.
+            // Extract WAL pool and snapshot store before service is moved into Arc.
             let wal_pool_for_shutdown = service.shared_wal_pool();
+            let snapshot_store_for_shutdown = service.snapshot_store();
 
             // For Kafka mode, wrap service in Arc for sharing.
             let service = Arc::new(service);
@@ -803,11 +812,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             kafka_server.run().await?;
 
-            // Graceful WAL shutdown (no new client writes can arrive now):
+            // Graceful shutdown sequence (no new client writes can arrive now):
             // 1. Flush write buffer to disk (fsync) so in-flight append_nowait
             //    writes are durable and don't create holes in the WAL.
             // 2. Upload the now-fully-durable segments to S3 so a pod restart
             //    on a new node (ephemeral disk) can recover without re-uploading.
+            // 3. Drain the snapshot upload worker so all queued snapshot S3 PUTs
+            //    complete before exit.
             if let Some(pool) = wal_pool_for_shutdown {
                 info!("Flushing SharedWalPool to disk before exit");
                 if let Err(e) = pool.shutdown().await {
@@ -816,6 +827,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     info!("Running final tiering pass after fsync");
                     pool.process_tiering(local_retention_ms_shutdown).await;
                 }
+            }
+            if let Some(store) = snapshot_store_for_shutdown {
+                info!("Draining snapshot upload worker before exit");
+                store.drain().await;
             }
         }
     }

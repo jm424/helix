@@ -43,10 +43,11 @@ use tracing::{debug, error, info, warn};
 use crate::controller::{ControllerState, BROKER_HEARTBEAT_TIMEOUT_MS, CONTROLLER_GROUP_ID};
 use crate::group_map::GroupMap;
 use crate::offset_group::{
-    is_offset_group, offset_group_slot, OFFSET_GROUP_COUNT, OFFSET_GROUP_COUNT_USIZE,
+    offset_group_slot, OFFSET_GROUP_COUNT, OFFSET_GROUP_COUNT_USIZE,
     OFFSET_GROUP_ID_BASE,
 };
 use crate::partition_storage::PartitionStorage;
+use crate::snapshot::Snapshottable;
 use crate::vote_store::{LocalFileVoteStorage, VoteState, VoteStore};
 
 use self::router::PartitionRouter;
@@ -520,6 +521,414 @@ async fn configure_pool_tiering<S: helix_wal::Storage + Clone + Send + Sync + 's
     info!("SharedWalPool tiering configured with simulated backend");
 }
 
+// =============================================================================
+// Shared WAL + Snapshot Recovery
+// =============================================================================
+
+/// Result of WAL + snapshot recovery, used to initialize Raft groups.
+///
+/// Returned by [`recover_from_wal_and_snapshots`] and consumed by both
+/// the production and DST constructors to create Raft groups with the
+/// correct committed log position after restart.
+struct WalRecoveryResult {
+    /// Controller (commit_index, commit_term) from WAL replay.
+    controller_commit: (u64, u64),
+    /// Per-offset-group (commit_index, commit_term) from WAL replay.
+    offset_commits: [(u64, u64); OFFSET_GROUP_COUNT_USIZE],
+    /// Recovered data partition states (snapshot + WAL entries).
+    data_partition_states: HashMap<GroupId, PartitionRecoveryState>,
+}
+
+/// Recovers controller, offset group, and data partition state from
+/// snapshots and WAL replay.
+///
+/// This function is the single source of truth for startup recovery logic,
+/// called by both the production (`new_multi_node_internal`) and DST
+/// (`new_multi_node_with_transport`) constructors. It:
+///
+/// 1. Loads controller + offset group snapshots (if `snapshot_store` is set)
+/// 2. Replays WAL entries via `pool.recover_streaming()`
+/// 3. Rebuilds controller and offset group state machines
+/// 4. Loads data partition snapshots and replays remaining WAL entries
+///
+/// The caller must open the pool and configure tiering/S3 downloads
+/// before calling this function.
+#[allow(clippy::too_many_lines)]
+async fn recover_from_wal_and_snapshots<S: Storage + Clone + Send + Sync + 'static>(
+    pool: &SharedWalPool<S>,
+    snapshot_store: Option<&Arc<crate::snapshot::SnapshotStore>>,
+    controller_state: &Arc<RwLock<ControllerState>>,
+    offset_group_states: &[Arc<RwLock<crate::offset_group::OffsetGroupState>>],
+    cluster_nodes: &[NodeId],
+    node_id: NodeId,
+) -> WalRecoveryResult {
+    // -----------------------------------------------------------------
+    // 1. Load controller snapshot (if available) before WAL replay.
+    // -----------------------------------------------------------------
+    let controller_snapshot_index: u64 = if let Some(store) = snapshot_store {
+        match store.load(CONTROLLER_GROUP_ID).await {
+            Some((meta, body, from_remote)) => {
+                let apply_result = controller_state
+                    .write()
+                    .await
+                    .apply_snapshot(&meta, body.as_ref());
+                match apply_result {
+                    Ok(()) => {
+                        info!(
+                            snap_index = meta.last_included_index,
+                            snap_term = meta.last_included_term,
+                            from_remote,
+                            "Loaded controller snapshot; WAL entries at or below \
+                             index will be skipped"
+                        );
+                        meta.last_included_index
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "Failed to apply controller snapshot; replaying WAL"
+                        );
+                        0
+                    }
+                }
+            }
+            None => 0,
+        }
+    } else {
+        0
+    };
+
+    // -----------------------------------------------------------------
+    // 2. Load offset group snapshots (if available).
+    // -----------------------------------------------------------------
+    let mut offset_snapshot_indices = [0u64; OFFSET_GROUP_COUNT_USIZE];
+    if let Some(store) = snapshot_store {
+        for slot in 0..OFFSET_GROUP_COUNT_USIZE {
+            #[allow(clippy::cast_possible_truncation)]
+            let group_id = GroupId::new(OFFSET_GROUP_ID_BASE.get() + slot as u64);
+            if let Some((meta, body, from_remote)) = store.load(group_id).await {
+                let apply_result = offset_group_states[slot]
+                    .write()
+                    .await
+                    .apply_snapshot(&meta, body.as_ref());
+                match apply_result {
+                    Ok(()) => {
+                        info!(
+                            slot,
+                            snap_index = meta.last_included_index,
+                            snap_term = meta.last_included_term,
+                            from_remote,
+                            "Loaded offset group snapshot; WAL entries at or \
+                             below index will be skipped"
+                        );
+                        offset_snapshot_indices[slot] = meta.last_included_index;
+                    }
+                    Err(e) => {
+                        warn!(
+                            slot,
+                            error = %e,
+                            "Failed to apply offset group snapshot; replaying WAL"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // 3. Streaming recovery: collect all entries by category.
+    // -----------------------------------------------------------------
+    let mut controller_entries_raw: Vec<SharedEntry> = Vec::new();
+    let mut offset_entries_raw: Vec<Vec<SharedEntry>> =
+        vec![Vec::new(); OFFSET_GROUP_COUNT_USIZE];
+    let mut data_entries_raw: HashMap<GroupId, Vec<SharedEntry>> = HashMap::new();
+    pool.recover_streaming(&mut |group_id, entry| {
+        if group_id == CONTROLLER_GROUP_ID {
+            controller_entries_raw.push(entry.clone());
+        } else if let Some(slot) = offset_group_slot(group_id) {
+            offset_entries_raw[slot].push(entry.clone());
+        } else {
+            data_entries_raw
+                .entry(group_id)
+                .or_default()
+                .push(entry.clone());
+        }
+    })
+    .await
+    .expect("Failed to recover from SharedWalPool");
+
+    info!(
+        data_groups = data_entries_raw.len(),
+        controller_entries = controller_entries_raw.len(),
+        "SharedWalPool recovery complete"
+    );
+
+    // -----------------------------------------------------------------
+    // 4. Replay controller entries into ControllerState.
+    //
+    // We use max_raft_index (not max_contiguous) for both the Raft
+    // commit_index and the WAL write guard. The state machine is built
+    // from ALL entries found in the WAL during startup replay (not just
+    // up to max_contiguous), so the Raft commit_index must match to
+    // prevent re-delivery of already-applied entries.
+    // -----------------------------------------------------------------
+    let (ctl_commit_index, ctl_commit_term) = {
+        let (max_contiguous_index, max_contiguous_term) = {
+            let mut sorted: Vec<u64> = controller_entries_raw
+                .iter()
+                .map(|e| e.header.raft_index)
+                .collect();
+            sorted.sort_unstable();
+            sorted.dedup();
+            if sorted.is_empty() {
+                (0u64, 0u64)
+            } else {
+                let min_ri = sorted[0];
+                let mut last_contiguous = min_ri.saturating_sub(1);
+                let terms: std::collections::HashMap<u64, u64> =
+                    controller_entries_raw
+                        .iter()
+                        .map(|e| (e.header.raft_index, e.header.term))
+                        .collect();
+                for idx in sorted {
+                    if idx == last_contiguous + 1 {
+                        last_contiguous = idx;
+                    } else {
+                        break;
+                    }
+                }
+                let term =
+                    terms.get(&last_contiguous).copied().unwrap_or(0);
+                (last_contiguous, term)
+            }
+        };
+
+        let mut state = controller_state.write().await;
+        let mut count = 0u64;
+        let (max_raft_index, max_raft_term) = controller_entries_raw
+            .iter()
+            .max_by_key(|e| e.header.raft_index)
+            .map_or((0, 0), |e| (e.header.raft_index, e.header.term));
+        for entry in &controller_entries_raw {
+            if entry.header.raft_index <= controller_snapshot_index {
+                continue;
+            }
+            if let Some(cmd) =
+                crate::controller::ControllerCommand::decode(&entry.payload)
+            {
+                let _ = state.apply(&cmd, cluster_nodes);
+                state.last_applied_index = entry.header.raft_index;
+                state.last_applied_term = entry.header.term;
+                state.last_applied_wal_index = entry.header.index;
+                count += 1;
+            } else {
+                warn!(
+                    raft_index = entry.header.raft_index,
+                    "Failed to decode controller entry during recovery"
+                );
+            }
+        }
+        drop(state);
+
+        let effective_max = max_raft_index.max(controller_snapshot_index);
+        tick::CONTROLLER_LAST_PERSISTED_INDEX
+            .store(effective_max, std::sync::atomic::Ordering::Relaxed);
+        if count > 0 || controller_snapshot_index > 0 {
+            info!(
+                replayed = count,
+                snapshot_index = controller_snapshot_index,
+                max_contiguous_index,
+                max_contiguous_term,
+                max_raft_index,
+                wal_holes =
+                    max_raft_index.saturating_sub(max_contiguous_index),
+                "Replayed controller state from SharedWAL"
+            );
+        }
+        (
+            effective_max,
+            if max_raft_index > 0 { max_raft_term } else { 0 },
+        )
+    };
+
+    // -----------------------------------------------------------------
+    // 5. Replay offset group entries.
+    // -----------------------------------------------------------------
+    let mut offset_commit_indices =
+        [(0u64, 0u64); OFFSET_GROUP_COUNT_USIZE];
+    for (slot, entries) in offset_entries_raw.into_iter().enumerate() {
+        let (max_contiguous_index, max_contiguous_term) = {
+            let mut sorted: Vec<u64> =
+                entries.iter().map(|e| e.header.raft_index).collect();
+            sorted.sort_unstable();
+            sorted.dedup();
+            if sorted.is_empty() {
+                (0u64, 0u64)
+            } else {
+                let min_ri = sorted[0];
+                let mut last_contiguous = min_ri.saturating_sub(1);
+                let terms: std::collections::HashMap<u64, u64> = entries
+                    .iter()
+                    .map(|e| (e.header.raft_index, e.header.term))
+                    .collect();
+                for idx in sorted {
+                    if idx == last_contiguous + 1 {
+                        last_contiguous = idx;
+                    } else {
+                        break;
+                    }
+                }
+                let term =
+                    terms.get(&last_contiguous).copied().unwrap_or(0);
+                (last_contiguous, term)
+            }
+        };
+
+        let (max_raft_index, max_raft_term) = entries
+            .iter()
+            .max_by_key(|e| e.header.raft_index)
+            .map_or((0, 0), |e| (e.header.raft_index, e.header.term));
+        let snap_index = offset_snapshot_indices[slot];
+        let mut count = 0u64;
+        let mut state = offset_group_states[slot].write().await;
+        // Lazy registration: only register offset groups that have WAL
+        // entries or a snapshot. Groups with no entries must not pin the
+        // eviction floor at 0.
+        #[allow(clippy::cast_possible_truncation)]
+        let og_group_id = GroupId::new(OFFSET_GROUP_ID_BASE.get() + slot as u64);
+        if !entries.is_empty() || snap_index > 0 {
+            pool.register_group(og_group_id);
+        }
+        for entry in entries {
+            if entry.header.raft_index <= snap_index {
+                continue;
+            }
+            if let Some(cmd) =
+                crate::offset_group::OffsetGroupCommand::decode(
+                    &entry.payload,
+                )
+            {
+                state.apply(
+                    &cmd,
+                    entry.header.raft_index,
+                    entry.header.term,
+                );
+                state.last_applied_wal_index = entry.header.index;
+                count += 1;
+            } else {
+                warn!(
+                    slot,
+                    raft_index = entry.header.raft_index,
+                    "Failed to decode offset group entry during recovery"
+                );
+            }
+        }
+        drop(state);
+
+        let effective_max = max_raft_index.max(snap_index);
+        offset_commit_indices[slot] = (
+            effective_max,
+            if max_raft_index > 0 { max_raft_term } else { 0 },
+        );
+        tick::OFFSET_GROUP_LAST_PERSISTED[slot]
+            .store(effective_max, std::sync::atomic::Ordering::Relaxed);
+        if count > 0 || snap_index > 0 {
+            info!(
+                slot,
+                replayed = count,
+                snapshot_index = snap_index,
+                max_contiguous_index,
+                max_contiguous_term,
+                max_raft_index,
+                wal_holes =
+                    max_raft_index.saturating_sub(max_contiguous_index),
+                "Replayed offset group state from SharedWAL"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // 6. Load data partition snapshots (after controller is rebuilt).
+    // -----------------------------------------------------------------
+    let mut partition_snapshot_anchors: HashMap<GroupId, u64> =
+        HashMap::new();
+    let mut data_partition_states: HashMap<GroupId, PartitionRecoveryState> =
+        HashMap::new();
+    if let Some(store) = snapshot_store {
+        let assigned_group_ids: Vec<GroupId> = {
+            let state = controller_state.read().await;
+            state
+                .all_assignments()
+                .filter(|(_, a)| a.replicas.contains(&node_id))
+                .map(|(_, a)| a.group_id)
+                .collect()
+        };
+        for group_id in assigned_group_ids {
+            if let Some((meta, body, from_remote)) =
+                store.load(group_id).await
+            {
+                match PartitionRecoveryState::from_snapshot(&meta, &body) {
+                    Ok(recovery_state) => {
+                        info!(
+                            group_id = group_id.get(),
+                            snap_index = meta.last_included_index,
+                            snap_wal_index =
+                                meta.last_included_wal_index,
+                            from_remote,
+                            "Loaded partition snapshot; WAL entries \
+                             at or below wal_index will be skipped"
+                        );
+                        partition_snapshot_anchors.insert(
+                            group_id,
+                            meta.last_included_wal_index,
+                        );
+                        data_partition_states
+                            .insert(group_id, recovery_state);
+                    }
+                    Err(e) => {
+                        warn!(
+                            group_id = group_id.get(),
+                            error = %e,
+                            "Failed to decode partition snapshot; \
+                             replaying WAL fully"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // 7. Replay data partition WAL entries.
+    // -----------------------------------------------------------------
+    for (group_id, entries) in &data_entries_raw {
+        let state = data_partition_states.entry(*group_id).or_default();
+        let anchor = partition_snapshot_anchors.get(group_id).copied();
+        for entry in entries {
+            if let Some(a) = anchor {
+                if entry.index() <= a {
+                    continue;
+                }
+            }
+            state.apply_entry(entry);
+        }
+    }
+
+    if !data_partition_states.is_empty() {
+        info!(
+            partitions = data_partition_states.len(),
+            snapshots = partition_snapshot_anchors.len(),
+            "Data partition recovery complete"
+        );
+    }
+
+    WalRecoveryResult {
+        controller_commit: (ctl_commit_index, ctl_commit_term),
+        offset_commits: offset_commit_indices,
+        data_partition_states,
+    }
+}
+
 /// The Helix gRPC service backed by Multi-Raft.
 ///
 /// This provides a Raft-replicated implementation using the Multi-Raft
@@ -625,9 +1034,9 @@ pub struct HelixService<
     pub(crate) offset_group_states: Vec<Arc<RwLock<crate::offset_group::OffsetGroupState>>>,
     /// Pending proposals across all offset groups.
     pub(crate) pending_offset_proposals: Arc<RwLock<Vec<PendingOffsetProposal>>>,
-    /// Snapshot stores, one per offset group (None in test/DST mode).
+    /// Unified snapshot store for all Raft group types (None in test/DST mode).
     #[allow(dead_code)]
-    pub(crate) offset_snapshot_stores: Vec<Option<Arc<crate::offset_group::OffsetSnapshotStore>>>,
+    pub(crate) snapshot_store: Option<Arc<crate::snapshot::SnapshotStore>>,
     /// Local disk retention in milliseconds.
     /// `None` means retention is disabled (segments kept forever).
     pub(crate) local_retention_ms: Option<u64>,
@@ -759,6 +1168,20 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
         let progress_config = ProgressConfig::for_testing();
         let progress_manager = Arc::new(ProgressManager::new(progress_store, progress_config));
 
+        // Create a local snapshot store for disk mode (uses SimulatedObjectStorage
+        // as a no-op S3 backend so the upload channel compiles but never uploads).
+        // Snapshots are persisted to local disk; S3 upload is skipped.
+        let snapshot_store_internal: Option<Arc<crate::snapshot::SnapshotStore>> =
+            data_dir.as_ref().map(|dir| {
+                let remote: Arc<dyn ObjectStorage> =
+                    Arc::new(SimulatedObjectStorage::new(0));
+                Arc::new(crate::snapshot::SnapshotStore::new(
+                    dir.clone(),
+                    format!("node-{}/", node_id.get()),
+                    remote,
+                ))
+            });
+
         // Initialize SharedWalPool if data_dir is set.
         let (shared_wal_pool, recovered_entries) = if let Some(ref dir) = data_dir {
             // Determine WAL count (default 4, or user override).
@@ -811,12 +1234,55 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                 }
             }
 
+            // Load partition snapshots (local disk only) before WAL replay.
+            let mut partition_snapshot_anchors_internal: HashMap<GroupId, u64> =
+                HashMap::new();
+            let mut data_partition_states_init_internal: HashMap<GroupId, PartitionRecoveryState> =
+                HashMap::new();
+            if let Some(ref store) = snapshot_store_internal {
+                for group_id in store.list_local_group_ids() {
+                    if group_id == CONTROLLER_GROUP_ID {
+                        continue;
+                    }
+                    if let Some((meta, body, _)) = store.load(group_id).await {
+                        match PartitionRecoveryState::from_snapshot(&meta, &body) {
+                            Ok(state) => {
+                                info!(
+                                    group_id = group_id.get(),
+                                    snap_wal_index = meta.last_included_wal_index,
+                                    "Loaded partition snapshot (single-node); WAL \
+                                     entries at or below wal_index will be skipped"
+                                );
+                                partition_snapshot_anchors_internal
+                                    .insert(group_id, meta.last_included_wal_index);
+                                data_partition_states_init_internal
+                                    .insert(group_id, state);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    group_id = group_id.get(),
+                                    error = %e,
+                                    "Failed to decode partition snapshot; replaying WAL"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             // Streaming recovery: build pre-built states per group without
             // accumulating all entries in memory (fixes OOM on large WALs).
-            let mut data_partition_states: HashMap<GroupId, PartitionRecoveryState> =
-                HashMap::new();
+            let mut data_partition_states = data_partition_states_init_internal;
             pool.recover_streaming(&mut |group_id, entry| {
                 if group_id != CONTROLLER_GROUP_ID {
+                    // Skip entries already covered by a partition snapshot.
+                    if let Some(&anchor) =
+                        partition_snapshot_anchors_internal.get(&group_id)
+                    {
+                        if entry.index() <= anchor {
+                            return;
+                        }
+                    }
                     data_partition_states
                         .entry(group_id)
                         .or_default()
@@ -884,10 +1350,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             output_processor_stats: None,
             vote_store: None, // Single-node mode doesn't persist vote state.
             offset_group_states: (0..OFFSET_GROUP_COUNT_USIZE)
-                .map(|_| Arc::new(RwLock::new(crate::offset_group::OffsetGroupState::new())))
+                .map(|slot| Arc::new(RwLock::new(crate::offset_group::OffsetGroupState::new_for_slot(slot))))
                 .collect(),
             pending_offset_proposals: Arc::new(RwLock::new(Vec::new())),
-            offset_snapshot_stores: vec![None; OFFSET_GROUP_COUNT_USIZE],
+            snapshot_store: snapshot_store_internal,
             local_retention_ms: None,
         };
 
@@ -1053,15 +1519,14 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
         // Initialize VoteStore for Raft vote state persistence.
         // Uses local file for fast recovery + S3 backup for disk loss scenarios.
         // Must be done before creating Raft groups so we can restore vote state.
-        let (vote_store, initial_vote_state, recovered_from_remote) =
+        // Also retains remote_storage so snapshot stores can share the same backend.
+        let (vote_store, initial_vote_state, recovered_from_remote, remote_object_storage) =
             if let Some(ref dir) = data_dir {
                 let vote_file_path = dir.join("vote-state.bin");
                 let local_storage = Arc::new(LocalFileVoteStorage::new(vote_file_path));
 
-                // Build remote storage for vote state backup.
-                // Uses S3 in production (when s3_config is set) so that vote state
-                // survives pod rescheduling to a new node. Falls back to simulated
-                // storage for DST and tests where no real object store is available.
+                // Build remote storage shared by vote state, snapshot stores, and tiering.
+                // Uses S3 in production; falls back to simulated storage otherwise.
                 #[cfg(feature = "s3")]
                 let remote_storage: Arc<dyn ObjectStorage> =
                     if let Some(ref cfg) = s3_config {
@@ -1106,6 +1571,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                     }
                 };
 
+                // Clone remote_storage before moving into VoteStore so snapshot
+                // stores can share the same object storage backend.
+                let remote_for_snapshots = Arc::clone(&remote_storage);
+
                 // Create VoteStore and spawn background S3 worker.
                 let (store, handle) = VoteStore::new(
                     node_id,
@@ -1121,11 +1590,34 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                     Some(Arc::new(Mutex::new(store))),
                     initial_state,
                     recovered_from_remote,
+                    Some(remote_for_snapshots),
                 )
             } else {
                 // In-memory mode - no vote persistence.
-                (None, VoteState::new(), false)
+                (None, VoteState::new(), false, None)
             };
+
+        // Create the unified snapshot store.
+        // Only created when a data_dir is set (multi-node production/test).
+        // Loaded before WAL replay so we can skip already-snapshotted entries.
+        let snapshot_store_opt: Option<Arc<crate::snapshot::SnapshotStore>> =
+            data_dir.as_ref().map(|dir| {
+                // Use the real S3 backend when configured, otherwise fall back to
+                // a no-op SimulatedObjectStorage so that local-only snapshots
+                // (disk save/load) still work without S3.
+                let remote: Arc<dyn ObjectStorage> =
+                    if let Some(ref real) = remote_object_storage {
+                        Arc::clone(real)
+                    } else {
+                        Arc::new(SimulatedObjectStorage::new(node_id.get()))
+                    };
+                let s3_prefix = format!("node-{}/", node_id.get());
+                Arc::new(crate::snapshot::SnapshotStore::new(
+                    dir.clone(),
+                    s3_prefix,
+                    remote,
+                ))
+            });
 
         // Controller partition (group 0) is created after WAL recovery so that
         // the committed log position from the WAL can be passed to the Raft
@@ -1141,17 +1633,16 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
         // Initialize per-offset-group state (populated by WAL recovery below).
         let offset_group_states_vec: Vec<Arc<RwLock<crate::offset_group::OffsetGroupState>>> =
             (0..OFFSET_GROUP_COUNT_USIZE)
-                .map(|_| Arc::new(RwLock::new(crate::offset_group::OffsetGroupState::new())))
+                .map(|slot| Arc::new(RwLock::new(crate::offset_group::OffsetGroupState::new_for_slot(slot))))
                 .collect();
-        // (commit_index, commit_term) per offset group; populated during WAL recovery.
-        let mut offset_commit_indices = [(0u64, 0u64); OFFSET_GROUP_COUNT_USIZE];
         let pending_offset_proposals: Arc<RwLock<Vec<PendingOffsetProposal>>> =
             Arc::new(RwLock::new(Vec::new()));
 
         // Initialize SharedWalPool if data_dir is set.
-        // Also returns the highest committed controller Raft index and term seen
-        // in the WAL, so the controller group can be created with correct state.
-        let (shared_wal_pool, recovered_entries, controller_wal_commit_index, controller_wal_commit_term) =
+        // WAL + snapshot recovery is handled by recover_from_wal_and_snapshots().
+        #[allow(clippy::type_complexity)]
+        let (shared_wal_pool, recovered_entries, controller_wal_commit_index, controller_wal_commit_term, offset_commit_indices) :
+            (Option<Arc<SharedWalPool<S>>>, Arc<RwLock<HashMap<GroupId, PartitionRecoveryState>>>, u64, u64, [(u64, u64); OFFSET_GROUP_COUNT_USIZE]) =
             if let Some(ref dir) = data_dir {
             // Determine WAL count (default 4, or user override).
             let wal_count = shared_wal_count.unwrap_or(4);
@@ -1204,217 +1695,36 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                 }
             }
 
-            // Streaming recovery: build pre-built states per group while
-            // collecting controller entries and offset group entries separately.
-            let mut controller_entries_raw: Vec<SharedEntry> = Vec::new();
-            let mut offset_entries_raw: Vec<Vec<SharedEntry>> =
-                vec![Vec::new(); OFFSET_GROUP_COUNT_USIZE];
-            let mut data_partition_states: HashMap<GroupId, PartitionRecoveryState> =
-                HashMap::new();
-            pool.recover_streaming(&mut |group_id, entry| {
-                if group_id == CONTROLLER_GROUP_ID {
-                    controller_entries_raw.push(entry.clone());
-                } else if let Some(slot) = offset_group_slot(group_id) {
-                    offset_entries_raw[slot].push(entry.clone());
-                } else {
-                    data_partition_states
-                        .entry(group_id)
-                        .or_default()
-                        .apply_entry(entry);
-                }
-            })
-            .await
-            .expect("Failed to recover from SharedWalPool");
-
-            info!(
-                partitions = data_partition_states.len(),
-                controller_entries = controller_entries_raw.len(),
-                "SharedWalPool recovery complete for multi-node"
-            );
-
-            // Replay controller entries into ControllerState immediately.
-            // This restores topics and partition assignments after a pod restart.
-            // Also capture the highest CONTIGUOUS committed Raft index and its
-            // term so the controller Raft group can be initialised with correct
-            // compacted state, preventing log divergence after restart.
-            //
-            // We use max_raft_index (not max_contiguous) for both the Raft
-            // commit_index and the WAL write guard. The state machine is built
-            // from ALL entries found in the WAL during startup replay (not just
-            // up to max_contiguous), so the Raft commit_index must match to
-            // prevent re-delivery of already-applied entries.
-            // max_contiguous is tracked for diagnostics only (wal_holes log field).
-            let (ctl_commit_index, ctl_commit_term) = {
-                // Compute max_contiguous: the highest N where all indices
-                // from min_raft_index..=N are present (no gaps).
-                // Entries below min_raft_index were committed and tiered to S3.
-                let (max_contiguous_index, max_contiguous_term) = {
-                    let mut sorted: Vec<u64> = controller_entries_raw
-                        .iter()
-                        .map(|e| e.header.raft_index)
-                        .collect();
-                    sorted.sort_unstable();
-                    sorted.dedup();
-                    if sorted.is_empty() {
-                        (0u64, 0u64)
-                    } else {
-                        let min_ri = sorted[0];
-                        // Start cursor one below min_ri so the first entry
-                        // advances it to min_ri (tiered entries < min_ri are
-                        // known committed; we treat them as part of the floor).
-                        let mut last_contiguous = min_ri.saturating_sub(1);
-                        let terms: std::collections::HashMap<u64, u64> =
-                            controller_entries_raw
-                                .iter()
-                                .map(|e| (e.header.raft_index, e.header.term))
-                                .collect();
-                        for idx in sorted {
-                            if idx == last_contiguous + 1 {
-                                last_contiguous = idx;
-                            } else {
-                                // Gap detected; stop at the last contiguous index.
-                                break;
-                            }
-                        }
-                        let term = terms.get(&last_contiguous).copied().unwrap_or(0);
-                        (last_contiguous, term)
-                    }
-                };
-
-                let mut state = controller_state.write().await;
-                let mut count = 0u64;
-                let (max_raft_index, max_raft_term) = controller_entries_raw
-                    .iter()
-                    .max_by_key(|e| e.header.raft_index)
-                    .map(|e| (e.header.raft_index, e.header.term))
-                    .unwrap_or((0, 0));
-                for entry in &controller_entries_raw {
-                    if let Some(cmd) =
-                        crate::controller::ControllerCommand::decode(&entry.payload)
-                    {
-                        // Discard follow-ups — they were already committed
-                        // and persisted as separate WAL entries.
-                        let _ = state.apply(&cmd, &cluster_nodes);
-                        count += 1;
-                    } else {
-                        warn!(
-                            raft_index = entry.header.raft_index,
-                            "Failed to decode controller entry during recovery"
-                        );
-                    }
-                }
-                drop(state);
-                // Tell tick tasks to skip WAL writes for entries at or
-                // below this index — they're already persisted.
-                // Use max_raft_index (the full WAL tip) so the WAL guard and
-                // Raft commit_index agree with the state machine, which was
-                // built from all entries. Using max_contiguous here caused a
-                // panic: the state machine saw entries above max_contiguous
-                // from startup replay, then Raft re-delivered them (via
-                // NeedEntries catch-up), and the monotonicity check fired.
-                tick::CONTROLLER_LAST_PERSISTED_INDEX
-                    .store(max_raft_index, std::sync::atomic::Ordering::Relaxed);
-                if count > 0 {
-                    info!(
-                        replayed = count,
-                        max_contiguous_index,
-                        max_contiguous_term,
-                        max_raft_index,
-                        wal_holes = max_raft_index.saturating_sub(max_contiguous_index),
-                        "Replayed controller state from SharedWAL"
-                    );
-                }
-                (max_raft_index, max_raft_term)
-            };
-
-            // Replay offset group entries into per-group state machines.
-            // Use max_raft_index (not max_contiguous) for the Raft commit_index
-            // and WAL guard so they agree with the state machine, which is built
-            // from all entries found in the WAL. max_contiguous is logged for
-            // diagnostics only.
-            for (slot, entries) in offset_entries_raw.into_iter().enumerate() {
-                // Compute max_contiguous for this offset group.
-                let (max_contiguous_index, max_contiguous_term) = {
-                    let mut sorted: Vec<u64> =
-                        entries.iter().map(|e| e.header.raft_index).collect();
-                    sorted.sort_unstable();
-                    sorted.dedup();
-                    if sorted.is_empty() {
-                        (0u64, 0u64)
-                    } else {
-                        let min_ri = sorted[0];
-                        let mut last_contiguous = min_ri.saturating_sub(1);
-                        let terms: std::collections::HashMap<u64, u64> = entries
-                            .iter()
-                            .map(|e| (e.header.raft_index, e.header.term))
-                            .collect();
-                        for idx in sorted {
-                            if idx == last_contiguous + 1 {
-                                last_contiguous = idx;
-                            } else {
-                                break;
-                            }
-                        }
-                        let term = terms.get(&last_contiguous).copied().unwrap_or(0);
-                        (last_contiguous, term)
-                    }
-                };
-
-                let (max_raft_index, max_raft_term) = entries
-                    .iter()
-                    .max_by_key(|e| e.header.raft_index)
-                    .map(|e| (e.header.raft_index, e.header.term))
-                    .unwrap_or((0, 0));
-                let mut count = 0u64;
-                let mut state = offset_group_states_vec[slot].write().await;
-                for entry in entries {
-                    if let Some(cmd) =
-                        crate::offset_group::OffsetGroupCommand::decode(&entry.payload)
-                    {
-                        state.apply(&cmd, entry.header.raft_index, entry.header.term);
-                        count += 1;
-                    } else {
-                        warn!(
-                            slot,
-                            raft_index = entry.header.raft_index,
-                            "Failed to decode offset group entry during recovery"
-                        );
-                    }
-                }
-                drop(state);
-                offset_commit_indices[slot] = (max_raft_index, max_raft_term);
-                // Guard: skip re-persisting recovered entries in tick task.
-                // Use max_raft_index so the guard and commit_index agree with
-                // the state machine (built from all WAL entries). Using
-                // max_contiguous caused a panic: the offset group state machine
-                // had entries above max_contiguous from startup replay, then
-                // Raft re-delivered them via catch-up, tripping the
-                // monotonicity assertion in offset_group.rs.
-                tick::OFFSET_GROUP_LAST_PERSISTED[slot]
-                    .store(max_raft_index, std::sync::atomic::Ordering::Relaxed);
-                if count > 0 {
-                    info!(
-                        slot,
-                        replayed = count,
-                        max_contiguous_index,
-                        max_contiguous_term,
-                        max_raft_index,
-                        wal_holes = max_raft_index.saturating_sub(max_contiguous_index),
-                        "Replayed offset group state from SharedWAL"
-                    );
-                }
-            }
+            // Run shared WAL + snapshot recovery.
+            let recovery = recover_from_wal_and_snapshots(
+                &pool,
+                snapshot_store_opt.as_ref(),
+                &controller_state,
+                &offset_group_states_vec,
+                &cluster_nodes,
+                node_id,
+            )
+            .await;
 
             (
                 Some(Arc::new(pool)),
-                Arc::new(RwLock::new(data_partition_states)),
-                ctl_commit_index,
-                ctl_commit_term,
+                Arc::new(RwLock::new(recovery.data_partition_states)),
+                recovery.controller_commit.0,
+                recovery.controller_commit.1,
+                recovery.offset_commits,
             )
         } else {
             // In-memory mode — no persisted state, start from zero.
-            (None, Arc::new(RwLock::new(HashMap::new())), 0u64, 0u64)
+            (None, Arc::new(RwLock::new(HashMap::new())), 0u64, 0u64, [(0u64, 0u64); OFFSET_GROUP_COUNT_USIZE])
         };
+
+        // Register controller with WAL pool for snapshot floor tracking.
+        // Offset groups are registered lazily on first WAL append — groups
+        // that never process entries (no consumer groups) must not pin the
+        // eviction floor at 0.
+        if let Some(ref pool) = shared_wal_pool {
+            pool.register_group(CONTROLLER_GROUP_ID);
+        }
 
         // Create controller partition (group 0) with all cluster nodes.
         // Uses WAL-recovered commit state so the Raft log's compacted position
@@ -1526,7 +1836,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             Arc::clone(&multi_raft),
             transport_handle.clone(),
             incoming_rx,
-            actor_setup::ActorSetupConfig::default(),
+            actor_setup::ActorSetupConfig::default(), // production: no trailing override
             vote_store.clone(),
             shared_wal_pool.clone(),
             data_dir.clone(),
@@ -1535,6 +1845,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             local_retention_ms,
             offset_group_states_vec.clone(),
             Arc::clone(&pending_offset_proposals),
+            snapshot_store_opt.clone(),
         )
         .await;
 
@@ -1561,6 +1872,8 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                 offset_group_states_vec.clone(),
                 Arc::clone(&pending_offset_proposals),
                 Arc::clone(&actor_handles.backpressure),
+                snapshot_store_opt.clone(),
+                None, // log_trailing_entries: use default in production
                 actor_handles.leader_update_rx,
                 rx,
             ));
@@ -1615,7 +1928,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
             vote_store,
             offset_group_states: offset_group_states_vec,
             pending_offset_proposals,
-            offset_snapshot_stores: vec![None; OFFSET_GROUP_COUNT_USIZE],
+            snapshot_store: snapshot_store_opt,
             local_retention_ms,
         })
     }
@@ -1799,10 +2112,10 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             output_processor_stats: None,
             vote_store: None,
             offset_group_states: (0..OFFSET_GROUP_COUNT_USIZE)
-                .map(|_| Arc::new(RwLock::new(crate::offset_group::OffsetGroupState::new())))
+                .map(|slot| Arc::new(RwLock::new(crate::offset_group::OffsetGroupState::new_for_slot(slot))))
                 .collect(),
             pending_offset_proposals: Arc::new(RwLock::new(Vec::new())),
-            offset_snapshot_stores: vec![None; OFFSET_GROUP_COUNT_USIZE],
+            snapshot_store: None,
             local_retention_ms: None,
         }
     }
@@ -1811,6 +2124,12 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
     #[must_use]
     pub fn shared_wal_pool(&self) -> Option<Arc<SharedWalPool<S>>> {
         self.shared_wal_pool.clone()
+    }
+
+    /// Returns the snapshot store (if snapshot persistence is enabled).
+    #[must_use]
+    pub fn snapshot_store(&self) -> Option<Arc<crate::snapshot::SnapshotStore>> {
+        self.snapshot_store.clone()
     }
 
     /// Returns the data directory (if durable storage is enabled).
@@ -2135,7 +2454,13 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
     ) -> Self {
         let node_id = NodeId::new(node_id);
 
-        let multi_raft = Arc::new(RwLock::new(MultiRaft::new(node_id)));
+        let mut mr = MultiRaft::new(node_id);
+        // Use a small trailing window in DST so the in-memory Raft log
+        // compacts aggressively. This forces NeedEntries when a restarted
+        // follower needs entries that are no longer in memory, exercising
+        // the WAL read → SegmentNotFound → snapshot transfer chain.
+        mr.set_log_trailing_entries_override(10);
+        let multi_raft = Arc::new(RwLock::new(mr));
         let partition_storage: GenericPartitionStorageMap<S> =
             Arc::new(RwLock::new(HashMap::new()));
         let group_map = Arc::new(RwLock::new(GroupMap::new()));
@@ -2148,49 +2473,36 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
         // Production multi-node uses VoteStore for crash recovery.
         let vote_store = None;
 
-        // Create controller partition (group 0) with all cluster nodes.
-        let create_result = multi_raft
-            .write()
-            .await
-            .create_group(CONTROLLER_GROUP_ID, cluster_nodes.clone());
-
-        match create_result {
-            Ok(()) => {
-                info!(
-                    group_id = CONTROLLER_GROUP_ID.get(),
-                    nodes = ?cluster_nodes.iter().map(|n| n.get()).collect::<Vec<_>>(),
-                    "Created controller partition for DST"
-                );
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to create controller partition");
-            }
-        }
-
-        // Create offset groups (IDs 1–3) for DST. No vote/WAL recovery in DST mode.
-        let offset_group_states_vec: Vec<Arc<RwLock<crate::offset_group::OffsetGroupState>>> =
-            (0..OFFSET_GROUP_COUNT_USIZE)
-                .map(|_| Arc::new(RwLock::new(crate::offset_group::OffsetGroupState::new())))
-                .collect();
-        let pending_offset_proposals_dst: Arc<RwLock<Vec<PendingOffsetProposal>>> =
-            Arc::new(RwLock::new(Vec::new()));
-        for i in 0..OFFSET_GROUP_COUNT {
-            let gid = GroupId::new(OFFSET_GROUP_ID_BASE.get() + i);
-            let result = multi_raft.write().await.create_group(gid, cluster_nodes.clone());
-            match result {
-                Ok(()) => info!(group_id = gid.get(), "Created offset partition for DST"),
-                Err(e) => error!(error = %e, group_id = gid.get(), "Failed to create offset partition"),
-            }
-        }
-
         // Create progress manager.
         let progress_store = SimulatedProgressStore::new(node_id.get());
         let progress_config = ProgressConfig::for_testing();
         let progress_manager = Arc::new(ProgressManager::new(progress_store, progress_config));
 
+        // Initialize per-offset-group state (populated by WAL recovery below).
+        let offset_group_states_vec: Vec<Arc<RwLock<crate::offset_group::OffsetGroupState>>> =
+            (0..OFFSET_GROUP_COUNT_USIZE)
+                .map(|slot| Arc::new(RwLock::new(crate::offset_group::OffsetGroupState::new_for_slot(slot))))
+                .collect();
+        let pending_offset_proposals_dst: Arc<RwLock<Vec<PendingOffsetProposal>>> =
+            Arc::new(RwLock::new(Vec::new()));
+
+        // Create snapshot store so DST exercises the same snapshot code paths
+        // as production. Uses SimulatedObjectStorage (no real S3).
+        let snapshot_store_opt: Option<Arc<crate::snapshot::SnapshotStore>> =
+            data_dir.as_ref().map(|dir| {
+                let remote: Arc<dyn ObjectStorage> =
+                    Arc::new(SimulatedObjectStorage::new(node_id.get()));
+                Arc::new(crate::snapshot::SnapshotStore::new(
+                    dir.clone(),
+                    format!("node-{}/", node_id.get()),
+                    remote,
+                ))
+            });
+
         // Initialize SharedWalPool if data_dir and shared_wal_count are set.
-        // When shared_wal_count is None, per-partition WAL mode is used instead.
-        let (shared_wal_pool, recovered_entries) =
+        // Uses the same shared recovery function as production so DST
+        // exercises controller/offset snapshot + WAL replay paths.
+        let (shared_wal_pool, recovered_entries, ctl_commit_index, ctl_commit_term, offset_commit_indices) =
             if let (Some(ref dir), Some(wal_count)) = (&data_dir, shared_wal_count) {
                 assert!(
                     (1..=16).contains(&wal_count),
@@ -2206,42 +2518,122 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                 let pool_config = PoolConfig::new(dir.join("shared-wal"), wal_count)
                     .with_flush_interval(std::time::Duration::from_millis(1))
                     .with_max_buffer_entries(1000)
-                    .with_durability(write_durability);
+                    .with_durability(write_durability)
+                    .with_segment_config(
+                        helix_wal::SegmentConfig::new().with_max_entries(10),
+                    );
 
                 let pool = SharedWalPool::open(storage.clone(), pool_config)
                     .await
                     .expect("Failed to open SharedWalPool");
 
-                // Streaming recovery for DST: controller and offset entries are not replayed
-                // here (DST does not test crash recovery of controller/offset state).
-                let mut data_partition_states: HashMap<GroupId, PartitionRecoveryState> =
-                    HashMap::new();
-                pool.recover_streaming(&mut |group_id, entry| {
-                    if group_id != CONTROLLER_GROUP_ID && !is_offset_group(group_id) {
-                        data_partition_states
-                            .entry(group_id)
-                            .or_default()
-                            .apply_entry(entry);
-                    }
-                })
-                .await
-                .expect("Failed to recover from SharedWalPool");
+                // Configure simulated tiering so that retention deletes local
+                // segment files (file-only) while keeping data accessible via
+                // the S3 fallback read path. This exercises the full chain:
+                // segment seals → tiering uploads → local file deleted →
+                // consumer reads fall back to S3 → Raft NeedEntries gets
+                // SegmentNotFound → snapshot transfer.
+                configure_pool_tiering(
+                    &pool,
+                    node_id.get(),
+                    None,
+                    #[cfg(feature = "s3")]
+                    None,
+                )
+                .await;
 
-                info!(
-                    partitions = data_partition_states.len(),
-                    "SharedWalPool recovery complete for DST multi-node"
-                );
+                // Run shared WAL + snapshot recovery (same path as production).
+                let recovery = recover_from_wal_and_snapshots(
+                    &pool,
+                    snapshot_store_opt.as_ref(),
+                    &controller_state,
+                    &offset_group_states_vec,
+                    &cluster_nodes,
+                    node_id,
+                )
+                .await;
 
                 (
                     Some(Arc::new(pool)),
-                    Arc::new(RwLock::new(data_partition_states)),
+                    Arc::new(RwLock::new(recovery.data_partition_states)),
+                    recovery.controller_commit.0,
+                    recovery.controller_commit.1,
+                    recovery.offset_commits,
                 )
             } else {
                 if data_dir.is_some() {
                     info!("Using per-partition WAL mode (no SharedWalPool)");
                 }
-                (None, Arc::new(RwLock::new(HashMap::new())))
+                (None, Arc::new(RwLock::new(HashMap::new())), 0u64, 0u64, [(0u64, 0u64); OFFSET_GROUP_COUNT_USIZE])
             };
+
+        // Create controller partition (group 0) AFTER WAL recovery so the
+        // commit_index from recovery can be passed to the Raft initialiser.
+        {
+            let commit_index = LogIndex::new(ctl_commit_index);
+            let commit_term = TermId::new(ctl_commit_term);
+            let create_result = multi_raft.write().await.create_group_with_recovery_state(
+                CONTROLLER_GROUP_ID,
+                cluster_nodes.clone(),
+                TermId::new(0),
+                None,
+                false, // no observation mode in DST
+                commit_index,
+                commit_term,
+            );
+            match create_result {
+                Ok(()) => {
+                    info!(
+                        group_id = CONTROLLER_GROUP_ID.get(),
+                        commit_index = commit_index.get(),
+                        commit_term = commit_term.get(),
+                        "Created controller partition for DST with recovery state"
+                    );
+                }
+                Err(e) => {
+                    error!(error = %e, "Failed to create controller partition");
+                }
+            }
+        }
+
+        // Create offset groups (IDs 1–3) with recovery state.
+        for i in 0..OFFSET_GROUP_COUNT {
+            let gid = GroupId::new(OFFSET_GROUP_ID_BASE.get() + i);
+            #[allow(clippy::cast_possible_truncation)]
+            let slot = i as usize;
+            let (ci_val, ct_val) = offset_commit_indices[slot];
+            let commit_index = LogIndex::new(ci_val);
+            let commit_term = TermId::new(ct_val);
+            let result = multi_raft.write().await.create_group_with_recovery_state(
+                gid,
+                cluster_nodes.clone(),
+                TermId::new(0),
+                None,
+                false,
+                commit_index,
+                commit_term,
+            );
+            match result {
+                Ok(()) => info!(
+                    group_id = gid.get(),
+                    commit_index = commit_index.get(),
+                    "Created offset partition for DST with recovery state"
+                ),
+                Err(e) => error!(
+                    error = %e,
+                    group_id = gid.get(),
+                    "Failed to create offset partition"
+                ),
+            }
+        }
+
+        // Register controller with WAL pool for snapshot floor tracking.
+        // Offset groups are registered lazily on first WAL append — groups
+        // that never process entries (no consumer groups) must not pin the
+        // eviction floor at 0.
+        if let Some(ref pool) = shared_wal_pool {
+            pool.register_group(CONTROLLER_GROUP_ID);
+        }
 
         let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
         let batch_pending_proposals: BatchPendingProposalMap =
@@ -2264,15 +2656,21 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             Arc::clone(&multi_raft),
             transport.clone(),
             incoming_rx,
-            actor_setup::ActorSetupConfig::default(),
+            actor_setup::ActorSetupConfig {
+                log_trailing_entries: Some(10),
+                ..Default::default()
+            },
             vote_store.clone(),
             shared_wal_pool.clone(),
             data_dir.clone(),
             Arc::clone(&recovered_entries),
             storage.clone(),
-            None, // local_retention_ms — set after service creation.
+            // Enable retention only when shared WAL is active (snapshot
+            // infrastructure provides the fallback for evicted entries).
+            if shared_wal_pool.is_some() { Some(500) } else { None },
             offset_group_states_vec.clone(),
             Arc::clone(&pending_offset_proposals_dst),
+            snapshot_store_opt.clone(),
         )
         .await;
 
@@ -2299,6 +2697,8 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                 offset_group_states_vec.clone(),
                 Arc::clone(&pending_offset_proposals_dst),
                 Arc::clone(&actor_handles.backpressure),
+                snapshot_store_opt.clone(),
+                Some(10), // log_trailing_entries: compact aggressively in DST
                 actor_handles.leader_update_rx,
                 rx,
             ));
@@ -2340,6 +2740,9 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             pending_proposals,
             pending_controller_proposals,
             local_broker_heartbeats,
+            // Enable retention only when shared WAL is active (snapshot
+            // infrastructure provides the fallback for evicted entries).
+            local_retention_ms: if shared_wal_pool.is_some() { Some(500) } else { None },
             shared_wal_pool,
             recovered_entries,
             batch_pending_proposals,
@@ -2354,8 +2757,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             vote_store,
             offset_group_states: offset_group_states_vec,
             pending_offset_proposals: pending_offset_proposals_dst,
-            offset_snapshot_stores: vec![None; OFFSET_GROUP_COUNT_USIZE],
-            local_retention_ms: None,
+            snapshot_store: snapshot_store_opt,
         }
     }
 }

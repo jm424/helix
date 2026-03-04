@@ -288,6 +288,20 @@ impl PartitionRouter {
         self.partitions.read().await.keys().copied().collect()
     }
 
+    /// Returns a map of `GroupId → is_leader_cached` for all partitions.
+    ///
+    /// Uses cached atomic reads (~1 ns per entry) so the single lock
+    /// acquisition dominates. Suitable for calling on each snapshot interval.
+    #[must_use]
+    pub async fn leader_cached_snapshot(&self) -> HashMap<GroupId, bool> {
+        self.partitions
+            .read()
+            .await
+            .iter()
+            .map(|(&gid, h)| (gid, h.is_leader_cached()))
+            .collect()
+    }
+
     /// Returns `(group_id, min_replicated_index)` for all partitions.
     ///
     /// Used by the retention system to determine safe deletion bounds.

@@ -134,6 +134,16 @@ pub enum MultiRaftOutput {
         /// Maximum bytes to read.
         max_bytes: u64,
     },
+    /// A complete snapshot was received and accepted from the leader.
+    ///
+    /// Emitted on the follower. The caller should apply the snapshot data to
+    /// the application state machine and advance any WAL floors.
+    ApplySnapshot {
+        /// The Raft group.
+        group_id: GroupId,
+        /// The snapshot to apply to the application state machine.
+        snapshot: Snapshot,
+    },
 }
 
 /// Information about a Raft group.
@@ -165,6 +175,13 @@ pub struct MultiRaft {
     /// Default peer list for auto-creating groups on message receipt.
     /// When set, groups are auto-created when receiving messages for unknown groups.
     default_peers: Option<Vec<NodeId>>,
+    /// Override for `log_trailing_entries` applied to all new groups.
+    ///
+    /// When set, newly created groups use this value instead of the
+    /// default (`LOG_TRAILING_ENTRIES_DEFAULT`). Useful in DST to force
+    /// in-memory log compaction so `NeedEntries` fires and exercises
+    /// the WAL → snapshot fallback path.
+    log_trailing_entries_override: Option<u64>,
 }
 
 impl MultiRaft {
@@ -176,7 +193,16 @@ impl MultiRaft {
             groups: BTreeMap::new(),
             outbound_batches: HashMap::new(),
             default_peers: None,
+            log_trailing_entries_override: None,
         }
+    }
+
+    /// Sets the `log_trailing_entries` override for all new groups.
+    ///
+    /// When set, newly created groups use this value instead of the
+    /// default. Useful in DST to force Raft log compaction.
+    pub fn set_log_trailing_entries_override(&mut self, entries: u64) {
+        self.log_trailing_entries_override = Some(entries);
     }
 
     /// Sets the default peer list for auto-creating groups.
@@ -265,8 +291,11 @@ impl MultiRaft {
         }
 
         // Use group_id as part of seed for deterministic but varied timeouts.
-        let config = RaftConfig::new(self.node_id, peers)
+        let mut config = RaftConfig::new(self.node_id, peers)
             .with_random_seed(self.node_id.get() ^ group_id.get());
+        if let Some(trailing) = self.log_trailing_entries_override {
+            config = config.with_log_trailing_entries(trailing);
+        }
         let node = RaftNode::new(config);
 
         self.groups.insert(group_id, GroupInfo { node });
@@ -313,9 +342,12 @@ impl MultiRaft {
             });
         }
 
-        let config = RaftConfig::new(self.node_id, peers)
+        let mut config = RaftConfig::new(self.node_id, peers)
             .with_tick_config(election_tick, heartbeat_tick)
             .with_random_seed(self.node_id.get() ^ group_id.get());
+        if let Some(trailing) = self.log_trailing_entries_override {
+            config = config.with_log_trailing_entries(trailing);
+        }
         let node = RaftNode::new(config);
 
         self.groups.insert(group_id, GroupInfo { node });
@@ -372,8 +404,11 @@ impl MultiRaft {
         }
 
         // Use group_id as part of seed for deterministic but varied timeouts.
-        let config = RaftConfig::new(self.node_id, peers)
+        let mut config = RaftConfig::new(self.node_id, peers)
             .with_random_seed(self.node_id.get() ^ group_id.get());
+        if let Some(trailing) = self.log_trailing_entries_override {
+            config = config.with_log_trailing_entries(trailing);
+        }
         let node = RaftNode::with_vote_state(config, term, voted_for, observation_mode);
 
         self.groups.insert(group_id, GroupInfo { node });
@@ -432,8 +467,11 @@ impl MultiRaft {
         }
 
         // Use group_id as part of seed for deterministic but varied timeouts.
-        let config = RaftConfig::new(self.node_id, peers)
+        let mut config = RaftConfig::new(self.node_id, peers)
             .with_random_seed(self.node_id.get() ^ group_id.get());
+        if let Some(trailing) = self.log_trailing_entries_override {
+            config = config.with_log_trailing_entries(trailing);
+        }
         let node =
             RaftNode::with_recovery_state(config, term, voted_for, observation_mode, commit_index, commit_term);
 
@@ -487,9 +525,12 @@ impl MultiRaft {
             });
         }
 
-        let config = RaftConfig::new(self.node_id, peers)
+        let mut config = RaftConfig::new(self.node_id, peers)
             .with_tick_config(election_tick, heartbeat_tick)
             .with_random_seed(self.node_id.get() ^ group_id.get());
+        if let Some(trailing) = self.log_trailing_entries_override {
+            config = config.with_log_trailing_entries(trailing);
+        }
         let node = RaftNode::with_vote_state(config, term, voted_for, observation_mode);
 
         self.groups.insert(group_id, GroupInfo { node });
@@ -712,6 +753,33 @@ impl MultiRaft {
         result
     }
 
+    /// Sends a snapshot to a follower that cannot be caught up via entries.
+    ///
+    /// Call this in response to a `NeedEntries` when WAL entries are not
+    /// available (e.g., they have been evicted past the WAL floor). The
+    /// snapshot carries the full application state at `snapshot.last_included_index`.
+    ///
+    /// Returns outbound messages (when still leader), or empty when not leader.
+    pub fn provide_group_snapshot(
+        &mut self,
+        group_id: GroupId,
+        follower_id: NodeId,
+        snapshot: &Snapshot,
+    ) -> Vec<MultiRaftOutput> {
+        let Some(info) = self.groups.get_mut(&group_id) else {
+            return Vec::new();
+        };
+        let outputs = info.node.provide_snapshot(
+            follower_id,
+            snapshot.last_included_index,
+            snapshot.last_included_term,
+            snapshot.data.clone(),
+        );
+        let mut result = self.process_outputs(group_id, outputs);
+        result.extend(self.flush_outbound_batches());
+        result
+    }
+
     /// Returns an iterator over groups where this node is the leader.
     #[must_use]
     pub fn leader_groups(&self) -> Vec<GroupId> {
@@ -821,6 +889,9 @@ impl MultiRaft {
                         prev_log_index,
                         max_bytes,
                     });
+                }
+                RaftOutput::ApplySnapshot { snapshot } => {
+                    result.push(MultiRaftOutput::ApplySnapshot { group_id, snapshot });
                 }
             }
         }

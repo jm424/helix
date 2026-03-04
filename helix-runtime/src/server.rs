@@ -435,9 +435,12 @@ impl RaftServer {
 
                 let _ = self.events.send(ServerEvent::SteppedDown).await;
             }
-            RaftOutput::VoteStateChanged { .. } | RaftOutput::NeedEntries { .. } => {
+            RaftOutput::VoteStateChanged { .. }
+            | RaftOutput::NeedEntries { .. }
+            | RaftOutput::ApplySnapshot { .. } => {
                 // VoteStateChanged: persistence handled by the HelixService tick task.
                 // NeedEntries: single-node server has no followers.
+                // ApplySnapshot: single-node server never receives snapshots.
             }
         }
     }
@@ -466,9 +469,12 @@ impl RaftServer {
             RaftOutput::SteppedDown => {
                 let _ = events.send(ServerEvent::SteppedDown).await;
             }
-            RaftOutput::VoteStateChanged { .. } | RaftOutput::NeedEntries { .. } => {
+            RaftOutput::VoteStateChanged { .. }
+            | RaftOutput::NeedEntries { .. }
+            | RaftOutput::ApplySnapshot { .. } => {
                 // VoteStateChanged: persistence handled by the HelixService tick task.
                 // NeedEntries: single-node server has no followers.
+                // ApplySnapshot: single-node server never receives snapshots.
             }
         }
     }

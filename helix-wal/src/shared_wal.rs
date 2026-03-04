@@ -1702,6 +1702,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
         // segment), blocking every concurrent WAL append (Raft log writes).
         // Instead, we write the file first and only acquire the lock for the
         // fast in-memory index update that follows.
+        //
+        // Uses the Storage trait instead of raw tokio::fs so the write works
+        // under deterministic simulation (MadSim) where tokio::fs is unavailable.
         let seg_path = self
             .inner
             .config
@@ -1709,7 +1712,15 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
             .wal_config()
             .dir
             .join(format!("segment-{segment_id:08x}.wal"));
-        if let Err(e) = tokio::fs::write(&seg_path, &bytes[..]).await {
+        let write_result = async {
+            let file = self.inner.storage.open(&seg_path).await?;
+            file.truncate(0).await?;
+            file.write_at(0, &bytes[..]).await?;
+            file.sync().await?;
+            Ok::<(), crate::WalError>(())
+        }
+        .await;
+        if let Err(e) = write_result {
             warn!(
                 segment_id,
                 error = %e,
@@ -1928,6 +1939,12 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
                     // Segment was locally deleted by tiering. Do NOT attempt
                     // S3 fallback on the Raft hot path — callers must use
                     // snapshot installation for followers that need these entries.
+                    eprintln!(
+                        "[DST-PROBE] SEGMENT_NOT_FOUND: group={} raft_index={} segment={}",
+                        self.group_id,
+                        raft_index,
+                        segment_id,
+                    );
                     warn!(
                         group_id = %self.group_id,
                         raft_index,
@@ -2174,6 +2191,12 @@ struct CoordinatorInner<S: Storage> {
     shutdown: AtomicBool,
     /// Per-group last index (for assertion without locking WAL).
     group_last_index: RwLock<HashMap<GroupId, u64>>,
+    /// Storage backend for writing restored segment files.
+    ///
+    /// Used by `restore_from_s3` to write downloaded segment data through the
+    /// `Storage` trait instead of raw `tokio::fs`, which is not available under
+    /// deterministic simulation (MadSim).
+    storage: S,
     // -------------------------------------------------------------------------
     // Tiering state (populated by configure_tiering; None = tiering disabled).
     // -------------------------------------------------------------------------
@@ -2198,6 +2221,22 @@ struct CoordinatorInner<S: Storage> {
     /// Other handles that need the same segment wait for the in-progress
     /// restore to complete rather than racing to write the same file.
     restore_in_progress: Mutex<HashMap<u64, Arc<watch::Sender<Option<bool>>>>>,
+    // -------------------------------------------------------------------------
+    // Snapshot floor tracking (safety guard for local segment deletion).
+    // -------------------------------------------------------------------------
+    /// Per-group WAL index of the last snapshot taken.
+    ///
+    /// A segment can only be deleted once all registered groups have taken a
+    /// snapshot that covers every entry in the segment. This prevents deleting
+    /// segments that are still needed for crash recovery on a node that has no
+    /// snapshot yet.
+    snapshot_floors: std::sync::RwLock<HashMap<GroupId, u64>>,
+    /// Groups that have been registered as users of this coordinator.
+    ///
+    /// All groups in this set must have a `snapshot_floors` entry before any
+    /// local deletion is allowed. Groups that have never taken a snapshot
+    /// contribute a floor of 0, blocking all deletion.
+    registered_groups: std::sync::RwLock<std::collections::HashSet<GroupId>>,
 }
 
 impl<S: Storage> CoordinatorInner<S> {
@@ -2290,6 +2329,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
             .wal_config
             .clone()
             .with_sync_on_rotation(config.durability.requires_fsync());
+        let storage_clone = storage.clone();
         let wal = SharedWal::open(storage, wal_config).await?;
 
         let inner = Arc::new(CoordinatorInner {
@@ -2299,11 +2339,14 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
             config,
             shutdown: AtomicBool::new(false),
             group_last_index: RwLock::new(HashMap::new()),
+            storage: storage_clone,
             segment_store: Mutex::new(None),
             committed_wal_index: std::sync::RwLock::new(HashMap::new()),
             tiered_segments: std::sync::RwLock::new(HashSet::new()),
             store_prefix: std::sync::RwLock::new(String::new()),
             restore_in_progress: Mutex::new(HashMap::new()),
+            snapshot_floors: std::sync::RwLock::new(HashMap::new()),
+            registered_groups: std::sync::RwLock::new(std::collections::HashSet::new()),
         });
 
         // Spawn flush task.
@@ -2704,6 +2747,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
             let key = format!("{}{:08x}.wal", prefix, segment_id.get());
             match store.put(&key, bytes).await {
                 Ok(()) => {
+                    eprintln!(
+                        "[DST-PROBE] TIERING_UPLOAD: segment={} key={}",
+                        segment_id.get(),
+                        key,
+                    );
                     info!(
                         segment_id = segment_id.get(),
                         key = %key,
@@ -2767,6 +2815,26 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
                 continue;
             }
 
+            // Safety guard: only delete segments whose entries are fully
+            // covered by snapshots for all registered groups. `eviction_floor()`
+            // returns the minimum snapshot WAL index across all registered
+            // groups, or 0 if any group has never taken a snapshot.
+            // If `last_index` is None (empty segment) it is always safe to delete.
+            let floor = self.eviction_floor();
+            let segment_last = info.last_index.unwrap_or(0);
+            eprintln!(
+                "[DST-PROBE] DELETION_CHECK: segment={} last_idx={} floor={} tiered={}",
+                segment_id.get(),
+                segment_last,
+                floor,
+                is_tiered,
+            );
+            if segment_last >= floor {
+                // Segment contains entries not yet covered by any snapshot;
+                // a restarting node may need to replay from this segment.
+                continue;
+            }
+
             // Respect local retention: don't delete until the segment is old enough.
             // If the seal time is unknown, skip deletion to be safe.
             if let Some(min_age_secs) = min_local_age_secs {
@@ -2782,6 +2850,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
             // subsequent reads can transparently fall back to S3.
             match self.delete_tiered_segment_file_only(segment_id).await {
                 Ok(()) => {
+                    eprintln!(
+                        "[DST-PROBE] LOCAL_DELETION: segment={}",
+                        segment_id.get(),
+                    );
                     info!(
                         segment_id = segment_id.get(),
                         "Deleted locally-tiered segment (S3 fallback read preserved)"
@@ -2829,6 +2901,106 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
             .insert(segment_id);
     }
 
+    // -------------------------------------------------------------------------
+    // Snapshot floor API
+    // -------------------------------------------------------------------------
+
+    /// Registers a group as a user of this coordinator.
+    ///
+    /// Once registered, the group must take a snapshot before any segment that
+    /// contains its entries can be deleted from local disk. Call this when a
+    /// partition actor is created.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `registered_groups` lock is poisoned.
+    pub fn register_group(&self, group_id: GroupId) {
+        self.inner
+            .registered_groups
+            .write()
+            .expect("registered_groups poisoned")
+            .insert(group_id);
+    }
+
+    /// Deregisters a group (e.g., partition deleted or reassigned away).
+    ///
+    /// Removes the group from both the registered set and the snapshot floor
+    /// map so it no longer participates in the `eviction_floor()` calculation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either lock is poisoned.
+    pub fn deregister_group(&self, group_id: GroupId) {
+        self.inner
+            .registered_groups
+            .write()
+            .expect("registered_groups poisoned")
+            .remove(&group_id);
+        self.inner
+            .snapshot_floors
+            .write()
+            .expect("snapshot_floors poisoned")
+            .remove(&group_id);
+    }
+
+    /// Records the WAL index through which `group_id`'s state is captured by
+    /// a durably saved snapshot.
+    ///
+    /// Call this after a snapshot has been saved to local disk (and optionally
+    /// S3). Once all registered groups have reported a floor, segments whose
+    /// `max_wal_index < eviction_floor()` become eligible for local deletion.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `snapshot_floors` lock is poisoned.
+    pub fn set_snapshot_floor(&self, group_id: GroupId, wal_index: u64) {
+        let mut floors = self
+            .inner
+            .snapshot_floors
+            .write()
+            .expect("snapshot_floors poisoned");
+        let entry = floors.entry(group_id).or_insert(0);
+        if wal_index > *entry {
+            *entry = wal_index;
+        }
+        drop(floors);
+    }
+
+    /// Returns the minimum WAL index that must be retained across all
+    /// registered groups for full crash recovery without snapshot fallback.
+    ///
+    /// Returns 0 if any registered group has not yet taken a snapshot (meaning
+    /// WAL replay from the beginning is still required for that group).
+    /// Returns `u64::MAX` if no groups are registered (vacuously safe — nothing
+    /// to protect).
+    ///
+    /// A segment can be safely deleted only when `segment.last_wal_index < eviction_floor()`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either lock is poisoned.
+    #[must_use]
+    pub fn eviction_floor(&self) -> u64 {
+        let registered = self
+            .inner
+            .registered_groups
+            .read()
+            .expect("registered_groups poisoned");
+        if registered.is_empty() {
+            return u64::MAX;
+        }
+        let floors = self
+            .inner
+            .snapshot_floors
+            .read()
+            .expect("snapshot_floors poisoned");
+        registered
+            .iter()
+            .map(|g| floors.get(g).copied().unwrap_or(0))
+            .min()
+            .unwrap_or(0)
+    }
+
     /// Downloads all segments from the object store that are not present locally.
     ///
     /// Called during startup before `recover()` to reconstruct WAL state on a
@@ -2846,6 +3018,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
     ///
     /// Panics if an internal lock is poisoned.
     pub async fn download_missing_segments(&self) -> WalResult<u32> {
+        // Declared first to satisfy items_after_statements lint.
+        // See comment near usage for rationale.
+        const DOWNLOAD_CONCURRENCY: usize = 16;
+
         let store_guard = self.inner.segment_store.lock().await;
         let store = match store_guard.as_ref() {
             Some(s) => s.clone(),
@@ -2898,7 +3074,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
         // to disk. Disk writes serialise through the mutex; S3 GETs run in
         // parallel. Peak in-flight memory is bounded at
         // DOWNLOAD_CONCURRENCY × max_segment_size.
-        const DOWNLOAD_CONCURRENCY: usize = 16;
 
         let inner = Arc::clone(&self.inner);
         let local_ids = Arc::new(local_ids);
@@ -2967,7 +3142,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
             .collect()
             .await;
 
+        // Safe: segment count is bounded by max_segments_per_wal (a u32 limit).
+        #[allow(clippy::cast_possible_truncation)]
         let downloaded: u32 = results.iter().filter(|(d, _)| *d).count() as u32;
+        #[allow(clippy::cast_possible_truncation)]
         let already_local: u32 = results.iter().filter(|(_, a)| *a).count() as u32;
 
         info!(
@@ -3178,6 +3356,13 @@ impl PoolConfig {
     #[must_use]
     pub const fn with_durability(mut self, durability: WriteDurability) -> Self {
         self.coordinator_config.durability = durability;
+        self
+    }
+
+    /// Sets the segment configuration for all WALs.
+    #[must_use]
+    pub fn with_segment_config(mut self, config: crate::SegmentConfig) -> Self {
+        self.coordinator_config = self.coordinator_config.with_segment_config(config);
         self
     }
 }
@@ -3410,6 +3595,47 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalPool<S> {
     #[must_use]
     pub fn coordinators(&self) -> &[SharedWalCoordinator<S>] {
         &self.coordinators
+    }
+
+    // -------------------------------------------------------------------------
+    // Snapshot floor API (delegates to the owning coordinator per group)
+    // -------------------------------------------------------------------------
+
+    /// Registers a group as a user of its assigned coordinator.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the group maps to an out-of-bounds coordinator index
+    /// (cannot happen given valid `wal_count`).
+    pub fn register_group(&self, group_id: GroupId) {
+        #[allow(clippy::cast_possible_truncation)]
+        let idx = (group_id.get() % u64::from(self.wal_count)) as usize;
+        assert!(idx < self.coordinators.len());
+        self.coordinators[idx].register_group(group_id);
+    }
+
+    /// Deregisters a group from its assigned coordinator.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the group maps to an out-of-bounds coordinator index.
+    pub fn deregister_group(&self, group_id: GroupId) {
+        #[allow(clippy::cast_possible_truncation)]
+        let idx = (group_id.get() % u64::from(self.wal_count)) as usize;
+        assert!(idx < self.coordinators.len());
+        self.coordinators[idx].deregister_group(group_id);
+    }
+
+    /// Advances the snapshot floor for `group_id` to `wal_index`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the group maps to an out-of-bounds coordinator index.
+    pub fn set_snapshot_floor(&self, group_id: GroupId, wal_index: u64) {
+        #[allow(clippy::cast_possible_truncation)]
+        let idx = (group_id.get() % u64::from(self.wal_count)) as usize;
+        assert!(idx < self.coordinators.len());
+        self.coordinators[idx].set_snapshot_floor(group_id, wal_index);
     }
 
     // -------------------------------------------------------------------------

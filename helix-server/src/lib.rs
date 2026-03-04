@@ -32,6 +32,8 @@ pub mod producer_state;
 pub mod service;
 /// Partition storage implementations.
 pub mod storage;
+/// Snapshot machinery for Raft group state machines.
+pub mod snapshot;
 /// Vote state persistence for Raft consensus.
 pub mod vote_store;
 

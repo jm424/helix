@@ -47,7 +47,6 @@ pub(super) fn run_e2e_dst_random_faults(
     progress_mod: u64,
 ) {
     use crate::madsim_scenarios::{FaultScenario, ScenarioExecutor};
-    use std::collections::HashSet;
 
     let mut failures: Vec<(u64, String, String)> = Vec::new();
     let mut scenario_counts: std::collections::HashMap<&'static str, u64> =
@@ -260,50 +259,9 @@ pub(super) fn run_e2e_dst_random_faults(
 
                 // Check data integrity violations (hash mismatches).
                 // ALL acked data must be readable and have correct content.
+                // With tiering enabled, locally-deleted WAL segments are
+                // transparently read from the object store, so no data loss.
                 if !check_result.consumer_violations.is_empty() {
-                    if debug_seed == Some(seed) {
-                        eprintln!("=== DEBUG SEED {}: consumer violations ===", seed);
-                        for violation in &check_result.consumer_violations {
-                            eprintln!(
-                                "violation: topic={} partition={} offset={} reason={}",
-                                violation.topic_id,
-                                violation.partition_id,
-                                violation.offset,
-                                violation.reason
-                            );
-                            for node_id in cluster.nodes.keys().copied() {
-                                let partition = violation.partition_id as u32;
-                                let commit_index = cluster
-                                    .get_partition_commit_index(node_id, topic, partition)
-                                    .await;
-                                let batches = cluster
-                                    .consume_from_node(node_id, topic, partition, 0)
-                                    .await;
-                                let mut offsets = HashSet::new();
-                                let mut max_offset: Option<u64> = None;
-                                if let Some(batches) = batches {
-                                    for batch in &batches {
-                                        if let Ok(offset) = E2ECluster::extract_base_offset(batch) {
-                                            offsets.insert(offset);
-                                            max_offset = Some(match max_offset {
-                                                Some(m) => m.max(offset),
-                                                None => offset,
-                                            });
-                                        }
-                                    }
-                                }
-                                let has_offset = offsets.contains(&violation.offset);
-                                eprintln!(
-                                    "  node={} commit_index={:?} has_offset={} max_offset={:?} offsets_seen={}",
-                                    node_id.get(),
-                                    commit_index,
-                                    has_offset,
-                                    max_offset,
-                                    offsets.len()
-                                );
-                            }
-                        }
-                    }
                     panic!(
                         "Seed {}: {} data integrity violations: {:?}",
                         seed,

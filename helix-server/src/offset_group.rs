@@ -12,16 +12,10 @@
 //! ensures no collision with data partition group IDs regardless of cluster age.
 
 use std::collections::HashMap;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use helix_core::{GroupId, PartitionId, TopicId};
-use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
 
-use helix_tier::{ObjectKey, ObjectStorage};
+use crate::snapshot::{SnapshotError, SnapshotMeta, Snapshottable};
 
 // =============================================================================
 // Constants
@@ -42,12 +36,6 @@ pub const OFFSET_GROUP_COUNT_USIZE: usize = OFFSET_GROUP_COUNT as usize;
 /// groups never collide with data partition group IDs, even on clusters that
 /// were created before offset groups were introduced.
 pub const OFFSET_GROUP_ID_BASE: GroupId = GroupId::new(1_000_000);
-
-/// Snapshot after this many entries have been committed since the last snapshot.
-pub const OFFSET_SNAPSHOT_ENTRY_THRESHOLD: u64 = 10_000;
-
-/// Minimum wall-clock interval between snapshots (prevents thrashing).
-pub const OFFSET_SNAPSHOT_INTERVAL_MS: u64 = 60_000;
 
 // Command type byte.
 const CMD_COMMIT_OFFSET: u8 = 1;
@@ -241,18 +229,50 @@ pub struct OffsetGroupState {
     /// Raft term of the last applied entry.
     pub last_applied_term: u64,
 
-    /// Number of entries applied since the last snapshot.
+    /// The `GroupId` of this offset group (`OFFSET_GROUP_ID_BASE + slot`).
     ///
-    /// When this crosses `OFFSET_SNAPSHOT_ENTRY_THRESHOLD`, the leader triggers
-    /// a new snapshot to bound WAL growth.
-    pub entries_since_snapshot: u64,
+    /// Stored so that `take_snapshot` can populate `SnapshotMeta::group_id`
+    /// without requiring the caller to pass it in. Set at construction time
+    /// via `new_for_slot`; the default value `GroupId::new(0)` is a sentinel
+    /// that must not appear in a real snapshot.
+    pub group_id: GroupId,
+
+    /// `SharedWAL` index of the last entry applied to this state machine.
+    ///
+    /// Set by the tick task on every committed entry. Placed into
+    /// `SnapshotMeta::last_included_wal_index` when taking a snapshot.
+    pub last_applied_wal_index: u64,
+
+    /// `SharedWAL` index at which this group's most recent snapshot was taken.
+    ///
+    /// `None` until the first snapshot is durably saved, or until state is
+    /// restored from a snapshot via `apply_snapshot`. Used by
+    /// `min_required_wal_index` to report the WAL retention floor.
+    pub last_snapshot_wal_index: Option<u64>,
 }
 
 impl OffsetGroupState {
     /// Creates a new empty state.
+    ///
+    /// The `group_id` is left at its default (`GroupId::new(0)`). Prefer
+    /// `new_for_slot` when the correct group ID is known.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a new empty state with the correct group ID for the given slot.
+    ///
+    /// Slot is the index in `[0, OFFSET_GROUP_COUNT)`.
+    #[must_use]
+    pub fn new_for_slot(slot: usize) -> Self {
+        // Safe: slot < OFFSET_GROUP_COUNT = 3, always fits in u64.
+        #[allow(clippy::cast_possible_truncation)]
+        let group_id = GroupId::new(OFFSET_GROUP_ID_BASE.get() + slot as u64);
+        Self {
+            group_id,
+            ..Self::default()
+        }
     }
 
     /// Applies a committed command and advances the index.
@@ -285,7 +305,6 @@ impl OffsetGroupState {
         );
         self.last_applied_index = raft_index;
         self.last_applied_term = raft_term;
-        self.entries_since_snapshot += 1;
     }
 
     /// Returns the committed offset and metadata for a consumer group / topic / partition.
@@ -310,81 +329,26 @@ impl OffsetGroupState {
     ) -> impl Iterator<Item = (&'a (String, TopicId, PartitionId), &'a (u64, String))> + 'a {
         self.offsets.iter().filter(move |((g, ..), _)| g == group)
     }
-}
 
-// =============================================================================
-// OffsetSnapshotStore
-// =============================================================================
+    // -------------------------------------------------------------------------
+    // Snapshot serialization (OSNP v2 format)
+    // -------------------------------------------------------------------------
 
-/// Persists offset group snapshots to local disk (and optionally S3).
-///
-/// # Design
-///
-/// ```text
-/// Snapshot trigger (leader only, threshold + interval based):
-///   ├─→ Local file + fsync  (synchronous, critical path)
-///   └─→ S3 upload (async, best-effort)          ← off critical path
-///
-/// Startup:
-///   ├─→ Local file exists? Use it (fast path)
-///   └─→ Fetch from S3 → return remote flag (safe recovery)
-/// ```
-///
-/// # Binary Format
-///
-/// ```text
-/// [magic: 4][version: u32 LE][last_included_index: u64 LE][last_included_term: u64 LE]
-/// [entry_count: u32 LE]
-/// per entry: [group_id_len: u32 LE][group_id bytes][topic_id: u64 LE][partition_id: u64 LE][offset: u64 LE]
-/// [crc32: u32 LE]
-/// ```
-pub struct OffsetSnapshotStore {
-    /// Local file path for this group's snapshot.
-    local_path: PathBuf,
-    /// S3 key for this group's snapshot.
-    s3_key: ObjectKey,
-    /// Channel for async S3 uploads.
-    upload_tx: mpsc::UnboundedSender<Bytes>,
-}
-
-impl OffsetSnapshotStore {
-    /// Creates a new snapshot store for the given offset group slot.
+    /// Serializes this state to the OSNP v2 binary format.
     ///
-    /// Spawns a background S3 upload worker.
-    pub fn new(
-        data_dir: &Path,
-        group_slot: usize,
-        remote: Arc<dyn ObjectStorage>,
-    ) -> Self {
-        let local_path = data_dir.join(format!("offset-group-{group_slot}-snapshot.bin"));
-        let s3_key = ObjectKey::new(format!("helix/offset-snapshot/group-{group_slot}.bin"));
-
-        let (upload_tx, upload_rx) = mpsc::unbounded_channel::<Bytes>();
-        let key_clone = s3_key.clone();
-
-        // Spawn async S3 upload worker.
-        tokio::spawn(offset_snapshot_s3_worker(remote, upload_rx, key_clone));
-
-        Self {
-            local_path,
-            s3_key,
-            upload_tx,
-        }
-    }
-
-    /// Serializes `state` to the snapshot format.
-    fn serialize(state: &OffsetGroupState) -> Bytes {
-        let entry_count = state.offsets.len();
-        // Estimate capacity: header (28) + per-entry overhead + average group key length.
+    /// The format is unchanged since the initial release so that snapshots
+    /// written by older nodes remain readable.
+    fn serialize_snapshot(&self) -> Bytes {
+        let entry_count = self.offsets.len();
         let mut buf = BytesMut::with_capacity(64 + entry_count * 64);
 
         buf.put_slice(OFFSET_SNAPSHOT_MAGIC);
         buf.put_u32_le(OFFSET_SNAPSHOT_VERSION);
-        buf.put_u64_le(state.last_applied_index);
-        buf.put_u64_le(state.last_applied_term);
+        buf.put_u64_le(self.last_applied_index);
+        buf.put_u64_le(self.last_applied_term);
 
         // Sort entries for deterministic output.
-        let mut entries: Vec<_> = state.offsets.iter().collect();
+        let mut entries: Vec<_> = self.offsets.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
 
         #[allow(clippy::cast_possible_truncation)]
@@ -404,79 +368,83 @@ impl OffsetSnapshotStore {
             buf.put_slice(meta_bytes);
         }
 
-        // Append CRC32 over everything above.
         let checksum = crc32fast::hash(&buf);
         buf.put_u32_le(checksum);
 
         buf.freeze()
     }
 
-    /// Deserializes a snapshot from raw bytes.
-    fn deserialize(data: &[u8]) -> Option<(OffsetGroupState, u64, u64)> {
+    /// Deserializes OSNP bytes (v1 or v2) into a fresh `OffsetGroupState`.
+    ///
+    /// Handles both v1 (no per-entry metadata) and v2 (with metadata) for
+    /// backward compatibility with snapshots written by older nodes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `SnapshotError` if the data is truncated, has bad magic,
+    /// an unsupported version, or a CRC mismatch.
+    fn deserialize_snapshot(data: &[u8]) -> Result<Self, SnapshotError> {
         if data.len() < 32 {
-            warn!("Offset snapshot too short: {} bytes", data.len());
-            return None;
+            return Err(SnapshotError::Truncated {
+                context: "snapshot shorter than minimum header (32 bytes)".to_string(),
+            });
         }
 
-        // Verify CRC32.
         let payload = &data[..data.len() - 4];
         let expected = crc32fast::hash(payload);
         let stored = u32::from_le_bytes(
-            data[data.len() - 4..]
-                .try_into()
-                .expect("4-byte slice"),
+            data[data.len() - 4..].try_into().expect("4-byte slice"),
         );
         if expected != stored {
-            warn!(
-                "Offset snapshot CRC mismatch: expected {expected:#x}, got {stored:#x}"
-            );
-            return None;
+            return Err(SnapshotError::ChecksumMismatch { expected, got: stored });
         }
 
         let mut buf = data;
 
-        // Parse magic.
         if &buf[..4] != OFFSET_SNAPSHOT_MAGIC {
-            warn!("Offset snapshot bad magic");
-            return None;
+            return Err(SnapshotError::BadMagic);
         }
         buf.advance(4);
 
         let version = buf.get_u32_le();
         // Version 1 had no per-entry metadata; version 2 adds it.
-        // Any other version is unknown.
         if version != OFFSET_SNAPSHOT_VERSION && version != 1 {
-            warn!("Offset snapshot unsupported version {version}");
-            return None;
+            return Err(SnapshotError::UnknownVersion { version });
         }
 
         let last_index = buf.get_u64_le();
         let last_term = buf.get_u64_le();
         let entry_count = buf.get_u32_le() as usize;
 
-        let mut state = OffsetGroupState::new();
+        let mut state = Self::new();
         state.last_applied_index = last_index;
         state.last_applied_term = last_term;
 
         for _ in 0..entry_count {
             if buf.remaining() < 4 {
-                warn!("Offset snapshot truncated at entry");
-                return None;
+                return Err(SnapshotError::Truncated {
+                    context: "offset entry".to_string(),
+                });
             }
             let group_len = buf.get_u32_le() as usize;
             if buf.remaining() < group_len + 24 {
-                warn!("Offset snapshot truncated in group string or fixed fields");
-                return None;
+                return Err(SnapshotError::Truncated {
+                    context: "group string or fixed offset fields".to_string(),
+                });
             }
-            let group = String::from_utf8(buf.copy_to_bytes(group_len).to_vec()).ok()?;
+            let group = String::from_utf8(buf.copy_to_bytes(group_len).to_vec())
+                .map_err(|_| SnapshotError::Truncated {
+                    context: "group string is not valid UTF-8".to_string(),
+                })?;
             let topic_id = TopicId::new(buf.get_u64_le());
             let partition_id = PartitionId::new(buf.get_u64_le());
             let offset = buf.get_u64_le();
-            // Version 2 includes per-entry metadata; version 1 entries have none.
+            // Version 2 includes per-entry metadata; v1 entries have none.
             let metadata = if version == OFFSET_SNAPSHOT_VERSION && buf.remaining() >= 4 {
                 let meta_len = buf.get_u32_le() as usize;
                 if buf.remaining() >= meta_len {
-                    String::from_utf8(buf.copy_to_bytes(meta_len).to_vec()).unwrap_or_default()
+                    String::from_utf8(buf.copy_to_bytes(meta_len).to_vec())
+                        .unwrap_or_default()
                 } else {
                     String::new()
                 }
@@ -486,156 +454,51 @@ impl OffsetSnapshotStore {
             state.offsets.insert((group, topic_id, partition_id), (offset, metadata));
         }
 
-        // Remaining 4 bytes are the CRC (already verified).
-        Some((state, last_index, last_term))
-    }
-
-    /// Saves the offset state to local disk (fsync) and queues an async S3 upload.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the local file write or fsync fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `state` has a non-zero `last_applied_index` but an empty offsets map.
-    pub fn save(&self, state: &OffsetGroupState) -> std::io::Result<()> {
-        assert!(
-            state.last_applied_index > 0 || state.offsets.is_empty(),
-            "cannot snapshot empty state with non-zero index"
-        );
-
-        let data = Self::serialize(state);
-
-        // Write to temp file then rename for atomicity.
-        let temp = self.local_path.with_extension("tmp");
-        let mut file = std::fs::File::create(&temp)?;
-        file.write_all(&data)?;
-        file.sync_all()?;
-        std::fs::rename(&temp, &self.local_path)?;
-
-        debug!(
-            path = %self.local_path.display(),
-            last_index = state.last_applied_index,
-            entries = state.offsets.len(),
-            "Offset snapshot saved to local disk"
-        );
-
-        // Queue async S3 upload (best-effort).
-        let _ = self.upload_tx.send(data);
-
-        Ok(())
-    }
-
-    /// Loads the snapshot from local disk, falling back to S3.
-    ///
-    /// Returns `(state, last_index, last_term, recovered_from_remote)`.
-    /// Returns `None` if no snapshot exists anywhere.
-    pub async fn load(
-        &self,
-        remote: &dyn ObjectStorage,
-    ) -> Option<(OffsetGroupState, u64, u64, bool)> {
-        // Try local file first.
-        match std::fs::read(&self.local_path) {
-            Ok(data) => {
-                if let Some((state, idx, term)) = Self::deserialize(&data) {
-                    info!(
-                        path = %self.local_path.display(),
-                        last_index = idx,
-                        entries = state.offsets.len(),
-                        "Loaded offset snapshot from local disk"
-                    );
-                    return Some((state, idx, term, false));
-                }
-                warn!(
-                    path = %self.local_path.display(),
-                    "Local offset snapshot corrupted, trying S3"
-                );
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                debug!(
-                    path = %self.local_path.display(),
-                    "No local offset snapshot found, trying S3"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    path = %self.local_path.display(),
-                    error = %e,
-                    "Failed to read local offset snapshot, trying S3"
-                );
-            }
-        }
-
-        // Try S3 (remote).
-        match remote.get(&self.s3_key).await {
-            Ok(data) => {
-                if let Some((state, idx, term)) = Self::deserialize(&data) {
-                    info!(
-                        key = %self.s3_key,
-                        last_index = idx,
-                        entries = state.offsets.len(),
-                        "Loaded offset snapshot from S3"
-                    );
-                    // Write to local for next restart.
-                    if let Err(e) = std::fs::write(&self.local_path, &data) {
-                        warn!(
-                            path = %self.local_path.display(),
-                            error = %e,
-                            "Failed to cache S3 offset snapshot locally"
-                        );
-                    }
-                    return Some((state, idx, term, true));
-                }
-                warn!(key = %self.s3_key, "S3 offset snapshot corrupted or invalid");
-                None
-            }
-            Err(helix_tier::TierError::NotFound { .. }) => {
-                debug!(key = %self.s3_key, "No S3 offset snapshot found");
-                None
-            }
-            Err(e) => {
-                warn!(key = %self.s3_key, error = %e, "Failed to fetch S3 offset snapshot");
-                None
-            }
-        }
+        Ok(state)
     }
 }
 
-/// Background worker that uploads offset snapshots to S3.
-async fn offset_snapshot_s3_worker(
-    remote: Arc<dyn ObjectStorage>,
-    mut rx: mpsc::UnboundedReceiver<Bytes>,
-    key: ObjectKey,
-) {
-    let mut pending: Option<Bytes> = None;
+// =============================================================================
+// Snapshottable impl
+// =============================================================================
 
-    loop {
-        let data = if let Some(d) = pending.take() {
-            d
-        } else {
-            let Some(d) = rx.recv().await else {
-                break; // Channel closed, store dropped.
-            };
-            d
+impl Snapshottable for OffsetGroupState {
+    fn take_snapshot(&self) -> Result<(SnapshotMeta, Bytes), SnapshotError> {
+        assert_ne!(
+            self.group_id,
+            GroupId::new(0),
+            "take_snapshot called on OffsetGroupState with unset group_id; use new_for_slot"
+        );
+        let bytes = self.serialize_snapshot();
+        let meta = SnapshotMeta {
+            last_included_index: self.last_applied_index,
+            last_included_term: self.last_applied_term,
+            last_included_wal_index: self.last_applied_wal_index,
+            group_id: self.group_id,
         };
+        Ok((meta, bytes))
+    }
 
-        // Drain channel — only upload latest snapshot.
-        while let Ok(newer) = rx.try_recv() {
-            pending = Some(newer);
-        }
-        let data = pending.take().unwrap_or(data);
+    fn apply_snapshot(&mut self, meta: &SnapshotMeta, data: &[u8]) -> Result<(), SnapshotError> {
+        assert!(
+            is_offset_group(meta.group_id),
+            "apply_snapshot called with non-offset group_id {:?}",
+            meta.group_id
+        );
+        let mut state = Self::deserialize_snapshot(data)?;
+        state.group_id = meta.group_id;
+        state.last_applied_wal_index = meta.last_included_wal_index;
+        state.last_snapshot_wal_index = Some(meta.last_included_wal_index);
+        *self = state;
+        Ok(())
+    }
 
-        match remote.put(&key, data.clone()).await {
-            Ok(()) => {
-                debug!(key = %key, "Uploaded offset snapshot to S3");
-            }
-            Err(e) => {
-                warn!(key = %key, error = %e, "S3 offset snapshot upload failed, will retry");
-                pending = Some(data);
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-        }
+    fn min_required_wal_index(&self) -> Option<u64> {
+        self.last_snapshot_wal_index.map(|w| w + 1)
+    }
+
+    fn set_last_snapshot_wal_index(&mut self, wal_index: u64) {
+        self.last_snapshot_wal_index = Some(wal_index);
     }
 }
 
@@ -713,7 +576,6 @@ mod tests {
             Some((100, "meta-a"))
         );
         assert_eq!(state.last_applied_index, 1);
-        assert_eq!(state.entries_since_snapshot, 1);
 
         // Overwrite with higher offset and different metadata.
         let cmd2 = OffsetGroupCommand::CommitOffset {
@@ -729,7 +591,6 @@ mod tests {
             state.get("group-1", TopicId::new(1), PartitionId::new(0)),
             Some((200, "meta-b"))
         );
-        assert_eq!(state.entries_since_snapshot, 2);
     }
 
     #[test]
@@ -768,50 +629,260 @@ mod tests {
         assert!(!is_offset_group(GroupId::new(1_000_003))); // out of range
     }
 
+    // -------------------------------------------------------------------------
+    // Snapshottable tests
+    // -------------------------------------------------------------------------
+
+    fn make_populated_offset_state(slot: usize) -> OffsetGroupState {
+        let mut state = OffsetGroupState::new_for_slot(slot);
+        state.last_applied_index = 77;
+        state.last_applied_term = 2;
+        state.last_applied_wal_index = 200;
+        state.offsets.insert(
+            ("cg-a".to_string(), TopicId::new(10), PartitionId::new(0)),
+            (500, "meta-a".to_string()),
+        );
+        state.offsets.insert(
+            ("cg-b".to_string(), TopicId::new(10), PartitionId::new(1)),
+            (999, String::new()),
+        );
+        state
+    }
+
     #[test]
-    fn test_offset_snapshot_serialize_deserialize() {
-        let mut state = OffsetGroupState::new();
-        state.last_applied_index = 42;
-        state.last_applied_term = 3;
-        state.offsets.insert(
-            ("group-1".to_string(), TopicId::new(1), PartitionId::new(0)),
-            (100, "client-state-1".to_string()),
-        );
-        state.offsets.insert(
-            ("group-2".to_string(), TopicId::new(2), PartitionId::new(1)),
-            (200, String::new()),
-        );
+    fn test_offset_snapshottable_roundtrip() {
+        let original = make_populated_offset_state(1);
+        let expected_gid = GroupId::new(OFFSET_GROUP_ID_BASE.get() + 1);
 
-        let bytes = OffsetSnapshotStore::serialize(&state);
-        let (recovered, last_index, last_term) =
-            OffsetSnapshotStore::deserialize(&bytes).unwrap();
+        let (meta, bytes) = original.take_snapshot().expect("take_snapshot failed");
 
-        assert_eq!(last_index, 42);
-        assert_eq!(last_term, 3);
-        assert_eq!(recovered.offsets.len(), 2);
+        assert_eq!(meta.last_included_index, 77);
+        assert_eq!(meta.last_included_term, 2);
+        assert_eq!(meta.last_included_wal_index, 200);
+        assert_eq!(meta.group_id, expected_gid);
+
+        let mut restored = OffsetGroupState::new_for_slot(1);
+        restored.apply_snapshot(&meta, &bytes).expect("apply_snapshot failed");
+
+        assert_eq!(restored.last_applied_index, 77);
+        assert_eq!(restored.last_applied_wal_index, 200);
+        assert_eq!(restored.last_snapshot_wal_index, Some(200));
+        assert_eq!(restored.group_id, expected_gid);
+        assert_eq!(restored.offsets.len(), 2);
         assert_eq!(
-            recovered.get("group-1", TopicId::new(1), PartitionId::new(0)),
-            Some((100, "client-state-1"))
-        );
-        assert_eq!(
-            recovered.get("group-2", TopicId::new(2), PartitionId::new(1)),
-            Some((200, ""))
+            restored.get("cg-a", TopicId::new(10), PartitionId::new(0)),
+            Some((500, "meta-a"))
         );
     }
 
     #[test]
-    fn test_offset_snapshot_detects_corruption() {
-        let mut state = OffsetGroupState::new();
+    fn test_offset_snapshottable_crc_mismatch() {
+        let state = make_populated_offset_state(0);
+        let (_meta, bytes) = state.take_snapshot().unwrap();
+
+        let mut corrupted = bytes.to_vec();
+        let mid = corrupted.len() / 2;
+        corrupted[mid] ^= 0xFF;
+
+        let result = OffsetGroupState::deserialize_snapshot(&corrupted);
+        assert!(
+            matches!(result, Err(SnapshotError::ChecksumMismatch { .. })),
+            "expected ChecksumMismatch, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_offset_snapshottable_bad_magic() {
+        let state = make_populated_offset_state(0);
+        let (_meta, bytes) = state.take_snapshot().unwrap();
+
+        let mut corrupted = bytes.to_vec();
+        corrupted[0] = b'X';
+        let payload_len = corrupted.len() - 4;
+        let new_crc = crc32fast::hash(&corrupted[..payload_len]);
+        corrupted[payload_len..].copy_from_slice(&new_crc.to_le_bytes());
+
+        let result = OffsetGroupState::deserialize_snapshot(&corrupted);
+        assert!(
+            matches!(result, Err(SnapshotError::BadMagic)),
+            "expected BadMagic, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_offset_snapshottable_empty_state() {
+        let mut state = OffsetGroupState::new_for_slot(2);
         state.last_applied_index = 1;
         state.last_applied_term = 1;
-        state.offsets.insert(
-            ("g".to_string(), TopicId::new(1), PartitionId::new(0)),
-            (0, String::new()),
+        state.last_applied_wal_index = 5;
+
+        let (meta, bytes) = state.take_snapshot().unwrap();
+        let mut restored = OffsetGroupState::new_for_slot(2);
+        restored.apply_snapshot(&meta, &bytes).unwrap();
+
+        assert_eq!(restored.offsets.len(), 0);
+        assert_eq!(restored.last_snapshot_wal_index, Some(5));
+        assert_eq!(restored.group_id, GroupId::new(OFFSET_GROUP_ID_BASE.get() + 2));
+    }
+
+    #[test]
+    fn test_offset_min_required_wal_index() {
+        let mut state = OffsetGroupState::new_for_slot(0);
+
+        // Before any snapshot: must return None.
+        assert_eq!(state.min_required_wal_index(), None);
+
+        state.last_applied_wal_index = 50;
+        let (meta, bytes) = state.take_snapshot().unwrap();
+        state.apply_snapshot(&meta, &bytes).unwrap();
+
+        assert_eq!(state.min_required_wal_index(), Some(51));
+    }
+
+    #[test]
+    fn test_offset_snapshottable_backward_compat_with_old_serialize() {
+        // Bytes produced by serialize_snapshot (the stable on-disk format) must be
+        // readable by the new deserialize_snapshot path without the envelope wrapper.
+        let original = make_populated_offset_state(0);
+        let old_bytes = original.serialize_snapshot();
+
+        let result = OffsetGroupState::deserialize_snapshot(&old_bytes);
+        assert!(result.is_ok(), "old-format bytes must be readable: {result:?}");
+        let restored = result.unwrap();
+        assert_eq!(restored.offsets.len(), original.offsets.len());
+    }
+
+    #[test]
+    fn test_new_for_slot_sets_correct_group_id() {
+        for slot in 0..OFFSET_GROUP_COUNT_USIZE {
+            let state = OffsetGroupState::new_for_slot(slot);
+            let expected = GroupId::new(OFFSET_GROUP_ID_BASE.get() + slot as u64);
+            assert_eq!(state.group_id, expected);
+        }
+    }
+
+    #[test]
+    fn test_snapshot_equivalence() {
+        // Property: snapshot at K + replay of K+1..N == full replay from scratch.
+        use helix_core::{PartitionId, TopicId};
+
+        // Build a deterministic sequence of CommitOffset commands.
+        let cmds: Vec<OffsetGroupCommand> = (1_u64..=20)
+            .map(|i| OffsetGroupCommand::CommitOffset {
+                group: format!("cg-{}", i % 3),
+                topic_id: TopicId::new(1),
+                partition_id: PartitionId::new(i % 4),
+                offset: i * 100,
+                timestamp_ms: i * 1000,
+                metadata: format!("meta-{i}"),
+            })
+            .collect();
+
+        let n = cmds.len();
+        let k = n / 2;
+
+        // Full replay: apply all N commands from scratch.
+        let mut state_full = OffsetGroupState::new_for_slot(0);
+        for (i, cmd) in cmds.iter().enumerate() {
+            let raft_index = (i as u64) + 1;
+            state_full.last_applied_wal_index = raft_index;
+            state_full.apply(cmd, raft_index, 1);
+        }
+
+        // Hybrid: apply K, snapshot, restore, apply K+1..N.
+        let mut state_at_k = OffsetGroupState::new_for_slot(0);
+        for (i, cmd) in cmds[..k].iter().enumerate() {
+            let raft_index = (i as u64) + 1;
+            state_at_k.last_applied_wal_index = raft_index;
+            state_at_k.apply(cmd, raft_index, 1);
+        }
+        let (meta, body) = state_at_k.take_snapshot().expect("take_snapshot at K");
+
+        let mut state_hybrid = OffsetGroupState::new_for_slot(0);
+        state_hybrid.apply_snapshot(&meta, &body).expect("apply_snapshot");
+
+        for (i, cmd) in cmds[k..].iter().enumerate() {
+            let raft_index = (k as u64) + (i as u64) + 1;
+            state_hybrid.last_applied_wal_index = raft_index;
+            state_hybrid.apply(cmd, raft_index, 1);
+        }
+
+        // Compare observable state: for every (group, topic, partition) combo
+        // the committed offset must match between full replay and hybrid.
+        let tid = TopicId::new(1);
+        for i in 1_u64..=20 {
+            let cg = format!("cg-{}", i % 3);
+            let pid = PartitionId::new(i % 4);
+            let full_val = state_full.get(&cg, tid, pid);
+            let hybrid_val = state_hybrid.get(&cg, tid, pid);
+            assert_eq!(
+                full_val, hybrid_val,
+                "offset mismatch for cg={cg} pid={pid:?}"
+            );
+        }
+
+        assert_eq!(
+            state_full.last_applied_index,
+            state_hybrid.last_applied_index,
+            "last_applied_index differs"
+        );
+    }
+
+    #[test]
+    fn test_offset_group_snapshot_raft_pipeline() {
+        // Phase 3 pipeline: take_snapshot → encode_envelope → decode_envelope → apply_snapshot.
+        //
+        // The Raft Snapshot struct only carries (index, term, data bytes).
+        // last_included_wal_index and group_id must therefore survive the Raft
+        // wire as part of the data payload via encode_envelope/decode_envelope.
+        use crate::snapshot::{decode_envelope, encode_envelope};
+
+        let original = make_populated_offset_state(2); // slot 2 → group_id = base + 2
+
+        let (meta, body) = original.take_snapshot().expect("take_snapshot");
+        assert_eq!(meta.last_included_wal_index, original.last_applied_wal_index);
+        assert_eq!(meta.group_id, original.group_id);
+
+        // Leader side (provide_controller_group_snapshot): pack body + meta into wire bytes.
+        let wire_bytes = encode_envelope(&meta, &body);
+
+        // Follower side (apply_controller_group_snapshot): decode wire bytes.
+        let (decoded_meta, decoded_body) =
+            decode_envelope(&wire_bytes).expect("decode_envelope");
+
+        // The envelope must preserve fields absent from the Raft Snapshot struct.
+        assert_eq!(
+            decoded_meta.last_included_wal_index,
+            meta.last_included_wal_index,
+            "wal_index must survive Raft wire transmission"
+        );
+        assert_eq!(
+            decoded_meta.group_id,
+            meta.group_id,
+            "group_id must survive Raft wire transmission"
         );
 
-        let mut bytes = OffsetSnapshotStore::serialize(&state).to_vec();
-        // Corrupt one byte in the middle.
-        bytes[10] ^= 0xFF;
-        assert!(OffsetSnapshotStore::deserialize(&bytes).is_none());
+        // Apply decoded snapshot to a fresh state machine — must restore full state.
+        let mut restored = OffsetGroupState::new_for_slot(2);
+        restored
+            .apply_snapshot(&decoded_meta, &decoded_body)
+            .expect("apply_snapshot from decoded envelope");
+
+        assert_eq!(
+            restored.last_applied_wal_index,
+            original.last_applied_wal_index,
+            "wal index must be restored after envelope roundtrip"
+        );
+        assert_eq!(restored.group_id, original.group_id, "group_id restored");
+        assert_eq!(
+            restored.offsets.len(),
+            original.offsets.len(),
+            "offset entries must be preserved"
+        );
+        assert_eq!(
+            restored.last_snapshot_wal_index,
+            Some(original.last_applied_wal_index),
+            "last_snapshot_wal_index must be set after apply_snapshot"
+        );
     }
 }

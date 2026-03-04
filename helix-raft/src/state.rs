@@ -124,6 +124,15 @@ pub enum RaftOutput {
         /// Maximum bytes of entries to read.
         max_bytes: u64,
     },
+    /// A complete snapshot was received and accepted from the leader.
+    ///
+    /// Emitted on the follower when `handle_install_snapshot` processes the
+    /// final chunk (`req.done == true`). The caller should apply the snapshot
+    /// data to the application state machine and advance any WAL floors.
+    ApplySnapshot {
+        /// The snapshot to apply to the application state machine.
+        snapshot: Snapshot,
+    },
 }
 
 /// Simple linear congruential generator for deterministic randomization.
@@ -1334,6 +1343,10 @@ impl RaftNode {
                 LogIndex::new(self.persisted_commit_index.get().max(snap_index.get()));
             self.commit_index = LogIndex::new(self.commit_index.get().max(snap_index.get()));
             self.log.set_compacted_state(snap_index.get(), snap_term.get());
+            // Signal the application to apply the snapshot data.
+            outputs.push(RaftOutput::ApplySnapshot {
+                snapshot: Snapshot::new(snap_index, snap_term, req.data.clone()),
+            });
             InstallSnapshotResponse::complete(self.current_term, self.config.node_id, req.leader_id)
         } else {
             // Request next chunk.
@@ -1683,6 +1696,7 @@ impl RaftNode {
         follower_id: NodeId,
         last_included_index: LogIndex,
         last_included_term: TermId,
+        data: bytes::Bytes,
     ) -> Vec<RaftOutput> {
         let mut outputs = Vec::new();
 
@@ -1709,8 +1723,8 @@ impl RaftNode {
                 last_included_index,
                 last_included_term,
                 0,
-                bytes::Bytes::new(), // No state to install for WAL snapshots.
-                true,                // Single chunk, done immediately.
+                data,
+                true, // Single chunk, done immediately.
             ),
         )));
 
@@ -3334,7 +3348,7 @@ mod tests {
         let inflight_before = node.replication_state.get(&peer).unwrap().inflight_count;
 
         // Provide the snapshot boundary — WAL floor is at index 5, term 2.
-        let outputs = node.provide_snapshot(peer, LogIndex::new(5), TermId::new(2));
+        let outputs = node.provide_snapshot(peer, LogIndex::new(5), TermId::new(2), bytes::Bytes::new());
 
         // wal_read_pending must be cleared.
         assert!(
@@ -3396,7 +3410,7 @@ mod tests {
         // Re-insert the flag (step_down already clears it, so simulate a race).
         node.wal_read_pending.insert(peer);
 
-        let outputs = node.provide_snapshot(peer, LogIndex::new(5), TermId::new(2));
+        let outputs = node.provide_snapshot(peer, LogIndex::new(5), TermId::new(2), bytes::Bytes::new());
 
         assert!(
             !node.wal_read_pending.contains(&peer),
@@ -3419,7 +3433,7 @@ mod tests {
         // Simulate an in-flight snapshot.
         node.wal_read_pending.insert(peer);
         let inflight_before = node.replication_state.get(&peer).unwrap().inflight_count;
-        let _ = node.provide_snapshot(peer, LogIndex::new(5), TermId::new(2));
+        let _ = node.provide_snapshot(peer, LogIndex::new(5), TermId::new(2), bytes::Bytes::new());
 
         let state = node.replication_state.get(&peer).unwrap();
         assert_eq!(
@@ -3452,7 +3466,7 @@ mod tests {
         let peer = NodeId::new(2);
 
         node.wal_read_pending.insert(peer);
-        let _ = node.provide_snapshot(peer, LogIndex::new(5), TermId::new(2));
+        let _ = node.provide_snapshot(peer, LogIndex::new(5), TermId::new(2), bytes::Bytes::new());
 
         let state = node.replication_state.get(&peer).unwrap();
         let inflight_after_provide = state.inflight_count;

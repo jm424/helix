@@ -136,8 +136,8 @@ impl MultiRaftActor {
                 MultiRaftOutput::VoteStateChanged { .. } => {
                     // Vote state persistence handled separately.
                 }
-                MultiRaftOutput::NeedEntries { .. } => {
-                    // WAL-backed AppendEntries; not exercised in this test.
+                MultiRaftOutput::NeedEntries { .. } | MultiRaftOutput::ApplySnapshot { .. } => {
+                    // WAL-backed AppendEntries and InstallSnapshot not exercised in this test.
                 }
             }
         }

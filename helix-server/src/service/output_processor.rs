@@ -51,6 +51,7 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::controller::ControllerCommand;
+use crate::snapshot::{decode_envelope, encode_envelope, Snapshottable};
 use crate::vote_store::{LocalFileVoteStorage, VoteStore};
 
 use crate::error::ServerError;
@@ -384,6 +385,10 @@ async fn process_output<
             .await;
             2
         }
+        PartitionOutput::ApplySnapshot { snapshot } => {
+            handle_apply_snapshot(group_id, snapshot, partition_storage).await;
+            2
+        }
     }
 }
 
@@ -565,16 +570,14 @@ async fn handle_need_wal_entries<S: Storage + Clone + Send + Sync + 'static>(
             // if floor > start_index, the read failed because those entries are
             // past retention, not due to some other I/O error.
             let storage_map = partition_storage.read().await;
-            let (wal_floor, compact_state) = if let Some(sl) = storage_map.get(&group_id) {
-                let floor = {
-                    let s = sl.read().await;
-                    s.wal_floor().await
-                };
-                let cs = {
-                    let s = sl.read().await;
-                    s.wal_compact_state().await
-                };
-                (floor, cs)
+            let (wal_floor, snapshot_for_fallback) = if let Some(sl) =
+                storage_map.get(&group_id)
+            {
+                let s = sl.read().await;
+                let floor = s.wal_floor().await;
+                let snap = build_snapshot_payload_for_follower(group_id, &s);
+                drop(s);
+                (floor, snap)
             } else {
                 (None, None)
             };
@@ -584,12 +587,19 @@ async fn handle_need_wal_entries<S: Storage + Clone + Send + Sync + 'static>(
             // For shared WAL: wal_floor is always None (floor not separately tracked).
             // In both cases, if entries cannot be served, use snapshot installation
             // to fast-forward the follower. map_or(true, ...) means: when wal_floor
-            // is None (shared WAL), always attempt the compact_state snapshot path.
+            // is None (shared WAL), always attempt the snapshot path.
             if wal_floor.is_none_or(|floor| floor > start_index.get()) {
+                eprintln!(
+                    "[DST-PROBE] DATA_NEED_ENTRIES_FALLBACK: group={} follower={} start={} wal_floor={:?}",
+                    group_id.get(),
+                    follower_id.get(),
+                    start_index.get(),
+                    wal_floor,
+                );
                 // WAL floor has advanced past the follower's position (dedicated WAL),
                 // or entries are unavailable due to tiering (shared WAL).
-                // Use InstallSnapshot to fast-forward the follower.
-                if let Some((compact_idx, compact_term)) = compact_state {
+                // Use InstallSnapshot with real state to fast-forward the follower.
+                if let Some((snap_idx, snap_term, snap_payload)) = snapshot_for_fallback {
                     let Ok(handle) = router.partition(group_id).await else {
                         warn!(
                             group = group_id.get(),
@@ -600,8 +610,9 @@ async fn handle_need_wal_entries<S: Storage + Clone + Send + Sync + 'static>(
                     if let Err(send_err) = handle
                         .provide_snapshot(
                             follower_id,
-                            LogIndex::new(compact_idx),
-                            TermId::new(compact_term),
+                            LogIndex::new(snap_idx),
+                            TermId::new(snap_term),
+                            snap_payload,
                         )
                         .await
                     {
@@ -617,7 +628,8 @@ async fn handle_need_wal_entries<S: Storage + Clone + Send + Sync + 'static>(
                     group = group_id.get(),
                     start = start_index.get(),
                     floor = wal_floor,
-                    "WAL floor past follower next_index but no compact state; follower cannot catch up"
+                    "WAL floor past follower next_index but no snapshot available; \
+                     follower cannot catch up"
                 );
                 return;
             }
@@ -638,18 +650,18 @@ async fn handle_need_wal_entries<S: Storage + Clone + Send + Sync + 'static>(
         );
         // Sending empty provide_entries would leave wal_read_pending set but
         // not advance next_index, causing NeedWalEntries to fire on every tick.
-        // Instead, use the compact state as a snapshot to fast-forward the
-        // follower past the missing entries.
+        // Instead, use a snapshot to fast-forward the follower past the missing
+        // entries, carrying real state data so the follower can apply it.
         let storage_map = partition_storage.read().await;
-        let compact_state = if let Some(sl) = storage_map.get(&group_id) {
+        let snapshot_for_fallback = if let Some(sl) = storage_map.get(&group_id) {
             let s = sl.read().await;
-            s.wal_compact_state().await
+            build_snapshot_payload_for_follower(group_id, &s)
         } else {
             None
         };
         drop(storage_map);
 
-        if let Some((compact_idx, compact_term)) = compact_state {
+        if let Some((snap_idx, snap_term, snap_payload)) = snapshot_for_fallback {
             let Ok(handle) = router.partition(group_id).await else {
                 warn!(group = group_id.get(), "Cannot find partition for snapshot");
                 return;
@@ -657,8 +669,9 @@ async fn handle_need_wal_entries<S: Storage + Clone + Send + Sync + 'static>(
             if let Err(e) = handle
                 .provide_snapshot(
                     follower_id,
-                    LogIndex::new(compact_idx),
-                    TermId::new(compact_term),
+                    LogIndex::new(snap_idx),
+                    TermId::new(snap_term),
+                    snap_payload,
                 )
                 .await
             {
@@ -672,7 +685,7 @@ async fn handle_need_wal_entries<S: Storage + Clone + Send + Sync + 'static>(
             warn!(
                 group = group_id.get(),
                 start = start_index.get(),
-                "No WAL entries and no compact state; follower cannot catch up"
+                "No WAL entries and no snapshot available; follower cannot catch up"
             );
         }
         return;
@@ -701,11 +714,45 @@ async fn handle_need_wal_entries<S: Storage + Clone + Send + Sync + 'static>(
                 }
                 Ok(None) => TermId::new(0),
                 Err(e) => {
+                    // prev_log entry unavailable (segment deleted by
+                    // tiering/retention). Fall back to snapshot.
+                    eprintln!(
+                        "[DST-PROBE] DATA_NEED_ENTRIES_FALLBACK: \
+                         group={} follower={} prev_log={} error={}",
+                        group_id.get(),
+                        follower_id.get(),
+                        prev_log_index.get(),
+                        e,
+                    );
                     warn!(
                         group = group_id.get(),
+                        follower = follower_id.get(),
+                        prev_log_index = prev_log_index.get(),
                         error = %e,
-                        "Failed to read prev_log entry from WAL"
+                        "Failed to read prev_log entry from WAL; \
+                         attempting snapshot fallback"
                     );
+                    let storage_map2 = partition_storage.read().await;
+                    let snap = if let Some(sl) = storage_map2.get(&group_id) {
+                        let s = sl.read().await;
+                        build_snapshot_payload_for_follower(group_id, &s)
+                    } else {
+                        None
+                    };
+                    drop(storage_map2);
+                    if let Some((si, st, sp)) = snap {
+                        let Ok(handle) = router.partition(group_id).await else {
+                            return;
+                        };
+                        let _ = handle
+                            .provide_snapshot(
+                                follower_id,
+                                LogIndex::new(si),
+                                TermId::new(st),
+                                sp,
+                            )
+                            .await;
+                    }
                     return;
                 }
             }
@@ -758,6 +805,109 @@ async fn handle_need_wal_entries<S: Storage + Clone + Send + Sync + 'static>(
             group = group_id.get(),
             error = %e,
             "Failed to send ProvideEntries to partition actor"
+        );
+    }
+}
+
+/// Builds an encoded snapshot payload for follower `InstallSnapshot` delivery.
+///
+/// Calls `take_snapshot()` on the partition storage, then wraps the result in
+/// the common snapshot envelope so the follower can decode both the application
+/// body and the full `SnapshotMeta` (including `last_included_wal_index`).
+///
+/// Returns `(last_included_index, last_included_term, encoded_bytes)` when a
+/// valid snapshot with `last_included_index > 0` is available, `None` otherwise.
+fn build_snapshot_payload_for_follower<S: Storage + Clone + Send + Sync + 'static>(
+    group_id: GroupId,
+    storage: &PartitionStorage<S>,
+) -> Option<(u64, u64, Bytes)> {
+    match storage.take_snapshot() {
+        Ok((meta, body)) if meta.last_included_index > 0 => {
+            eprintln!(
+                "[DST-PROBE] DATA_PROVIDE_SNAPSHOT: group={} index={}",
+                group_id.get(),
+                meta.last_included_index,
+            );
+            let encoded = encode_envelope(&meta, &body);
+            Some((meta.last_included_index, meta.last_included_term, encoded))
+        }
+        // No snapshot yet (fresh partition with no committed entries).
+        Ok(_) => None,
+        Err(e) => {
+            warn!(
+                group = group_id.get(),
+                error = %e,
+                "Failed to take partition snapshot for InstallSnapshot fallback"
+            );
+            None
+        }
+    }
+}
+
+/// Applies a snapshot received via `InstallSnapshot` to the partition storage.
+///
+/// Decodes the snapshot envelope to extract the full `SnapshotMeta` (including
+/// `last_included_wal_index`), then calls `apply_snapshot` on the storage.
+/// On success, the follower's state machine is fully restored.
+async fn handle_apply_snapshot<S: Storage + Clone + Send + Sync + 'static>(
+    group_id: GroupId,
+    snapshot: helix_raft::snapshot::Snapshot,
+    partition_storage: &Arc<RwLock<HashMap<GroupId, Arc<RwLock<PartitionStorage<S>>>>>>,
+) {
+    assert!(
+        snapshot.last_included_index.get() > 0,
+        "apply_snapshot: snapshot must have last_included_index > 0"
+    );
+    assert!(
+        !snapshot.data.is_empty(),
+        "apply_snapshot: snapshot data must not be empty"
+    );
+
+    let (meta, body) = match decode_envelope(&snapshot.data) {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(
+                group = group_id.get(),
+                index = snapshot.last_included_index.get(),
+                error = %e,
+                "Failed to decode snapshot envelope for ApplySnapshot"
+            );
+            return;
+        }
+    };
+
+    let Some(storage_lock) = partition_storage
+        .read()
+        .await
+        .get(&group_id)
+        .cloned()
+    else {
+        warn!(
+            group = group_id.get(),
+            "ApplySnapshot for unknown group"
+        );
+        return;
+    };
+    let mut storage = storage_lock.write().await;
+    if let Err(e) = storage.apply_snapshot(&meta, &body) {
+        warn!(
+            group = group_id.get(),
+            index = meta.last_included_index,
+            error = %e,
+            "Failed to apply snapshot to partition storage"
+        );
+    } else {
+        eprintln!(
+            "[DST-PROBE] DATA_APPLY_SNAPSHOT: group={} index={} term={}",
+            group_id.get(),
+            meta.last_included_index,
+            meta.last_included_term,
+        );
+        info!(
+            group = group_id.get(),
+            index = meta.last_included_index,
+            term = meta.last_included_term,
+            "Applied snapshot to partition storage"
         );
     }
 }
