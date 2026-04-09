@@ -1201,6 +1201,19 @@ impl<S: Storage, E: WalEntry> Wal<S, E> {
         self.sealed_segments.keys().copied().collect()
     }
 
+    /// Ensures `next_segment_id` is at least `min_id + 1`.
+    ///
+    /// Called after discovering remote segments in S3 that were not
+    /// downloaded (below snapshot floor). Without this, a fresh node
+    /// would allocate new segment IDs starting from 1, colliding with
+    /// old S3 segment IDs and causing data confusion.
+    pub fn ensure_next_segment_id_above(&mut self, min_id: SegmentId) {
+        let required = min_id.next();
+        if required > self.next_segment_id {
+            self.next_segment_id = required;
+        }
+    }
+
     /// Loads a sealed segment from disk for streaming recovery.
     ///
     /// Returns the fully decoded segment. The caller should process entries

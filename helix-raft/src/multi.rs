@@ -201,7 +201,7 @@ impl MultiRaft {
     ///
     /// When set, newly created groups use this value instead of the
     /// default. Useful in DST to force Raft log compaction.
-    pub fn set_log_trailing_entries_override(&mut self, entries: u64) {
+    pub const fn set_log_trailing_entries_override(&mut self, entries: u64) {
         self.log_trailing_entries_override = Some(entries);
     }
 

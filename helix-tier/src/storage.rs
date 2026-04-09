@@ -122,6 +122,39 @@ pub trait ObjectStorage: Send + Sync {
     ///
     /// Returns an error if the check fails.
     async fn exists(&self, key: &ObjectKey) -> TierResult<bool>;
+
+    /// Downloads a byte range from the object at `key`.
+    ///
+    /// Returns `length` bytes starting at byte offset `start`. Backends
+    /// with native range support (S3 HTTP Range header) override the
+    /// default to avoid downloading the full object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the object does not exist or download fails.
+    async fn get_range(
+        &self,
+        key: &ObjectKey,
+        start: u64,
+        length: u64,
+    ) -> TierResult<Bytes> {
+        let data = self.get(key).await?;
+        // Safety: start and length are bounded by segment header size (32 bytes).
+        #[allow(clippy::cast_possible_truncation)]
+        let start_usize = start as usize;
+        #[allow(clippy::cast_possible_truncation)]
+        let end_usize = start_usize.saturating_add(length as usize).min(data.len());
+        if start_usize >= data.len() {
+            return Err(TierError::DownloadFailed {
+                key: key.to_string(),
+                message: format!(
+                    "range start {start} exceeds object size {}",
+                    data.len()
+                ),
+            });
+        }
+        Ok(data.slice(start_usize..end_usize))
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -645,6 +678,38 @@ impl ObjectStorage for SimulatedObjectStorage {
         let objects = self.objects.lock().expect("objects lock poisoned");
         Ok(objects.contains_key(key))
     }
+
+    async fn get_range(
+        &self,
+        key: &ObjectKey,
+        start: u64,
+        length: u64,
+    ) -> TierResult<Bytes> {
+        assert!(!key.as_str().is_empty(), "object key must not be empty");
+        assert!(length > 0, "range length must be positive");
+
+        let objects = self.objects.lock().expect("objects lock poisoned");
+        let data = objects.get(key).ok_or_else(|| TierError::NotFound {
+            key: key.as_str().to_string(),
+        })?;
+
+        // Safety: start and length are bounded by segment header size (32 bytes).
+        #[allow(clippy::cast_possible_truncation)]
+        let start_usize = start as usize;
+        #[allow(clippy::cast_possible_truncation)]
+        let end_usize = start_usize.saturating_add(length as usize).min(data.len());
+        if start_usize >= data.len() {
+            return Err(TierError::DownloadFailed {
+                key: key.to_string(),
+                message: format!(
+                    "range start {start} exceeds object size {}",
+                    data.len()
+                ),
+            });
+        }
+
+        Ok(Bytes::copy_from_slice(&data[start_usize..end_usize]))
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -712,6 +777,25 @@ impl<T: ObjectStorage + 'static> helix_wal::WalSegmentStore for WalSegmentStoreA
             .await
             .map_err(|e| helix_wal::WalError::io("tier_list", e))?;
         Ok(keys.into_iter().map(|k| k.as_str().to_string()).collect())
+    }
+
+    async fn get_range(
+        &self,
+        key: &str,
+        start: u64,
+        length: u64,
+    ) -> helix_wal::WalResult<bytes::Bytes> {
+        self.inner
+            .get_range(&ObjectKey::new(key), start, length)
+            .await
+            .map_err(|e| match &e {
+                TierError::NotFound { .. } => {
+                    let segment_id =
+                        helix_wal::parse_segment_id_from_key(key).unwrap_or(0);
+                    helix_wal::WalError::SegmentNotFound { segment_id }
+                }
+                _ => helix_wal::WalError::io("tier_get_range", e),
+            })
     }
 }
 

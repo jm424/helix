@@ -248,7 +248,8 @@ pub async fn setup_single_partition<
 #[allow(
     clippy::too_many_arguments,
     clippy::implicit_hasher,
-    clippy::unused_async
+    clippy::unused_async,
+    clippy::too_many_lines
 )]
 pub async fn setup_multi_partition<
     S: Storage + Clone + Send + Sync + 'static,

@@ -58,6 +58,36 @@ pub trait WalSegmentStore: Send + Sync + 'static {
     ///
     /// Returns `WalError::Io` on listing failure.
     async fn list(&self, prefix: &str) -> WalResult<Vec<String>>;
+
+    /// Downloads a byte range from the object at `key`.
+    ///
+    /// Returns `length` bytes starting at byte offset `start`.
+    /// This allows reading just the segment header (32 bytes) without
+    /// downloading the full ~4 MB segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns `WalError::SegmentNotFound` if the key does not exist.
+    /// Returns `WalError::Io` on download or range failure.
+    async fn get_range(&self, key: &str, start: u64, length: u64) -> WalResult<Bytes> {
+        // Default: download full object and slice.
+        let data = self.get(key).await?;
+        // Safety: start and length are bounded by segment header size (32 bytes).
+        #[allow(clippy::cast_possible_truncation)]
+        let start_usize = start as usize;
+        #[allow(clippy::cast_possible_truncation)]
+        let end_usize = start_usize.saturating_add(length as usize).min(data.len());
+        if start_usize >= data.len() {
+            return Err(WalError::Io {
+                operation: "get_range",
+                message: format!(
+                    "range start {start} exceeds object size {}",
+                    data.len()
+                ),
+            });
+        }
+        Ok(data.slice(start_usize..end_usize))
+    }
 }
 
 /// A no-op [`WalSegmentStore`] that discards all writes and returns empty lists.
@@ -84,6 +114,12 @@ impl WalSegmentStore for NoopSegmentStore {
 
     async fn list(&self, _prefix: &str) -> WalResult<Vec<String>> {
         Ok(Vec::new())
+    }
+
+    async fn get_range(&self, key: &str, _start: u64, _length: u64) -> WalResult<Bytes> {
+        Err(WalError::SegmentNotFound {
+            segment_id: parse_segment_id_from_key(key).unwrap_or(0),
+        })
     }
 }
 

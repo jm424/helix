@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::error::{TierError, TierResult};
 use crate::storage::{ObjectKey, ObjectStorage};
@@ -361,6 +362,52 @@ impl ObjectStorage for FilesystemObjectStorage {
                 message: format!("failed to check '{}': {e}", path.display()),
             }),
         }
+    }
+
+    async fn get_range(
+        &self,
+        key: &ObjectKey,
+        start: u64,
+        length: u64,
+    ) -> TierResult<Bytes> {
+        assert!(!key.as_str().is_empty(), "key must not be empty");
+        assert!(length > 0, "range length must be positive");
+
+        let path = self.object_path(key);
+
+        let file = tokio::fs::File::open(&path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                TierError::NotFound {
+                    key: key.to_string(),
+                }
+            } else {
+                TierError::DownloadFailed {
+                    key: key.to_string(),
+                    message: format!("failed to open file: {e}"),
+                }
+            }
+        })?;
+
+        let mut file = file;
+        file.seek(std::io::SeekFrom::Start(start)).await.map_err(|e| {
+            TierError::DownloadFailed {
+                key: key.to_string(),
+                message: format!("failed to seek: {e}"),
+            }
+        })?;
+
+        // Safety: length is bounded by SEGMENT_HEADER_SIZE (32 bytes) in practice.
+        #[allow(clippy::cast_possible_truncation)]
+        let mut buf = vec![0u8; length as usize];
+        let n = file.read_exact(&mut buf).await.map_err(|e| {
+            TierError::DownloadFailed {
+                key: key.to_string(),
+                message: format!("failed to read range: {e}"),
+            }
+        })?;
+
+        buf.truncate(n);
+        Ok(Bytes::from(buf))
     }
 }
 

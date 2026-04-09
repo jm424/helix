@@ -553,7 +553,7 @@ impl SnapshotStore {
                     );
                 }
             }
-        } // guard dropped here, before prune_local await
+        } // guard dropped here, before prune_local
 
         self.prune_local(meta.group_id).await;
         Ok(())
@@ -704,8 +704,38 @@ impl SnapshotStore {
             .collect()
     }
 
+    /// Returns the group IDs for which at least one remote snapshot exists.
+    ///
+    /// Lists S3 keys under `{s3_prefix}snapshots/` and parses group IDs from
+    /// the hex directory component. Used at startup to discover which groups
+    /// have snapshots without relying on controller state.
+    pub async fn list_remote_group_ids(&self) -> Vec<GroupId> {
+        let prefix = format!("{}snapshots/", self.s3_prefix);
+        let keys = match self.remote.list(&prefix).await {
+            Ok(k) => k,
+            Err(e) => {
+                warn!(error = %e, "Failed to list remote snapshots");
+                return Vec::new();
+            }
+        };
+        // S3 key format: {s3_prefix}snapshots/{group_id_hex}/snap_{wal_index}.bin
+        // Extract the hex directory component after "snapshots/".
+        let mut group_ids: Vec<GroupId> = keys
+            .iter()
+            .filter_map(|k| {
+                let after_prefix = k.as_str().strip_prefix(prefix.as_str())?;
+                let hex_part = after_prefix.split('/').next()?;
+                u64::from_str_radix(hex_part, 16).ok().map(GroupId::new)
+            })
+            .collect();
+        group_ids.sort_unstable();
+        group_ids.dedup();
+        group_ids
+    }
+
     /// Deletes the oldest local snapshot files, keeping only the most recent
     /// `LOCAL_SNAPSHOT_RETENTION` files per group.
+    #[allow(clippy::unused_async)]
     async fn prune_local(&self, group_id: GroupId) {
         let group_dir = self.group_dir(group_id);
         let Ok(entries) = std::fs::read_dir(&group_dir) else { return };

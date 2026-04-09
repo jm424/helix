@@ -531,12 +531,85 @@ async fn configure_pool_tiering<S: helix_wal::Storage + Clone + Send + Sync + 's
 /// the production and DST constructors to create Raft groups with the
 /// correct committed log position after restart.
 struct WalRecoveryResult {
-    /// Controller (commit_index, commit_term) from WAL replay.
+    /// Controller (`commit_index`, `commit_term`) from WAL replay.
     controller_commit: (u64, u64),
-    /// Per-offset-group (commit_index, commit_term) from WAL replay.
+    /// Per-offset-group (`commit_index`, `commit_term`) from WAL replay.
     offset_commits: [(u64, u64); OFFSET_GROUP_COUNT_USIZE],
     /// Recovered data partition states (snapshot + WAL entries).
     data_partition_states: HashMap<GroupId, PartitionRecoveryState>,
+}
+
+/// Result of loading partition snapshot anchors.
+///
+/// Returned by [`load_snapshot_anchors`], consumed by both the download-
+/// floor computation (Raft indices) and WAL replay skipping (WAL indices).
+struct SnapshotAnchors {
+    /// Maps each `GroupId` to its `last_included_wal_index` (node-local
+    /// `SharedWAL` auto-counter). Used during WAL replay to skip entries
+    /// already captured in the snapshot.
+    wal_anchors: HashMap<GroupId, u64>,
+    /// Maps each `GroupId` to its `last_included_index` (Raft log index,
+    /// globally consistent). Used to compute the S3 download floor —
+    /// segments below this are not pre-downloaded but are fetched lazily
+    /// on demand when consumer reads need them.
+    raft_anchors: HashMap<GroupId, u64>,
+    /// Recovered partition states from the snapshots.
+    states: HashMap<GroupId, PartitionRecoveryState>,
+}
+
+/// Loads data partition snapshot anchors from the snapshot store.
+///
+/// Called BEFORE `download_missing_segments` so we can compute a floor
+/// for S3 downloads. The minimum Raft index across all groups tells us
+/// the earliest entry we still need from S3.
+async fn load_snapshot_anchors(
+    store: &crate::snapshot::SnapshotStore,
+) -> SnapshotAnchors {
+    let mut wal_anchors: HashMap<GroupId, u64> = HashMap::new();
+    let mut raft_anchors: HashMap<GroupId, u64> = HashMap::new();
+    let mut states: HashMap<GroupId, PartitionRecoveryState> = HashMap::new();
+
+    // Merge local + remote group IDs.
+    let mut candidate_ids = store.list_local_group_ids();
+    let remote_ids = store.list_remote_group_ids().await;
+    candidate_ids.extend(remote_ids);
+    candidate_ids.sort_unstable();
+    candidate_ids.dedup();
+
+    // Exclude controller and offset groups — loaded separately.
+    candidate_ids.retain(|gid| {
+        *gid != CONTROLLER_GROUP_ID
+            && offset_group_slot(*gid).is_none()
+    });
+
+    for group_id in candidate_ids {
+        if let Some((meta, body, from_remote)) = store.load(group_id).await {
+            match PartitionRecoveryState::from_snapshot(&meta, &body) {
+                Ok(recovery_state) => {
+                    info!(
+                        group_id = group_id.get(),
+                        snap_raft_index = meta.last_included_index,
+                        snap_wal_index = meta.last_included_wal_index,
+                        from_remote,
+                        "Loaded partition snapshot"
+                    );
+                    wal_anchors.insert(group_id, meta.last_included_wal_index);
+                    raft_anchors.insert(group_id, meta.last_included_index);
+                    states.insert(group_id, recovery_state);
+                }
+                Err(e) => {
+                    warn!(
+                        group_id = group_id.get(),
+                        error = %e,
+                        "Failed to decode partition snapshot; \
+                         replaying WAL fully"
+                    );
+                }
+            }
+        }
+    }
+
+    SnapshotAnchors { wal_anchors, raft_anchors, states }
 }
 
 /// Recovers controller, offset group, and data partition state from
@@ -549,10 +622,14 @@ struct WalRecoveryResult {
 /// 1. Loads controller + offset group snapshots (if `snapshot_store` is set)
 /// 2. Replays WAL entries via `pool.recover_streaming()`
 /// 3. Rebuilds controller and offset group state machines
-/// 4. Loads data partition snapshots and replays remaining WAL entries
+/// 4. Uses pre-loaded partition snapshot anchors for WAL entry skipping
 ///
 /// The caller must open the pool and configure tiering/S3 downloads
 /// before calling this function.
+///
+/// `preloaded_anchors` — if `Some`, partition snapshot anchors and states
+/// that were already loaded (to compute the S3 download floor). When
+/// `None`, the function loads them itself (single-node or test paths).
 #[allow(clippy::too_many_lines)]
 async fn recover_from_wal_and_snapshots<S: Storage + Clone + Send + Sync + 'static>(
     pool: &SharedWalPool<S>,
@@ -560,7 +637,7 @@ async fn recover_from_wal_and_snapshots<S: Storage + Clone + Send + Sync + 'stat
     controller_state: &Arc<RwLock<ControllerState>>,
     offset_group_states: &[Arc<RwLock<crate::offset_group::OffsetGroupState>>],
     cluster_nodes: &[NodeId],
-    node_id: NodeId,
+    preloaded_anchors: Option<SnapshotAnchors>,
 ) -> WalRecoveryResult {
     // -----------------------------------------------------------------
     // 1. Load controller snapshot (if available) before WAL replay.
@@ -636,35 +713,71 @@ async fn recover_from_wal_and_snapshots<S: Storage + Clone + Send + Sync + 'stat
     }
 
     // -----------------------------------------------------------------
-    // 3. Streaming recovery: collect all entries by category.
+    // 3. Load data partition snapshots BEFORE WAL replay.
+    //
+    // When pre-loaded anchors are provided (multi-node path), use them
+    // directly — they were loaded before S3 downloads to compute the
+    // download floor. Otherwise load them now (single-node / test paths).
     // -----------------------------------------------------------------
+    let (partition_snapshot_anchors, mut data_partition_states) =
+        if let Some(snap) = preloaded_anchors {
+            (snap.wal_anchors, snap.states)
+        } else if let Some(store) = snapshot_store {
+            let snap = load_snapshot_anchors(store).await;
+            (snap.wal_anchors, snap.states)
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
+
+    // -----------------------------------------------------------------
+    // 4. Streaming recovery: buffer controller/offset entries (small),
+    //    apply data entries inline (avoids cloning into HashMap).
+    // -----------------------------------------------------------------
+    let alloc_before = crate::alloc_stats::sample_allocated();
     let mut controller_entries_raw: Vec<SharedEntry> = Vec::new();
     let mut offset_entries_raw: Vec<Vec<SharedEntry>> =
         vec![Vec::new(); OFFSET_GROUP_COUNT_USIZE];
-    let mut data_entries_raw: HashMap<GroupId, Vec<SharedEntry>> = HashMap::new();
+    let mut data_entries_applied = 0u64;
+    let mut data_entries_skipped = 0u64;
     pool.recover_streaming(&mut |group_id, entry| {
         if group_id == CONTROLLER_GROUP_ID {
             controller_entries_raw.push(entry.clone());
         } else if let Some(slot) = offset_group_slot(group_id) {
             offset_entries_raw[slot].push(entry.clone());
         } else {
-            data_entries_raw
+            // Data entries: skip if below snapshot anchor, else apply inline.
+            if let Some(&anchor) = partition_snapshot_anchors.get(&group_id) {
+                if entry.index() <= anchor {
+                    data_entries_skipped += 1;
+                    return;
+                }
+            }
+            data_partition_states
                 .entry(group_id)
                 .or_default()
-                .push(entry.clone());
+                .apply_entry(entry);
+            data_entries_applied += 1;
         }
     })
     .await
     .expect("Failed to recover from SharedWalPool");
 
+    let alloc_after = crate::alloc_stats::sample_allocated();
+    let alloc_delta_mb =
+        alloc_after.saturating_sub(alloc_before) / (1024 * 1024);
     info!(
-        data_groups = data_entries_raw.len(),
+        data_groups = data_partition_states.len(),
         controller_entries = controller_entries_raw.len(),
+        data_entries_applied,
+        data_entries_skipped,
+        alloc_before_mb = alloc_before / (1024 * 1024),
+        alloc_after_mb = alloc_after / (1024 * 1024),
+        alloc_delta_mb,
         "SharedWalPool recovery complete"
     );
 
     // -----------------------------------------------------------------
-    // 4. Replay controller entries into ControllerState.
+    // 5. Replay controller entries into ControllerState.
     //
     // We use max_raft_index (not max_contiguous) for both the Raft
     // commit_index and the WAL write guard. The state machine is built
@@ -752,7 +865,7 @@ async fn recover_from_wal_and_snapshots<S: Storage + Clone + Send + Sync + 'stat
     };
 
     // -----------------------------------------------------------------
-    // 5. Replay offset group entries.
+    // 6. Replay offset group entries.
     // -----------------------------------------------------------------
     let mut offset_commit_indices =
         [(0u64, 0u64); OFFSET_GROUP_COUNT_USIZE];
@@ -847,79 +960,27 @@ async fn recover_from_wal_and_snapshots<S: Storage + Clone + Send + Sync + 'stat
         }
     }
 
-    // -----------------------------------------------------------------
-    // 6. Load data partition snapshots (after controller is rebuilt).
-    // -----------------------------------------------------------------
-    let mut partition_snapshot_anchors: HashMap<GroupId, u64> =
-        HashMap::new();
-    let mut data_partition_states: HashMap<GroupId, PartitionRecoveryState> =
-        HashMap::new();
-    if let Some(store) = snapshot_store {
-        let assigned_group_ids: Vec<GroupId> = {
-            let state = controller_state.read().await;
-            state
-                .all_assignments()
-                .filter(|(_, a)| a.replicas.contains(&node_id))
-                .map(|(_, a)| a.group_id)
-                .collect()
-        };
-        for group_id in assigned_group_ids {
-            if let Some((meta, body, from_remote)) =
-                store.load(group_id).await
-            {
-                match PartitionRecoveryState::from_snapshot(&meta, &body) {
-                    Ok(recovery_state) => {
-                        info!(
-                            group_id = group_id.get(),
-                            snap_index = meta.last_included_index,
-                            snap_wal_index =
-                                meta.last_included_wal_index,
-                            from_remote,
-                            "Loaded partition snapshot; WAL entries \
-                             at or below wal_index will be skipped"
-                        );
-                        partition_snapshot_anchors.insert(
-                            group_id,
-                            meta.last_included_wal_index,
-                        );
-                        data_partition_states
-                            .insert(group_id, recovery_state);
-                    }
-                    Err(e) => {
-                        warn!(
-                            group_id = group_id.get(),
-                            error = %e,
-                            "Failed to decode partition snapshot; \
-                             replaying WAL fully"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------
-    // 7. Replay data partition WAL entries.
-    // -----------------------------------------------------------------
-    for (group_id, entries) in &data_entries_raw {
-        let state = data_partition_states.entry(*group_id).or_default();
-        let anchor = partition_snapshot_anchors.get(group_id).copied();
-        for entry in entries {
-            if let Some(a) = anchor {
-                if entry.index() <= a {
-                    continue;
-                }
-            }
-            state.apply_entry(entry);
-        }
-    }
-
     if !data_partition_states.is_empty() {
         info!(
             partitions = data_partition_states.len(),
             snapshots = partition_snapshot_anchors.len(),
             "Data partition recovery complete"
         );
+    }
+
+    // Seed SharedWAL group_state for snapshot-recovered groups that had
+    // all WAL entries skipped (everything below the anchor). Without this,
+    // read_or_load returns None for valid indices because group_state is
+    // empty, preventing S3 lazy reads on fresh nodes.
+    for (group_id, state) in &data_partition_states {
+        if state.last_applied_wal_index > 0 {
+            pool.set_group_state_if_absent(
+                *group_id,
+                state.last_applied_wal_index,
+                state.last_applied_term,
+            )
+            .await;
+        }
     }
 
     WalRecoveryResult {
@@ -1177,7 +1238,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                     Arc::new(SimulatedObjectStorage::new(0));
                 Arc::new(crate::snapshot::SnapshotStore::new(
                     dir.clone(),
-                    format!("node-{}/", node_id.get()),
+                    String::new(),
                     remote,
                 ))
             });
@@ -1214,16 +1275,33 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                 .await
                 .expect("Failed to open SharedWalPool");
 
+            // Load partition snapshot anchors before S3 downloads.
+            let snap_result = if let Some(ref store) = snapshot_store_internal {
+                load_snapshot_anchors(store).await
+            } else {
+                SnapshotAnchors {
+                    wal_anchors: HashMap::new(),
+                    raft_anchors: HashMap::new(),
+                    states: HashMap::new(),
+                }
+            };
+            let partition_snapshot_anchors_internal = snap_result.wal_anchors;
+            let data_partition_states_init_internal = snap_result.states;
+
+            let min_raft_floor: u64 = snap_result.raft_anchors
+                .values()
+                .copied()
+                .min()
+                .unwrap_or(0);
+
             // Configure coordinator-level tiering for filesystem backend if available.
             if object_storage_dir.is_some() {
                 configure_pool_tiering(&pool, node_id.get(), object_storage_dir.as_ref(), #[cfg(feature = "s3")] None).await;
 
-                // Download any segments present in object storage but missing from local
-                // disk before replay. This recovers a pod that restarted on a new node with
-                // an empty local directory.
-                match pool.download_missing_segments().await {
+                match pool.download_missing_segments(min_raft_floor).await {
                     Ok(n) if n > 0 => info!(
                         downloaded = n,
+                        min_raft_floor,
                         "Downloaded missing shared WAL segments from object storage before replay"
                     ),
                     Ok(_) => {}
@@ -1231,42 +1309,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                         error = %e,
                         "Failed to download missing shared WAL segments from object storage"
                     ),
-                }
-            }
-
-            // Load partition snapshots (local disk only) before WAL replay.
-            let mut partition_snapshot_anchors_internal: HashMap<GroupId, u64> =
-                HashMap::new();
-            let mut data_partition_states_init_internal: HashMap<GroupId, PartitionRecoveryState> =
-                HashMap::new();
-            if let Some(ref store) = snapshot_store_internal {
-                for group_id in store.list_local_group_ids() {
-                    if group_id == CONTROLLER_GROUP_ID {
-                        continue;
-                    }
-                    if let Some((meta, body, _)) = store.load(group_id).await {
-                        match PartitionRecoveryState::from_snapshot(&meta, &body) {
-                            Ok(state) => {
-                                info!(
-                                    group_id = group_id.get(),
-                                    snap_wal_index = meta.last_included_wal_index,
-                                    "Loaded partition snapshot (single-node); WAL \
-                                     entries at or below wal_index will be skipped"
-                                );
-                                partition_snapshot_anchors_internal
-                                    .insert(group_id, meta.last_included_wal_index);
-                                data_partition_states_init_internal
-                                    .insert(group_id, state);
-                            }
-                            Err(e) => {
-                                warn!(
-                                    group_id = group_id.get(),
-                                    error = %e,
-                                    "Failed to decode partition snapshot; replaying WAL"
-                                );
-                            }
-                        }
-                    }
                 }
             }
 
@@ -1611,10 +1653,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                     } else {
                         Arc::new(SimulatedObjectStorage::new(node_id.get()))
                     };
-                let s3_prefix = format!("node-{}/", node_id.get());
                 Arc::new(crate::snapshot::SnapshotStore::new(
                     dir.clone(),
-                    s3_prefix,
+                    String::new(),
                     remote,
                 ))
             });
@@ -1674,17 +1715,41 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                 .await
                 .expect("Failed to open SharedWalPool");
 
+            // Load partition snapshot anchors BEFORE S3 downloads so we
+            // can compute a floor and avoid downloading the entire WAL.
+            let preloaded_anchors = if let Some(ref store) = snapshot_store_opt {
+                let snap = load_snapshot_anchors(store).await;
+                if !snap.wal_anchors.is_empty() {
+                    info!(
+                        anchor_count = snap.wal_anchors.len(),
+                        "Loaded partition snapshot anchors before S3 download"
+                    );
+                }
+                Some(snap)
+            } else {
+                None
+            };
+
+            // Compute minimum Raft index floor from snapshot anchors.
+            // Segments below this floor are not downloaded at startup but
+            // ARE marked as tiered — consumer reads trigger lazy S3 fetches
+            // on demand via restore_and_scan_tiered().
+            let min_raft_floor: u64 = preloaded_anchors
+                .as_ref()
+                .and_then(|snap| snap.raft_anchors.values().copied().min())
+                .unwrap_or(0);
+
             // Configure coordinator-level tiering on the pool if tiering is enabled.
             // Uses the same backend selection logic as per-partition tiering.
             if tiering_config.is_some() {
                 configure_pool_tiering(&pool, node_id.get(), object_storage_dir.as_ref(), #[cfg(feature = "s3")] s3_config.as_ref()).await;
 
-                // Download any segments present in object storage but missing from local
-                // disk before replay. This recovers a pod that restarted on a new node with
-                // an empty local directory.
-                match pool.download_missing_segments().await {
+                // Download segments from S3 that are at or above the snapshot floor.
+                // Segments below the floor are still marked as tiered for lazy reads.
+                match pool.download_missing_segments(min_raft_floor).await {
                     Ok(n) if n > 0 => info!(
                         downloaded = n,
+                        min_raft_floor,
                         "Downloaded missing shared WAL segments from object storage before replay (multi-node)"
                     ),
                     Ok(_) => {}
@@ -1702,7 +1767,7 @@ impl<S: Storage + Clone + Send + Sync + 'static> HelixService<S> {
                 &controller_state,
                 &offset_group_states_vec,
                 &cluster_nodes,
-                node_id,
+                preloaded_anchors,
             )
             .await;
 
@@ -2494,7 +2559,7 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     Arc::new(SimulatedObjectStorage::new(node_id.get()));
                 Arc::new(crate::snapshot::SnapshotStore::new(
                     dir.clone(),
-                    format!("node-{}/", node_id.get()),
+                    String::new(),
                     remote,
                 ))
             });
@@ -2543,13 +2608,14 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                 .await;
 
                 // Run shared WAL + snapshot recovery (same path as production).
+                // DST does not use S3, so no pre-loaded anchors needed.
                 let recovery = recover_from_wal_and_snapshots(
                     &pool,
                     snapshot_store_opt.as_ref(),
                     &controller_state,
                     &offset_group_states_vec,
                     &cluster_nodes,
-                    node_id,
+                    None,
                 )
                 .await;
 
@@ -2601,9 +2667,9 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
             let gid = GroupId::new(OFFSET_GROUP_ID_BASE.get() + i);
             #[allow(clippy::cast_possible_truncation)]
             let slot = i as usize;
-            let (ci_val, ct_val) = offset_commit_indices[slot];
-            let commit_index = LogIndex::new(ci_val);
-            let commit_term = TermId::new(ct_val);
+            let (recovered_index, recovered_term) = offset_commit_indices[slot];
+            let commit_index = LogIndex::new(recovered_index);
+            let commit_term = TermId::new(recovered_term);
             let result = multi_raft.write().await.create_group_with_recovery_state(
                 gid,
                 cluster_nodes.clone(),

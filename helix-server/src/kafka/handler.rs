@@ -787,16 +787,10 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
 
     /// Get log start offset (earliest available), returning 0 if not found.
     ///
-    /// For now, log start offset is always 0 (no log truncation/compaction).
-    /// Takes `&self` for future implementation that will access partition state.
-    #[allow(
-        clippy::unused_self,
-        clippy::missing_const_for_fn,
-        clippy::unused_async
-    )]
-    async fn get_log_start_offset(&self, _topic: &str, _partition: i32) -> u64 {
-        // TODO: Implement log truncation/compaction and track actual start offset.
-        0
+    /// After snapshot-only recovery, log start offset equals HWM: the node
+    /// has no local data for older offsets.
+    async fn get_log_start_offset(&self, topic: &str, partition: i32) -> u64 {
+        self.service.get_log_start_offset(topic, partition).await
     }
 
     /// Handle Fetch request.
@@ -862,6 +856,29 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> KafkaHandl
                         log_end_offset,
                         "Fetch HWM differs from blob log end offset"
                     );
+                }
+
+                // If the requested offset is below log_start_offset, return
+                // OFFSET_OUT_OF_RANGE. This happens when a node recovered from
+                // a remote snapshot and has no local data for old offsets.
+                if fetch_offset < log_start {
+                    warn!(
+                        topic = %topic_name,
+                        partition = partition_id,
+                        fetch_offset,
+                        log_start,
+                        "Fetch: offset below log start"
+                    );
+                    partition_response.error_code = 1; // OFFSET_OUT_OF_RANGE
+                    #[allow(clippy::cast_possible_wrap)]
+                    {
+                        partition_response.high_watermark = high_watermark as i64;
+                        partition_response.last_stable_offset = high_watermark as i64;
+                        partition_response.log_start_offset = log_start as i64;
+                    }
+                    partition_response.records = Some(Bytes::new());
+                    topic_response.partitions.push(partition_response);
+                    continue;
                 }
 
                 // Fetch blobs.

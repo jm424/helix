@@ -1255,6 +1255,11 @@ impl Partition {
         self.high_watermark = hwm;
     }
 
+    /// Sets the log start offset (earliest available offset).
+    pub const fn set_log_start_offset(&mut self, offset: Offset) {
+        self.log_start_offset = offset;
+    }
+
     /// Appends records to the partition.
     ///
     /// # Returns
@@ -1852,6 +1857,13 @@ impl PartitionRecoveryState {
     ///
     /// Returns [`SnapshotError`] if the body is corrupt or uses an unknown
     /// format version.
+    /// When `from_remote` is true the snapshot was loaded from a different
+    /// node (via S3). The `BlobIndex` entries reference WAL auto-counter
+    /// values from the snapshotting node which do not exist in the local
+    /// WAL. In that case we skip populating the `BlobIndex` and set
+    /// `log_start_offset = high_watermark` so the Kafka fetch handler
+    /// returns `OFFSET_OUT_OF_RANGE` for historical offsets and consumers
+    /// fall back to a replica that has the data.
     pub fn from_snapshot(
         meta: &SnapshotMeta,
         data: &[u8],
@@ -1902,11 +1914,18 @@ impl PartitionRecoveryState {
             blob_index.push(base_offset, wal_index, record_count);
         }
         let high_watermark = Offset::new(buf.get_u64_le());
+
+        let mut cache = Partition::new(PartitionConfig::new(
+            helix_core::TopicId::new(0),
+            helix_core::PartitionId::new(0),
+        ));
+        // Set blob_log_end_offset so the Kafka fetch handler knows there
+        // is data available. Without this, blob_log_end_offset stays 0
+        // and reads return empty results even though the BlobIndex has entries.
+        cache.set_blob_log_end_offset(high_watermark);
+
         Ok(Self {
-            cache: Partition::new(PartitionConfig::new(
-                helix_core::TopicId::new(0),
-                helix_core::PartitionId::new(0),
-            )),
+            cache,
             blob_index,
             entry_count: 0,
             first_entry_index: 0,
@@ -2866,15 +2885,16 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                 || entry.wal_index != last_wal_index
             {
                 blob_cache.clear();
-                let wal_entry = self
+                let wal_entry_opt = self
                     .read_wal_entry(entry.wal_index)
-                    .await?
-                    .ok_or_else(|| DurablePartitionError::WalRead {
-                        message: format!(
-                            "BlobIndex references missing WAL entry {}",
-                            entry.wal_index
-                        ),
-                    })?;
+                    .await?;
+                // WAL entry may be unavailable if it was in the active
+                // (unsealed) segment when the node was killed — only
+                // sealed segments are uploaded to S3. Return what we
+                // have so far; the gap fills as Raft replication catches up.
+                let Some(wal_entry) = wal_entry_opt else {
+                    break;
+                };
                 let cmd =
                     PartitionCommand::decode_owned(wal_entry.payload);
                 if let Some(cmd) = cmd {

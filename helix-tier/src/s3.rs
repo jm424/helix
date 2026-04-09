@@ -446,6 +446,52 @@ impl ObjectStorage for S3ObjectStorage {
             }
         }
     }
+
+    async fn get_range(
+        &self,
+        key: &ObjectKey,
+        start: u64,
+        length: u64,
+    ) -> TierResult<Bytes> {
+        assert!(!key.as_str().is_empty(), "key must not be empty");
+        assert!(length > 0, "range length must be positive");
+
+        let full_key = self.full_key(key);
+        let range = format!("bytes={}-{}", start, start + length - 1);
+
+        let response = self
+            .client
+            .get_object()
+            .bucket(&self.config.bucket)
+            .key(&full_key)
+            .range(range)
+            .send()
+            .await
+            .map_err(|e| {
+                if is_not_found_error(&e) {
+                    TierError::NotFound {
+                        key: key.to_string(),
+                    }
+                } else {
+                    TierError::DownloadFailed {
+                        key: key.to_string(),
+                        message: format!("S3 GetObject range failed: {e}"),
+                    }
+                }
+            })?;
+
+        let bytes = response
+            .body
+            .collect()
+            .await
+            .map_err(|e| TierError::DownloadFailed {
+                key: key.to_string(),
+                message: format!("failed to read S3 range response body: {e}"),
+            })?
+            .into_bytes();
+
+        Ok(bytes)
+    }
 }
 
 // -----------------------------------------------------------------------------

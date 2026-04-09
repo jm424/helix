@@ -776,4 +776,36 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
 
         Some(ps.high_watermark().get())
     }
+
+    /// Returns the log start offset for a partition (earliest available).
+    ///
+    /// After snapshot-only recovery from a remote node, the log start offset
+    /// equals the high watermark: no historical data is available locally.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn get_log_start_offset(&self, topic: &str, partition: i32) -> u64 {
+        let Some(topic_meta) = self.get_topic(topic).await else {
+            return 0;
+        };
+        if partition < 0 || partition >= topic_meta.partition_count {
+            return 0;
+        }
+        #[allow(clippy::cast_sign_loss)]
+        let partition_id = PartitionId::new(partition as u64);
+        let group_id = {
+            let gm = self.group_map.read().await;
+            match gm.get(topic_meta.topic_id, partition_id) {
+                Some(g) => g,
+                None => return 0,
+            }
+        };
+        let ps_lock = {
+            let storage = self.partition_storage.read().await;
+            match storage.get(&group_id).cloned() {
+                Some(ps) => ps,
+                None => return 0,
+            }
+        };
+        let ps = ps_lock.read().await;
+        ps.log_start_offset().get()
+    }
 }

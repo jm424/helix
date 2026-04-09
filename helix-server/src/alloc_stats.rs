@@ -56,6 +56,22 @@ async fn run(port: u16) -> std::io::Result<()> {
     }
 }
 
+/// Returns the current jemalloc `allocated` counter in bytes.
+///
+/// Advances the epoch first to flush per-thread caches. Used by WAL
+/// recovery to measure memory growth across the replay pass.
+///
+/// # Panics
+///
+/// Panics if jemalloc epoch MIB lookup or advance fails.
+#[must_use]
+pub fn sample_allocated() -> usize {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    let epoch_mib = epoch::mib().expect("jemalloc epoch mib");
+    epoch_mib.advance().expect("jemalloc epoch advance");
+    stats::allocated::read().unwrap_or(0)
+}
+
 /// Samples jemalloc counters after advancing the epoch.
 ///
 /// Advancing the epoch flushes per-thread cache counters into the global

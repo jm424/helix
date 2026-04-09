@@ -749,12 +749,39 @@ impl<S: Storage> SharedWal<S> {
         self.group_state.keys().copied()
     }
 
+    /// Sets group state from an external source (e.g., snapshot recovery).
+    ///
+    /// On a fresh node recovering from a remote snapshot, the WAL has no
+    /// local entries for the group, but `read_or_load` needs `group_state`
+    /// to avoid early-returning `None` for indices that exist in S3.
+    /// Calling this with the snapshot's last WAL auto-counter and term
+    /// ensures the bounds check passes and the S3 fallback path activates.
+    ///
+    /// No-op if the group already has state (from WAL recovery).
+    pub fn set_group_state_if_absent(
+        &mut self,
+        group_id: GroupId,
+        last_index: u64,
+        last_term: u64,
+    ) {
+        self.group_state.entry(group_id).or_insert(GroupState {
+            last_index,
+            last_term,
+        });
+    }
+
     /// Returns the list of sealed segment IDs.
     ///
     /// Sealed segments are immutable and can be safely uploaded to tiering storage.
     #[must_use]
     pub fn sealed_segment_ids(&self) -> Vec<crate::SegmentId> {
         self.wal.sealed_segment_ids()
+    }
+
+    /// Ensures segment ID counter is above `min_id` to prevent collisions
+    /// with remote segments that were not downloaded locally.
+    pub fn ensure_next_segment_id_above(&mut self, min_id: crate::SegmentId) {
+        self.wal.ensure_next_segment_id_above(min_id);
     }
 
     /// Reads the raw bytes of a sealed segment.
@@ -1102,6 +1129,49 @@ impl<S: Storage> SharedWal<S> {
             group_index_has_group = self.group_index.contains_key(&group_id),
             "read_or_load: not in group_index or evicted_index, returning None"
         );
+        Ok(None)
+    }
+
+    /// Scans all sealed segments on disk for an entry matching (group, index).
+    ///
+    /// Used as a fallback when the entry is within `group_state` range but
+    /// not in `group_index` or `evicted_index`. This happens on fresh nodes
+    /// that loaded a remote snapshot and restored S3 segments to disk but
+    /// have not yet built the index mappings for those segments.
+    ///
+    /// Returns `Ok(Some(entry))` if found, `Ok(None)` if no segment has it.
+    /// Returns `Err(SegmentNotFound)` if a segment is registered but the
+    /// file is missing (trigger for another S3 restore attempt).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if segment decode fails.
+    pub async fn scan_sealed_segments_for_entry(
+        &mut self,
+        group_id: GroupId,
+        index: u64,
+    ) -> WalResult<Option<SharedEntry>> {
+        let segment_ids = self.wal.sealed_segment_ids();
+        for sid in segment_ids {
+            match self
+                .wal
+                .scan_segment_for_entry(sid, |e| {
+                    e.group_id() == group_id && e.index() == index
+                })
+                .await
+            {
+                Ok(Some(entry)) => {
+                    // Populate evicted_index so future lookups are O(1).
+                    self.evicted_index
+                        .entry(group_id)
+                        .or_default()
+                        .insert(index, (sid, entry.raft_index()));
+                    return Ok(Some(entry));
+                }
+                Ok(None) => {}
+                Err(e) => return Err(e),
+            }
+        }
         Ok(None)
     }
 
@@ -1754,12 +1824,14 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
         succeeded
     }
 
-    /// Reads a specific entry by Raft index for this partition.
+    /// Reads a specific entry by WAL auto-counter for this partition.
     ///
     /// Uses the per-partition `BTreeMap` index for O(log n) lookup.
     /// Falls back to disk read if the entry's segment has been evicted.
     /// If the segment file has been deleted by tiering, transparently downloads
-    /// it from S3 and retries the read.
+    /// it from S3 and retries the read. If the entry is not in any local
+    /// index (fresh node with remote snapshot), scans sealed segments and
+    /// restores from S3 as needed.
     /// Returns `None` if no entry exists at the given index.
     pub async fn read_entry(&self, index: u64) -> Option<SharedEntry> {
         // First attempt: try local disk (with evicted_index fallback).
@@ -1769,22 +1841,20 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
             wal.read_or_load(self.group_id, index).await
         };
         match first_result {
-            Ok(entry) => entry,
+            Ok(Some(entry)) => return Some(entry),
+            Ok(None) => {
+                // Entry not in group_index or evicted_index.
+                // On a fresh node with snapshot recovery, segments
+                // may exist locally (downloaded) or only in S3.
+                // Fall through to S3 scan below.
+            }
             Err(crate::WalError::SegmentNotFound { segment_id }) => {
                 // Segment file was deleted by tiering; attempt S3 fallback.
                 if self.restore_from_s3(segment_id).await {
                     let mut wal = self.inner.wal.lock().await;
                     match wal.read_or_load(self.group_id, index).await {
-                        Ok(Some(entry)) => Some(entry),
-                        Ok(None) => {
-                            warn!(
-                                group_id = %self.group_id,
-                                index,
-                                segment_id,
-                                "read_entry: S3 restore succeeded but entry still missing after restore"
-                            );
-                            None
-                        }
+                        Ok(Some(entry)) => return Some(entry),
+                        Ok(None) => {}
                         Err(e) => {
                             warn!(
                                 group_id = %self.group_id,
@@ -1792,17 +1862,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
                                 error = %e,
                                 "Read failed after S3 segment restore"
                             );
-                            None
+                            return None;
                         }
                     }
-                } else {
-                    warn!(
-                        group_id = %self.group_id,
-                        index,
-                        segment_id,
-                        "Segment not found locally or in S3"
-                    );
-                    None
                 }
             }
             Err(e) => {
@@ -1812,9 +1874,95 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
                     error = %e,
                     "Failed to read entry from disk"
                 );
-                None
+                return None;
             }
         }
+
+        // Fallback: scan local sealed segments (handles segments restored
+        // from S3 that aren't in evicted_index yet).
+        {
+            let mut wal = self.inner.wal.lock().await;
+            match wal
+                .scan_sealed_segments_for_entry(self.group_id, index)
+                .await
+            {
+                Ok(Some(entry)) => return Some(entry),
+                Err(crate::WalError::SegmentNotFound { segment_id }) => {
+                    // A registered segment's file is missing; try S3.
+                    drop(wal);
+                    if self.restore_from_s3(segment_id).await {
+                        let mut wal2 = self.inner.wal.lock().await;
+                        if let Ok(Some(entry)) = wal2
+                            .scan_sealed_segments_for_entry(self.group_id, index)
+                            .await
+                        {
+                            return Some(entry);
+                        }
+                    }
+                }
+                Ok(None) | Err(_) => {}
+            }
+        }
+
+        // Last resort: restore tiered segments from S3 and scan each.
+        // This is the cold path for fresh nodes where the entry's segment
+        // was never downloaded (below snapshot floor, only in S3).
+        self.restore_and_scan_tiered(index).await
+    }
+
+    /// Restores tiered segments from S3 one at a time, scanning each for
+    /// a specific entry. Stops as soon as the entry is found.
+    ///
+    /// Segments are restored in ascending order (oldest first) since
+    /// `BlobIndex` entries for earlier offsets are in older segments.
+    /// Each restored segment is cached locally, amortizing the cost
+    /// across subsequent reads.
+    async fn restore_and_scan_tiered(&self, index: u64) -> Option<SharedEntry> {
+        let tiered: Vec<u64> = {
+            let guard = self
+                .inner
+                .tiered_segments
+                .read()
+                .expect("tiered_segments poisoned");
+            let ids: Vec<u64> = guard.iter().copied().collect();
+            drop(guard);
+            let mut sorted = ids;
+            sorted.sort_unstable();
+            sorted
+        };
+
+        if tiered.is_empty() {
+            return None;
+        }
+
+        for segment_id in tiered {
+            // Skip if already local (was scanned above).
+            {
+                let wal = self.inner.wal.lock().await;
+                if wal.wal.segment_info(crate::SegmentId::new(segment_id)).is_some() {
+                    continue;
+                }
+            }
+
+            if !self.restore_from_s3(segment_id).await {
+                continue;
+            }
+
+            let mut wal = self.inner.wal.lock().await;
+            if let Ok(Some(entry)) = wal
+                .scan_sealed_segments_for_entry(self.group_id, index)
+                .await
+            {
+                return Some(entry);
+            }
+        }
+
+        warn!(
+            group_id = %self.group_id,
+            index,
+            "read_entry: entry not found in any local or tiered segment"
+        );
+        None
     }
 
     /// Reads a range of entries for this partition, bounded by byte size.
@@ -2195,7 +2343,7 @@ struct CoordinatorInner<S: Storage> {
     ///
     /// Used by `restore_from_s3` to write downloaded segment data through the
     /// `Storage` trait instead of raw `tokio::fs`, which is not available under
-    /// deterministic simulation (MadSim).
+    /// deterministic simulation (`MadSim`).
     storage: S,
     // -------------------------------------------------------------------------
     // Tiering state (populated by configure_tiering; None = tiering disabled).
@@ -2359,6 +2507,22 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
             inner,
             flush_handle: Mutex::new(Some(flush_handle)),
         })
+    }
+
+    /// Sets group state from snapshot metadata (if no local WAL state).
+    ///
+    /// On a fresh node with a remote snapshot, the WAL has no entries for
+    /// snapshot-recovered groups. This seeds `group_state` so that
+    /// `read_or_load` knows the valid index range and can trigger S3
+    /// fallback instead of returning `None` immediately.
+    pub async fn set_group_state_if_absent(
+        &self,
+        group_id: GroupId,
+        last_index: u64,
+        last_term: u64,
+    ) {
+        let mut wal = self.inner.wal.lock().await;
+        wal.set_group_state_if_absent(group_id, last_index, last_term);
     }
 
     /// Gets a handle for a group.
@@ -2815,25 +2979,10 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
                 continue;
             }
 
-            // Safety guard: only delete segments whose entries are fully
-            // covered by snapshots for all registered groups. `eviction_floor()`
-            // returns the minimum snapshot WAL index across all registered
-            // groups, or 0 if any group has never taken a snapshot.
-            // If `last_index` is None (empty segment) it is always safe to delete.
-            let floor = self.eviction_floor();
-            let segment_last = info.last_index.unwrap_or(0);
-            eprintln!(
-                "[DST-PROBE] DELETION_CHECK: segment={} last_idx={} floor={} tiered={}",
-                segment_id.get(),
-                segment_last,
-                floor,
-                is_tiered,
-            );
-            if segment_last >= floor {
-                // Segment contains entries not yet covered by any snapshot;
-                // a restarting node may need to replay from this segment.
-                continue;
-            }
+            // The segment is confirmed in S3 — the local copy is redundant.
+            // A restarting node calls `download_missing_segments` which fetches
+            // any needed segments from S3, and on-demand consumer reads fall
+            // back to S3 transparently.  The only gate is local retention age.
 
             // Respect local retention: don't delete until the segment is old enough.
             // If the seal time is unknown, skip deletion to be safe.
@@ -2969,12 +3118,20 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
     /// Returns the minimum WAL index that must be retained across all
     /// registered groups for full crash recovery without snapshot fallback.
     ///
-    /// Returns 0 if any registered group has not yet taken a snapshot (meaning
-    /// WAL replay from the beginning is still required for that group).
-    /// Returns `u64::MAX` if no groups are registered (vacuously safe — nothing
-    /// to protect).
+    /// Returns 0 if no registered group has taken a snapshot yet (nothing
+    /// is safe to delete).  Returns `u64::MAX` if no groups are registered
+    /// (vacuously safe — nothing to protect).
     ///
-    /// A segment can be safely deleted only when `segment.last_wal_index < eviction_floor()`.
+    /// Only groups that have reported a snapshot floor participate in the
+    /// minimum calculation.  Groups that are registered but have never
+    /// snapshotted (e.g. follower replicas that only receive entries via
+    /// Raft, or brand-new partitions awaiting their first eager snapshot)
+    /// are excluded so they do not pin the floor at 0 globally.  Their
+    /// entries are protected by Raft replication and can be recovered from
+    /// the leader or from S3.
+    ///
+    /// A segment can be safely deleted only when
+    /// `segment.last_wal_index < eviction_floor()`.
     ///
     /// # Panics
     ///
@@ -2994,9 +3151,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
             .snapshot_floors
             .read()
             .expect("snapshot_floors poisoned");
+        // Only consider groups that have actually taken a snapshot.
+        // Groups without a floor entry (followers, newly created) are
+        // excluded — their entries are replicated via Raft and stored
+        // in S3, so local deletion is safe.
         registered
             .iter()
-            .map(|g| floors.get(g).copied().unwrap_or(0))
+            .filter_map(|g| floors.get(g).copied())
             .min()
             .unwrap_or(0)
     }
@@ -3017,9 +3178,30 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
     /// # Panics
     ///
     /// Panics if an internal lock is poisoned.
-    pub async fn download_missing_segments(&self) -> WalResult<u32> {
+    /// Downloads segments from S3 that are missing locally.
+    ///
+    /// When `min_raft_index > 0`, only segments whose first entry's Raft
+    /// index is at or above the floor are downloaded. The floor is a Raft
+    /// log index (globally consistent across nodes), not a WAL auto-counter
+    /// index (node-local). This is critical because snapshots may come from
+    /// a different node, and Raft indices are the only portable reference.
+    ///
+    /// To find the first entry's Raft index, we read 72 bytes per segment:
+    /// 32-byte segment header + 40-byte `SharedEntryHeader`, where bytes
+    /// 64–71 contain `raft_index`.
+    ///
+    /// Segments below the floor are still marked as tiered (for lazy S3
+    /// reads) but not fetched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if listing the object store fails.
+    #[allow(clippy::too_many_lines)]
+    pub async fn download_missing_segments(
+        &self,
+        min_raft_index: u64,
+    ) -> WalResult<u32> {
         // Declared first to satisfy items_after_statements lint.
-        // See comment near usage for rationale.
         const DOWNLOAD_CONCURRENCY: usize = 16;
 
         let store_guard = self.inner.segment_store.lock().await;
@@ -3039,14 +3221,23 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
         let remote_keys = store.list(&prefix).await?;
 
         // Parse segment IDs from remote keys.
-        let remote_ids: Vec<u64> = remote_keys
+        let mut remote_ids: Vec<u64> = remote_keys
             .iter()
             .filter_map(|k| crate::segment_store::parse_segment_id_from_key(k))
             .collect();
 
         if remote_ids.is_empty() {
+            info!(
+                prefix = %prefix,
+                remote_key_count = remote_keys.len(),
+                min_raft_index,
+                "No remote segment IDs found in object store"
+            );
             return Ok(0);
         }
+
+        // Sort ascending so we can binary-search for the floor cutoff.
+        remote_ids.sort_unstable();
 
         let local_ids: HashSet<u64> = {
             let wal = self.inner.wal.lock().await;
@@ -3056,103 +3247,202 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalCoordinator<S> {
                 .collect()
         };
 
-        // Mark all remote segments as tiered (fast sync operation) before
-        // launching concurrent downloads.
+        // Mark ALL remote segments as tiered before downloading. Segments
+        // below the floor are not downloaded but must still be marked so
+        // that lazy S3 reads work for old data.
         for &segment_id in &remote_ids {
             self.mark_segment_tiered(segment_id);
         }
 
-        // Download missing segments concurrently.
-        //
-        // S3 GET latency (~100ms) dominates over local disk writes (~5ms), so
-        // parallelising downloads yields an N-fold speedup on startup time.
-        // DOWNLOAD_CONCURRENCY=16 is grounded in reference implementations
-        // (object_store uses 10, Neon uses 16 for startup replay) and comfortably
-        // below the S3 per-prefix rate limit of 5,500 GET/s.
-        //
-        // Each future downloads its segment then acquires the WAL mutex to write
-        // to disk. Disk writes serialise through the mutex; S3 GETs run in
-        // parallel. Peak in-flight memory is bounded at
-        // DOWNLOAD_CONCURRENCY × max_segment_size.
+        // Bump the WAL's segment ID counter above the max remote segment ID.
+        // Without this, a fresh node (wiped disk) would allocate new segments
+        // starting from ID 1, colliding with old S3 segments that were not
+        // downloaded (below the snapshot floor). The collision causes
+        // restore_from_s3 to skip S3 segments it thinks are already local.
+        if let Some(&max_remote) = remote_ids.last() {
+            let mut wal = self.inner.wal.lock().await;
+            wal.ensure_next_segment_id_above(
+                crate::SegmentId::new(max_remote),
+            );
+        }
 
+        // Determine which segments to download. When min_raft_index > 0,
+        // read segment + entry headers (72 bytes each) to find the cutoff.
+        // We read the 32-byte segment header + 40-byte SharedEntry header
+        // to extract the first entry's raft_index (bytes 64–71). Raft
+        // indices are globally consistent, unlike WAL auto-counter indices
+        // which are node-local.
+        //
+        // Segment IDs are monotonically increasing, so once we find a
+        // segment whose first entry's raft_index >= min_raft_index,
+        // download it and everything after. We also download the segment
+        // immediately before the cutoff to catch straddling entries.
+        let download_ids: Vec<u64> = if min_raft_index == 0 {
+            remote_ids.clone()
+        } else {
+            // 32-byte segment header + 40-byte SharedEntry header.
+            let probe_size: u64 = (crate::segment::SEGMENT_HEADER_SIZE
+                + crate::shared_entry::SHARED_ENTRY_HEADER_SIZE)
+                as u64;
+            let mut cutoff_idx: Option<usize> = None;
+
+            for (i, &seg_id) in remote_ids.iter().enumerate() {
+                // Skip header reads for segments already local.
+                if local_ids.contains(&seg_id) {
+                    continue;
+                }
+
+                let key = format!("{prefix}{seg_id:08x}.wal");
+                match store.get_range(&key, 0, probe_size).await {
+                    Ok(header_bytes) => {
+                        let mut buf = &header_bytes[..];
+                        // Decode segment header (32 bytes).
+                        if let Err(e) =
+                            crate::segment::SegmentHeader::decode(&mut buf)
+                        {
+                            warn!(
+                                seg_id,
+                                error = %e,
+                                "Failed to decode S3 segment header; \
+                                 including in download set"
+                            );
+                            cutoff_idx = Some(i);
+                            break;
+                        }
+                        // Decode first SharedEntry header to get raft_index.
+                        match crate::shared_entry::SharedEntryHeader::decode(
+                            &mut buf, 0,
+                        ) {
+                            Ok(entry_hdr) => {
+                                if entry_hdr.raft_index >= min_raft_index {
+                                    cutoff_idx = Some(i);
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    seg_id,
+                                    error = %e,
+                                    "Failed to decode S3 entry header; \
+                                     including in download set"
+                                );
+                                cutoff_idx = Some(i);
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            seg_id,
+                            error = %e,
+                            "Failed to read S3 segment header; \
+                             including in download set"
+                        );
+                        cutoff_idx = Some(i);
+                        break;
+                    }
+                }
+            }
+
+            // Include one segment before the cutoff to catch entries
+            // that straddle the boundary. If all segments are below the
+            // floor, nothing to download.
+            cutoff_idx.map_or_else(Vec::new, |idx| {
+                let start = idx.saturating_sub(1);
+                remote_ids[start..].to_vec()
+            })
+        };
+
+        let skipped = remote_ids.len().saturating_sub(download_ids.len());
+
+        // Download qualifying segments concurrently.
         let inner = Arc::clone(&self.inner);
         let local_ids = Arc::new(local_ids);
 
         // Each element: (downloaded: bool, already_local: bool).
-        let results: Vec<(bool, bool)> = futures::stream::iter(remote_ids.iter().copied())
-            .map(|segment_id| {
-                let store = Arc::clone(&store);
-                let prefix = prefix.clone();
-                let local_ids = Arc::clone(&local_ids);
-                let inner = Arc::clone(&inner);
-                async move {
-                    if local_ids.contains(&segment_id) {
-                        // Already present locally — no need to download.
-                        return (false, true);
-                    }
+        let results: Vec<(bool, bool)> =
+            futures::stream::iter(download_ids.iter().copied())
+                .map(|segment_id| {
+                    let store = Arc::clone(&store);
+                    let prefix = prefix.clone();
+                    let local_ids = Arc::clone(&local_ids);
+                    let inner = Arc::clone(&inner);
+                    async move {
+                        if local_ids.contains(&segment_id) {
+                            return (false, true);
+                        }
 
-                    let key = format!("{prefix}{segment_id:08x}.wal");
-                    let bytes = match store.get(&key).await {
-                        Ok(b) => b,
-                        Err(e) => {
+                        let key =
+                            format!("{prefix}{segment_id:08x}.wal");
+                        let bytes = match store.get(&key).await {
+                            Ok(b) => b,
+                            Err(e) => {
+                                warn!(
+                                    segment_id,
+                                    key = %key,
+                                    error = %e,
+                                    "Failed to download segment from \
+                                     object store during startup"
+                                );
+                                return (false, false);
+                            }
+                        };
+
+                        if bytes.len()
+                            <= crate::segment::SEGMENT_HEADER_SIZE
+                        {
                             warn!(
                                 segment_id,
                                 key = %key,
-                                error = %e,
-                                "Failed to download segment from object store during startup"
+                                bytes = bytes.len(),
+                                "Skipping corrupt/empty segment from \
+                                 S3 (header-only or truncated)"
                             );
                             return (false, false);
                         }
-                    };
 
-                    // Validate: refuse to restore empty or header-only segments
-                    // from S3. A corrupt S3 object must not be registered in the
-                    // WAL — doing so would cause "segment header too small" errors
-                    // on every read.
-                    if bytes.len() <= crate::segment::SEGMENT_HEADER_SIZE {
-                        warn!(
-                            segment_id,
-                            key = %key,
-                            bytes = bytes.len(),
-                            "Skipping corrupt/empty segment from S3 (header-only or truncated)"
-                        );
-                        return (false, false);
-                    }
-
-                    // Write to WAL directory. The WAL mutex serialises disk writes
-                    // while S3 downloads run concurrently.
-                    let mut wal = inner.wal.lock().await;
-                    match wal.restore_segment_from_bytes(segment_id, bytes).await {
-                        Ok(()) => {
-                            info!(segment_id, "Downloaded segment from object store");
-                            (true, false)
-                        }
-                        Err(e) => {
-                            warn!(
-                                segment_id,
-                                error = %e,
-                                "Failed to restore downloaded segment"
-                            );
-                            (false, false)
+                        let mut wal = inner.wal.lock().await;
+                        match wal
+                            .restore_segment_from_bytes(segment_id, bytes)
+                            .await
+                        {
+                            Ok(()) => {
+                                info!(
+                                    segment_id,
+                                    "Downloaded segment from object store"
+                                );
+                                (true, false)
+                            }
+                            Err(e) => {
+                                warn!(
+                                    segment_id,
+                                    error = %e,
+                                    "Failed to restore downloaded segment"
+                                );
+                                (false, false)
+                            }
                         }
                     }
-                }
-            })
-            .buffer_unordered(DOWNLOAD_CONCURRENCY)
-            .collect()
-            .await;
+                })
+                .buffer_unordered(DOWNLOAD_CONCURRENCY)
+                .collect()
+                .await;
 
-        // Safe: segment count is bounded by max_segments_per_wal (a u32 limit).
+        // Safe: segment count is bounded by max_segments_per_wal.
         #[allow(clippy::cast_possible_truncation)]
-        let downloaded: u32 = results.iter().filter(|(d, _)| *d).count() as u32;
+        let downloaded: u32 =
+            results.iter().filter(|(d, _)| *d).count() as u32;
         #[allow(clippy::cast_possible_truncation)]
-        let already_local: u32 = results.iter().filter(|(_, a)| *a).count() as u32;
+        let already_local: u32 =
+            results.iter().filter(|(_, a)| *a).count() as u32;
 
         info!(
             remote_count = remote_ids.len(),
+            skipped_below_floor = skipped,
             already_local,
             downloaded,
-            "SharedWal startup: S3 segment scan complete"
+            min_raft_index,
+            "Downloaded missing shared WAL segments"
         );
 
         Ok(downloaded)
@@ -3453,6 +3743,31 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalPool<S> {
         self.coordinators[wal_index].handle(group_id)
     }
 
+    /// Seeds group state from snapshot metadata for lazy S3 reads.
+    ///
+    /// Routes to the coordinator owning `group_id` and sets its
+    /// `group_state` if no local WAL state exists. This must be
+    /// called after loading snapshot anchors and before any reads
+    /// so that `read_or_load` can validate index bounds and trigger
+    /// the S3 fallback path on fresh nodes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the computed coordinator index exceeds the pool size.
+    pub async fn set_group_state_if_absent(
+        &self,
+        group_id: GroupId,
+        last_index: u64,
+        last_term: u64,
+    ) {
+        #[allow(clippy::cast_possible_truncation)]
+        let wal_index = (group_id.get() % u64::from(self.wal_count)) as usize;
+        assert!(wal_index < self.coordinators.len());
+        self.coordinators[wal_index]
+            .set_group_state_if_absent(group_id, last_index, last_term)
+            .await;
+    }
+
     /// Returns which WAL index a group is assigned to.
     ///
     /// Useful for debugging and metrics.
@@ -3690,13 +4005,25 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalPool<S> {
     /// # Errors
     ///
     /// Returns an error if listing the object store fails.
-    pub async fn download_missing_segments(&self) -> WalResult<u32> {
-        // Run all coordinator downloads concurrently. Each coordinator manages
-        // an independent WAL directory, so there is no shared state between them.
+    /// Downloads segments from S3 that are missing locally.
+    ///
+    /// When `min_raft_index > 0`, only segments at or above the floor are
+    /// downloaded. Segments below the floor are still marked as tiered for
+    /// lazy S3 reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if listing the object store fails.
+    pub async fn download_missing_segments(
+        &self,
+        min_raft_index: u64,
+    ) -> WalResult<u32> {
+        // Run all coordinator downloads concurrently. Each coordinator
+        // manages an independent WAL directory.
         let futures = self
             .coordinators
             .iter()
-            .map(SharedWalCoordinator::download_missing_segments);
+            .map(|c| c.download_missing_segments(min_raft_index));
         let counts = futures::future::try_join_all(futures).await?;
         Ok(counts.iter().sum())
     }

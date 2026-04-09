@@ -12,7 +12,7 @@ use helix_wal::Storage;
 use crate::controller::{ControllerCommand, CONTROLLER_GROUP_ID};
 use crate::error::{ServerError, ServerResult};
 use crate::offset_group::{offset_group_id, OffsetGroupCommand};
-use crate::partition_storage::PartitionStorage;
+use crate::partition_storage::{PartitionStorage, TieringOptions};
 
 use super::super::{HelixService, PendingControllerProposal, PendingOffsetProposal, TopicMetadata};
 
@@ -59,6 +59,12 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                 })?;
 
             // Create partition storage (durable or in-memory based on config).
+            let tiering_opts = TieringOptions {
+                object_storage_dir: self.object_storage_dir.clone(),
+                #[cfg(feature = "s3")]
+                s3_config: self.s3_config.clone(),
+                tiering_config: self.tiering_config.clone(),
+            };
             let ps = if let Some(ref pool) = self.shared_wal_pool {
                 // Shared WAL mode: get handle from pool and recovered entries.
                 let data_dir = self
@@ -73,7 +79,6 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     .remove(&group_id)
                     .unwrap_or_default();
 
-                #[cfg(feature = "s3")]
                 let ps_result = PartitionStorage::new_durable_with_shared_wal_state(
                     data_dir,
                     topic_id,
@@ -81,52 +86,18 @@ impl<S: Storage + Clone + Send + Sync + 'static, T: TransportService> HelixServi
                     group_id,
                     wal_handle,
                     state,
-                    self.object_storage_dir.as_ref(),
-                    self.s3_config.as_ref(),
-                    self.tiering_config.as_ref(),
-                );
-                #[cfg(not(feature = "s3"))]
-                let ps_result = PartitionStorage::new_durable_with_shared_wal_state(
-                    data_dir,
-                    topic_id,
-                    partition_id,
-                    group_id,
-                    wal_handle,
-                    state,
-                    self.object_storage_dir.as_ref(),
-                    self.tiering_config.as_ref(),
+                    &tiering_opts,
                 );
                 ps_result.map_err(|e| ServerError::Internal {
                     message: format!("failed to create partition with shared WAL: {e}"),
                 })?
             } else {
                 // Dedicated WAL mode (used when shared WAL is not available).
-                #[cfg(feature = "s3")]
                 let ps_inner = if let Some(data_dir) = &self.data_dir {
                     PartitionStorage::new_durable(
                         self.storage.clone(),
                         data_dir,
-                        self.object_storage_dir.as_ref(),
-                        self.s3_config.as_ref(),
-                        self.tiering_config.as_ref(),
-                        topic_id,
-                        partition_id,
-                        group_id,
-                    )
-                    .await
-                    .map_err(|e| ServerError::Internal {
-                        message: format!("failed to create durable partition: {e}"),
-                    })?
-                } else {
-                    PartitionStorage::new_in_memory(topic_id, partition_id)
-                };
-                #[cfg(not(feature = "s3"))]
-                let ps_inner = if let Some(data_dir) = &self.data_dir {
-                    PartitionStorage::new_durable(
-                        self.storage.clone(),
-                        data_dir,
-                        self.object_storage_dir.as_ref(),
-                        self.tiering_config.as_ref(),
+                        &tiering_opts,
                         topic_id,
                         partition_id,
                         group_id,

@@ -3757,7 +3757,7 @@ async fn test_shared_wal_startup_downloads_missing_segments() {
         pool.configure_tiering(store.clone(), PREFIX.to_string()).await;
 
         // download_missing_segments() should fetch the tiered segment from S3.
-        let downloaded = pool.download_missing_segments().await.unwrap();
+        let downloaded = pool.download_missing_segments(0).await.unwrap();
         assert!(
             downloaded > 0,
             "Must download at least one segment from object storage on empty-disk restart"

@@ -56,6 +56,45 @@ use crate::storage::{
 use helix_tier::S3Config;
 use helix_tier::TieringConfig;
 
+/// Bundled tiering/object-storage options for partition creation.
+///
+/// Groups the optional configuration fields that control where tiered
+/// segment data is stored, reducing argument counts on the various
+/// `new_durable*` constructors.
+#[derive(Clone, Debug, Default)]
+pub struct TieringOptions {
+    /// Optional directory for filesystem-based object storage.
+    pub object_storage_dir: Option<PathBuf>,
+    /// Optional S3 configuration (requires `s3` feature).
+    #[cfg(feature = "s3")]
+    pub s3_config: Option<S3Config>,
+    /// Optional tiering configuration (enables tiering when set).
+    pub tiering_config: Option<TieringConfig>,
+}
+
+impl TieringOptions {
+    /// Applies these options to a `DurablePartitionConfig`.
+    fn configure(
+        &self,
+        mut config: DurablePartitionConfig,
+    ) -> DurablePartitionConfig {
+        #[cfg(feature = "s3")]
+        if let Some(s3_cfg) = &self.s3_config {
+            config = config.with_s3_config(s3_cfg.clone());
+        } else if let Some(object_dir) = &self.object_storage_dir {
+            config = config.with_object_storage_dir(object_dir);
+        }
+        #[cfg(not(feature = "s3"))]
+        if let Some(object_dir) = &self.object_storage_dir {
+            config = config.with_object_storage_dir(object_dir);
+        }
+        if let Some(tier_cfg) = &self.tiering_config {
+            config = config.with_tiering(tier_cfg.clone());
+        }
+        config
+    }
+}
+
 /// Inner storage type for a partition.
 ///
 /// # Type Parameters
@@ -116,82 +155,24 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     ///
     /// * `storage` - Storage backend to use for WAL operations
     /// * `data_dir` - Base directory for partition data
-    /// * `object_storage_dir` - Optional directory for object storage (tiering)
-    /// * `s3_config` - Optional S3 configuration for tiering (requires `s3` feature)
-    /// * `tiering_config` - Optional tiering configuration (enables tiering when set)
+    /// * `tiering_opts` - Bundled tiering/object-storage options
     /// * `topic_id` - Topic identifier
     /// * `partition_id` - Partition identifier
+    /// * `group_id` - Group identifier
     ///
     /// # Errors
     /// Returns an error if the WAL cannot be opened.
-    #[cfg(feature = "s3")]
     pub async fn new_durable(
         storage: S,
         data_dir: &PathBuf,
-        object_storage_dir: Option<&PathBuf>,
-        s3_config: Option<&S3Config>,
-        tiering_config: Option<&TieringConfig>,
+        tiering_opts: &TieringOptions,
         topic_id: TopicId,
         partition_id: PartitionId,
         group_id: GroupId,
     ) -> Result<Self, DurablePartitionError> {
-        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id)
+        let config = DurablePartitionConfig::new(data_dir, topic_id, partition_id)
             .with_group_id(group_id);
-        if let Some(s3_cfg) = s3_config {
-            config = config.with_s3_config(s3_cfg.clone());
-        } else if let Some(object_dir) = object_storage_dir {
-            config = config.with_object_storage_dir(object_dir);
-        }
-        // Enable tiering when config is provided.
-        if let Some(tier_cfg) = tiering_config {
-            config = config.with_tiering(tier_cfg.clone());
-        }
-        let durable = DurablePartition::open(storage, config).await?;
-        // Initialize last_applied from recovered WAL state for proper idempotency.
-        let last_applied = LogIndex::new(durable.last_applied_index());
-        let last_applied_term = helix_core::TermId::new(durable.last_applied_term());
-        Ok(Self {
-            topic_id,
-            partition_id,
-            inner: PartitionStorageInner::Durable(Box::new(durable)),
-            last_applied,
-            last_applied_term,
-            producer_state: PartitionProducerState::new(),
-        })
-    }
-
-    /// Creates new durable partition storage with the given storage backend.
-    ///
-    /// # Arguments
-    ///
-    /// * `storage` - Storage backend to use for WAL operations
-    /// * `data_dir` - Base directory for partition data
-    /// * `object_storage_dir` - Optional directory for object storage (tiering)
-    /// * `tiering_config` - Optional tiering configuration (enables tiering when set)
-    /// * `topic_id` - Topic identifier
-    /// * `partition_id` - Partition identifier
-    ///
-    /// # Errors
-    /// Returns an error if the WAL cannot be opened.
-    #[cfg(not(feature = "s3"))]
-    pub async fn new_durable(
-        storage: S,
-        data_dir: &PathBuf,
-        object_storage_dir: Option<&PathBuf>,
-        tiering_config: Option<&TieringConfig>,
-        topic_id: TopicId,
-        partition_id: PartitionId,
-        group_id: GroupId,
-    ) -> Result<Self, DurablePartitionError> {
-        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id)
-            .with_group_id(group_id);
-        if let Some(object_dir) = object_storage_dir {
-            config = config.with_object_storage_dir(object_dir);
-        }
-        // Enable tiering when config is provided.
-        if let Some(tier_cfg) = tiering_config {
-            config = config.with_tiering(tier_cfg.clone());
-        }
+        let config = tiering_opts.configure(config);
         let durable = DurablePartition::open(storage, config).await?;
         // Initialize last_applied from recovered WAL state for proper idempotency.
         let last_applied = LogIndex::new(durable.last_applied_index());
@@ -215,16 +196,13 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     /// * `data_dir` - Base directory for partition data
     /// * `topic_id` - Topic identifier
     /// * `partition_id` - Partition identifier
+    /// * `group_id` - Group identifier
     /// * `wal_handle` - Shared WAL handle from the pool
     /// * `recovered_entries` - Entries recovered from the shared WAL for this partition
-    /// * `object_storage_dir` - Optional directory for object storage (tiering)
-    /// * `s3_config` - Optional S3 configuration for tiering (requires `s3` feature)
-    /// * `tiering_config` - Optional tiering configuration
+    /// * `tiering_opts` - Bundled tiering/object-storage options
     ///
     /// # Errors
     /// Returns an error if the partition cannot be opened.
-    #[cfg(feature = "s3")]
-    #[allow(clippy::too_many_arguments)]
     pub fn new_durable_with_shared_wal(
         data_dir: &PathBuf,
         topic_id: TopicId,
@@ -232,61 +210,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         group_id: GroupId,
         wal_handle: SharedWalHandle<S>,
         recovered_entries: Vec<SharedEntry>,
-        object_storage_dir: Option<&PathBuf>,
-        s3_config: Option<&S3Config>,
-        tiering_config: Option<&TieringConfig>,
+        tiering_opts: &TieringOptions,
     ) -> Result<Self, DurablePartitionError> {
-        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id)
+        let config = DurablePartitionConfig::new(data_dir, topic_id, partition_id)
             .with_group_id(group_id);
-        if let Some(s3_cfg) = s3_config {
-            config = config.with_s3_config(s3_cfg.clone());
-        } else if let Some(object_dir) = object_storage_dir {
-            config = config.with_object_storage_dir(object_dir);
-        }
-        if let Some(tier_cfg) = tiering_config {
-            config = config.with_tiering(tier_cfg.clone());
-        }
-        let durable =
-            DurablePartition::open_with_shared_wal(config, wal_handle, recovered_entries)?;
-        // Initialize last_applied from recovered WAL state for proper idempotency.
-        let last_applied = LogIndex::new(durable.last_applied_index());
-        let last_applied_term = helix_core::TermId::new(durable.last_applied_term());
-        Ok(Self {
-            topic_id,
-            partition_id,
-            inner: PartitionStorageInner::Durable(Box::new(durable)),
-            last_applied,
-            last_applied_term,
-            producer_state: PartitionProducerState::new(),
-        })
-    }
-
-    /// Creates new durable partition storage with a shared WAL handle.
-    ///
-    /// This is used when partitions share a WAL pool for fsync amortization.
-    ///
-    /// # Errors
-    /// Returns an error if the partition cannot be opened.
-    #[cfg(not(feature = "s3"))]
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_durable_with_shared_wal(
-        data_dir: &PathBuf,
-        topic_id: TopicId,
-        partition_id: PartitionId,
-        group_id: GroupId,
-        wal_handle: SharedWalHandle<S>,
-        recovered_entries: Vec<SharedEntry>,
-        object_storage_dir: Option<&PathBuf>,
-        tiering_config: Option<&TieringConfig>,
-    ) -> Result<Self, DurablePartitionError> {
-        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id)
-            .with_group_id(group_id);
-        if let Some(object_dir) = object_storage_dir {
-            config = config.with_object_storage_dir(object_dir);
-        }
-        if let Some(tier_cfg) = tiering_config {
-            config = config.with_tiering(tier_cfg.clone());
-        }
+        let config = tiering_opts.configure(config);
         let durable =
             DurablePartition::open_with_shared_wal(config, wal_handle, recovered_entries)?;
         // Initialize last_applied from recovered WAL state for proper idempotency.
@@ -310,8 +238,6 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
     ///
     /// # Errors
     /// Returns an error if the partition cannot be opened.
-    #[cfg(feature = "s3")]
-    #[allow(clippy::too_many_arguments)]
     pub fn new_durable_with_shared_wal_state(
         data_dir: &PathBuf,
         topic_id: TopicId,
@@ -319,60 +245,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         group_id: GroupId,
         wal_handle: SharedWalHandle<S>,
         state: PartitionRecoveryState,
-        object_storage_dir: Option<&PathBuf>,
-        s3_config: Option<&S3Config>,
-        tiering_config: Option<&TieringConfig>,
+        tiering_opts: &TieringOptions,
     ) -> Result<Self, DurablePartitionError> {
-        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id)
+        let config = DurablePartitionConfig::new(data_dir, topic_id, partition_id)
             .with_group_id(group_id);
-        if let Some(s3_cfg) = s3_config {
-            config = config.with_s3_config(s3_cfg.clone());
-        } else if let Some(object_dir) = object_storage_dir {
-            config = config.with_object_storage_dir(object_dir);
-        }
-        if let Some(tier_cfg) = tiering_config {
-            config = config.with_tiering(tier_cfg.clone());
-        }
-        let durable = DurablePartition::open_with_recovery_state(config, wal_handle, state)?;
-        let last_applied = LogIndex::new(durable.last_applied_index());
-        let last_applied_term = helix_core::TermId::new(durable.last_applied_term());
-        Ok(Self {
-            topic_id,
-            partition_id,
-            inner: PartitionStorageInner::Durable(Box::new(durable)),
-            last_applied,
-            last_applied_term,
-            producer_state: PartitionProducerState::new(),
-        })
-    }
-
-    /// Creates new durable partition storage from pre-built streaming recovery state.
-    ///
-    /// This is the memory-efficient path: instead of accumulating all recovered
-    /// `SharedEntry` objects, the caller built `state` incrementally via the
-    /// streaming recovery callback. O(one-segment) peak memory during recovery.
-    ///
-    /// # Errors
-    /// Returns an error if the partition cannot be opened.
-    #[cfg(not(feature = "s3"))]
-    pub fn new_durable_with_shared_wal_state(
-        data_dir: &PathBuf,
-        topic_id: TopicId,
-        partition_id: PartitionId,
-        group_id: GroupId,
-        wal_handle: SharedWalHandle<S>,
-        state: PartitionRecoveryState,
-        object_storage_dir: Option<&PathBuf>,
-        tiering_config: Option<&TieringConfig>,
-    ) -> Result<Self, DurablePartitionError> {
-        let mut config = DurablePartitionConfig::new(data_dir, topic_id, partition_id)
-            .with_group_id(group_id);
-        if let Some(object_dir) = object_storage_dir {
-            config = config.with_object_storage_dir(object_dir);
-        }
-        if let Some(tier_cfg) = tiering_config {
-            config = config.with_tiering(tier_cfg.clone());
-        }
+        let config = tiering_opts.configure(config);
         let durable = DurablePartition::open_with_recovery_state(config, wal_handle, state)?;
         let last_applied = LogIndex::new(durable.last_applied_index());
         let last_applied_term = helix_core::TermId::new(durable.last_applied_term());

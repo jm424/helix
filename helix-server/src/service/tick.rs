@@ -52,7 +52,7 @@ pub static OFFSET_GROUP_LAST_PERSISTED: [std::sync::atomic::AtomicU64; 3] = [
 
 use crate::error::ServerError;
 use crate::group_map::GroupMap;
-use crate::partition_storage::PartitionStorage;
+use crate::partition_storage::{PartitionStorage, TieringOptions};
 use super::{
     output_processor::extract_and_record_producer_state, PendingControllerProposal,
     PendingOffsetProposal, PendingProposal, TICK_INTERVAL_MS,
@@ -2052,6 +2052,7 @@ async fn recover_partition_actors<S: Storage + Clone + Send + Sync + 'static>(
 /// 1. Shared WAL pool (when `shared_wal_pool` is set) — fsync amortization
 /// 2. Per-partition dedicated WAL (when `data_dir` is set) — simpler, one WAL per partition
 /// 3. In-memory (fallback) — no durability
+#[allow(clippy::too_many_lines)]
 async fn create_partition_storage<S: Storage + Clone + Send + Sync + 'static>(
     topic_id: helix_core::TopicId,
     partition_id: PartitionId,
@@ -2075,7 +2076,6 @@ async fn create_partition_storage<S: Storage + Clone + Send + Sync + 'static>(
             PartitionRecoveryState::default()
         };
 
-        #[cfg(feature = "s3")]
         let result = PartitionStorage::new_durable_with_shared_wal_state(
             dir,
             topic_id,
@@ -2083,20 +2083,7 @@ async fn create_partition_storage<S: Storage + Clone + Send + Sync + 'static>(
             data_group_id,
             wal_handle,
             state,
-            None, // object_storage_dir
-            None, // s3_config
-            None, // tiering_config
-        );
-        #[cfg(not(feature = "s3"))]
-        let result = PartitionStorage::new_durable_with_shared_wal_state(
-            dir,
-            topic_id,
-            partition_id,
-            data_group_id,
-            wal_handle,
-            state,
-            None, // object_storage_dir
-            None, // tiering_config
+            &TieringOptions::default(),
         );
 
         return match result {
@@ -2122,24 +2109,10 @@ async fn create_partition_storage<S: Storage + Clone + Send + Sync + 'static>(
 
     // Mode 2: Per-partition dedicated WAL.
     if let (Some(dir), Some(storage)) = (data_dir, storage) {
-        #[cfg(feature = "s3")]
         let result = PartitionStorage::new_durable(
             storage.clone(),
             dir,
-            None, // object_storage_dir
-            None, // s3_config
-            None, // tiering_config
-            topic_id,
-            partition_id,
-            data_group_id,
-        )
-        .await;
-        #[cfg(not(feature = "s3"))]
-        let result = PartitionStorage::new_durable(
-            storage.clone(),
-            dir,
-            None, // object_storage_dir
-            None, // tiering_config
+            &TieringOptions::default(),
             topic_id,
             partition_id,
             data_group_id,
