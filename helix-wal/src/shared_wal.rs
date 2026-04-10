@@ -201,6 +201,18 @@ impl<S: Storage> SharedWal<S> {
             .map(|s| s.last_index)
     }
 
+    /// Returns a reference to the evicted index for a group.
+    ///
+    /// The evicted index maps WAL auto-counter → (`SegmentId`, `raft_index`)
+    /// for entries whose segments have been evicted from memory.
+    #[must_use]
+    pub fn evicted_index_for_group(
+        &self,
+        group_id: GroupId,
+    ) -> Option<&BTreeMap<u64, (crate::SegmentId, u64)>> {
+        self.evicted_index.get(&group_id)
+    }
+
     /// Appends an entry for a group.
     ///
     /// # Panics
@@ -2263,6 +2275,41 @@ impl<S: Storage + Clone + Send + Sync + 'static> SharedWalHandle<S> {
     // -------------------------------------------------------------------------
     // Tiering
     // -------------------------------------------------------------------------
+
+    /// Returns the highest WAL auto-counter for this group whose entry is
+    /// in a tiered (S3-confirmed) sealed segment.
+    ///
+    /// Walks the group's evicted index in reverse to find the highest
+    /// WAL index backed by S3. `BlobIndex` entries at or below this value
+    /// are safely retrievable from S3.
+    ///
+    /// Returns `None` if no entries for this group are in tiered segments
+    /// (tiering disabled, or no segments tiered yet).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `tiered_segments` lock is poisoned.
+    pub async fn max_tiered_wal_index_for_group(&self) -> Option<(u64, u64)> {
+        let tiered_ids: HashSet<u64> = {
+            let guard = self
+                .inner
+                .tiered_segments
+                .read()
+                .expect("tiered_segments poisoned");
+            guard.iter().copied().collect()
+        };
+        if tiered_ids.is_empty() {
+            return None;
+        }
+        let wal = self.inner.wal.lock().await;
+        let evicted = wal.evicted_index_for_group(self.group_id)?;
+        // Walk in reverse (highest wal_index first).
+        let found = evicted.iter().rev().find_map(|(&wal_idx, &(seg_id, raft_idx))| {
+            tiered_ids.contains(&seg_id.get()).then_some((wal_idx, raft_idx))
+        });
+        drop(wal);
+        found
+    }
 
     /// Reports the latest WAL auto-counter index that this group has committed
     /// through Raft consensus.

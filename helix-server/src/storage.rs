@@ -2029,6 +2029,16 @@ pub struct DurablePartition<S: Storage + Clone + Send + Sync + 'static> {
     tiering: Option<TieringBackend<S>>,
     /// Set of segment IDs that have been registered with tiering.
     tiered_segments: std::collections::HashSet<u64>,
+    /// Maximum WAL auto-counter across all tiered (S3-confirmed) sealed
+    /// segments. Updated by the tick loop before `take_snapshot`. Snapshots
+    /// only include `BlobIndex` entries at or below this value so that a
+    /// recovering node doesn't claim coverage of entries that were only
+    /// in the active (unsealed) segment.
+    max_tiered_wal_index: u64,
+    /// Raft index corresponding to `max_tiered_wal_index`.
+    max_tiered_raft_index: u64,
+    /// Term corresponding to `max_tiered_wal_index`.
+    max_tiered_term: u64,
     /// Progress manager for consumer offset tracking (optional).
     progress: Option<SimulatedProgressManager>,
 }
@@ -2282,6 +2292,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             last_snapshot_wal_index: None,
             tiering,
             tiered_segments: std::collections::HashSet::new(),
+            max_tiered_wal_index: 0,
+            max_tiered_raft_index: 0,
+            max_tiered_term: 0,
             progress,
         })
     }
@@ -2429,6 +2442,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             last_snapshot_wal_index: None,
             tiering,
             tiered_segments: std::collections::HashSet::new(),
+            max_tiered_wal_index: 0,
+            max_tiered_raft_index: 0,
+            max_tiered_term: 0,
             progress,
         })
     }
@@ -2517,6 +2533,9 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
             last_snapshot_wal_index: None,
             tiering,
             tiered_segments: std::collections::HashSet::new(),
+            max_tiered_wal_index: 0,
+            max_tiered_raft_index: 0,
+            max_tiered_term: 0,
             progress,
         })
     }
@@ -2562,6 +2581,23 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
     #[must_use]
     pub const fn last_applied_wal_index(&self) -> u64 {
         self.last_applied_wal_index
+    }
+
+    /// Updates the cached max tiered WAL index and corresponding Raft state.
+    ///
+    /// Called by the tick loop before `take_snapshot` so the snapshot only
+    /// covers entries backed by S3. A recovering node that loads this
+    /// snapshot will request Raft replication for entries above this point,
+    /// ensuring it has all data before becoming leader.
+    pub const fn set_max_tiered_wal_index(
+        &mut self,
+        wal_index: u64,
+        raft_index: u64,
+        term: u64,
+    ) {
+        self.max_tiered_wal_index = wal_index;
+        self.max_tiered_raft_index = raft_index;
+        self.max_tiered_term = term;
     }
 
     /// Returns the term of the last applied WAL entry.
@@ -4014,10 +4050,50 @@ impl<S: Storage + Clone + Send + Sync + 'static> Snapshottable for DurablePartit
             "DurablePartition::take_snapshot: group_id not set — call with_group_id"
         );
 
-        let entries = &self.blob_index.entries;
+        // Cap the snapshot at the last WAL index confirmed in S3.
+        // Entries above this are only in the active (unsealed) segment —
+        // a recovering node won't have them on S3. By capping here, the
+        // recovering node's Raft state starts at max_tiered_raft_index
+        // and Raft replicates the remaining entries from peers.
+        let cap = self.max_tiered_wal_index;
+        let (snap_raft_index, snap_term, snap_wal_index) = if cap > 0
+            && cap < self.last_applied_wal_index
+        {
+            (
+                self.max_tiered_raft_index,
+                self.max_tiered_term,
+                cap,
+            )
+        } else {
+            // No tiering configured, or all entries are tiered — use
+            // full state (same as before).
+            (
+                self.last_applied_index,
+                self.last_applied_term,
+                self.last_applied_wal_index,
+            )
+        };
+
+        // Only include BlobIndex entries at or below the cap.
+        let capped_entries: Vec<&BlobIndexEntry> = if cap > 0 {
+            self.blob_index
+                .entries
+                .iter()
+                .filter(|e| e.wal_index <= cap)
+                .collect()
+        } else {
+            self.blob_index.entries.iter().collect()
+        };
+
+        // Compute HWM from the capped entries: last entry's base_offset +
+        // record_count. If no entries pass the filter, HWM is 0.
+        let capped_hwm = capped_entries
+            .last()
+            .map_or(0, |e| e.base_offset + u64::from(e.record_count));
+
         // 4 magic + 4 version + 4 count + 20 per entry + 8 hwm + 4 crc
         #[allow(clippy::cast_possible_truncation)]
-        let entry_count = entries.len() as u32;
+        let entry_count = capped_entries.len() as u32;
         let capacity = 4 + 4 + 4 + (entry_count as usize) * 20 + 8 + 4;
         let mut buf = BytesMut::with_capacity(capacity);
 
@@ -4025,21 +4101,21 @@ impl<S: Storage + Clone + Send + Sync + 'static> Snapshottable for DurablePartit
         buf.put_u32_le(PARTITION_SNAPSHOT_VERSION);
         buf.put_u32_le(entry_count);
 
-        for e in entries {
+        for e in &capped_entries {
             buf.put_u64_le(e.base_offset);
             buf.put_u64_le(e.wal_index);
             buf.put_u32_le(e.record_count);
         }
 
-        buf.put_u64_le(self.cache.high_watermark().get());
+        buf.put_u64_le(capped_hwm);
 
         let checksum = crc32fast::hash(&buf);
         buf.put_u32_le(checksum);
 
         let meta = SnapshotMeta {
-            last_included_index: self.last_applied_index,
-            last_included_term: self.last_applied_term,
-            last_included_wal_index: self.last_applied_wal_index,
+            last_included_index: snap_raft_index,
+            last_included_term: snap_term,
+            last_included_wal_index: snap_wal_index,
             group_id: self.config.group_id,
         };
 

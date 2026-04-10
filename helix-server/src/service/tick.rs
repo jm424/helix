@@ -830,6 +830,30 @@ where
         if !leader_map.get(&group_id).copied().unwrap_or(false) {
             continue;
         }
+        // Update the tiered WAL index cap before snapshotting so the
+        // snapshot only covers entries backed by S3. Without this, a
+        // recovering node's snapshot would claim coverage of entries
+        // in the active (unsealed) segment, preventing Raft from
+        // replicating them.
+        drop(ps);
+        if let Some(pool) = &wal_pool {
+            if let Some((wal_idx, raft_idx)) = pool
+                .handle(group_id)
+                .max_tiered_wal_index_for_group()
+                .await
+            {
+                // Look up the term from the WAL entry.
+                let term = pool
+                    .handle(group_id)
+                    .read_entry(wal_idx)
+                    .await
+                    .map_or(0, |e| e.term());
+                let mut ps_w = storage_lock.write().await;
+                ps_w.set_max_tiered_wal_index(wal_idx, raft_idx, term);
+                drop(ps_w);
+            }
+        }
+        let ps = storage_lock.read().await;
         // Serialize under read lock (fast, no I/O).
         let snapshot_result = ps.take_snapshot();
         drop(ps);

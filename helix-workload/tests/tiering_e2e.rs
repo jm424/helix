@@ -1306,27 +1306,21 @@ async fn test_shared_wal_tiering_and_recovery() {
             corrupted.is_empty(),
             "Partition {p}: corrupted messages: {corrupted:?}"
         );
-        // Tolerate active-segment gap: data in the unsealed segment at
-        // kill time is not in S3 — only sealed segments are uploaded.
-        // With 15K messages per partition and ~4 MiB segments (~60K entries
-        // each), at most one segment's worth of entries can be in the
-        // unsealed segment. Allow up to 10% loss per partition for this.
-        let acked_count = acknowledged_per_partition[p as usize].len();
-        let max_lost = acked_count / 10;
-        let lost_count = lost.len();
+        // Snapshot capping ensures the recovering node's snapshot only
+        // covers entries backed by S3. Raft replicates the remaining
+        // entries from peers, so all committed data is available.
+        // Zero loss is required.
         assert!(
-            lost_count <= max_lost,
-            "Partition {p}: too many lost messages (lost={lost_count}, \
-             max_allowed={max_lost}, matched={matched}, acked={acked_count})"
+            lost.is_empty(),
+            "Partition {p}: lost messages: {lost:?}"
         );
         total_matched += matched;
     }
 
-    // Require at least 90% of all messages recovered across the cluster.
     let total_acked: usize = acknowledged_per_partition.iter().map(Vec::len).sum();
-    assert!(
-        total_matched >= total_acked * 9 / 10,
-        "Too few messages recovered: {total_matched}/{total_acked}"
+    assert_eq!(
+        total_matched, total_acked,
+        "Expected zero loss: {total_matched}/{total_acked}"
     );
     eprintln!(
         "\n=== Results: {total_matched}/{total_acked} messages verified \

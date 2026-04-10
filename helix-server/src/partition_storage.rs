@@ -320,6 +320,18 @@ impl<S: Storage + Clone + Send + Sync + 'static> PartitionStorage<S> {
         }
     }
 
+    /// Updates the cached max tiered WAL index for snapshot capping.
+    pub fn set_max_tiered_wal_index(
+        &mut self,
+        wal_index: u64,
+        raft_index: u64,
+        term: u64,
+    ) {
+        if let PartitionStorageInner::Durable(p) = &mut self.inner {
+            p.set_max_tiered_wal_index(wal_index, raft_index, term);
+        }
+    }
+
     /// Returns the term of the last applied Raft log entry.
     #[must_use]
     pub const fn last_applied_term(&self) -> helix_core::TermId {
