@@ -2995,6 +2995,11 @@ impl<S: Storage + Clone + Send + Sync + 'static> DurablePartition<S> {
                     .map_err(|e| DurablePartitionError::WalWrite {
                         message: e.to_string(),
                     })?;
+                // For dedicated WAL, the WAL auto-counter equals the Raft index.
+                // BlobIndex uses last_applied_wal_index via apply_command_to_cache;
+                // leaving it at 0 stamps every blob entry with wal_index=0 and the
+                // fetch path's read_wal_entry(0) then bombs out at WAL bounds.
+                self.last_applied_wal_index = raft_index;
                 raft_index
             }
             WalBackend::Shared(handle) => {

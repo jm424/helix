@@ -139,15 +139,13 @@ pub(super) fn run_e2e_dst_random_faults(
                 cluster.heal_all();
 
                 // Restart any crashed nodes for full WAL replay recovery.
-                let crashed_nodes: Vec<NodeId> = {
-                    let state = cluster.network_state.lock().expect("lock poisoned");
-                    cluster
-                        .node_ids
-                        .iter()
-                        .filter(|&&n| state.is_crashed(n))
-                        .copied()
-                        .collect()
-                };
+                let crashed_nodes: Vec<NodeId> = cluster
+                    .crashed_nodes
+                    .lock()
+                    .expect("lock poisoned")
+                    .iter()
+                    .copied()
+                    .collect();
                 let had_restarts = !crashed_nodes.is_empty();
                 for node_id in crashed_nodes {
                     cluster.restart_node(node_id).await;
@@ -395,14 +393,13 @@ pub(super) fn run_e2e_dst_concurrent_faults(
                 // ===== PHASE 2: START CONCURRENT PRODUCERS =====
                 // Inflate network latency so messages are in-flight long
                 // enough for the fault injection task to modify network
-                // state while they're sleeping. With 50x multiplier,
-                // NETWORK_LATENCY (1ms) becomes 50ms per hop, making Raft
-                // replication take ~100ms round-trip. Fault ticks at 10ms
+                // state while they're sleeping. ~50ms per hop makes Raft
+                // replication take ~100ms round-trip; fault ticks at 10ms
                 // intervals can then hit mid-replication.
-                {
-                    let mut net = cluster.network_state.lock().expect("lock poisoned");
-                    net.set_global_latency_multiplier(50);
-                }
+                madsim::net::NetSim::current().update_config(|cfg| {
+                    cfg.send_latency =
+                        std::time::Duration::from_millis(40)..std::time::Duration::from_millis(60);
+                });
 
                 let (shutdown_tx, shutdown_rx) =
                     tokio::sync::watch::channel(false);
@@ -506,23 +503,24 @@ pub(super) fn run_e2e_dst_concurrent_faults(
                 }
 
                 // ===== PHASE 5: HEAL AND VERIFY =====
-                // Reset latency to normal speed for verification.
-                {
-                    let mut net = cluster.network_state.lock().expect("lock poisoned");
-                    net.set_global_latency_multiplier(1);
-                }
+                // Reset latency back to madsim's default (1ms..10ms). The
+                // earlier verify-phase code used 1ms..1ms to mean "fast", but
+                // that's an empty Range<Duration>; `Network::test_link` calls
+                // `gen_range` per message and empty ranges panic.
+                madsim::net::NetSim::current().update_config(|cfg| {
+                    cfg.send_latency =
+                        std::time::Duration::from_millis(1)..std::time::Duration::from_millis(10);
+                });
                 cluster.heal_all();
 
                 // Restart crashed nodes for WAL replay.
-                let crashed_nodes: Vec<NodeId> = {
-                    let state = cluster.network_state.lock().expect("lock poisoned");
-                    cluster
-                        .node_ids
-                        .iter()
-                        .filter(|&&n| state.is_crashed(n))
-                        .copied()
-                        .collect()
-                };
+                let crashed_nodes: Vec<NodeId> = cluster
+                    .crashed_nodes
+                    .lock()
+                    .expect("lock poisoned")
+                    .iter()
+                    .copied()
+                    .collect();
                 let had_restarts = !crashed_nodes.is_empty();
                 for node_id in crashed_nodes {
                     cluster.restart_node(node_id).await;

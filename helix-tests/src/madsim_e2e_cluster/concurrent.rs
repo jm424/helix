@@ -6,17 +6,19 @@
 
 #![cfg(all(test, madsim))]
 
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 use helix_core::{NodeId, Offset};
 use helix_wal::{FaultConfig, SimulatedStorage};
+use madsim::net::NetSim;
+use madsim::task::NodeId as MadsimNodeId;
 
-use crate::madsim_transport::SharedMadSimNetworkState;
 use crate::properties::SharedHelixPropertyState;
 
-use super::cluster::{E2EHelixService, E2EKafkaHandler, E2ECluster};
+use super::cluster::{E2ECluster, E2EHelixService, E2EKafkaHandler};
 use super::helpers::create_test_record_batch;
 
 /// Handle for a background producer task that runs concurrently with fault
@@ -27,8 +29,8 @@ pub(crate) struct ConcurrentProducerHandle {
     pub(crate) handlers: Vec<(NodeId, Arc<E2EKafkaHandler>)>,
     /// Node services for topic_id lookup (`Arc`-cloned from `E2ECluster`).
     pub(crate) services: Vec<(NodeId, Arc<E2EHelixService>)>,
-    /// Shared network state (to check which nodes are available).
-    pub(crate) network_state: SharedMadSimNetworkState,
+    /// Shared crashed-node bookkeeping (cloned Arc from `E2ECluster`).
+    pub(crate) crashed_nodes: Arc<Mutex<BTreeSet<NodeId>>>,
     /// All node IDs.
     pub(crate) node_ids: Vec<NodeId>,
     /// Property state for recording acked produces.
@@ -38,10 +40,10 @@ pub(crate) struct ConcurrentProducerHandle {
 impl ConcurrentProducerHandle {
     /// Returns node IDs that are not crashed.
     fn get_available_nodes(&self) -> Vec<NodeId> {
-        let state = self.network_state.lock().expect("lock poisoned");
+        let crashed = self.crashed_nodes.lock().expect("lock poisoned");
         self.node_ids
             .iter()
-            .filter(|&&node_id| !state.is_crashed(node_id))
+            .filter(|&&node_id| !crashed.contains(&node_id))
             .copied()
             .collect()
     }
@@ -193,12 +195,16 @@ impl ConcurrentProducerHandle {
 /// Only holds `Arc`-cloned references, so the `E2ECluster` owner can
 /// still access the cluster after creating this handle.
 pub(crate) struct FaultInjectorHandle {
-    /// Shared network state for partition/crash simulation.
-    pub(crate) network_state: SharedMadSimNetworkState,
-    /// All node IDs.
+    /// All helix node IDs.
     pub(crate) node_ids: Vec<NodeId>,
+    /// helix → madsim NodeId map for clog_link/clog_node translation.
+    pub(crate) madsim_node_ids: BTreeMap<NodeId, MadsimNodeId>,
     /// Per-node storage for `simulate_crash()`.
     pub(crate) storages: Vec<(NodeId, SimulatedStorage)>,
+    /// Shared crashed-node bookkeeping (cloned Arc from `E2ECluster`).
+    pub(crate) crashed_nodes: Arc<Mutex<BTreeSet<NodeId>>>,
+    /// Shared clogged-link bookkeeping (cloned Arc from `E2ECluster`).
+    pub(crate) clogged_links: Arc<Mutex<BTreeSet<(NodeId, NodeId)>>>,
 }
 
 impl crate::madsim_scenarios::FaultInjectable for FaultInjectorHandle {
@@ -207,26 +213,64 @@ impl crate::madsim_scenarios::FaultInjectable for FaultInjectorHandle {
     }
 
     fn partition(&self, nodes: &[NodeId]) {
-        let mut state = self.network_state.lock().expect("lock poisoned");
-        state.partition(nodes);
+        let net = NetSim::current();
+        let mut clogged = self.clogged_links.lock().expect("lock poisoned");
+        for i in 0..nodes.len() {
+            for j in (i + 1)..nodes.len() {
+                let a = nodes[i];
+                let b = nodes[j];
+                let m_a = *self.madsim_node_ids.get(&a).expect("madsim node id missing");
+                let m_b = *self.madsim_node_ids.get(&b).expect("madsim node id missing");
+                net.clog_link(m_a, m_b);
+                net.clog_link(m_b, m_a);
+                clogged.insert((a, b));
+                clogged.insert((b, a));
+            }
+        }
     }
 
     fn heal(&self, nodes: &[NodeId]) {
-        let mut state = self.network_state.lock().expect("lock poisoned");
-        state.heal(nodes);
+        let net = NetSim::current();
+        let mut clogged = self.clogged_links.lock().expect("lock poisoned");
+        for i in 0..nodes.len() {
+            for j in (i + 1)..nodes.len() {
+                let a = nodes[i];
+                let b = nodes[j];
+                let m_a = *self.madsim_node_ids.get(&a).expect("madsim node id missing");
+                let m_b = *self.madsim_node_ids.get(&b).expect("madsim node id missing");
+                net.unclog_link(m_a, m_b);
+                net.unclog_link(m_b, m_a);
+                clogged.remove(&(a, b));
+                clogged.remove(&(b, a));
+            }
+        }
     }
 
     fn crash_node(&self, node_id: NodeId) {
         if let Some((_, storage)) = self.storages.iter().find(|(id, _)| *id == node_id) {
             storage.simulate_crash();
         }
-        let mut state = self.network_state.lock().expect("lock poisoned");
-        state.crash_node(node_id);
+        let m_id = *self
+            .madsim_node_ids
+            .get(&node_id)
+            .expect("madsim node id missing");
+        NetSim::current().clog_node(m_id);
+        self.crashed_nodes
+            .lock()
+            .expect("lock poisoned")
+            .insert(node_id);
     }
 
     fn recover_node(&self, node_id: NodeId) {
-        let mut state = self.network_state.lock().expect("lock poisoned");
-        state.recover_node(node_id);
+        let m_id = *self
+            .madsim_node_ids
+            .get(&node_id)
+            .expect("madsim node id missing");
+        NetSim::current().unclog_node(m_id);
+        self.crashed_nodes
+            .lock()
+            .expect("lock poisoned")
+            .remove(&node_id);
     }
 
     fn set_storage_faults(&self, node_id: NodeId, config: FaultConfig) {
@@ -235,9 +279,9 @@ impl crate::madsim_scenarios::FaultInjectable for FaultInjectorHandle {
         }
     }
 
-    fn set_node_latency(&self, node_id: NodeId, multiplier: u32) {
-        let mut state = self.network_state.lock().expect("lock poisoned");
-        state.set_node_latency(node_id, multiplier);
+    fn set_node_latency(&self, _node_id: NodeId, _multiplier: u32) {
+        // No-op under Endpoint-based transport (madsim's send_latency is a
+        // global Range). Phase 2 will reintroduce this via buggify.
     }
 }
 

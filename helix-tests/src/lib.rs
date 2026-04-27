@@ -54,9 +54,9 @@ pub mod scenarios;
 #[cfg(feature = "madsim")]
 pub mod madsim_e2e_cluster;
 #[cfg(feature = "madsim")]
-pub mod madsim_scenarios;
+pub mod madsim_endpoint_transport;
 #[cfg(feature = "madsim")]
-pub mod madsim_transport;
+pub mod madsim_scenarios;
 
 // DST test modules (deterministic simulation with fault injection).
 #[cfg(test)]

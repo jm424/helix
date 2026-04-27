@@ -1,171 +1,236 @@
-//! Fault injection methods and `FaultInjectable` trait implementations.
+//! Fault injection methods (`E2ECluster`) and `FaultInjectable` trait impls.
+//!
+//! Partitions go through `NetSim::clog_link(src, dst)` with helix→madsim
+//! `NodeId` translation. Crashes use `NetSim::clog_node(madsim_id)` plus
+//! `SimulatedStorage::simulate_crash()` to revert unsynced writes. Restart
+//! re-spawns the service inside the madsim node via `Handle::restart`.
+//!
+//! # Why this exists
+//!
+//! The previous implementation maintained a custom `BTreeSet<(NodeId,
+//! NodeId)>` of partitioned helix-NodeId pairs that the custom mpsc
+//! transport consulted at delivery time. With the `Endpoint`-based
+//! transport, partitions are enforced by madsim's network simulator, and
+//! this file is the translation layer between helix's `NodeId`-keyed API
+//! and madsim's `MadsimNodeId`-keyed API.
 
 use std::sync::Arc;
 
 use helix_core::NodeId;
 use helix_server::kafka::KafkaHandler;
 use helix_wal::FaultConfig;
+use madsim::net::{Endpoint, NetSim};
+use madsim::runtime::Handle;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
-use crate::madsim_transport::MadSimTransport;
+use crate::madsim_endpoint_transport::{spawn_receive_loops, MadSimEndpointTransport};
 
 use super::cluster::{E2ECluster, E2ENode};
-use super::helpers::message_bridge_task;
 
 impl E2ECluster {
     // ========================================================================
     // Fault Injection
     // ========================================================================
 
-    /// Partitions the given nodes from each other.
+    /// Partitions the given nodes from each other (bidirectional clog).
     pub fn partition(&self, nodes: &[NodeId]) {
-        let mut state = self.network_state.lock().expect("lock poisoned");
-        state.partition(nodes);
+        let net = NetSim::current();
+        let mut clogged = self.clogged_links.lock().expect("lock poisoned");
+        for i in 0..nodes.len() {
+            for j in (i + 1)..nodes.len() {
+                let a = nodes[i];
+                let b = nodes[j];
+                let m_a = *self.madsim_node_ids.get(&a).expect("madsim node id missing");
+                let m_b = *self.madsim_node_ids.get(&b).expect("madsim node id missing");
+                net.clog_link(m_a, m_b);
+                net.clog_link(m_b, m_a);
+                clogged.insert((a, b));
+                clogged.insert((b, a));
+            }
+        }
         info!(?nodes, "Network partition created");
     }
 
-    /// Heals a partition between the given nodes.
+    /// Heals the partition between the given nodes (bidirectional unclog).
     pub fn heal(&self, nodes: &[NodeId]) {
-        let mut state = self.network_state.lock().expect("lock poisoned");
-        state.heal(nodes);
+        let net = NetSim::current();
+        let mut clogged = self.clogged_links.lock().expect("lock poisoned");
+        for i in 0..nodes.len() {
+            for j in (i + 1)..nodes.len() {
+                let a = nodes[i];
+                let b = nodes[j];
+                let m_a = *self.madsim_node_ids.get(&a).expect("madsim node id missing");
+                let m_b = *self.madsim_node_ids.get(&b).expect("madsim node id missing");
+                net.unclog_link(m_a, m_b);
+                net.unclog_link(m_b, m_a);
+                clogged.remove(&(a, b));
+                clogged.remove(&(b, a));
+            }
+        }
         info!(?nodes, "Network partition healed");
     }
 
     /// Heals all partitions in the cluster.
     pub fn heal_all(&self) {
-        let mut state = self.network_state.lock().expect("lock poisoned");
-        // Heal all pairs.
         for i in 0..self.node_ids.len() {
             for j in (i + 1)..self.node_ids.len() {
-                state.heal(&[self.node_ids[i], self.node_ids[j]]);
+                self.heal(&[self.node_ids[i], self.node_ids[j]]);
             }
         }
         info!("All network partitions healed");
     }
 
-    /// Crashes a node (stops receiving messages and reverts unsynced storage).
+    /// Crashes a node (network-isolated + reverts unsynced storage).
     ///
-    /// This calls `SimulatedStorage::simulate_crash()` to revert any writes
-    /// that were not fsync'd, simulating a real power failure. The node's
-    /// in-memory state (HelixService) continues running but is network-isolated.
-    /// Use `restart_node()` after `recover_node()` for full crash recovery
-    /// with WAL replay.
+    /// The node's `HelixService` keeps running but its madsim node is
+    /// clogged, so all incoming/outgoing traffic is dropped. Use
+    /// `restart_node()` for full crash recovery with WAL replay.
     pub fn crash_node(&self, node_id: NodeId) {
-        // Revert unsynced writes in storage.
         if let Some(node) = self.nodes.get(&node_id) {
             node.storage.simulate_crash();
         }
-        let mut state = self.network_state.lock().expect("lock poisoned");
-        state.crash_node(node_id);
-        info!(node = node_id.get(), "Node crashed (storage crash-reverted)");
+        let m_id = *self
+            .madsim_node_ids
+            .get(&node_id)
+            .expect("madsim node id missing");
+        NetSim::current().clog_node(m_id);
+        self.crashed_nodes
+            .lock()
+            .expect("lock poisoned")
+            .insert(node_id);
+        info!(
+            node = node_id.get(),
+            "Node crashed (storage crash-reverted, network isolated)"
+        );
     }
 
-    /// Recovers a crashed node (network only — no WAL replay).
-    ///
-    /// This re-enables network communication for the node but does NOT restart
-    /// the service. The existing `HelixService` continues with its in-memory
-    /// state. For full crash recovery with WAL replay, use `restart_node()`.
+    /// Recovers a crashed node (re-enables network, no WAL replay).
     pub fn recover_node(&self, node_id: NodeId) {
-        let mut state = self.network_state.lock().expect("lock poisoned");
-        state.recover_node(node_id);
+        let m_id = *self
+            .madsim_node_ids
+            .get(&node_id)
+            .expect("madsim node id missing");
+        NetSim::current().unclog_node(m_id);
+        self.crashed_nodes
+            .lock()
+            .expect("lock poisoned")
+            .remove(&node_id);
         info!(node = node_id.get(), "Node recovered (network only)");
     }
 
-    /// Restarts a crashed node with a fresh `HelixService` instance.
+    /// Restarts a crashed node with a fresh `HelixService` (full WAL replay).
     ///
-    /// This simulates a real crash recovery:
-    /// 1. Gets the node's `SimulatedStorage` (Arc-backed, survives drop)
-    /// 2. Drops the old `E2ENode` (stops old service tasks)
-    /// 3. Creates new mailbox channel, swaps sender into shared mailboxes
-    /// 4. Spawns new `message_bridge_task`
-    /// 5. Creates new `MadSimTransport` with same shared state
-    /// 6. Calls `HelixService::new_multi_node_with_transport()` — this
-    ///    opens `SharedWalPool` which replays from the crash-reverted files
-    /// 7. Creates new `KafkaHandler`, inserts new `E2ENode`
-    /// 8. Clears the crashed flag in network state
-    ///
-    /// The node replays its WAL from the last fsync'd state, catching up
-    /// via Raft replication for entries that were lost in the crash.
+    /// The madsim node is restarted via `Handle::restart`, killing any
+    /// in-flight tasks. The new service is built inside the same madsim node
+    /// (preserving its IP/identity for `clog_link`-based partition routing)
+    /// and replays the WAL from the crash-reverted storage.
     pub async fn restart_node(&mut self, node_id: NodeId) {
         use helix_core::WriteDurability;
         use helix_server::service::HelixService;
 
-        // Get storage from the old node (Arc-backed, survives drop).
         let storage = self
             .nodes
             .get(&node_id)
             .expect("node must exist to restart")
             .storage
             .clone();
+        let node_data_dir = self
+            .base_data_dir
+            .as_ref()
+            .map(|base| base.join(format!("node-{}", node_id.get())));
 
-        let node_data_dir = self.base_data_dir.as_ref().map(|base| {
-            base.join(format!("node-{}", node_id.get()))
-        });
-
-        // Drop the old node (stops background tasks).
+        // Drop old E2ENode (releases handler/service Arcs; tasks die when
+        // their owning madsim node is restarted below).
         self.nodes.remove(&node_id);
 
-        // Create new mailbox and swap into shared mailboxes.
-        let (tx, madsim_rx) = mpsc::channel(self.config.mailbox_capacity);
-        self.shared_mailboxes.replace(node_id, tx);
+        let m_id = *self
+            .madsim_node_ids
+            .get(&node_id)
+            .expect("madsim node id missing");
+        let addr = *self.peers.get(&node_id).expect("peer addr missing");
 
-        // Bridge MadSim messages to helix_runtime format.
-        let (incoming_tx, incoming_rx) = mpsc::channel(self.config.mailbox_capacity);
-        tokio::spawn(message_bridge_task(madsim_rx, incoming_tx));
+        let madsim_handle = Handle::current();
+        // Restart the madsim node: kills all its tasks, allows new spawns.
+        // The node retains its NodeId and bound IP.
+        madsim_handle.restart(m_id);
+        // madsim's `Handle::restart` only swaps the task-scheduler state for
+        // the node — it does NOT clear the network simulator's per-node
+        // socket table or the clog-node sets. Without these two calls the
+        // new spawn's `Endpoint::bind(addr)` returns `AddrInUse` (the
+        // crashed node's socket entry is still there), and even if bind
+        // somehow succeeded the node would remain network-isolated from
+        // the prior `crash_node`'s `clog_node`. `Handle::kill`'s code path
+        // (`kill_id` in madsim/src/sim/task/mod.rs) calls `sim.reset_node`
+        // through every registered simulator; `restart` does not. We
+        // replicate the cleanup explicitly here.
+        let net = NetSim::current();
+        net.reset_node(m_id);
+        net.unclog_node(m_id);
+        let madsim_node = madsim_handle
+            .get_node(m_id)
+            .expect("madsim node missing after restart");
 
-        // Create new transport with same shared state.
-        let transport = MadSimTransport::new(
-            node_id,
-            self.network_state.clone(),
-            self.shared_mailboxes.clone(),
-        );
+        let peers = self.peers.clone();
+        let node_ids = self.node_ids.clone();
+        let mailbox_capacity = self.config.mailbox_capacity;
+        let shared_wal_count = self.config.shared_wal_count;
+        let storage_for_service = storage.clone();
+        let storage_for_node = storage.clone();
+        let node_data_dir_for_spawn = node_data_dir.clone();
 
-        // Create new service — this replays WAL from crash-reverted storage.
-        let service = HelixService::new_multi_node_with_transport(
-            "e2e-cluster".to_string(),
-            node_id.get(),
-            self.node_ids.clone(),
-            transport.clone(),
-            incoming_rx,
-            node_data_dir.clone(),
-            self.config.shared_wal_count,
-            WriteDurability::Fsync,
-            storage.clone(),
-        )
-        .await;
+        let join = madsim_node.spawn(async move {
+            let endpoint = Endpoint::bind(addr).await.expect("bind endpoint");
+            let transport = MadSimEndpointTransport::new(node_id, endpoint.clone(), peers);
 
-        let actor_router = service.actor_router().cloned();
-        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+            let (incoming_tx, incoming_rx) = mpsc::channel(mailbox_capacity);
+            spawn_receive_loops(endpoint, incoming_tx);
 
-        let service = Arc::new(service);
-        let handler = Arc::new(KafkaHandler::new(
-            Arc::clone(&service),
-            "127.0.0.1".to_string(),
-            9092,
-            true, // auto_create_topics
-            1,    // auto_create_partitions
-        ));
+            let service = HelixService::new_multi_node_with_transport(
+                "e2e-cluster".to_string(),
+                node_id.get(),
+                node_ids,
+                transport.clone(),
+                incoming_rx,
+                node_data_dir_for_spawn.clone(),
+                shared_wal_count,
+                WriteDurability::Fsync,
+                storage_for_service,
+            )
+            .await;
 
-        self.nodes.insert(
-            node_id,
+            let actor_router = service.actor_router().cloned();
+            let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+            let service = Arc::new(service);
+            let handler = Arc::new(KafkaHandler::new(
+                Arc::clone(&service),
+                "127.0.0.1".to_string(),
+                9092,
+                true,
+                1,
+            ));
+
             E2ENode {
                 node_id,
+                madsim_node_id: m_id,
                 service,
                 handler,
-                storage,
+                storage: storage_for_node,
                 transport,
                 shutdown_tx,
-                data_dir: node_data_dir,
+                data_dir: node_data_dir_for_spawn,
                 actor_router,
-            },
-        );
+            }
+        });
 
-        // Clear the crashed flag.
-        {
-            let mut state = self.network_state.lock().expect("lock poisoned");
-            state.recover_node(node_id);
-        }
+        let new_node = join.await.expect("restart task panicked");
+        self.nodes.insert(node_id, new_node);
+
+        // Clear the crashed flag (madsim node is unclogged by `restart`).
+        self.crashed_nodes
+            .lock()
+            .expect("lock poisoned")
+            .remove(&node_id);
 
         info!(
             node = node_id.get(),
@@ -211,12 +276,15 @@ impl crate::madsim_scenarios::FaultInjectable for E2ECluster {
         E2ECluster::set_storage_faults(self, node_id, config);
     }
 
-    fn set_node_latency(&self, node_id: NodeId, multiplier: u32) {
-        let mut state = self.network_state.lock().expect("lock poisoned");
-        state.set_node_latency(node_id, multiplier);
-        info!(
+    fn set_node_latency(&self, node_id: NodeId, _multiplier: u32) {
+        // madsim's send_latency is a global Range<Duration>, not per-node.
+        // The plan calls for buggify-driven destination-side delay in Phase 2;
+        // for now this is a no-op, so existing SlowFollower scenarios produce
+        // the same global latency as everything else.
+        warn!(
             node = node_id.get(),
-            multiplier, "Node latency multiplier set"
+            "set_node_latency is a no-op under the Endpoint-based transport \
+             (Phase 2 will reintroduce via buggify destination-side delay)"
         );
     }
 }
@@ -238,9 +306,11 @@ impl E2ECluster {
             .map(|(&id, node)| (id, node.storage.clone()))
             .collect();
         super::concurrent::FaultInjectorHandle {
-            network_state: self.network_state.clone(),
             node_ids: self.node_ids.clone(),
+            madsim_node_ids: self.madsim_node_ids.clone(),
             storages,
+            crashed_nodes: self.crashed_nodes.clone(),
+            clogged_links: self.clogged_links.clone(),
         }
     }
 
@@ -263,7 +333,7 @@ impl E2ECluster {
         super::concurrent::ConcurrentProducerHandle {
             handlers,
             services,
-            network_state: self.network_state.clone(),
+            crashed_nodes: self.crashed_nodes.clone(),
             node_ids: self.node_ids.clone(),
             property_state: self.property_state.clone(),
         }

@@ -1,6 +1,6 @@
 //! E2ECluster struct, configuration, types, startup, and client API.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,19 +10,20 @@ use helix_server::kafka::KafkaHandler;
 use helix_server::service::router::PartitionRouter;
 use helix_server::service::HelixService;
 use helix_wal::{FaultConfig, SimulatedStorage};
+use madsim::net::Endpoint;
+use madsim::task::NodeId as MadsimNodeId;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
 
-use crate::madsim_transport::{
-    create_cluster_mailboxes, MadSimNetworkState, MadSimTransport, SharedMadSimNetworkState,
-    SharedNodeMailboxes,
+use crate::madsim_endpoint_transport::{
+    build_node_addrs, spawn_receive_loops, MadSimEndpointTransport, NodeAddrMap,
 };
 use crate::properties::{
-    check_helix_properties, HelixPropertyCheckResult, SharedHelixPropertyState,
-    HelixPropertyState,
+    check_helix_properties, HelixPropertyCheckResult, HelixPropertyState,
+    SharedHelixPropertyState,
 };
 
-use super::helpers::{create_test_record_batch, message_bridge_task, split_record_batches};
+use super::helpers::{create_test_record_batch, split_record_batches};
 
 // ============================================================================
 // E2E Cluster Configuration
@@ -105,15 +106,18 @@ impl E2EClusterConfig {
 // ============================================================================
 
 /// Type alias for the service used in E2E tests.
-pub type E2EHelixService = HelixService<SimulatedStorage, MadSimTransport>;
+pub type E2EHelixService = HelixService<SimulatedStorage, MadSimEndpointTransport>;
 
 /// Type alias for the Kafka handler used in E2E tests.
-pub type E2EKafkaHandler = KafkaHandler<SimulatedStorage, MadSimTransport>;
+pub type E2EKafkaHandler = KafkaHandler<SimulatedStorage, MadSimEndpointTransport>;
 
 /// A single node in the E2E cluster with its service and infrastructure.
 pub struct E2ENode {
-    /// The node's ID.
+    /// The node's ID (helix-side).
     pub node_id: NodeId,
+    /// The madsim-side NodeId for this helix node's task scheduler / network identity.
+    /// Used by fault injection (`NetSim::clog_link`, `NetSim::reset_node`).
+    pub madsim_node_id: MadsimNodeId,
     /// The real HelixService instance (shared with handler).
     pub service: Arc<E2EHelixService>,
     /// Kafka protocol handler for this node.
@@ -121,7 +125,7 @@ pub struct E2ENode {
     /// Storage for fault injection.
     pub storage: SimulatedStorage,
     /// Transport for sending messages.
-    pub transport: MadSimTransport,
+    pub transport: MadSimEndpointTransport,
     /// Shutdown sender to stop background tasks.
     pub(crate) shutdown_tx: mpsc::Sender<()>,
     /// Data directory for durable storage (if enabled).
@@ -160,10 +164,21 @@ pub struct E2ECluster {
     pub(crate) config: E2EClusterConfig,
     /// All nodes in the cluster.
     pub nodes: BTreeMap<NodeId, E2ENode>,
-    /// Shared network state for partition simulation.
-    pub(crate) network_state: SharedMadSimNetworkState,
-    /// Shared mailboxes for inter-node communication (supports restart_node).
-    pub(crate) shared_mailboxes: Arc<SharedNodeMailboxes>,
+    /// helix NodeId → madsim NodeId mapping. Used by fault injection to
+    /// translate helix-level partition/crash requests into madsim
+    /// NetSim/runtime calls (`clog_link`, `reset_node`).
+    pub(crate) madsim_node_ids: BTreeMap<NodeId, MadsimNodeId>,
+    /// helix NodeId → bound SocketAddr (10.0.0.{n}:8000). Cloned into each
+    /// node's transport so it knows where to send.
+    pub(crate) peers: NodeAddrMap,
+    /// Set of helix NodeIds whose madsim nodes are currently killed
+    /// (`Handle::kill` was called and `Handle::restart` hasn't been). madsim
+    /// doesn't expose `is_killed` back to us, so we track it ourselves.
+    pub(crate) crashed_nodes: Arc<Mutex<BTreeSet<NodeId>>>,
+    /// Set of directional partitions currently in effect, helix-NodeId pairs.
+    /// Mirrors `NetSim::clog_link` so `is_node_available` can reason about
+    /// which links are open without poking at madsim internals.
+    pub(crate) clogged_links: Arc<Mutex<BTreeSet<(NodeId, NodeId)>>>,
     /// Base data directory for durable storage.
     pub(crate) base_data_dir: Option<std::path::PathBuf>,
     /// All node IDs for convenience.
@@ -195,12 +210,10 @@ impl E2ECluster {
             })
             .collect();
 
-        // Create shared network state.
-        let network_state = Arc::new(Mutex::new(MadSimNetworkState::new()));
-
-        // Create mailboxes for inter-node communication.
-        let (shared_mailboxes, mut receivers) =
-            create_cluster_mailboxes(&node_ids, config.mailbox_capacity);
+        // Build the shared peer-address map. Each helix node gets a deterministic
+        // IP (10.0.0.{n}) and binds its endpoint at port 8000. The map is
+        // cloned into every node's transport so each one knows where to send.
+        let peers = build_node_addrs(&node_ids);
 
         // Create base data directory for durable storage (if enabled).
         // Use thread ID to avoid collisions when cargo test runs multiple
@@ -218,77 +231,89 @@ impl E2ECluster {
             None
         };
 
-        // Create nodes using the production constructor with injected transport.
+        // Each helix node lives in its own madsim node so that selective
+        // partitions (NetSim::clog_link(src_madsim, dst_madsim)) can address
+        // them individually. Background tasks spawned inside the per-node
+        // closure inherit the madsim node, so the entire HelixService —
+        // tick, batcher, output processor, partition actors — runs under
+        // the right network identity automatically.
+        let madsim_handle = madsim::runtime::Handle::current();
+
         let mut nodes = BTreeMap::new();
+        let mut madsim_node_ids = BTreeMap::new();
 
         for &node_id in &node_ids {
-            // Create storage with per-node seed for fault injection.
-            let storage_seed = config.base_seed.wrapping_add(node_id.get());
-            let storage =
-                SimulatedStorage::with_faults(storage_seed, config.storage_faults.clone());
+            let addr = *peers.get(&node_id).expect("peers map missing node");
+            let madsim_node = madsim_handle.create_node().ip(addr.ip()).build();
+            let madsim_node_id = madsim_node.id();
+            madsim_node_ids.insert(node_id, madsim_node_id);
 
-            // Create transport with shared network state and shared mailboxes.
-            let transport =
-                MadSimTransport::new(node_id, network_state.clone(), shared_mailboxes.clone());
-
-            // Get incoming message receiver for this node.
-            let madsim_rx = receivers.remove(&node_id).expect("receiver should exist");
-
-            // Create per-node data directory (if durable storage enabled).
             let node_data_dir = base_data_dir.as_ref().map(|base| {
                 let dir = base.join(format!("node-{}", node_id.get()));
                 std::fs::create_dir_all(&dir).expect("Failed to create node data directory");
                 dir
             });
 
-            // Bridge MadSim messages to helix_runtime format.
-            let (incoming_tx, incoming_rx) = mpsc::channel(config.mailbox_capacity);
-            tokio::spawn(message_bridge_task(madsim_rx, incoming_tx));
+            let storage_seed = config.base_seed.wrapping_add(node_id.get());
+            let storage_faults = config.storage_faults.clone();
+            let mailbox_capacity = config.mailbox_capacity;
+            let shared_wal_count = config.shared_wal_count;
+            let peers_clone = peers.clone();
+            let node_ids_clone = node_ids.clone();
+            let node_data_dir_for_spawn = node_data_dir.clone();
 
-            // Use the production constructor with injected transport.
-            // This exercises the exact same wiring as production code.
-            let service = HelixService::new_multi_node_with_transport(
-                "e2e-cluster".to_string(),
-                node_id.get(),
-                node_ids.clone(),
-                transport.clone(),
-                incoming_rx,
-                node_data_dir.clone(),
-                config.shared_wal_count,
-                WriteDurability::Fsync,
-                storage.clone(),
-            )
-            .await;
+            // Build the node inside its madsim node so bind/spawn inherit
+            // the per-node network/scheduler identity. Await the JoinHandle
+            // to retrieve the assembled E2ENode.
+            let join = madsim_node.spawn(async move {
+                let storage = SimulatedStorage::with_faults(storage_seed, storage_faults);
 
-            // Get actor router from service (if actor mode enabled).
-            let actor_router = service.actor_router().cloned();
+                let endpoint = Endpoint::bind(addr).await.expect("bind endpoint");
+                let transport =
+                    MadSimEndpointTransport::new(node_id, endpoint.clone(), peers_clone);
 
-            // Create shutdown channel for graceful shutdown.
-            let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+                let (incoming_tx, incoming_rx) = mpsc::channel(mailbox_capacity);
+                spawn_receive_loops(endpoint, incoming_tx);
 
-            // Create Kafka handler for this node.
-            let service = Arc::new(service);
-            let handler = Arc::new(KafkaHandler::new(
-                Arc::clone(&service),
-                "127.0.0.1".to_string(),
-                9092,
-                true, // auto_create_topics
-                1,    // auto_create_partitions
-            ));
+                let service = HelixService::new_multi_node_with_transport(
+                    "e2e-cluster".to_string(),
+                    node_id.get(),
+                    node_ids_clone,
+                    transport.clone(),
+                    incoming_rx,
+                    node_data_dir_for_spawn.clone(),
+                    shared_wal_count,
+                    WriteDurability::Fsync,
+                    storage.clone(),
+                )
+                .await;
 
-            nodes.insert(
-                node_id,
+                let actor_router = service.actor_router().cloned();
+                let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+                let service = Arc::new(service);
+                let handler = Arc::new(KafkaHandler::new(
+                    Arc::clone(&service),
+                    "127.0.0.1".to_string(),
+                    9092,
+                    true, // auto_create_topics
+                    1,    // auto_create_partitions
+                ));
+
                 E2ENode {
                     node_id,
+                    madsim_node_id,
                     service,
                     handler,
                     storage,
                     transport,
                     shutdown_tx,
-                    data_dir: node_data_dir,
+                    data_dir: node_data_dir_for_spawn,
                     actor_router,
-                },
-            );
+                }
+            });
+
+            let e2e_node = join.await.expect("node setup task panicked");
+            nodes.insert(node_id, e2e_node);
         }
 
         let property_state = Arc::new(Mutex::new(HelixPropertyState::new()));
@@ -303,8 +328,10 @@ impl E2ECluster {
         Self {
             config,
             nodes,
-            network_state,
-            shared_mailboxes,
+            madsim_node_ids,
+            peers,
+            crashed_nodes: Arc::new(Mutex::new(BTreeSet::new())),
+            clogged_links: Arc::new(Mutex::new(BTreeSet::new())),
             base_data_dir,
             node_ids,
             property_state,
@@ -528,27 +555,33 @@ impl E2ECluster {
         Err(format!("Failed to find leader after retries: {last_error}"))
     }
 
-    /// Returns a list of available (non-partitioned, non-crashed) node IDs.
+    /// Returns a list of available (non-crashed) node IDs.
+    ///
+    /// Note: this filters by crash state only, not by partition state.
+    /// Producers/consumers in the test harness should be willing to hit
+    /// partitioned nodes (that's where Antithesis-class bugs hide).
     pub(crate) fn get_available_nodes(&self) -> Vec<NodeId> {
-        let state = self.network_state.lock().expect("lock poisoned");
+        let crashed = self.crashed_nodes.lock().expect("lock poisoned");
         self.node_ids
             .iter()
-            .filter(|&&node_id| !state.is_crashed(node_id))
+            .filter(|&&node_id| !crashed.contains(&node_id))
             .copied()
             .collect()
     }
 
     /// Checks if a specific node is available (not partitioned from all others, not crashed).
     pub(crate) fn is_node_available(&self, node_id: NodeId) -> bool {
-        let state = self.network_state.lock().expect("lock poisoned");
-        if state.is_crashed(node_id) {
+        if self.crashed_nodes.lock().expect("lock poisoned").contains(&node_id) {
             return false;
         }
-        // Check if this node can reach at least one other node.
+        let clogged = self.clogged_links.lock().expect("lock poisoned");
+        // Check if this node can reach at least one other node — i.e., at
+        // least one outgoing link to a non-crashed peer is unclogged.
+        let crashed = self.crashed_nodes.lock().expect("lock poisoned");
         self.node_ids
             .iter()
-            .filter(|&&n| n != node_id)
-            .any(|&other| !state.is_partitioned(node_id, other))
+            .filter(|&&n| n != node_id && !crashed.contains(&n))
+            .any(|&other| !clogged.contains(&(node_id, other)))
     }
 
     /// Consumes data from a topic partition using the Kafka protocol handler.

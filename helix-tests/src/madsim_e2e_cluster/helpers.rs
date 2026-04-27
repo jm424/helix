@@ -3,9 +3,6 @@
 //! These have zero dependency on `E2ECluster` and are extracted first.
 
 use bytes::{BufMut, Bytes, BytesMut};
-use tokio::sync::mpsc;
-
-use crate::madsim_transport::{IncomingMessage as MadSimIncomingMessage, NodeMailboxReceiver};
 
 /// Creates a minimal valid Kafka RecordBatch for testing.
 ///
@@ -139,24 +136,3 @@ pub(crate) fn split_record_batches(data: &Bytes) -> Vec<Bytes> {
     batches
 }
 
-/// Bridge task that converts MadSimTransport messages to helix_runtime format.
-pub(crate) async fn message_bridge_task(
-    mut madsim_rx: NodeMailboxReceiver,
-    runtime_tx: mpsc::Sender<helix_runtime::IncomingMessage>,
-) {
-    while let Some(msg) = madsim_rx.recv().await {
-        let runtime_msg = match msg {
-            MadSimIncomingMessage::Raft(raft_msg) => {
-                helix_runtime::IncomingMessage::Batch(raft_msg.messages)
-            }
-            MadSimIncomingMessage::Heartbeat(hb_msg) => {
-                helix_runtime::IncomingMessage::Heartbeat(hb_msg.heartbeat)
-            }
-        };
-
-        if runtime_tx.send(runtime_msg).await.is_err() {
-            // Receiver dropped, task shutting down.
-            break;
-        }
-    }
-}

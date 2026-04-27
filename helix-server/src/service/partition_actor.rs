@@ -1238,6 +1238,33 @@ impl PartitionActorShared {
             return;
         }
 
+        // Reject writes while we still have uncommitted prior-term entries
+        // in the log. After a leader change the new leader's log can carry
+        // entries replicated by the old leader that were never propagated
+        // as committed (the old leader committed locally but crashed before
+        // broadcasting the new commit_index). next_base_offset only tracks
+        // committed entries, so proposing now would re-use a base_offset
+        // that the old leader already acked under its own term — same Kafka
+        // offset, two different produces. Mirror the OLD batcher's
+        // wait_for_stability gate: stall new proposes until commit_index
+        // catches up to last_log_index. Once the leader's term-bootstrap
+        // no-op commits, all prior-term entries cascade-commit and we can
+        // resume safely. NotEnoughReplicas is retriable in the produce
+        // client path.
+        let last_log_index = self.raft_node.log().last_index();
+        let commit_index = self.raft_node.commit_index();
+        if commit_index < last_log_index {
+            let err = ServerError::NotEnoughReplicas {
+                topic: "unknown".to_string(),
+                partition: 0,
+            };
+            self.release_global_backpressure(&batch_info);
+            for result_tx in batch_info.result_txs {
+                let _ = result_tx.send(Err(err.clone()));
+            }
+            return;
+        }
+
         // Patch base_offset in metadata to ensure monotonicity. The batcher
         // reads blob_log_end_offset (committed only), so concurrent
         // batches can get the same stale offset. The actor's

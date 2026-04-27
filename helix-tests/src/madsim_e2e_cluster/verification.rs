@@ -112,15 +112,17 @@ impl E2ECluster {
 
         for &node_id in self.node_ids() {
             // Skip crashed nodes - they may be behind.
+            if self
+                .crashed_nodes
+                .lock()
+                .expect("lock poisoned")
+                .contains(&node_id)
             {
-                let state = self.network_state.lock().expect("lock poisoned");
-                if state.is_crashed(node_id) {
-                    debug!(
-                        node = node_id.get(),
-                        "Skipping crashed node in consistency check"
-                    );
-                    continue;
-                }
+                debug!(
+                    node = node_id.get(),
+                    "Skipping crashed node in consistency check"
+                );
+                continue;
             }
 
             // Read data from this node.
