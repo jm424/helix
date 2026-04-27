@@ -57,6 +57,18 @@ pub struct RaftConfig {
     /// stricter drives compaction. Prevents OOM when individual entries are
     /// large (e.g. multi-blob batches at high throughput).
     pub log_trailing_bytes_max: u64,
+
+    /// Enables `CheckQuorum`: leader self-stepdown on quorum loss.
+    ///
+    /// When `true`, the leader checks once per randomized election timeout
+    /// that a majority of peers (counting itself) have responded since the
+    /// last check. If not, it steps down to follower at the current term
+    /// without advancing it. This bounds the time a partitioned-away leader
+    /// can hold onto leadership when no higher-term message arrives to
+    /// trigger the normal step-down path.
+    ///
+    /// Per Ongaro thesis §9.6. See `docs/design/raft-check-quorum.md`.
+    pub check_quorum: bool,
 }
 
 impl RaftConfig {
@@ -84,6 +96,7 @@ impl RaftConfig {
             random_seed: node_id.get(),
             log_trailing_entries: LOG_TRAILING_ENTRIES_DEFAULT,
             log_trailing_bytes_max: LOG_TRAILING_BYTES_MAX_DEFAULT,
+            check_quorum: true,
         }
     }
 
@@ -152,6 +165,16 @@ impl RaftConfig {
     #[must_use]
     pub const fn with_log_trailing_bytes_max(mut self, bytes: u64) -> Self {
         self.log_trailing_bytes_max = bytes;
+        self
+    }
+
+    /// Enables or disables `CheckQuorum`.
+    ///
+    /// Default is `true`. Disable only for tests that deliberately exercise
+    /// long partitions without wanting the leader to step down on its own.
+    #[must_use]
+    pub const fn with_check_quorum(mut self, enabled: bool) -> Self {
+        self.check_quorum = enabled;
         self
     }
 

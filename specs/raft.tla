@@ -1,9 +1,13 @@
 -------------------------------- MODULE raft --------------------------------
-\* Helix Raft Consensus Specification with Pre-Vote and Leadership Transfer
+\* Helix Raft Consensus Specification with Pre-Vote, Leadership Transfer,
+\* and CheckQuorum.
 \*
 \* This specification models the Raft consensus algorithm with:
 \* - Pre-Vote extension: prevents disruption from partitioned nodes
 \* - Leadership Transfer: enables graceful handoff via TimeoutNow message
+\* - CheckQuorum: leader self-stepdown when it cannot reach a majority of
+\*   peers (Ongaro thesis §9.6); ensures liveness when a leader is
+\*   partitioned away and no higher-term message arrives.
 \*
 \* Based on the Raft paper by Ongaro and Ousterhout, with extensions from
 \* "Consensus: Bridging Theory and Practice" (Ongaro PhD thesis).
@@ -46,12 +50,19 @@ VARIABLES nextIndex,    \* For each server, index of next log entry to send
 \* Message channels (for modeling network)
 VARIABLES messages      \* Set of messages in flight
 
+\* CheckQuorum state on leaders
+\* recentActive[s][d] = TRUE if leader s has observed a response from peer d
+\* since its last election-timeout reset. Reset on the StepDownOnQuorumLoss
+\* transition and on the recheck-window action.
+VARIABLES recentActive
+
 \* Auxiliary variables for specification/model checking
 VARIABLES elections,    \* History of elections for property checking
           committed     \* Set of committed entries for checking
 
 vars == <<currentTerm, votedFor, log, commitIndex, state,
-          nextIndex, matchIndex, messages, elections, committed>>
+          nextIndex, matchIndex, messages, recentActive,
+          elections, committed>>
 
 \* ============================================================================
 \* HELPERS
@@ -149,7 +160,8 @@ StartPreVote(s) ==
     /\ messages' = messages \cup
         {PreVoteRequest(s, d, currentTerm[s] + 1,
                        Len(log[s]), LastTerm(s)) : d \in Servers \ {s}}
-    /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, nextIndex, matchIndex, elections, committed>>
+    /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, nextIndex, matchIndex,
+                   recentActive, elections, committed>>
 
 \* Server s handles a PreVote request
 \* Key: Pre-vote doesn't change votedFor or currentTerm
@@ -167,7 +179,7 @@ HandlePreVote(s, m) ==
             {PreVoteResponse(s, m.src, m.term, grant)}
     \* Pre-vote doesn't change persistent state
     /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, state,
-                  nextIndex, matchIndex, elections, committed>>
+                  nextIndex, matchIndex, recentActive, elections, committed>>
 
 \* PreCandidate s receives enough pre-votes to start actual election
 BecomeCandidate(s) ==
@@ -184,7 +196,8 @@ BecomeCandidate(s) ==
     /\ messages' = messages \cup
         {RequestVoteRequest(s, d, currentTerm[s] + 1,
                            Len(log[s]), LastTerm(s)) : d \in Servers \ {s}}
-    /\ UNCHANGED <<log, commitIndex, nextIndex, matchIndex, elections, committed>>
+    /\ UNCHANGED <<log, commitIndex, nextIndex, matchIndex,
+                   recentActive, elections, committed>>
 
 \* ============================================================================
 \* VOTE ACTIONS
@@ -209,19 +222,26 @@ HandleRequestVote(s, m) ==
             {RequestVoteResponse(s, m.src,
                 IF m.term > currentTerm[s] THEN m.term ELSE currentTerm[s],
                 grant)}
-    /\ UNCHANGED <<log, commitIndex, nextIndex, matchIndex, elections, committed>>
+    /\ UNCHANGED <<log, commitIndex, nextIndex, matchIndex,
+                   recentActive, elections, committed>>
 
 \* Candidate s receives enough votes to become leader
+\*
+\* CheckQuorum: seed recentActive[s][d] = TRUE for peers that voted in this
+\* term. They're plainly reachable, so the first quorum-check window after
+\* election won't fire a spurious self-stepdown before any heartbeats land.
 BecomeLeader(s) ==
     /\ state[s] = "candidate"
     /\ LET votesReceived == {m.src : m \in {m \in messages :
             m.type = "RequestVoteResponse" /\ m.dst = s /\
             m.term = currentTerm[s] /\ m.granted}} \cup {s}
-       IN Cardinality(votesReceived) * 2 > Cardinality(Servers)
-    /\ state' = [state EXCEPT ![s] = "leader"]
-    /\ nextIndex' = [nextIndex EXCEPT ![s] = [d \in Servers |-> Len(log[s]) + 1]]
-    /\ matchIndex' = [matchIndex EXCEPT ![s] = [d \in Servers |-> 0]]
-    /\ elections' = elections \cup {[term |-> currentTerm[s], leader |-> s]}
+       IN /\ Cardinality(votesReceived) * 2 > Cardinality(Servers)
+          /\ state' = [state EXCEPT ![s] = "leader"]
+          /\ nextIndex' = [nextIndex EXCEPT ![s] = [d \in Servers |-> Len(log[s]) + 1]]
+          /\ matchIndex' = [matchIndex EXCEPT ![s] = [d \in Servers |-> 0]]
+          /\ recentActive' = [recentActive EXCEPT ![s] =
+                [d \in Servers |-> d \in votesReceived]]
+          /\ elections' = elections \cup {[term |-> currentTerm[s], leader |-> s]}
     /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, messages, committed>>
 
 \* ============================================================================
@@ -234,7 +254,8 @@ ClientRequest(s, v) ==
     /\ Len(log[s]) < MaxLogLength
     /\ log' = [log EXCEPT ![s] = Append(@, [term |-> currentTerm[s], value |-> v])]
     /\ UNCHANGED <<currentTerm, votedFor, commitIndex, state,
-                   nextIndex, matchIndex, messages, elections, committed>>
+                   nextIndex, matchIndex, messages, recentActive,
+                   elections, committed>>
 
 \* Leader s sends AppendEntries to follower d
 SendAppendEntries(s, d) ==
@@ -250,7 +271,7 @@ SendAppendEntries(s, d) ==
             {AppendEntriesRequest(s, d, currentTerm[s], prevIdx, prevTerm,
                                   entries, commitIndex[s])}
     /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, state,
-                   nextIndex, matchIndex, elections, committed>>
+                   nextIndex, matchIndex, recentActive, elections, committed>>
 
 \* Server s handles an AppendEntries request
 HandleAppendEntries(s, m) ==
@@ -261,7 +282,7 @@ HandleAppendEntries(s, m) ==
             /\ messages' = (messages \ {m}) \cup
                 {AppendEntriesResponse(s, m.src, currentTerm[s], FALSE, 0)}
             /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, state,
-                          nextIndex, matchIndex, elections, committed>>
+                          nextIndex, matchIndex, recentActive, elections, committed>>
        ELSE \* Valid request
             /\ IF m.term > currentTerm[s]
                THEN currentTerm' = [currentTerm EXCEPT ![s] = m.term]
@@ -282,14 +303,16 @@ HandleAppendEntries(s, m) ==
                        /\ messages' = (messages \ {m}) \cup
                             {AppendEntriesResponse(s, m.src, m.term, TRUE,
                                 m.prevLogIdx + Len(m.entries))}
-                       /\ UNCHANGED <<nextIndex, matchIndex, elections, committed>>
+                       /\ UNCHANGED <<nextIndex, matchIndex, recentActive,
+                                     elections, committed>>
                   ELSE \* Log mismatch
                        /\ messages' = (messages \ {m}) \cup
                             {AppendEntriesResponse(s, m.src, m.term, FALSE, 0)}
                        /\ UNCHANGED <<log, commitIndex, nextIndex, matchIndex,
-                                     elections, committed>>
+                                     recentActive, elections, committed>>
 
 \* Leader s handles an AppendEntries response from follower
+\* CheckQuorum: any response (success or rejection) marks the peer active.
 HandleAppendEntriesResponse(s, m) ==
     /\ m.type = "AppendEntriesResponse"
     /\ m.dst = s
@@ -301,6 +324,7 @@ HandleAppendEntriesResponse(s, m) ==
        ELSE /\ nextIndex' = [nextIndex EXCEPT ![s][m.src] =
                 Max({1, nextIndex[s][m.src] - 1})]
             /\ UNCHANGED matchIndex
+    /\ recentActive' = [recentActive EXCEPT ![s][m.src] = TRUE]
     /\ messages' = messages \ {m}
     /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, state, elections, committed>>
 
@@ -318,7 +342,8 @@ AdvanceCommitIndex(s) ==
              /\ committed' = committed \cup
                   {[idx |-> i, term |-> log[s][i].term, value |-> log[s][i].value] :
                    i \in (commitIndex[s]+1)..newCommitIdx}
-    /\ UNCHANGED <<currentTerm, votedFor, log, state, nextIndex, matchIndex, messages, elections>>
+    /\ UNCHANGED <<currentTerm, votedFor, log, state, nextIndex, matchIndex,
+                   messages, recentActive, elections>>
 
 \* ============================================================================
 \* LEADERSHIP TRANSFER ACTIONS
@@ -334,7 +359,7 @@ SendTimeoutNow(s, d) ==
     /\ matchIndex[s][d] >= Len(log[s])
     /\ messages' = messages \cup {TimeoutNowRequest(s, d, currentTerm[s])}
     /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, state,
-                   nextIndex, matchIndex, elections, committed>>
+                   nextIndex, matchIndex, recentActive, elections, committed>>
 
 \* Server s handles TimeoutNow by immediately starting an election
 \* Key: This bypasses pre-vote because the leader explicitly requested the transfer
@@ -351,7 +376,39 @@ HandleTimeoutNow(s, m) ==
     /\ messages' = (messages \ {m}) \cup
         {RequestVoteRequest(s, d, currentTerm[s] + 1,
                            Len(log[s]), LastTerm(s)) : d \in Servers \ {s}}
-    /\ UNCHANGED <<log, commitIndex, nextIndex, matchIndex, elections, committed>>
+    /\ UNCHANGED <<log, commitIndex, nextIndex, matchIndex,
+                   recentActive, elections, committed>>
+
+\* ============================================================================
+\* CHECKQUORUM ACTIONS (Ongaro thesis §9.6)
+\* ============================================================================
+
+\* Leader s steps down at the current term because fewer than a quorum of
+\* peers (counting itself) have responded since the last reset of recentActive.
+\*
+\* Key safety property: term and votedFor are unchanged. SingleLeaderPerTerm
+\* still holds because we never elect a new leader here, only demote one.
+\* Liveness: a peer that can still reach a majority is now free to win an
+\* election (it will time out and start a pre-vote on its own).
+LeaderStepDownOnQuorumLoss(s) ==
+    /\ state[s] = "leader"
+    /\ LET active == {d \in Servers : recentActive[s][d]} \cup {s}
+       IN Cardinality(active) * 2 <= Cardinality(Servers)
+    /\ state' = [state EXCEPT ![s] = "follower"]
+    /\ recentActive' = [recentActive EXCEPT ![s] = [d \in Servers |-> FALSE]]
+    /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex,
+                   nextIndex, matchIndex, messages, elections, committed>>
+
+\* Recheck-window action: at an election-timeout boundary, if the leader
+\* still sees a quorum of recently-active peers (counting itself), reset the
+\* flags for the next window. Models the non-stepdown branch of the tick.
+RecheckQuorumWindow(s) ==
+    /\ state[s] = "leader"
+    /\ LET active == {d \in Servers : recentActive[s][d]} \cup {s}
+       IN Cardinality(active) * 2 > Cardinality(Servers)
+    /\ recentActive' = [recentActive EXCEPT ![s] = [d \in Servers |-> FALSE]]
+    /\ UNCHANGED <<currentTerm, votedFor, log, commitIndex, state,
+                   nextIndex, matchIndex, messages, elections, committed>>
 
 \* ============================================================================
 \* SPECIFICATION
@@ -365,6 +422,7 @@ Init ==
     /\ state = [s \in Servers |-> "follower"]
     /\ nextIndex = [s \in Servers |-> [d \in Servers |-> 1]]
     /\ matchIndex = [s \in Servers |-> [d \in Servers |-> 0]]
+    /\ recentActive = [s \in Servers |-> [d \in Servers |-> FALSE]]
     /\ messages = {}
     /\ elections = {}
     /\ committed = {}
@@ -386,6 +444,9 @@ Next ==
     \* Leadership transfer
     \/ \E s, d \in Servers : SendTimeoutNow(s, d)
     \/ \E s \in Servers, m \in messages : HandleTimeoutNow(s, m)
+    \* CheckQuorum
+    \/ \E s \in Servers : LeaderStepDownOnQuorumLoss(s)
+    \/ \E s \in Servers : RecheckQuorumWindow(s)
 
 Spec == Init /\ [][Next]_vars
 
@@ -437,5 +498,6 @@ TypeOK ==
     /\ votedFor \in [Servers -> Servers \cup {Nil}]
     /\ state \in [Servers -> {"follower", "preCandidate", "candidate", "leader"}]
     /\ commitIndex \in [Servers -> Nat]
+    /\ recentActive \in [Servers -> [Servers -> BOOLEAN]]
 
 =============================================================================

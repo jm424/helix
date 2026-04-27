@@ -61,6 +61,10 @@ struct ReplicationState {
     /// Reset to 0 when a response is received. Used to timeout stale
     /// inflight state (e.g., after follower crash/recovery).
     inflight_stale_ticks: u32,
+    /// `CheckQuorum`: set true on any response from this peer, reset to
+    /// false at each election-timeout boundary. The leader steps down
+    /// when fewer than a quorum of peers (counting itself) are active.
+    recent_active: bool,
 }
 
 /// Number of ticks without response before resetting inflight state.
@@ -75,6 +79,7 @@ impl ReplicationState {
             match_index: LogIndex::new(0),
             inflight_count: 0,
             inflight_stale_ticks: 0,
+            recent_active: false,
         }
     }
 }
@@ -530,8 +535,12 @@ impl RaftNode {
     /// Tick processing for leaders.
     ///
     /// Sends heartbeats when `heartbeat_elapsed` >= `heartbeat_tick`.
-    /// Also tracks inflight timeouts to handle follower crash/recovery.
+    /// Also tracks inflight timeouts to handle follower crash/recovery,
+    /// and runs the `CheckQuorum` self-stepdown check once per election
+    /// timeout window when enabled.
     fn tick_leader(&mut self) -> Vec<RaftOutput> {
+        let mut outputs = Vec::new();
+
         self.heartbeat_elapsed += 1;
 
         // Abort stale leadership transfers. If the target node is dead or
@@ -565,12 +574,38 @@ impl RaftNode {
             }
         }
 
+        // CheckQuorum: once per randomized election-timeout window, count
+        // peers (including self) seen as active since the last reset. If
+        // we have not heard from a majority, step down at the current term
+        // so a peer that can still reach a majority is free to win an
+        // election. Per Ongaro thesis §9.6.
+        if self.config.check_quorum {
+            self.election_elapsed += 1;
+            if self.election_elapsed >= self.randomized_election_timeout {
+                let active = 1 + self
+                    .replication_state
+                    .values()
+                    .filter(|r| r.recent_active)
+                    .count();
+                let quorum = self.config.quorum_size();
+                if active < quorum {
+                    outputs.extend(self.step_down_at_current_term());
+                    return outputs;
+                }
+                for r in self.replication_state.values_mut() {
+                    r.recent_active = false;
+                }
+                self.election_elapsed = 0;
+                self.reset_randomized_election_timeout();
+            }
+        }
+
         if self.heartbeat_elapsed >= self.config.heartbeat_tick {
             self.heartbeat_elapsed = 0;
-            self.send_heartbeats()
-        } else {
-            Vec::new()
+            outputs.extend(self.send_heartbeats());
         }
+
+        outputs
     }
 
     /// Tick processing for non-leaders.
@@ -809,6 +844,40 @@ impl RaftNode {
         }]
     }
 
+    /// `CheckQuorum` step-down: demotes leader to follower at the *current*
+    /// term, leaving `voted_for` and the term unchanged. Used when no peer
+    /// has shown us a higher term but we have lost contact with a majority.
+    ///
+    /// Emits only `SteppedDown`; no `VoteStateChanged` is needed because
+    /// neither term nor `voted_for` change.
+    fn step_down_at_current_term(&mut self) -> Vec<RaftOutput> {
+        debug_assert!(self.state == RaftState::Leader);
+
+        self.state = RaftState::Follower;
+        self.transfer_target = None;
+        self.transfer_elapsed = 0;
+        self.wal_read_pending.clear();
+
+        // Reset election timing so the new follower waits a full window
+        // before starting its own pre-election. Otherwise it would fire
+        // on the very next tick (election_elapsed is at the timeout).
+        self.reset_election_elapsed();
+        self.reset_randomized_election_timeout();
+
+        // Don't touch voted_for: we're still in the same term and our
+        // existing self-vote is still correct. Don't touch leader_id:
+        // it will be overwritten when AppendEntries from the next leader
+        // arrives, matching how step_down(higher_term) leaves it.
+
+        info!(
+            node_id = self.config.node_id.get(),
+            term = self.current_term.get(),
+            "CheckQuorum: stepping down at current term (quorum lost)"
+        );
+
+        vec![RaftOutput::SteppedDown]
+    }
+
     /// Handles a pre-vote request.
     ///
     /// Pre-vote doesn't update term or `voted_for` state - it's speculative.
@@ -976,6 +1045,16 @@ impl RaftNode {
     fn handle_request_vote_response(&mut self, resp: RequestVoteResponse) -> Vec<RaftOutput> {
         let mut outputs = Vec::new();
 
+        // Late vote arriving after we already became leader still proves
+        // the sender is reachable in this term: mark them active for
+        // CheckQuorum so we don't ignore the signal.
+        if self.state == RaftState::Leader && resp.term == self.current_term {
+            if let Some(state) = self.replication_state.get_mut(&resp.from) {
+                state.recent_active = true;
+            }
+            return outputs;
+        }
+
         // Ignore if not a candidate or term doesn't match.
         if self.state != RaftState::Candidate || resp.term != self.current_term {
             return outputs;
@@ -1003,16 +1082,27 @@ impl RaftNode {
         self.state = RaftState::Leader;
         self.leader_id = Some(self.config.node_id);
         self.heartbeat_elapsed = 0;
+        // Reset election_elapsed so the first CheckQuorum window starts
+        // fresh. Otherwise we could fire a spurious self-stepdown one
+        // tick after election if election_elapsed had been non-zero.
+        self.election_elapsed = 0;
+        self.reset_randomized_election_timeout();
         self.wal_read_pending.clear();
 
         // Initialize leader state.
         // next_index starts at last_index + 1 (optimistic).
         // match_index starts at 0 (unknown).
         // inflight_count starts at 0 (no in-flight requests).
+        // recent_active is seeded true for peers that voted for us in
+        // this term: they're plainly reachable, so the first CheckQuorum
+        // window won't fire a spurious stepdown before any heartbeats.
         let next_idx = LogIndex::new(self.log.last_index().get() + 1);
         for peer in self.config.peers() {
-            self.replication_state
-                .insert(peer, ReplicationState::new(next_idx));
+            let mut state = ReplicationState::new(next_idx);
+            if self.votes_received.contains(&peer) {
+                state.recent_active = true;
+            }
+            self.replication_state.insert(peer, state);
         }
 
         // Postcondition: leader state initialized for all peers.
@@ -1186,6 +1276,10 @@ impl RaftNode {
 
         // Reset stale tick counter - we got a response from this follower.
         state.inflight_stale_ticks = 0;
+
+        // CheckQuorum: any response (success or rejection) proves
+        // bidirectional reachability since the last election-timeout reset.
+        state.recent_active = true;
 
         if resp.success {
             // Decrement inflight count - this response completes one request.
@@ -1376,6 +1470,8 @@ impl RaftNode {
         }
 
         if let Some(state) = self.replication_state.get_mut(&resp.from) {
+            // CheckQuorum: any snapshot response proves reachability.
+            state.recent_active = true;
             if resp.success {
                 state.inflight_count = state.inflight_count.saturating_sub(1);
             }
@@ -3485,6 +3581,126 @@ mod tests {
             state.inflight_count,
             inflight_after_provide,
             "failed response must NOT decrement inflight_count"
+        );
+    }
+
+    // ========================================================================
+    // CheckQuorum tests (Ongaro thesis §9.6)
+    // ========================================================================
+
+    #[test]
+    fn test_check_quorum_leader_steps_down_when_isolated() {
+        // A fully-isolated leader must step down on its own once an
+        // election timeout elapses without a quorum of peers responding,
+        // even when no higher-term message arrives to trigger the normal
+        // step_down path.
+        let mut node = RaftNode::new(make_config(1));
+        make_leader(&mut node);
+        assert!(node.is_leader());
+        let term_before = node.current_term();
+
+        // Tick through enough windows to fire CheckQuorum twice. The first
+        // window passes because become_leader seeds recent_active=true for
+        // the peer that voted; the second window sees no responses and
+        // triggers stepdown.
+        let max_ticks = node.config.election_tick * 6;
+        let mut stepped_down_outputs: Option<Vec<RaftOutput>> = None;
+        for _ in 0..max_ticks {
+            let outputs = node.tick();
+            if outputs.iter().any(|o| matches!(o, RaftOutput::SteppedDown)) {
+                stepped_down_outputs = Some(outputs);
+                break;
+            }
+        }
+
+        let outputs = stepped_down_outputs.expect("leader must self-stepdown when isolated");
+        assert_eq!(node.state(), RaftState::Follower);
+        assert_eq!(node.current_term(), term_before, "term must not change");
+        assert!(
+            !outputs
+                .iter()
+                .any(|o| matches!(o, RaftOutput::VoteStateChanged { .. })),
+            "stepdown at current term must not emit VoteStateChanged"
+        );
+    }
+
+    #[test]
+    fn test_check_quorum_leader_stays_leader_with_majority_reachable() {
+        let mut node = RaftNode::new(make_config(1));
+        make_leader(&mut node);
+        let peer = NodeId::new(2);
+
+        // Tick repeatedly while one peer keeps acknowledging. With self +
+        // peer 2 = 2, quorum is met every window so the leader must hold.
+        let max_ticks = node.config.election_tick * 6;
+        for _ in 0..max_ticks {
+            node.tick();
+            let resp = AppendEntriesResponse::new(
+                node.current_term(),
+                peer,
+                node.node_id(),
+                true,
+                node.log().last_index(),
+                LogIndex::new(0),
+            );
+            node.handle_message(Message::AppendEntriesResponse(resp));
+        }
+
+        assert!(
+            node.is_leader(),
+            "leader must stay leader while a peer remains reachable"
+        );
+    }
+
+    #[test]
+    fn test_check_quorum_disabled_by_config() {
+        // With check_quorum=false, an isolated leader must NOT step down.
+        let cluster = vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)];
+        let config = RaftConfig::new(NodeId::new(1), cluster)
+            .with_tick_config(5, 1)
+            .with_check_quorum(false);
+        let mut node = RaftNode::new(config);
+        make_leader(&mut node);
+        assert!(node.is_leader());
+
+        // Many ticks with no peer responses; must remain leader.
+        for _ in 0..100 {
+            let outputs = node.tick();
+            assert!(
+                !outputs.iter().any(|o| matches!(o, RaftOutput::SteppedDown)),
+                "must not step down when CheckQuorum is disabled"
+            );
+        }
+        assert!(node.is_leader());
+    }
+
+    #[test]
+    fn test_check_quorum_response_marks_peer_active() {
+        // An AppendEntries response (success or rejection) must mark the
+        // peer active for CheckQuorum purposes.
+        let mut node = RaftNode::new(make_config(1));
+        make_leader(&mut node);
+        let peer = NodeId::new(3); // node 3 did not vote in make_leader.
+
+        // After make_leader, node 3 has recent_active=false (didn't vote).
+        let active_before = node.replication_state.get(&peer).unwrap().recent_active;
+        assert!(!active_before, "peer that did not vote starts inactive");
+
+        // A rejection (success=false) still proves reachability.
+        let resp = AppendEntriesResponse::new(
+            node.current_term(),
+            peer,
+            node.node_id(),
+            false,
+            LogIndex::new(0),
+            LogIndex::new(0),
+        );
+        node.handle_message(Message::AppendEntriesResponse(resp));
+
+        let active_after = node.replication_state.get(&peer).unwrap().recent_active;
+        assert!(
+            active_after,
+            "any AppendEntries response must mark peer active"
         );
     }
 }
